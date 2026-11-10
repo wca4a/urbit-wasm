@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["runtime", "sdk", "agents/counter"]
+# The SDK and agents only link for wasm32, so plain `cargo build` / `cargo test` cover the runtime.
+default-members = ["runtime"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+
+[profile.release]
+opt-level = 3
