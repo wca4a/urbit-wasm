@@ -1,6 +1,6 @@
 # urbit-wasm
 
-A prototype runtime for an Urbit without Hoon or Nock. Many ships run in one
+A prototype runtime for an Urbit-like process without Hoon or Nock. Multiple ships can run in one
 process. Each ship is one SQLite file plus WASM agents written in Rust.
 
 Experimental. This is the runtime only: there is no kernel, networking,
