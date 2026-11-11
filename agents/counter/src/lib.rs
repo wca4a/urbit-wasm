@@ -29,13 +29,32 @@ fn handle(event: &[u8]) -> Vec<u8> {
         }
         // Publish an entry of a given size.
         (Some("log-big"), Some(len), None) => {
+            kv::put(b"latest", format!("big {len}").as_bytes());
             log::append("counter", &vec![b'x'; len.parse().unwrap_or(0)]).to_string()
         }
-        // Add one, and publish the new value in this agent's log for anyone following it.
+        // Add one, and publish the new value in this agent's log for anyone following it. The
+        // latest entry is also what this log's state amounts to, so it is kept for checkpoints.
         (Some("log"), Some(key), None) => {
             let value = read(key) + 1;
             write(key, value);
-            log::append("counter", format!("{key}={value}").as_bytes()).to_string()
+            let entry = format!("{key}={value}");
+            kv::put(b"latest", entry.as_bytes());
+            log::append("counter", entry.as_bytes()).to_string()
+        }
+        // Add a line to the journal: a log that is a history, never summed up by a checkpoint.
+        (Some("journal"), Some(_), _) => {
+            log::append("journal", text.trim_start()["journal".len()..].trim().as_bytes()).to_string()
+        }
+        // Make this log's state a given size.
+        (Some("state"), Some(len), None) => {
+            kv::put(b"latest", &vec![b's'; len.parse().unwrap_or(0)]);
+            "ok".to_string()
+        }
+        // How the checkpoint handler behaves: `broken` makes it fail, `meddling` makes it try
+        // to change something, `padded` makes its answer large, anything else makes it behave.
+        (Some("checkpoints"), Some(mode), None) => {
+            kv::put(b"checkpoints", mode.as_bytes());
+            "ok".to_string()
         }
         (Some("del"), Some(key), None) => {
             kv::delete(key.as_bytes());
@@ -79,4 +98,20 @@ fn value(key: &[u8]) -> Vec<u8> {
     read(&String::from_utf8_lossy(key)).to_string().into_bytes()
 }
 
-agent!(handle, read = value);
+/// Checkpoint handler: the state behind the `counter` log is its latest entry. The journal is
+/// a history, so it has no state that could stand in for its entries.
+fn state(log: &str) -> Option<Vec<u8>> {
+    match kv::get(b"checkpoints").as_deref() {
+        Some(b"broken") => panic!("checkpoints are broken"),
+        Some(b"meddling") => kv::put(b"latest", b"changed while describing it"),
+        _ => {}
+    }
+    let latest = kv::get(b"latest").unwrap_or_default();
+    match (log, kv::get(b"checkpoints").as_deref()) {
+        ("counter", Some(b"padded")) => Some([latest, vec![b'.'; 10_000]].concat()),
+        ("counter", _) => Some(latest),
+        _ => None,
+    }
+}
+
+agent!(handle, read = value, checkpoint = state);

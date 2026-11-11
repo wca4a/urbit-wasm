@@ -1,7 +1,24 @@
 //! A test agent that depends on the counter agent: it reads a counter, and asks for it to be
 //! incremented. Used to exercise permissions and queued commands.
 
+use ship_sdk::proto::{Message, NextReply, NextRequest};
 use ship_sdk::{agent, emit, invocation, kv, log, read, send};
+
+#[link(wasm_import_module = "host")]
+extern "C" {
+    #[link_name = "log_next"]
+    fn raw_log_next(req: *const u8, req_len: u32, buf: *mut u8, buf_cap: u32) -> i64;
+}
+
+/// Take entries the way an agent built before checkpoints existed would: its request does not
+/// say it can take a checkpoint, and it would not notice one in the reply.
+fn old_next(agent: &str, log: &str, max: u32) -> log::Batch {
+    let request = NextRequest { agent: agent.into(), log: log.into(), max, checkpoints: false }.encode_to_vec();
+    let mut buf = vec![0u8; 64 << 10];
+    let len = unsafe { raw_log_next(request.as_ptr(), request.len() as u32, buf.as_mut_ptr(), buf.len() as u32) };
+    let reply = NextReply::decode(&buf[..len as usize]).expect("the runtime sent a malformed log reply");
+    log::Batch { checkpoint: None, entries: reply.entries, more: reply.more }
+}
 
 /// Who is calling and through which interface, as the runtime reports it.
 fn caller() -> String {
@@ -56,8 +73,17 @@ fn handle(event: &[u8]) -> Vec<u8> {
         }
         // Ask the counter's log for no entries at all: how many came back, and whether more remain.
         (Some("glance"), None) => {
-            let (entries, more) = log::next("counter", "counter", 0);
-            format!("{} {more}", entries.len())
+            let batch = log::next("counter", "counter", 0);
+            format!("{} {}", batch.entries.len() + batch.checkpoint.iter().count(), batch.more)
+        }
+        // Behave like an agent built before checkpoints existed, or stop doing so.
+        (Some("old"), None) => {
+            kv::put(b"old", b"yes");
+            "ok".to_string()
+        }
+        (Some("modern"), None) => {
+            kv::delete(b"old");
+            "ok".to_string()
         }
         // Stop refusing entries that mention poison.
         (Some("tolerate"), None) => {
@@ -102,6 +128,8 @@ fn view(request: &[u8]) -> Vec<u8> {
         // How many log entries this agent has taken, and the latest one.
         (Some("seen"), None) => seen().to_string().into_bytes(),
         (Some("last"), None) => kv::get(b"last").unwrap_or_default(),
+        // How many times this agent was handed a checkpoint in place of entries.
+        (Some("jumps"), None) => kv::get(b"jumps").map_or(0, |jumps| jumps.len()).to_string().into_bytes(),
         (Some("note"), None) => kv::get(b"note").unwrap_or_default(),
         (Some("who"), None) => caller().into_bytes(),
         // A read of ourselves, to see what a nested read is told about its caller.
@@ -129,9 +157,21 @@ fn seen() -> u32 {
 fn notified(_: &[u8]) -> Vec<u8> {
     let call = invocation();
     let publisher = call.source.unwrap_or_default().agent;
-    let (entries, _more) = log::next(&publisher, &call.interface, 3);
+    let batch = match kv::get(b"old") {
+        Some(_) => old_next(&publisher, &call.interface, 3),
+        None => log::next(&publisher, &call.interface, 3),
+    };
     let mut count = seen();
-    for entry in &entries {
+    // Too far behind for the entries to still exist: take the publisher's state as of the
+    // entry the checkpoint stands for, and carry on counting from there.
+    if let Some(checkpoint) = &batch.checkpoint {
+        count = checkpoint.seq as u32;
+        kv::put(b"last", &checkpoint.state);
+        let mut jumps = kv::get(b"jumps").unwrap_or_default();
+        jumps.push(b'j');
+        kv::put(b"jumps", &jumps);
+    }
+    for entry in &batch.entries {
         if entry.payload.starts_with(b"poison") && kv::get(b"tolerate").is_none() {
             panic!("refusing a poisoned entry");
         }

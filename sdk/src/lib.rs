@@ -3,7 +3,9 @@
 use std::cell::RefCell;
 
 pub use ship_proto as proto;
-use ship_proto::{AppendRequest, FollowRequest, Invocation, Message, NextReply, NextRequest, ReadRequest, SendRequest};
+use ship_proto::{
+    AppendRequest, CheckpointReply, FollowRequest, Invocation, Message, NextReply, NextRequest, ReadRequest, SendRequest,
+};
 
 #[link(wasm_import_module = "host")]
 extern "C" {
@@ -92,7 +94,19 @@ fn once(mut call: impl FnMut(*mut u8, u32) -> i64) -> Vec<u8> {
 /// follow. An agent has one log per interface it offers, named after that interface.
 pub mod log {
     use super::*;
-    pub use ship_proto::Entry;
+    pub use ship_proto::{Checkpoint, Entry};
+
+    /// What `next` hands over.
+    pub struct Batch {
+        /// Set when this agent was so far behind that the entries it needed have been dropped.
+        /// Replace whatever was built from this log with `state`, which is the publisher's
+        /// state as of entry `seq`. `entries` is then empty, and the next call carries on from
+        /// there.
+        pub checkpoint: Option<Checkpoint>,
+        pub entries: Vec<Entry>,
+        /// Whether the log has more beyond this batch.
+        pub more: bool,
+    }
 
     /// Add an entry to one of this agent's own logs and return its number. The runtime signs
     /// it and tells every follower. Kept only if this event commits.
@@ -108,14 +122,14 @@ pub mod log {
         unsafe { host_log_follow(request.as_ptr(), request.len() as u32) }
     }
 
-    /// Take up to `max` entries after this agent's position in a log it follows, and whether
-    /// more remain. The position moves past them only if this event commits, so an entry is
-    /// never lost and never handled twice.
-    pub fn next(agent: &str, log: &str, max: u32) -> (Vec<Entry>, bool) {
-        let request = NextRequest { agent: agent.into(), log: log.into(), max }.encode_to_vec();
+    /// Take up to `max` entries after this agent's position in a log it follows. The position
+    /// moves past them only if this event commits, so an entry is never lost and never handled
+    /// twice.
+    pub fn next(agent: &str, log: &str, max: u32) -> Batch {
+        let request = NextRequest { agent: agent.into(), log: log.into(), max, checkpoints: true }.encode_to_vec();
         let bytes = once(|buf, cap| unsafe { host_log_next(request.as_ptr(), request.len() as u32, buf, cap) });
         let reply = NextReply::decode(&*bytes).expect("the runtime sent a malformed log reply");
-        (reply.entries, reply.more)
+        Batch { checkpoint: reply.checkpoint, entries: reply.entries, more: reply.more }
     }
 }
 
@@ -149,6 +163,11 @@ pub unsafe fn __handle(ptr: *mut u8, len: u32, handler: fn(&[u8]) -> Vec<u8>) ->
     })
 }
 
+#[doc(hidden)]
+pub fn __checkpoint(log: &[u8], handler: fn(&str) -> Option<Vec<u8>>) -> Vec<u8> {
+    CheckpointReply { state: handler(&String::from_utf8_lossy(log)) }.encode_to_vec()
+}
+
 /// Export the allocator the runtime uses to hand input to this module.
 #[macro_export]
 macro_rules! export_alloc {
@@ -176,21 +195,45 @@ macro_rules! export_fn {
     };
 }
 
-/// Declare an agent: a command handler, and optionally a read handler and a notify handler. All
-/// are `fn(&[u8]) -> Vec<u8>`. A read handler cannot write, send, or emit. The notify handler is
-/// called when a log this agent follows has new entries; `invocation()` says which.
+/// Declare an agent: a command handler, then any of `read = f`, `notify = f`, `checkpoint = f`.
+///
+/// The command, read, and notify handlers are `fn(&[u8]) -> Vec<u8>`. A read handler cannot
+/// write, send, or emit. The notify handler is called when a log this agent follows has new
+/// entries; `invocation()` says which.
+///
+/// The checkpoint handler is `fn(&str) -> Option<Vec<u8>>`. The runtime calls it with the name
+/// of one of this agent's logs once that log has grown enough, and it can only read. Returning
+/// the present state behind the log lets the runtime drop old entries: a follower that is far
+/// behind is handed that state in place of them. The runtime signs what is returned as the
+/// state as of the log's newest entry, and has no way to check that it is. So an agent must
+/// only change the state behind a log in the same event that appends the entry describing the
+/// change, and the state must be one a follower can use in place of every entry before it. Returning `None` says the log is a history
+/// whose every entry matters, and it is then kept whole. An agent with no checkpoint handler is
+/// never asked, and its logs are kept whole.
 #[macro_export]
 macro_rules! agent {
-    ($command:path) => {
+    ($command:path $(, $role:ident = $handler:path)* $(,)?) => {
         $crate::export_alloc!();
         $crate::export_fn!("handle", $command);
+        $($crate::__export_role!($role, $handler);)*
     };
-    ($command:path, read = $read:path) => {
-        $crate::agent!($command);
-        $crate::export_fn!("read", $read);
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __export_role {
+    (read, $handler:path) => {
+        $crate::export_fn!("read", $handler);
     };
-    ($command:path, read = $read:path, notify = $notify:path) => {
-        $crate::agent!($command, read = $read);
-        $crate::export_fn!("notify", $notify);
+    (notify, $handler:path) => {
+        $crate::export_fn!("notify", $handler);
+    };
+    (checkpoint, $handler:path) => {
+        const _: () = {
+            #[export_name = "checkpoint"]
+            pub unsafe extern "C" fn __ship_export(ptr: *mut u8, len: u32) -> u64 {
+                $crate::__handle(ptr, len, |log| $crate::__checkpoint(log, $handler))
+            }
+        };
     };
 }

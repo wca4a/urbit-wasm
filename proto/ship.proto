@@ -16,6 +16,9 @@ enum Kind {
   // Tells an agent that a log it follows has new entries. Carries no payload: the agent asks
   // for the entries. Runs as its own event, like a command.
   KIND_NOTIFY = 3;
+  // Asks an agent for the present state behind one of its logs, so that old entries can be
+  // dropped. The payload is the log's name. The agent can only read while answering.
+  KIND_CHECKPOINT = 4;
 }
 
 // Who is asking.
@@ -127,6 +130,11 @@ message EntryBody {
 
 // An entry as stored and sent. `body` is an encoded EntryBody, kept exactly as it was signed;
 // it is never re-encoded before the signature is checked.
+//
+// What is signed is never the bare body. A label naming the kind of message comes first:
+// the bytes of "ship.v1.entry\n" for an entry, "ship.v1.checkpoint\n" for a checkpoint. A
+// signature made for one kind of message can therefore never be passed off as the other,
+// however alike the two messages look.
 message SignedEntry {
   bytes body = 1;
   bytes signature = 2;
@@ -150,6 +158,10 @@ message NextRequest {
   string agent = 1;
   string log = 2;
   uint32 max = 3;
+  // Set by a follower that knows what to do with NextReply.checkpoint. One that does not set
+  // it is never moved past entries it has not seen: if they have been dropped, its request
+  // fails instead.
+  bool checkpoints = 4;
 }
 
 message Entry {
@@ -161,6 +173,41 @@ message NextReply {
   repeated Entry entries = 1;
   // True when the log has entries beyond these.
   bool more = 2;
+  // Set when the follower was so far behind that the entries it needed have been dropped. It
+  // must replace what it holds with this state; its position is then the checkpoint's.
+  Checkpoint checkpoint = 3;
+}
+
+// A checkpoint says: as of entry `seq`, the state behind this log is `state`. It lets entries
+// up to an earlier point be dropped without anyone losing the ability to catch up.
+
+// The signed part of a checkpoint.
+message CheckpointBody {
+  string ship = 1;
+  string agent = 2;
+  string log = 3;
+  uint64 seq = 4;
+  // SHA-256 of entry `seq`'s body, so a reader can carry on checking entries from here.
+  bytes hash = 5;
+  bytes state = 6;
+}
+
+// A checkpoint as stored and sent, signed over `body` exactly as it stands.
+message SignedCheckpoint {
+  bytes body = 1;
+  bytes signature = 2;
+}
+
+// Agent to runtime, in answer to KIND_CHECKPOINT. Leaving `state` unset means this log is a
+// history whose every entry matters, and must never be trimmed.
+message CheckpointReply {
+  optional bytes state = 1;
+}
+
+// Runtime to a follower: the state to take, and the entry it stands for.
+message Checkpoint {
+  uint64 seq = 1;
+  bytes state = 2;
 }
 
 // The kernel's own stored state. A kernel rewrites the whole registry when it changes, and

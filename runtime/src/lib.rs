@@ -21,10 +21,10 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use ship_proto::admin_request::Op;
-use ship_proto::{AdminRequest, Install, Message, Source};
+use ship_proto::{AdminRequest, CheckpointBody, Install, Message, Source};
 use wasmtime::{Engine, InstancePre, Linker, Module};
 
-pub use ship_proto::{EntryBody, Manifest, Provide, SignedEntry, Use};
+pub use ship_proto::{EntryBody, Manifest, Provide, SignedCheckpoint, SignedEntry, Use};
 
 use host::Ctx;
 use ship::Ship;
@@ -77,8 +77,19 @@ pub struct Config {
     pub max_outbox_bytes: u64,
     /// Commands between agents that may be waiting to run, counted the same way.
     pub max_inbox_bytes: u64,
-    /// Log entries a ship may hold in total, counted the same way.
+    /// Entries one log may hold, counted the same way. When an append has no room, the entries
+    /// that log's checkpoint already covers are dropped to make some. Each log has its own
+    /// limit, so one log can never use up another's room. A log's checkpoint is not counted:
+    /// there is at most one, of at most `max_checkpoint_bytes`. What bounds all of a ship's
+    /// logs together is `max_logs` and, in the end, `max_ship_bytes`.
     pub max_log_bytes: u64,
+    /// How many logs a ship may have.
+    pub max_logs: usize,
+    /// A log's publisher is asked for a checkpoint once the entries added since the last one
+    /// outweigh both this and that checkpoint itself.
+    pub checkpoint_min_bytes: u64,
+    /// The largest state a checkpoint may carry.
+    pub max_checkpoint_bytes: usize,
     /// Queued commands run straight after the event that caused them, up to this many. The rest
     /// wait for `run_pending`, so agents that keep sending to each other cannot hold a ship.
     pub max_queued_per_deliver: usize,
@@ -107,7 +118,10 @@ impl Default for Config {
             max_reply_bytes: 1 << 20,
             max_outbox_bytes: 64 << 20,
             max_inbox_bytes: 64 << 20,
-            max_log_bytes: 256 << 20,
+            max_log_bytes: 64 << 20,
+            max_logs: 16_384,
+            checkpoint_min_bytes: 64 << 10,
+            max_checkpoint_bytes: 1 << 20,
             max_queued_per_deliver: 64,
             max_awake: 64,
             audit_rows: 10_000,
@@ -170,6 +184,9 @@ pub enum Error {
     InstallRefused(String),
     /// Another runtime already has this data directory open.
     DataDirInUse,
+    /// The entries asked for have been dropped: the log now starts after this entry number. The
+    /// reader should fetch the log's checkpoint and carry on from there.
+    LogTrimmed(u64),
     /// The event was refused. It changed no state and queued no messages. The audit log records
     /// it on a best-effort basis.
     Rejected(Rejection),
@@ -189,6 +206,7 @@ impl fmt::Display for Error {
             Error::BadShipFile(why) => write!(f, "bad ship file: {why}"),
             Error::InstallRefused(why) => write!(f, "install refused: {why}"),
             Error::DataDirInUse => write!(f, "another runtime is using this data directory"),
+            Error::LogTrimmed(base) => write!(f, "the log no longer holds entries up to {base}; fetch its checkpoint"),
             Error::Rejected(Rejection::OutOfFuel) => write!(f, "event rejected: compute budget exhausted"),
             Error::Rejected(Rejection::Timeout) => write!(f, "event rejected: ran too long"),
             Error::Rejected(Rejection::Denied(why)) => write!(f, "event rejected: not permitted: {why}"),
@@ -400,6 +418,16 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+/// The labels that go in front of a message before it is signed, one per kind of message, so
+/// that a signature made for one kind can never be passed off as another.
+pub(crate) const ENTRY_DOMAIN: &[u8] = b"ship.v1.entry\n";
+pub(crate) const CHECKPOINT_DOMAIN: &[u8] = b"ship.v1.checkpoint\n";
+
+/// The bytes a signature covers: the label for the kind of message, then the message.
+pub(crate) fn signed_bytes(domain: &[u8], body: &[u8]) -> Vec<u8> {
+    [domain, body].concat()
+}
+
 /// Checks a run of log entries one at a time: each must be signed by the ship's key, belong to
 /// the expected log, and follow directly on from the one before.
 pub(crate) struct ChainCheck<'a> {
@@ -407,35 +435,59 @@ pub(crate) struct ChainCheck<'a> {
     ship: &'a str,
     pub agent: String,
     pub log: String,
-    /// The entry already accepted, as (number, hash). `None` means none yet, so the next must
-    /// be entry 1.
-    last: Option<(u64, [u8; 32])>,
+    last: Last,
+}
+
+/// How far a chain check has got.
+enum Last {
+    /// Nothing accepted yet, so the next must be entry 1.
+    Start,
+    /// The entry already accepted, as (number, hash).
+    Entry(u64, [u8; 32]),
+    /// The entries up to this number have been dropped, so the next one's link back to them
+    /// cannot be checked. Its signature and number still are.
+    Dropped(u64),
 }
 
 impl<'a> ChainCheck<'a> {
     /// `after` is the last entry the caller already trusts, or `None` to start from entry 1.
     pub fn new(key: &'a VerifyingKey, ship: &'a str, agent: &str, log: &str, after: Option<(u64, [u8; 32])>) -> Self {
-        ChainCheck { key, ship, agent: agent.to_string(), log: log.to_string(), last: after }
+        let last = after.map_or(Last::Start, |(seq, hash)| Last::Entry(seq, hash));
+        ChainCheck { key, ship, agent: agent.to_string(), log: log.to_string(), last }
+    }
+
+    /// For a log whose entries up to `base` have been dropped: the next must be `base + 1`.
+    pub fn resuming(key: &'a VerifyingKey, ship: &'a str, agent: &str, log: &str, base: u64) -> Self {
+        ChainCheck { key, ship, agent: agent.to_string(), log: log.to_string(), last: Last::Dropped(base) }
+    }
+
+    /// The last entry accepted, if any has been.
+    fn position(&self) -> Option<Position> {
+        match self.last {
+            Last::Entry(seq, hash) => Some((seq, hash)),
+            Last::Start | Last::Dropped(_) => None,
+        }
     }
 
     /// Accept the next entry, returning its number, its hash, and the size of its payload.
     pub fn accept(&mut self, body: &[u8], signature: &[u8]) -> Result<(u64, [u8; 32], usize), String> {
         let signature = Signature::from_slice(signature).map_err(|_| "an entry's signature is malformed")?;
         // Checked over the bytes as stored, never over a re-encoding of them.
-        self.key.verify(body, &signature).map_err(|_| "an entry is not signed by this ship's key")?;
+        self.key.verify(&signed_bytes(ENTRY_DOMAIN, body), &signature).map_err(|_| "an entry is not signed by this ship's key")?;
         let entry = EntryBody::decode(body).map_err(|_| "an entry cannot be decoded")?;
         if entry.ship != self.ship || entry.agent != self.agent || entry.log != self.log {
             return Err("an entry belongs to a different log".into());
         }
         let follows_on = match &self.last {
-            Some((seq, hash)) => seq.checked_add(1) == Some(entry.seq) && entry.prev == hash,
-            None => entry.seq == 1 && entry.prev.is_empty(),
+            Last::Entry(seq, hash) => seq.checked_add(1) == Some(entry.seq) && entry.prev == hash,
+            Last::Start => entry.seq == 1 && entry.prev.is_empty(),
+            Last::Dropped(base) => base.checked_add(1) == Some(entry.seq) && entry.prev.len() == 32,
         };
         if !follows_on {
             return Err(format!("entry {} does not follow on from the one before it", entry.seq));
         }
         let hash = sha256(body);
-        self.last = Some((entry.seq, hash));
+        self.last = Last::Entry(entry.seq, hash);
         Ok((entry.seq, hash, entry.payload.len()))
     }
 }
@@ -463,7 +515,37 @@ pub fn verify_log(
     let ship = canonical_ship(ship).map_err(|e| e.to_string())?;
     let mut chain = ChainCheck::new(&key, &ship, agent, log, after);
     entries.iter().try_for_each(|entry| chain.accept(&entry.body, &entry.signature).map(drop))?;
-    Ok(chain.last)
+    Ok(chain.position())
+}
+
+/// Check a checkpoint read from a ship's log, as a client or another ship would. It must be
+/// signed by `public_key` and belong to that log. Returns the position it stands for and the
+/// state as of that position. The reader replaces what it holds with the state, and carries on
+/// by asking for the entries after that position and checking them with `verify_log`.
+///
+/// Like `verify_log`, this shows the checkpoint is genuine, not that it is the newest one.
+pub fn verify_checkpoint(
+    public_key: &[u8; 32],
+    ship: &str,
+    agent: &str,
+    log: &str,
+    checkpoint: &SignedCheckpoint,
+) -> Result<(Position, Vec<u8>), String> {
+    let key = VerifyingKey::from_bytes(public_key).map_err(|_| "not a valid public key")?;
+    let ship = canonical_ship(ship).map_err(|e| e.to_string())?;
+    let signature = Signature::from_slice(&checkpoint.signature).map_err(|_| "the checkpoint's signature is malformed")?;
+    // Checked over the bytes as stored, never over a re-encoding of them.
+    key.verify(&signed_bytes(CHECKPOINT_DOMAIN, &checkpoint.body), &signature)
+        .map_err(|_| "the checkpoint is not signed by this ship's key")?;
+    let body = CheckpointBody::decode(&*checkpoint.body).map_err(|_| "the checkpoint cannot be decoded")?;
+    if body.ship != ship || body.agent != agent || body.log != log {
+        return Err("the checkpoint belongs to a different log".into());
+    }
+    let hash = <[u8; 32]>::try_from(body.hash).map_err(|_| "the checkpoint names no entry")?;
+    if body.seq == 0 {
+        return Err("the checkpoint names no entry".into());
+    }
+    Ok(((body.seq, hash), body.state))
 }
 
 /// Read a ship's signing key: 32 bytes in a regular file.
@@ -605,11 +687,16 @@ impl Runtime {
         })
     }
 
-    /// Deliver a command from the ship's owner, then run the commands it caused agents to send
-    /// each other. Events for the same ship run one at a time; different ships run in parallel.
+    /// Deliver a command from the ship's owner, then run events that are waiting on the ship:
+    /// the commands it caused agents to send each other, and anything left from earlier calls.
+    /// Events for the same ship run one at a time; different ships run in parallel.
     ///
-    /// A command over the size limit is rejected without running, and only its first bytes are
-    /// kept in the audit log.
+    /// `Error::Rejected` means this command changed nothing. It does not mean nothing ran:
+    /// waiting events are run after a rejected command too, because one of them may be the
+    /// checkpoint that makes room for what was just refused.
+    ///
+    /// A command over the size limit is rejected without running anything, and only its first
+    /// bytes are kept in the audit log.
     pub fn deliver(&self, ship: &str, agent: &str, event: &[u8]) -> Result<Outcome, Error> {
         check_agent_name(agent)?;
         let cfg = &self.inner.cfg;
@@ -623,15 +710,20 @@ impl Runtime {
                 return Err(Error::Rejected(Rejection::Limit(why)));
             }
             let source = Source { owner: true, agent: String::new() };
-            let outcome = ship.command(&self.inner, &source, agent, "", event)?;
-            // The owner's command has committed, so a problem while running what it queued must
-            // not be reported as that command failing. Whatever is left runs on a later call.
-            for _ in 0..cfg.max_queued_per_deliver {
-                if !matches!(ship.run_queued(&self.inner), Ok(true)) {
-                    break;
+            let outcome = ship.command(&self.inner, &source, agent, "", event);
+            // The owner's command has committed or been rejected: either way it is settled, so
+            // a problem while running what is queued must not change what is reported for it.
+            // A rejected command queues nothing itself, but the runtime may have queued a
+            // checkpoint request on its account, which is what lets a full log recover.
+            // Whatever is left runs on a later call.
+            if matches!(outcome, Ok(_) | Err(Error::Rejected(_))) {
+                for _ in 0..cfg.max_queued_per_deliver {
+                    if !matches!(ship.run_queued(&self.inner), Ok(true)) {
+                        break;
+                    }
                 }
             }
-            Ok(outcome)
+            outcome
         })
     }
 
@@ -676,13 +768,33 @@ impl Runtime {
     /// entry is always returned if any exist. It does not run the agent. Check what comes back
     /// with `verify_log`.
     ///
+    /// Old entries of a log are dropped once a checkpoint can stand in for them. If the entry
+    /// straight after `after` is gone, this returns `Error::LogTrimmed`, never a run of entries
+    /// with a gap before it; the reader then takes `log_checkpoint` and carries on from there.
+    ///
     /// This is the owner's view and checks no permissions. Anything that serves logs to other
     /// people has to decide who may read which log before calling it.
     pub fn log_entries(&self, ship: &str, agent: &str, log: &str, after: u64, max_bytes: usize) -> Result<Vec<SignedEntry>, Error> {
         check_target(agent, log)?;
         self.inner.with_ship(ship, |ship| {
-            let stored = store::log_range(&lock(&ship.conn), agent, log, after, 1024, max_bytes)?;
+            let conn = lock(&ship.conn);
+            let base = store::log_base(&conn, agent, log)?;
+            if after < base {
+                return Err(Error::LogTrimmed(base));
+            }
+            let stored = store::log_range(&conn, agent, log, after, 1024, max_bytes)?;
             Ok(stored.into_iter().map(|entry| SignedEntry { body: entry.body, signature: entry.signature }).collect())
+        })
+    }
+
+    /// A log's newest checkpoint, if it has one: the state behind the log as of one of its
+    /// entries, signed by the ship. Check it with `verify_checkpoint`. Like `log_entries`, this
+    /// is the owner's view and checks no permissions.
+    pub fn log_checkpoint(&self, ship: &str, agent: &str, log: &str) -> Result<Option<SignedCheckpoint>, Error> {
+        check_target(agent, log)?;
+        self.inner.with_ship(ship, |ship| {
+            let stored = store::checkpoint(&lock(&ship.conn), agent, log)?;
+            Ok(stored.map(|stored| SignedCheckpoint { body: stored.body, signature: stored.signature }))
         })
     }
 
@@ -806,7 +918,6 @@ impl Runtime {
                 key: Arc::new(key.clone()),
                 outbox_bytes: 0,
                 inbox_bytes: 0,
-                log_bytes: 0,
             };
             staged.modules(&self.inner)?
         };
@@ -981,8 +1092,7 @@ impl Inner {
             Arc::new(load_key(&self.key_path(name))?)
         };
         let (outbox_bytes, inbox_bytes) = (store::outbox_bytes(&conn)?, store::inbox_bytes(&conn)?);
-        let log_bytes = store::log_bytes(&conn)?;
-        Ok(Ship { name: name.into(), conn: Arc::new(Mutex::new(conn)), kernel, key, outbox_bytes, inbox_bytes, log_bytes })
+        Ok(Ship { name: name.into(), conn: Arc::new(Mutex::new(conn)), kernel, key, outbox_bytes, inbox_bytes })
     }
 
     fn with_ship<R>(&self, name: &str, f: impl FnOnce(&mut Ship) -> Result<R, Error>) -> Result<R, Error> {

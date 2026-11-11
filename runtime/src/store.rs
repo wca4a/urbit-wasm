@@ -6,16 +6,16 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 
-use ship_proto::Kind;
+use ship_proto::{CheckpointBody, Kind, Message};
 
-use crate::{AuditEntry, ChainCheck, Config, Durability, Effect, Error};
+use crate::{signed_bytes, AuditEntry, ChainCheck, Config, Durability, Effect, Error, CHECKPOINT_DOMAIN};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Each pending message counts as its payload plus this, so empty messages still use up quota.
 pub const MESSAGE_OVERHEAD: u64 = 64;
@@ -35,7 +35,7 @@ const MAX_NOTIFY_FAILURES: i64 = 3;
 /// run as its own event.
 pub struct Queued {
     pub seq: i64,
-    /// `Kind::Command` or `Kind::Notify`, as a number.
+    /// `Kind::Command`, `Kind::Notify`, or `Kind::Checkpoint`, as a number.
     pub kind: i32,
     pub source: String,
     pub agent: String,
@@ -80,6 +80,18 @@ CREATE TABLE logs (
     head INTEGER NOT NULL,
     head_hash BLOB NOT NULL,
     bytes INTEGER NOT NULL,
+    base INTEGER NOT NULL,
+    tail_bytes INTEGER NOT NULL,
+    asked INTEGER NOT NULL,
+    history INTEGER NOT NULL,
+    PRIMARY KEY (agent, name)
+) WITHOUT ROWID;
+CREATE TABLE checkpoints (
+    agent TEXT NOT NULL,
+    name TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    body BLOB NOT NULL,
+    signature BLOB NOT NULL,
     PRIMARY KEY (agent, name)
 ) WITHOUT ROWID;
 CREATE TABLE log_entries (
@@ -237,7 +249,7 @@ pub struct StoredEntry {
     pub signature: Vec<u8>,
 }
 
-/// What an entry counts for against the ship's log quota.
+/// What an entry counts for against its log's limit.
 pub fn entry_cost(body_len: usize) -> u64 {
     body_len as u64 + 64 + MESSAGE_OVERHEAD
 }
@@ -254,9 +266,13 @@ pub fn log_head(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<
 pub fn log_append(conn: &Connection, agent: &str, name: &str, seq: u64, body: &[u8], signature: &[u8], hash: &[u8]) -> rusqlite::Result<()> {
     conn.prepare_cached("INSERT INTO log_entries VALUES (?1, ?2, ?3, ?4, ?5)")?
         .execute(params![agent, name, seq as i64, body, signature])?;
+    // Columns: head, head_hash, bytes held, base (entries up to here are dropped), tail_bytes
+    // (entries since the last checkpoint), asked (a checkpoint request is queued), history
+    // (the publisher has said this log must never be trimmed).
     conn.prepare_cached(
-        "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (agent, name) DO UPDATE
-         SET head = excluded.head, head_hash = excluded.head_hash, bytes = bytes + excluded.bytes",
+        "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, ?5, 0, ?5, 0, 0) ON CONFLICT (agent, name) DO UPDATE
+         SET head = excluded.head, head_hash = excluded.head_hash, bytes = bytes + excluded.bytes,
+             tail_bytes = tail_bytes + excluded.tail_bytes",
     )?
     .execute(params![agent, name, seq as i64, hash, entry_cost(body.len()) as i64])
     .map(drop)
@@ -282,8 +298,187 @@ pub fn log_range(conn: &Connection, agent: &str, name: &str, after: u64, max_ent
     Ok(entries)
 }
 
-pub fn log_bytes(conn: &Connection) -> Result<u64, Error> {
-    Ok(conn.query_row("SELECT COALESCE(SUM(bytes), 0) FROM logs", [], |r| r.get::<_, i64>(0))? as u64)
+/// The number of the newest entry that has been dropped: 0 if the log still starts at entry 1.
+pub fn log_base(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<u64> {
+    let base = conn
+        .prepare_cached("SELECT base FROM logs WHERE agent = ?1 AND name = ?2")?
+        .query_row(params![agent, name], |r| r.get::<_, i64>(0))
+        .optional()?;
+    Ok(base.unwrap_or(0) as u64)
+}
+
+/// A checkpoint as it sits in the file.
+pub struct StoredCheckpoint {
+    pub seq: u64,
+    pub body: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+/// The entry a log's checkpoint stands for, if it has a checkpoint.
+pub fn checkpoint_seq(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<Option<u64>> {
+    conn.prepare_cached("SELECT seq FROM checkpoints WHERE agent = ?1 AND name = ?2")?
+        .query_row(params![agent, name], |r| r.get::<_, i64>(0))
+        .optional()
+        .map(|seq| seq.map(|seq| seq as u64))
+}
+
+/// What a log's entries count for against its limit.
+pub fn log_size(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<u64> {
+    let bytes = conn
+        .prepare_cached("SELECT bytes FROM logs WHERE agent = ?1 AND name = ?2")?
+        .query_row(params![agent, name], |r| r.get::<_, i64>(0))
+        .optional()?;
+    Ok(bytes.unwrap_or(0) as u64)
+}
+
+pub fn checkpoint(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<Option<StoredCheckpoint>> {
+    conn.prepare_cached("SELECT seq, body, signature FROM checkpoints WHERE agent = ?1 AND name = ?2")?
+        .query_row(params![agent, name], |r| {
+            Ok(StoredCheckpoint { seq: r.get::<_, i64>(0)? as u64, body: r.get(1)?, signature: r.get(2)? })
+        })
+        .optional()
+}
+
+/// Whether a log has grown enough since its last checkpoint to be worth another. The entries
+/// since then must outweigh both `min_tail` and the last checkpoint itself, which keeps what a
+/// log holds to about twice its state. Never while a request is already queued, and never for
+/// a log its publisher has declared a history.
+pub fn checkpoint_due(conn: &Connection, agent: &str, name: &str, min_tail: u64) -> rusqlite::Result<bool> {
+    let row = conn
+        .prepare_cached(
+            "SELECT l.tail_bytes, l.asked, l.history, LENGTH(c.body)
+             FROM logs l LEFT JOIN checkpoints c ON c.agent = l.agent AND c.name = l.name
+             WHERE l.agent = ?1 AND l.name = ?2",
+        )?
+        .query_row(params![agent, name], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<i64>>(3)?))
+        })
+        .optional()?;
+    Ok(row.is_some_and(|(tail, asked, history, last)| {
+        // Both sides are counted the way a log's limit counts entries.
+        let last = last.map_or(0, |body| entry_cost(body as usize));
+        asked == 0 && history == 0 && tail > min_tail.max(last)
+    }))
+}
+
+/// An append to this log was refused for lack of room. If the log has entries that no
+/// checkpoint covers yet, ask for one whatever the usual threshold says: once it exists, the
+/// entries it covers can go.
+pub fn ask_checkpoint_when_full(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<()> {
+    let behind = conn
+        .prepare_cached("SELECT 1 FROM logs WHERE agent = ?1 AND name = ?2 AND asked = 0 AND history = 0 AND tail_bytes > 0")?
+        .query_row(params![agent, name], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if behind {
+        ask_checkpoint(conn, agent, name)?;
+    }
+    Ok(())
+}
+
+/// How many logs this ship has.
+pub fn log_count(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM logs")?.query_row([], |r| r.get::<_, i64>(0)).map(|count| count as usize)
+}
+
+/// Work out afresh what a log's entries count for, from the entries that are actually there.
+fn recount(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "UPDATE logs SET bytes =
+             (SELECT COALESCE(SUM(LENGTH(body) + ?3), 0) FROM log_entries WHERE agent = ?1 AND name = ?2)
+         WHERE agent = ?1 AND name = ?2",
+    )?
+    .execute(params![agent, name, entry_cost(0) as i64])
+    .map(drop)
+}
+
+/// Drop every entry that a log's checkpoint already covers, where normally those back to the
+/// checkpoint before are kept. Does nothing for a log with no checkpoint, or one its publisher
+/// has declared a history.
+pub fn trim_to_checkpoint(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<()> {
+    let found = conn
+        .prepare_cached(
+            "SELECT c.seq FROM logs l JOIN checkpoints c ON c.agent = l.agent AND c.name = l.name
+             WHERE l.agent = ?1 AND l.name = ?2 AND l.history = 0 AND l.base < c.seq",
+        )?
+        .query_row(params![agent, name], |r| r.get::<_, i64>(0))
+        .optional()?;
+    let Some(seq) = found else { return Ok(()) };
+    conn.prepare_cached("DELETE FROM log_entries WHERE agent = ?1 AND name = ?2 AND seq <= ?3")?
+        .execute(params![agent, name, seq])?;
+    conn.prepare_cached("UPDATE logs SET base = ?3 WHERE agent = ?1 AND name = ?2")?.execute(params![agent, name, seq])?;
+    recount(conn, agent, name)
+}
+
+/// Queue a request to the publisher for a checkpoint of one of its logs. At most one is ever
+/// queued per log, so like notifications these need no room in the command queue.
+pub fn ask_checkpoint(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<()> {
+    let marked = conn
+        .prepare_cached("UPDATE logs SET asked = 1 WHERE agent = ?1 AND name = ?2 AND asked = 0")?
+        .execute(params![agent, name])?;
+    if marked == 1 {
+        inbox_push(conn, Kind::Checkpoint, agent, agent, name, name.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// A checkpoint request has been taken off the queue, so a later append may queue another.
+pub fn checkpoint_answered(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE logs SET asked = 0 WHERE agent = ?1 AND name = ?2")?
+        .execute(params![agent, name])
+        .map(drop)
+}
+
+/// The publisher has said this log is a history: every entry matters and none may be dropped.
+pub fn mark_history(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE logs SET history = 1 WHERE agent = ?1 AND name = ?2")?
+        .execute(params![agent, name])
+        .map(drop)
+}
+
+/// Store a checkpoint for the log's present end, and drop the entries up to the checkpoint
+/// before it. Keeping entries back to the previous checkpoint means a follower that is only a
+/// little behind still catches up entry by entry. All of it lands in the caller's transaction.
+///
+/// What always holds for a log with a checkpoint: `base <= checkpoint <= head`, and the
+/// entries held are exactly those after `base`. A log can hold none (`base == head`), but only
+/// when its checkpoint stands for its newest entry.
+pub fn checkpoint_write(conn: &Connection, agent: &str, name: &str, seq: u64, body: &[u8], signature: &[u8]) -> rusqlite::Result<()> {
+    // The entries go first, so that their room is free for the new checkpoint. In a ship whose
+    // file is nearly full the other order can fail for want of the very room this frees.
+    if let Some(previous) = checkpoint_seq(conn, agent, name)? {
+        conn.prepare_cached("DELETE FROM log_entries WHERE agent = ?1 AND name = ?2 AND seq <= ?3")?
+            .execute(params![agent, name, previous as i64])?;
+        conn.prepare_cached("UPDATE logs SET base = MAX(base, ?3) WHERE agent = ?1 AND name = ?2")?
+            .execute(params![agent, name, previous as i64])?;
+    }
+    conn.prepare_cached("INSERT OR REPLACE INTO checkpoints VALUES (?1, ?2, ?3, ?4, ?5)")?
+        .execute(params![agent, name, seq as i64, body, signature])?;
+    conn.prepare_cached("UPDATE logs SET tail_bytes = 0 WHERE agent = ?1 AND name = ?2")?.execute(params![agent, name])?;
+    recount(conn, agent, name)
+}
+
+/// The ship's file is full. Drop, from every log, the entries its checkpoint already covers,
+/// which are normally kept a while for followers that are only a little behind. A log whose
+/// checkpoint covers everything is left with no entries at all: its checkpoint and its
+/// recorded end are enough to carry on from. A ship with nothing to let go of pays one query
+/// over its logs; otherwise each log that gives something up is counted afresh.
+pub fn reclaim(conn: &Connection) -> rusqlite::Result<()> {
+    let covered: Vec<(String, String, i64)> = conn
+        .prepare_cached(
+            "SELECT l.agent, l.name, c.seq
+             FROM logs l JOIN checkpoints c ON c.agent = l.agent AND c.name = l.name
+             WHERE l.history = 0 AND l.base < c.seq",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (agent, name, upto) in &covered {
+        conn.prepare_cached("DELETE FROM log_entries WHERE agent = ?1 AND name = ?2 AND seq <= ?3")?
+            .execute(params![agent, name, upto])?;
+        conn.prepare_cached("UPDATE logs SET base = ?3 WHERE agent = ?1 AND name = ?2")?.execute(params![agent, name, upto])?;
+        recount(conn, agent, name)?;
+    }
+    Ok(())
 }
 
 /// Record that `follower` follows a log, starting before its first entry. Returns false if it
@@ -482,12 +677,29 @@ pub fn audit(conn: &Connection, agent: &str, event: &[u8], ok: bool, keep: u64) 
 
 /// Record a rejected input in a transaction of its own and, when it was queued, take it off the
 /// queue in that same transaction. `notice` names the log (publisher, name) when the input was
-/// a notification to `agent`, so that the next new entry can notify it again. Leaves no
-/// transaction open, whatever happens.
-pub fn record_rejection(conn: &Connection, queued: Option<i64>, notice: Option<(&str, &str)>, agent: &str, event: &[u8], keep: u64) -> rusqlite::Result<()> {
+/// a notification to `agent`, so that the next new entry can notify it again; `checkpoint`
+/// names the log when it was a checkpoint request to `agent`, so that one can be asked for
+/// again; `full` names the log of `agent` that an append found full, so that a checkpoint of
+/// it is asked for; `storage_full` says the ship's file itself was full, so that entries its
+/// logs no longer need are let go. Leaves no transaction open, whatever happens.
+#[allow(clippy::too_many_arguments)]
+pub fn record_rejection(
+    conn: &Connection,
+    queued: Option<i64>,
+    notice: Option<(&str, &str)>,
+    checkpoint: Option<&str>,
+    full: Option<&str>,
+    storage_full: bool,
+    agent: &str,
+    event: &[u8],
+    keep: u64,
+) -> rusqlite::Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let saved = queued
-        .map_or(Ok(()), |seq| inbox_delete(conn, seq))
+    // Making room comes first, since everything after it needs some.
+    let saved = (if storage_full { reclaim(conn) } else { Ok(()) })
+        .and_then(|()| queued.map_or(Ok(()), |seq| inbox_delete(conn, seq)))
+        .and_then(|()| checkpoint.map_or(Ok(()), |log| checkpoint_answered(conn, agent, log)))
+        .and_then(|()| full.map_or(Ok(()), |log| ask_checkpoint_when_full(conn, agent, log)))
         .and_then(|()| {
             notice.map_or(Ok(()), |(publisher, name)| {
                 clear_notified(conn, agent, publisher, name)?;
@@ -505,7 +717,7 @@ pub fn record_rejection(conn: &Connection, queued: Option<i64>, notice: Option<(
 /// Record a rejected input that never reached a handler. Best effort: the caller's rejection
 /// is the result that matters, so a failure to log it is not reported.
 pub fn audit_failure(conn: &Connection, agent: &str, event: &[u8], keep: u64) {
-    let _ = record_rejection(conn, None, None, agent, event, keep);
+    let _ = record_rejection(conn, None, None, None, None, false, agent, event, keep);
 }
 
 /// The newest audit rows, newest first.
@@ -594,7 +806,8 @@ pub fn import(
     // source's schema. They make it refuse oversized values and SQL instead of loading them.
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let from = Connection::open_with_flags(src, flags).map_err(|_| bad_row("not a ship file"))?;
-    let largest = cfg.limits.max_value_bytes.max(cfg.limits.max_effect_bytes).max(cfg.max_event_bytes);
+    let largest =
+        cfg.limits.max_value_bytes.max(cfg.limits.max_effect_bytes).max(cfg.max_event_bytes).max(cfg.max_checkpoint_bytes);
     let _ = from.set_limit(Limit::SQLITE_LIMIT_LENGTH, i32::try_from(largest + (64 << 10)).unwrap_or(i32::MAX));
     let _ = from.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 64 << 10);
     from.pragma_update(None, "trusted_schema", "OFF").map_err(|_| bad_row("not a ship file"))?;
@@ -654,36 +867,122 @@ pub fn import(
         to.execute("INSERT INTO outbox VALUES (?1, ?2, ?3)", params![seq, agent, payload])?;
     }
 
-    let mut pending = 0u64;
-    // Only commands are carried over. Notifications are worked out again below from where each
-    // follower has got to, so they can never disagree with the logs.
-    let mut stmt = from.prepare("SELECT seq, source, agent, interface, payload FROM inbox WHERE kind = 1 ORDER BY seq")?;
+    // Logs. First, what the source says about each one: where it ends, how much of its start
+    // has been dropped, and its checkpoint if it has one. Then its entries, each of which must
+    // be signed by this ship's key and follow on from the one before, and must between them
+    // reach exactly where the source says the log ends. Each log's summary is rebuilt from what
+    // is actually there. A file with its newest entries removed would otherwise be accepted,
+    // and the ship would go on to reuse their numbers.
+    struct Claim {
+        head: u64,
+        head_hash: Vec<u8>,
+        base: u64,
+        history: bool,
+        /// The checkpoint's entry number and that entry's hash.
+        checkpoint: Option<(u64, [u8; 32])>,
+        rebuilt: bool,
+    }
+    let mut claims: HashMap<(String, String), Claim> = HashMap::new();
+    let mut stmt = from.prepare("SELECT agent, name, head, head_hash, base, history FROM logs")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         in_time()?;
-        let (seq, source, agent, interface) = (integer(row, 0)?, text(row, 1)?, text(row, 2)?, text(row, 3)?);
-        check_agent(&source)?;
+        let (agent, log) = (text(row, 0)?, text(row, 1)?);
+        let (head, head_hash) = (integer(row, 2)? as u64, blob(row, 3, 32)?);
+        let (base, history) = (integer(row, 4)? as u64, integer(row, 5)?);
         check_agent(&agent)?;
-        let payload = blob(row, 4, cfg.max_event_bytes)?;
-        pending += payload.len() as u64 + MESSAGE_OVERHEAD;
-        if seq == 0 || interface.len() > MAX_INTERFACE_BYTES || pending > cfg.max_inbox_bytes {
-            return Err(bad_row("queued commands are larger than this runtime allows"));
+        // A damaged file can list one log twice, so each must be seen once and only once.
+        let fresh = Claim { head, head_hash, base, history: history == 1, checkpoint: None, rebuilt: false };
+        // Counted before anything is kept, so a file listing millions of logs is turned away
+        // after reading a bounded number of them.
+        if claims.len() >= cfg.max_logs {
+            return Err(bad_row("more logs than this runtime allows"));
         }
-        to.execute(
-            "INSERT INTO inbox VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![seq, Kind::Command as i32, source, agent, interface, payload],
-        )?;
+        if log.len() > MAX_INTERFACE_BYTES || head == 0 || base > head || history > 1 || claims.insert((agent, log), fresh).is_some() {
+            return Err(bad_row("a log is described wrongly or twice"));
+        }
     }
 
-    // Logs. Every entry must be signed by this ship's key and follow on from the one before it,
-    // and each log's summary row is rebuilt from its entries rather than copied.
-    let (mut heads, mut total) = (HashMap::new(), 0u64);
-    let mut open: Option<(ChainCheck, u64, [u8; 32], u64)> = None;
-    let close = |finished: Option<(ChainCheck, u64, [u8; 32], u64)>, heads: &mut HashMap<(String, String), u64>| -> Result<(), Error> {
-        if let Some((chain, head, hash, bytes)) = finished {
-            to.execute("INSERT INTO logs VALUES (?1, ?2, ?3, ?4, ?5)", params![chain.agent, chain.log, head as i64, &hash[..], bytes as i64])?;
-            heads.insert((chain.agent, chain.log), head);
+    let mut stmt = from.prepare("SELECT agent, name, seq, body, signature FROM checkpoints")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (agent, log, seq) = (text(row, 0)?, text(row, 1)?, integer(row, 2)? as u64);
+        let (body, signature) = (blob(row, 3, cfg.max_checkpoint_bytes + (4 << 10))?, blob(row, 4, 64)?);
+        let genuine = Signature::from_slice(&signature)
+            .is_ok_and(|signature| key.verify(&signed_bytes(CHECKPOINT_DOMAIN, &body), &signature).is_ok());
+        let stated = CheckpointBody::decode(&*body).map_err(|_| bad_row("a checkpoint cannot be decoded"))?;
+        let Some(claim) = claims.get_mut(&(agent.clone(), log.clone())) else {
+            return Err(bad_row("there is a checkpoint for a log the file does not list"));
+        };
+        // Entries are only ever dropped up to a checkpoint, never past the newest one. So the
+        // checkpoint stands for an entry that is still held, or for the last one dropped.
+        let fits = stated.ship == name
+            && stated.agent == agent
+            && stated.log == log
+            && stated.seq == seq
+            && stated.state.len() <= cfg.max_checkpoint_bytes
+            && seq >= 1
+            && seq >= claim.base
+            && seq <= claim.head;
+        let hash = <[u8; 32]>::try_from(stated.hash).ok();
+        let (true, true, Some(hash), None) = (genuine, fits, hash, &claim.checkpoint) else {
+            return Err(bad_row("a checkpoint is not signed by this ship's key or does not fit its log"));
+        };
+        claim.checkpoint = Some((seq, hash));
+        to.execute("INSERT INTO checkpoints VALUES (?1, ?2, ?3, ?4, ?5)", params![agent, log, seq as i64, body, signature])?;
+    }
+    // Entries can only have been dropped from a log that has a checkpoint to stand in for them.
+    if claims.values().any(|claim| claim.base > 0 && claim.checkpoint.is_none()) {
+        return Err(bad_row("a log has lost its early entries but has no checkpoint"));
+    }
+
+    // A log can hold no entries at all, when a full ship let go of everything its checkpoint
+    // covers. The checkpoint is then the only signed evidence of where the log ends, so it
+    // must stand for exactly that entry and name the hash the log gives for it.
+    for ((agent, log), claim) in claims.iter_mut().filter(|(_, claim)| claim.base == claim.head) {
+        in_time()?;
+        let ends_here = claim.checkpoint.is_some_and(|(seq, hash)| seq == claim.head && hash[..] == claim.head_hash[..]);
+        if !ends_here {
+            return Err(bad_row("a log with no entries left has no checkpoint for its end"));
         }
+        to.execute(
+            "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, 0, ?5, 0, 0, ?6)",
+            params![agent, log, claim.head as i64, claim.head_hash, claim.base as i64, claim.history],
+        )?;
+        claim.rebuilt = true;
+    }
+
+    struct Open<'a> {
+        chain: ChainCheck<'a>,
+        head: u64,
+        hash: [u8; 32],
+        bytes: u64,
+        tail: u64,
+        /// Whether the entry the checkpoint stands for has been seen and has the stated hash.
+        anchored: bool,
+    }
+    let mut open: Option<Open> = None;
+    let close = |finished: Option<Open>, claims: &mut HashMap<(String, String), Claim>| -> Result<(), Error> {
+        let Some(log) = finished else { return Ok(()) };
+        let claim = claims.get_mut(&(log.chain.agent.clone(), log.chain.log.clone())).expect("checked when opened");
+        if log.head != claim.head || log.hash[..] != claim.head_hash[..] || (claim.checkpoint.is_some() && !log.anchored) {
+            return Err(bad_row("a log's entries do not reach where the log says it ends"));
+        }
+        claim.rebuilt = true;
+        to.execute(
+            "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+            params![
+                log.chain.agent,
+                log.chain.log,
+                log.head as i64,
+                &log.hash[..],
+                log.bytes as i64,
+                claim.base as i64,
+                log.tail as i64,
+                claim.history
+            ],
+        )?;
         Ok(())
     };
     let mut stmt = from.prepare("SELECT agent, name, seq, body, signature FROM log_entries ORDER BY agent, name, seq")?;
@@ -692,48 +991,62 @@ pub fn import(
         in_time()?;
         let (agent, log, seq) = (text(row, 0)?, text(row, 1)?, integer(row, 2)? as u64);
         let (body, signature) = (blob(row, 3, cfg.max_event_bytes + (4 << 10))?, blob(row, 4, 64)?);
-        if open.as_ref().is_none_or(|(chain, ..)| chain.agent != agent || chain.log != log) {
-            close(open.take(), &mut heads)?;
-            check_agent(&agent)?;
-            if log.len() > MAX_INTERFACE_BYTES || seq != 1 {
-                return Err(bad_row("a log does not start at its first entry"));
+        if open.as_ref().is_none_or(|open| open.chain.agent != agent || open.chain.log != log) {
+            close(open.take(), &mut claims)?;
+            let Some(claim) = claims.get(&(agent.clone(), log.clone())) else {
+                return Err(bad_row("there are log entries for a log the file does not list"));
+            };
+            // The entries that are left start straight after the ones that were dropped.
+            if seq != claim.base + 1 || claim.rebuilt {
+                return Err(bad_row("a log does not start where it says it does"));
             }
-            open = Some((ChainCheck::new(key, name, &agent, &log, None), 0, [0; 32], 0));
+            let (chain, anchored) = match (claim.base, &claim.checkpoint) {
+                (0, _) => (ChainCheck::new(key, name, &agent, &log, None), false),
+                // Everything the checkpoint covers is gone. The first entry left must link back
+                // to the very entry the checkpoint names, which ties the two together.
+                (base, Some((at, hash))) if *at == base => {
+                    (ChainCheck::new(key, name, &agent, &log, Some((base, *hash))), true)
+                }
+                (base, _) => (ChainCheck::resuming(key, name, &agent, &log, base), false),
+            };
+            open = Some(Open { chain, head: 0, hash: [0; 32], bytes: 0, tail: 0, anchored });
         }
-        let (chain, head, hash, bytes) = open.as_mut().expect("opened above");
-        let (accepted, accepted_hash, payload_len) = chain.accept(&body, &signature).map_err(|why| bad_row(&why))?;
-        total += entry_cost(body.len());
-        if accepted != seq || payload_len > cfg.max_event_bytes || total > cfg.max_log_bytes {
+        let open = open.as_mut().expect("opened above");
+        let (accepted, accepted_hash, payload_len) = open.chain.accept(&body, &signature).map_err(|why| bad_row(&why))?;
+        let cost = entry_cost(body.len());
+        if accepted != seq || payload_len > cfg.max_event_bytes || open.bytes + cost > cfg.max_log_bytes {
             return Err(bad_row("logs are numbered wrongly or larger than this runtime allows"));
         }
-        (*head, *hash, *bytes) = (accepted, accepted_hash, *bytes + entry_cost(body.len()));
+        let claim = &claims[&(agent.clone(), log.clone())];
+        let after_checkpoint = match &claim.checkpoint {
+            Some((at, hash)) if *at == accepted => {
+                // The checkpoint names this entry, so it must be the entry the checkpoint saw.
+                if hash[..] != accepted_hash[..] {
+                    return Err(bad_row("a checkpoint does not match the entry it stands for"));
+                }
+                open.anchored = true;
+                false
+            }
+            Some((at, _)) => accepted > *at,
+            None => true,
+        };
+        (open.head, open.hash, open.bytes) = (accepted, accepted_hash, open.bytes + cost);
+        if after_checkpoint {
+            open.tail += cost;
+        }
         to.execute("INSERT INTO log_entries VALUES (?1, ?2, ?3, ?4, ?5)", params![agent, log, seq as i64, body, signature])?;
     }
-    close(open.take(), &mut heads)?;
-
-    // The source's own record of where each log ends must agree with the entries that are
-    // actually there. Otherwise a file with its newest entries removed would be accepted, and
-    // the ship would go on to reuse their numbers.
-    let mut claimed = HashSet::new();
-    let mut stmt = from.prepare("SELECT agent, name, head, head_hash FROM logs")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        in_time()?;
-        let (agent, log, head, hash) = (text(row, 0)?, text(row, 1)?, integer(row, 2)? as u64, blob(row, 3, 32)?);
-        let rebuilt: Option<Vec<u8>> = to
-            .query_row("SELECT head_hash FROM logs WHERE agent = ?1 AND name = ?2 AND head = ?3", params![agent, log, head as i64], |r| r.get(0))
-            .optional()?;
-        // A damaged file can list one log twice, so each must be seen once and only once.
-        if rebuilt != Some(hash) || !claimed.insert((agent, log)) {
-            return Err(bad_row("a log's entries do not reach where the log says it ends"));
-        }
+    close(open.take(), &mut claims)?;
+    if claims.values().any(|claim| !claim.rebuilt) {
+        return Err(bad_row("the file lists a log that has no entries"));
     }
-    if claimed.len() != heads.len() || !heads.keys().all(|log| claimed.contains(log)) {
-        return Err(bad_row("there are log entries for a log the file does not list"));
-    }
+    // Where each log ends, and whether it is a history.
+    let heads: HashMap<(String, String), (u64, bool)> =
+        claims.into_iter().map(|(log, claim)| (log, (claim.head, claim.history))).collect();
 
     let mut behind = Vec::new();
     let mut following: HashMap<String, usize> = HashMap::new();
+    let mut follows: HashMap<(String, String, String), bool> = HashMap::new();
     let mut stmt = from.prepare("SELECT follower, agent, name, cursor FROM follows")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -741,7 +1054,7 @@ pub fn import(
         let (follower, agent, log, cursor) = (text(row, 0)?, text(row, 1)?, text(row, 2)?, integer(row, 3)? as u64);
         check_agent(&follower)?;
         check_agent(&agent)?;
-        let head = heads.get(&(agent.clone(), log.clone())).copied().unwrap_or(0);
+        let head = heads.get(&(agent.clone(), log.clone())).map_or(0, |(head, _)| *head);
         let count = following.entry(follower.clone()).or_default();
         *count += 1;
         if log.len() > MAX_INTERFACE_BYTES || cursor > head || *count > MAX_FOLLOWS {
@@ -749,9 +1062,66 @@ pub fn import(
         }
         to.execute("INSERT INTO follows VALUES (?1, ?2, ?3, ?4, 0, 0)", params![follower, agent, log, cursor as i64])?;
         if cursor < head {
-            behind.push((follower, agent, log));
+            behind.push((follower.clone(), agent.clone(), log.clone()));
         }
+        follows.insert((follower, agent, log), false);
     }
+
+    // The queue, in its order and with its numbers, so that what runs after an import is what
+    // would have run without one. That matters: a queued command that is refused is dropped
+    // for good, and whether it is refused can depend on a checkpoint request ahead of it.
+    //
+    // A command is carried over as it is. The runtime's own two kinds of event carry nothing
+    // but names, so each is checked against the logs and followers just rebuilt, and written
+    // afresh: a checkpoint request must be for a log this ship has, addressed to its own
+    // publisher, and a notification must be for a follower of that log. At most one of each
+    // per log or follower, as the runtime itself keeps it. Anything else is not a ship file.
+    let mut pending = 0u64;
+    let mut asked: HashSet<(String, String)> = HashSet::new();
+    let mut stmt = from.prepare("SELECT seq, kind, source, agent, interface, payload FROM inbox ORDER BY seq")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (seq, kind) = (integer(row, 0)?, integer(row, 1)?);
+        let (source, agent, interface) = (text(row, 2)?, text(row, 3)?, text(row, 4)?);
+        check_agent(&source)?;
+        check_agent(&agent)?;
+        if seq == 0 || interface.len() > MAX_INTERFACE_BYTES {
+            return Err(bad_row("a queued event is numbered or named wrongly"));
+        }
+        let payload = if kind == Kind::Command as i64 {
+            let payload = blob(row, 5, cfg.max_event_bytes)?;
+            pending += payload.len() as u64 + MESSAGE_OVERHEAD;
+            if pending > cfg.max_inbox_bytes {
+                return Err(bad_row("queued commands are larger than this runtime allows"));
+            }
+            payload
+        } else if kind == Kind::Checkpoint as i64 {
+            let log = (agent.clone(), interface.clone());
+            let known = heads.get(&log).is_some_and(|(_, history)| !history);
+            if source != agent || !known || !asked.insert(log) {
+                return Err(bad_row("a queued checkpoint request is not one this ship would have made"));
+            }
+            to.execute("UPDATE logs SET asked = 1 WHERE agent = ?1 AND name = ?2", params![agent, interface])?;
+            interface.clone().into_bytes()
+        } else if kind == Kind::Notify as i64 {
+            // `source` is the publisher and `agent` the follower being told.
+            match follows.get_mut(&(agent.clone(), source.clone(), interface.clone())) {
+                Some(told @ false) => *told = true,
+                _ => return Err(bad_row("a queued notification is not one this ship would have made")),
+            }
+            to.execute(
+                "UPDATE follows SET notified = 1 WHERE follower = ?1 AND agent = ?2 AND name = ?3",
+                params![agent, source, interface],
+            )?;
+            Vec::new()
+        } else {
+            return Err(bad_row("a queued event is of a kind this runtime does not know"));
+        };
+        to.execute("INSERT INTO inbox VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![seq, kind, source, agent, interface, payload])?;
+    }
+    // A follower that is behind and has no notification waiting had been given up on after
+    // repeated failures. An import starts it off afresh, behind everything already queued.
     for (follower, agent, log) in &behind {
         in_time()?;
         notify(&to, follower, agent, log)?;

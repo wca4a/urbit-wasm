@@ -28,6 +28,10 @@ can follow. There is no networking, identity, or update mechanism yet.
 - Every log entry is signed with the ship's key and carries the hash of the
   entry before it, so anyone holding a copy can check that nothing was forged,
   altered, or left out.
+- A log does not grow for ever. Once it has grown enough, the runtime asks the
+  agent for a checkpoint: its state as of the newest entry. Older entries are
+  then dropped, and a follower that is far behind is handed the checkpoint in
+  their place. An agent can say a log is a history, and it is then kept whole.
 
 ## Layout
 

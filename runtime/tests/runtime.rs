@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use runtime::{verify_log, Config, Durability, Error, Limits, Manifest, Provide, Rejection, Runtime, Use};
+use runtime::{
+    verify_checkpoint, verify_log, Config, Durability, Error, Limits, Manifest, Provide, Rejection, Runtime,
+    SignedCheckpoint, Use,
+};
 
 const NO_LIMIT: usize = usize::MAX;
 
@@ -1526,7 +1529,9 @@ fn verification_covers_the_link_to_the_previous_entry_and_the_exact_bytes() {
             payload: b"hits=4".to_vec(),
         }
         .encode_to_vec();
-        runtime::SignedEntry { signature: signer.sign(&body).to_bytes().to_vec(), body }
+        // What is signed is a label for the kind of message, then the message.
+        let signature = signer.sign(&[b"ship.v1.entry\n".as_slice(), &body].concat()).to_bytes().to_vec();
+        runtime::SignedEntry { signature, body }
     };
     // Properly signed, properly numbered, and linked to the real third entry: accepted.
     let mut extended = all.clone();
@@ -1612,11 +1617,13 @@ fn import_refuses_logs_that_do_not_check_out() {
 
 #[test]
 fn logs_are_bounded() {
+    // The journal is a log whose entries no checkpoint can stand in for, so it can only fill.
     let dir = TempDir::new("log-quota");
-    let rt = boot(&dir, Config { max_log_bytes: 600, ..fast() });
+    let rt = boot_with_journal(&dir, Config { max_log_bytes: 600, ..fast() });
     let mut accepted = 0;
     let refused = loop {
-        match rt.deliver("~zod", "counter", b"log hits") {
+        assert!(accepted < 100, "the log never filled");
+        match rt.deliver("~zod", "counter", b"journal a line") {
             Ok(_) => accepted += 1,
             Err(Error::Rejected(rejection)) => break rejection,
             Err(e) => panic!("unexpected error: {e}"),
@@ -1625,9 +1632,10 @@ fn logs_are_bounded() {
     assert!(matches!(refused, Rejection::Limit(_)), "{refused:?}");
     assert!((1..10).contains(&accepted), "accepted {accepted}");
     // The refused append left nothing behind, and the count survives a sleep and wake.
-    assert_eq!(rt.log_entries("~zod", "counter", "counter", 0, NO_LIMIT).unwrap().len(), accepted);
+    assert_eq!(rt.log_entries("~zod", "counter", "journal", 0, NO_LIMIT).unwrap().len(), accepted);
     rt.sleep_idle(Duration::ZERO);
-    assert!(matches!(rejection(&rt, "counter", "log hits"), Rejection::Limit(_)));
+    assert!(matches!(rejection(&rt, "counter", "journal a line"), Rejection::Limit(_)));
+    assert_eq!(rt.log_entries("~zod", "counter", "journal", 0, NO_LIMIT).unwrap().len(), accepted);
 }
 
 #[test]
@@ -1889,7 +1897,7 @@ fn a_followers_place_moves_only_when_it_has_the_entries() {
     // This follower asks for entries with a buffer of no size at all, so they can never fit.
     // One version stops there; the other goes on to collect what it asked for.
     let follow = FollowRequest { agent: "counter".into(), log: "counter".into() }.encode_to_vec();
-    let next = NextRequest { agent: "counter".into(), log: "counter".into(), max: 10 }.encode_to_vec();
+    let next = NextRequest { agent: "counter".into(), log: "counter".into(), max: 10, checkpoints: false }.encode_to_vec();
     let escaped = |bytes: &[u8]| bytes.iter().map(|b| format!("\\{b:02x}")).collect::<String>();
     let follower = |then: &str| {
         format!(
@@ -2014,4 +2022,991 @@ fn asking_a_log_for_no_entries_takes_none() {
     assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(0));
     while rt.run_pending("~zod", 10).unwrap() > 0 {}
     assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(1));
+}
+
+/// Small enough that a checkpoint is asked for every few entries.
+fn checkpointing() -> Config {
+    Config { checkpoint_min_bytes: 500, ..fast() }
+}
+
+/// The counter agent offering both its state log and its journal, which is a history.
+fn counter_with_journal() -> Manifest {
+    let provide = |interface: &str| Provide { interface: interface.into(), public: false };
+    Manifest { provides: vec![provide("counter"), provide("journal")], uses: vec![] }
+}
+
+/// A runtime with one ship, `~zod`, running the counter agent with both of its logs.
+fn boot_with_journal(dir: &TempDir, cfg: Config) -> Runtime {
+    let rt = Runtime::open(&dir.0, cfg).unwrap();
+    let hash = rt.add_module(&counter_wasm()).unwrap();
+    rt.create_ship("~zod", &kernel(&rt)).unwrap();
+    rt.install("~zod", "counter", &hash, &counter_with_journal()).unwrap();
+    rt
+}
+
+/// Run everything queued on the ship. Bounded, so that a regression fails instead of hanging.
+fn settle(rt: &Runtime) {
+    for _ in 0..1000 {
+        if rt.run_pending("~zod", 10).unwrap() == 0 {
+            return;
+        }
+    }
+    panic!("the ship's queue never emptied");
+}
+
+/// Sign a checkpoint the way the runtime does, with a ship's key read from `key_file`.
+fn sign_checkpoint(key_file: &Path, body: &ship_proto::CheckpointBody) -> SignedCheckpoint {
+    use ed25519_dalek::Signer;
+    use ship_proto::Message;
+    let key = ed25519_dalek::SigningKey::from_bytes(&fs::read(key_file).unwrap().try_into().unwrap());
+    let body = body.encode_to_vec();
+    let signature = key.sign(&[b"ship.v1.checkpoint\n".as_slice(), &body].concat()).to_bytes().to_vec();
+    SignedCheckpoint { body, signature }
+}
+
+/// How many of the counter log's early entries have been dropped.
+fn dropped(rt: &Runtime) -> u64 {
+    match rt.log_entries("~zod", "counter", "counter", 0, NO_LIMIT) {
+        Err(Error::LogTrimmed(base)) => base,
+        Ok(_) => 0,
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}
+
+/// The counter log's checkpoint, checked: the entry it stands for, that entry's hash, the state.
+fn checkpoint(rt: &Runtime) -> (u64, [u8; 32], String) {
+    let key = rt.public_key("~zod").unwrap();
+    let signed = rt.log_checkpoint("~zod", "counter", "counter").unwrap().expect("the log has a checkpoint");
+    let ((seq, hash), state) = verify_checkpoint(&key, "~zod", "counter", "counter", &signed).unwrap();
+    (seq, hash, String::from_utf8(state).unwrap())
+}
+
+/// How many times an event with exactly this payload is in the audit log, by outcome.
+fn audited(rt: &Runtime, event: &[u8], ok: bool) -> usize {
+    rt.audit("~zod", 10_000).unwrap().iter().filter(|entry| entry.event == event && entry.ok == ok).count()
+}
+
+#[test]
+fn old_entries_are_dropped_once_a_checkpoint_can_stand_in_for_them() {
+    let dir = TempDir::new("cp-trim");
+    let rt = boot(&dir, checkpointing());
+    for expected in 1..=20 {
+        assert_eq!(send(&rt, "~zod", "counter", "log hits"), expected.to_string());
+    }
+    // The log's start is gone, and a reader that asks for it is told so rather than being
+    // handed entries with a gap before them.
+    let base = dropped(&rt);
+    assert!(base > 0, "nothing was dropped");
+    assert!(matches!(rt.log_entries("~zod", "counter", "counter", base - 1, NO_LIMIT), Err(Error::LogTrimmed(b)) if b == base));
+
+    // The checkpoint is the state as of one entry, newer than anything dropped.
+    let key = rt.public_key("~zod").unwrap();
+    let (seq, hash, state) = checkpoint(&rt);
+    assert!(seq > base && seq <= 20, "checkpoint at {seq}, entries dropped up to {base}");
+    assert_eq!(state, format!("hits={seq}"));
+
+    // What is left runs from just after the dropped part to the same end as before.
+    let kept = rt.log_entries("~zod", "counter", "counter", base, NO_LIMIT).unwrap();
+    let expected: Vec<String> = (base + 1..=20).map(|n| format!("hits={n}")).collect();
+    assert_eq!(payloads(&kept), expected);
+    assert!(kept.len() < 10, "{} entries are still held", kept.len());
+
+    // A reader carries on from the checkpoint, and the entries after it check out against it.
+    let after = rt.log_entries("~zod", "counter", "counter", seq, NO_LIMIT).unwrap();
+    let end = verify_log(&key, "~zod", "counter", "counter", Some((seq, hash)), &after).unwrap();
+    assert_eq!(end, rt.log_head("~zod", "counter", "counter").unwrap());
+    assert_eq!(end.unwrap().0, 20);
+    // A reader holding a wrong idea of the checkpointed entry is caught at the next one.
+    assert!(!after.is_empty(), "the checkpoint is at the log's end, so this would show nothing");
+    assert!(verify_log(&key, "~zod", "counter", "counter", Some((seq, [9; 32])), &after).is_err());
+
+    // Numbering carries on across a sleep and wake.
+    rt.sleep_idle(Duration::ZERO);
+    assert_eq!(send(&rt, "~zod", "counter", "log hits"), "21");
+    assert!(dropped(&rt) >= base);
+    drop(rt);
+
+    // The dropped entries are really gone from the file, not merely hidden.
+    let file = rusqlite::Connection::open(dir.0.join("ships").join("zod.ship")).unwrap();
+    let hidden: i64 = file
+        .query_row(
+            "SELECT COUNT(*) FROM log_entries e JOIN logs l ON l.agent = e.agent AND l.name = e.name WHERE e.seq <= l.base",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(hidden, 0);
+}
+
+#[test]
+fn a_checkpoint_is_checked_like_an_entry() {
+    let dir = TempDir::new("cp-verify");
+    let rt = boot(&dir, checkpointing());
+    for _ in 0..8 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    let key = rt.public_key("~zod").unwrap();
+    let signed = rt.log_checkpoint("~zod", "counter", "counter").unwrap().unwrap();
+    assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &signed).is_ok());
+
+    // The wrong key, the wrong log, the wrong ship.
+    assert!(verify_checkpoint(&[7; 32], "~zod", "counter", "counter", &signed).is_err());
+    assert!(verify_checkpoint(&key, "~zod", "counter", "journal", &signed).is_err());
+    assert!(verify_checkpoint(&key, "~zod", "tally", "counter", &signed).is_err());
+    assert!(verify_checkpoint(&key, "~nec", "counter", "counter", &signed).is_err());
+    // The state changed, extra bytes added, and the signature changed.
+    let mut altered = signed.clone();
+    *altered.body.last_mut().unwrap() ^= 1;
+    assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &altered).is_err());
+    let mut padded = signed.clone();
+    padded.body.extend_from_slice(&[0x38, 0x01]);
+    assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &padded).is_err());
+    let mut resigned = signed.clone();
+    resigned.signature[0] ^= 1;
+    assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &resigned).is_err());
+    assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &SignedCheckpoint::default()).is_err());
+
+    // Signed with the ship's own key, but naming no entry, or giving no usable hash for it.
+    use ship_proto::Message;
+    let key_file = dir.0.join("keys").join("zod.key");
+    let genuine = ship_proto::CheckpointBody::decode(&*signed.body).unwrap();
+    let resign = |body: &ship_proto::CheckpointBody| sign_checkpoint(&key_file, body);
+    assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &resign(&genuine)).is_ok());
+    let nowhere = ship_proto::CheckpointBody { seq: 0, ..genuine.clone() };
+    assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &resign(&nowhere)).is_err());
+    let unhashed = ship_proto::CheckpointBody { hash: vec![1; 5], ..genuine.clone() };
+    assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &resign(&unhashed)).is_err());
+
+    // A log with no checkpoint has none to give, and nor does a log that does not exist.
+    let dir = TempDir::new("cp-none");
+    let rt = boot(&dir, fast());
+    send(&rt, "~zod", "counter", "log hits");
+    assert!(rt.log_checkpoint("~zod", "counter", "counter").unwrap().is_none());
+    assert!(rt.log_checkpoint("~zod", "counter", "nothing").unwrap().is_none());
+    assert_eq!(dropped(&rt), 0);
+}
+
+#[test]
+fn a_follower_too_far_behind_is_handed_the_checkpoint() {
+    // Nothing queued runs by itself, so the test decides when the follower gets its turn.
+    let dir = TempDir::new("cp-follow");
+    let cfg = Config { max_queued_per_deliver: 0, ..checkpointing() };
+    let rt = boot_pair(&dir, cfg.clone(), counter_manifest(false), tally_manifest(true));
+    for _ in 0..20 {
+        send(&rt, "~zod", "counter", "log hits");
+        settle(&rt);
+    }
+    let base = dropped(&rt);
+    let (seq, _, state) = checkpoint(&rt);
+    assert!(base > 0 && seq < 20, "dropped up to {base}, checkpoint at {seq}");
+
+    send(&rt, "~zod", "tally", "follow");
+    // Asking for nothing takes nothing, even from a log whose start is gone.
+    assert_eq!(send(&rt, "~zod", "tally", "glance"), "0 true");
+    assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(0));
+
+    // Its first round cannot be given entry 1. It gets the state as of the checkpoint's entry,
+    // and its place moves there in the same step.
+    assert_eq!(rt.run_pending("~zod", 1).unwrap(), 1);
+    assert_eq!(read(&rt, "tally", "tally", "jumps"), "1");
+    assert_eq!(read(&rt, "tally", "tally", "seen"), seq.to_string());
+    assert_eq!(read(&rt, "tally", "tally", "last"), state);
+    assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(seq));
+
+    // From there it takes the remaining entries one by one, in order, as usual.
+    settle(&rt);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "20");
+    assert_eq!(read(&rt, "tally", "tally", "last"), "hits=20");
+    assert_eq!(read(&rt, "tally", "tally", "jumps"), "1");
+
+    // A follower that keeps up never needs a checkpoint: it sees every entry.
+    let dir = TempDir::new("cp-keeping-up");
+    let rt = boot_pair(&dir, checkpointing(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    for _ in 0..20 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    assert!(dropped(&rt) > 0);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "20");
+    assert_eq!(read(&rt, "tally", "tally", "jumps"), "0");
+}
+
+#[test]
+fn a_history_log_is_kept_whole_and_asked_about_once() {
+    let (dir, b, out) = (TempDir::new("cp-history"), TempDir::new("cp-history-b"), TempDir::new("cp-history-out"));
+    let rt = boot_with_journal(&dir, checkpointing());
+    for n in 1..=20 {
+        assert_eq!(send(&rt, "~zod", "counter", &format!("journal line {n}")), n.to_string());
+    }
+    // The agent said this log has no state that could stand in for its entries.
+    assert_eq!(rt.log_entries("~zod", "counter", "journal", 0, NO_LIMIT).unwrap().len(), 20);
+    assert!(rt.log_checkpoint("~zod", "counter", "journal").unwrap().is_none());
+    // A checkpoint request is recorded with the log's name as its event. One was enough.
+    assert_eq!((audited(&rt, b"journal", true), audited(&rt, b"journal", false)), (1, 0));
+
+    // Its other log, on the same ship, is still trimmed.
+    for _ in 0..20 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    assert!(dropped(&rt) > 0);
+    assert_eq!(rt.log_entries("~zod", "counter", "journal", 0, NO_LIMIT).unwrap().len(), 20);
+
+    // The agent's answer goes with the ship: an imported copy does not ask again either.
+    rt.export_ship("~zod", &out.0).unwrap();
+    let other = Runtime::open(&b.0, checkpointing()).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    for n in 21..=40 {
+        assert_eq!(send(&other, "~zod", "counter", &format!("journal line {n}")), n.to_string());
+    }
+    assert_eq!(other.log_entries("~zod", "counter", "journal", 0, NO_LIMIT).unwrap().len(), 40);
+    assert_eq!((audited(&other, b"journal", true), audited(&other, b"journal", false)), (1, 0));
+}
+
+#[test]
+fn a_checkpoint_that_cannot_be_taken_leaves_the_log_whole() {
+    let dir = TempDir::new("cp-failing");
+    let cfg = Config { max_queued_per_deliver: 0, max_checkpoint_bytes: 1000, ..checkpointing() };
+    let rt = boot(&dir, cfg);
+    let settle = || settle(&rt);
+
+    // A handler that fails: every entry is still there, and no checkpoint exists.
+    send(&rt, "~zod", "counter", "checkpoints broken");
+    for _ in 0..10 {
+        send(&rt, "~zod", "counter", "log hits");
+        settle();
+    }
+    assert!(audited(&rt, b"counter", false) >= 2, "the failed requests are on record");
+    assert_eq!(audited(&rt, b"counter", true), 0);
+    assert_eq!(dropped(&rt), 0);
+    assert!(rt.log_checkpoint("~zod", "counter", "counter").unwrap().is_none());
+
+    // A handler that tries to change something while describing its state is refused.
+    send(&rt, "~zod", "counter", "checkpoints meddling");
+    send(&rt, "~zod", "counter", "log hits");
+    settle();
+    // Had the write been allowed, the request would have succeeded and left a checkpoint.
+    assert_eq!(audited(&rt, b"counter", true), 0);
+    assert!(rt.log_checkpoint("~zod", "counter", "counter").unwrap().is_none());
+
+    // A state just larger than a checkpoint may carry. The request is queued by the append,
+    // and the state grows before the request runs.
+    send(&rt, "~zod", "counter", "checkpoints fine");
+    send(&rt, "~zod", "counter", "log hits");
+    send(&rt, "~zod", "counter", "state 1005");
+    settle();
+    assert_eq!(audited(&rt, b"counter", true), 0);
+    assert!(rt.log_checkpoint("~zod", "counter", "counter").unwrap().is_none());
+    assert_eq!(rt.log_entries("~zod", "counter", "counter", 0, NO_LIMIT).unwrap().len(), 12);
+
+    // None of that stops a later request from working.
+    send(&rt, "~zod", "counter", "log hits");
+    settle();
+    assert_eq!(checkpoint(&rt), (13, rt.log_head("~zod", "counter", "counter").unwrap().unwrap().1, "hits=13".into()));
+    assert_eq!(audited(&rt, b"counter", true), 1);
+}
+
+#[test]
+fn a_log_with_checkpoints_does_not_fill_up() {
+    let dir = TempDir::new("cp-quota");
+    let rt = boot_with_journal(&dir, Config { max_log_bytes: 4000, ..checkpointing() });
+
+    // Without checkpoints about twenty of these entries would fit.
+    for expected in 1..=200 {
+        assert_eq!(send(&rt, "~zod", "counter", "log hits"), expected.to_string());
+    }
+    // A log that is never trimmed does fill, and what it is recorded as holding survives a
+    // sleep and wake: it takes not one entry more afterwards.
+    let fill = |rt: &Runtime| {
+        let mut accepted = 0;
+        while accepted < 100 && rt.deliver("~zod", "counter", b"journal a line of history").is_ok() {
+            accepted += 1;
+        }
+        accepted
+    };
+    let accepted = fill(&rt);
+    assert!((5..30).contains(&accepted), "the journal took {accepted} entries");
+    settle(&rt);
+    rt.sleep_idle(Duration::ZERO);
+    assert_eq!(fill(&rt), 0);
+    assert_eq!(send(&rt, "~zod", "counter", "log hits"), "201");
+    drop(rt);
+
+    // What each log is recorded as holding is exactly the entries that are there, and within
+    // the limit. Checkpoints are not counted as entries.
+    let file = rusqlite::Connection::open(dir.0.join("ships").join("zod.ship")).unwrap();
+    let total = |sql: &str| file.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
+    let wrong = total(
+        "SELECT COUNT(*) FROM logs l WHERE l.bytes !=
+           (SELECT COALESCE(SUM(LENGTH(body) + 128), 0) FROM log_entries e WHERE e.agent = l.agent AND e.name = l.name)",
+    );
+    assert_eq!((wrong, total("SELECT COUNT(*) FROM logs")), (0, 2));
+    assert!(total("SELECT MAX(bytes) FROM logs") <= 4000);
+    assert_eq!(total("SELECT COUNT(*) FROM checkpoints"), 1);
+    assert_eq!(total("SELECT COUNT(*) FROM inbox"), 0);
+}
+
+#[test]
+fn a_trimmed_log_survives_export_and_import() {
+    let (a, b, out) = (TempDir::new("cp-export-a"), TempDir::new("cp-export-b"), TempDir::new("cp-export-out"));
+    let cfg = Config { max_queued_per_deliver: 0, ..checkpointing() };
+    let rt = boot_pair(&a, cfg.clone(), counter_manifest(false), tally_manifest(true));
+    for _ in 0..20 {
+        send(&rt, "~zod", "counter", "log hits");
+        settle(&rt);
+    }
+    // A follower that has not had a turn yet, so it is behind the dropped part at export time.
+    send(&rt, "~zod", "tally", "follow");
+    let (key, base, taken) = (rt.public_key("~zod").unwrap(), dropped(&rt), checkpoint(&rt));
+    let signed = rt.log_checkpoint("~zod", "counter", "counter").unwrap();
+    rt.export_ship("~zod", &out.0).unwrap();
+
+    let other = Runtime::open(&b.0, cfg).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    assert_eq!(dropped(&other), base);
+    assert_eq!(other.log_checkpoint("~zod", "counter", "counter").unwrap(), signed);
+    assert_eq!(other.log_head("~zod", "counter", "counter").unwrap().unwrap().0, 20);
+
+    // The follower is prompted afresh, takes the checkpoint, and catches up.
+    settle(&other);
+    assert_eq!(read(&other, "tally", "tally", "seen"), "20");
+    assert_eq!(read(&other, "tally", "tally", "jumps"), "1");
+
+    // Trimming picks up exactly where it left off: the copy takes its next checkpoint after the
+    // same number of new entries as the original does.
+    assert!(taken.0 < 20, "the log had nothing since its checkpoint, so this would show nothing");
+    let until_next_checkpoint = |rt: &Runtime| {
+        let (before, mut added) = (checkpoint(rt).0, 0);
+        while checkpoint(rt).0 == before {
+            assert!(added < 20, "no further checkpoint was taken");
+            send(rt, "~zod", "counter", "log hits");
+            settle(&rt);
+            added += 1;
+        }
+        added
+    };
+    let added = until_next_checkpoint(&other);
+    assert_eq!(added, until_next_checkpoint(&rt));
+
+    // The log carries on: same numbering, same chain.
+    for _ in 0..10 {
+        send(&other, "~zod", "counter", "log hits");
+        settle(&other);
+    }
+    let head = 20 + added + 10;
+    assert!(dropped(&other) > base);
+    let (seq, hash, state) = checkpoint(&other);
+    assert!(seq > taken.0 && state == format!("hits={seq}"), "checkpoint at {seq} says {state}");
+    let rest = other.log_entries("~zod", "counter", "counter", seq, NO_LIMIT).unwrap();
+    let end = verify_log(&key, "~zod", "counter", "counter", Some((seq, hash)), &rest).unwrap();
+    assert_eq!(end.unwrap().0, head);
+    assert_eq!(read(&other, "tally", "tally", "seen"), head.to_string());
+}
+
+#[test]
+fn import_refuses_a_trimmed_log_that_does_not_check_out() {
+    // Export a ship whose counter log has been trimmed, damage the export, and import it.
+    let import = |label: &str, damage: &dyn Fn(&Path)| -> Result<(), Error> {
+        let (a, b, out, early) = (
+            TempDir::new(&format!("{label}-a")),
+            TempDir::new(&format!("{label}-b")),
+            TempDir::new(&format!("{label}-out")),
+            TempDir::new(&format!("{label}-early")),
+        );
+        let rt = boot(&a, checkpointing());
+        for _ in 0..8 {
+            send(&rt, "~zod", "counter", "log hits");
+        }
+        // An earlier export of the same ship, kept beside the later one as `early.ship`.
+        rt.export_ship("~zod", &early.0).unwrap();
+        for _ in 0..12 {
+            send(&rt, "~zod", "counter", "log hits");
+        }
+        rt.export_ship("~zod", &out.0).unwrap();
+        fs::copy(early.0.join("zod.ship"), out.0.join("early.ship")).unwrap();
+        damage(&out.0);
+        fs::remove_file(out.0.join("early.ship")).unwrap();
+        Runtime::open(&b.0, checkpointing()).unwrap().import_ship(&out.0, "~zod")
+    };
+    let sql = |statement: &'static str| {
+        move |out: &Path| {
+            let file = rusqlite::Connection::open(out.join("zod.ship")).unwrap();
+            file.execute("ATTACH ?1 AS early", [out.join("early.ship").to_str().unwrap()]).unwrap();
+            file.execute_batch(statement).unwrap();
+        }
+    };
+    let refused = |label: &str, statement: &'static str| {
+        let result = import(label, &sql(statement));
+        assert!(matches!(result, Err(Error::BadShipFile(_))), "{label}: {result:?}");
+    };
+    assert!(import("cp-intact", &|_| {}).is_ok());
+
+    // The checkpoint removed: entries are missing with nothing to stand in for them.
+    refused("cp-removed", "DELETE FROM checkpoints");
+    // Its state altered. The last byte of the body is the last byte of the state.
+    refused("cp-altered", "UPDATE checkpoints SET body = CAST(substr(body, 1, length(body) - 1) || x'7a' AS BLOB)");
+    // Filed under a different entry than the one it was signed for.
+    refused("cp-moved", "UPDATE checkpoints SET seq = seq - 1");
+    // A genuine but older checkpoint of the same log put in its place. It stands for an entry
+    // that has since been dropped, so it cannot be tied to what is left.
+    refused("cp-stale", "DELETE FROM checkpoints; INSERT INTO checkpoints SELECT * FROM early.checkpoints");
+    // More dropped than the log admits to, less than it admits to, and more than the
+    // checkpoint covers.
+    refused("cp-short", "DELETE FROM log_entries WHERE seq = (SELECT MIN(seq) FROM log_entries)");
+    refused("cp-base", "UPDATE logs SET base = base - 1");
+    refused(
+        "cp-past",
+        "UPDATE logs SET base = (SELECT seq + 1 FROM checkpoints);
+         DELETE FROM log_entries WHERE seq <= (SELECT seq + 1 FROM checkpoints)",
+    );
+    // Everything the checkpoint covers dropped, and no more, is a state a ship gets into by
+    // itself when it is short of room. The entries left link straight back to the checkpoint.
+    let tight = import(
+        "cp-all",
+        &sql("UPDATE logs SET base = (SELECT seq FROM checkpoints);
+              DELETE FROM log_entries WHERE seq <= (SELECT seq FROM checkpoints)"),
+    );
+    assert!(tight.is_ok(), "{tight:?}");
+    // The same, with a checkpoint that is signed but gives its entry the wrong hash. The entry
+    // itself is gone, so what shows it is the next entry's link back.
+    let unlinked = import("cp-all-forged", &|out| {
+        use ship_proto::Message;
+        let file = rusqlite::Connection::open(out.join("zod.ship")).unwrap();
+        let body: Vec<u8> = file.query_row("SELECT body FROM checkpoints", [], |row| row.get(0)).unwrap();
+        let wrong = ship_proto::CheckpointBody { hash: vec![9; 32], ..ship_proto::CheckpointBody::decode(&*body).unwrap() };
+        let signed = sign_checkpoint(&out.join("zod.key"), &wrong);
+        file.execute("UPDATE checkpoints SET body = ?1, signature = ?2", rusqlite::params![signed.body, signed.signature]).unwrap();
+        file.execute_batch(
+            "UPDATE logs SET base = (SELECT seq FROM checkpoints);
+             DELETE FROM log_entries WHERE seq <= (SELECT seq FROM checkpoints)",
+        )
+        .unwrap();
+    });
+    assert!(matches!(unlinked, Err(Error::BadShipFile(_))), "{unlinked:?}");
+    // Every entry dropped. A log may hold none, but only when its checkpoint stands for its
+    // newest entry, which this one does not.
+    refused("cp-empty", "DELETE FROM log_entries");
+    refused("cp-emptied", "UPDATE logs SET base = head; DELETE FROM log_entries");
+    // A checkpoint that really is signed by the ship, for the right entry, but giving that
+    // entry a hash it does not have. Only comparing it with the entry itself shows this.
+    let forged = import("cp-forged", &|out| {
+        use ship_proto::Message;
+        let file = rusqlite::Connection::open(out.join("zod.ship")).unwrap();
+        let body: Vec<u8> = file.query_row("SELECT body FROM checkpoints", [], |row| row.get(0)).unwrap();
+        let wrong = ship_proto::CheckpointBody { hash: vec![9; 32], ..ship_proto::CheckpointBody::decode(&*body).unwrap() };
+        let signed = sign_checkpoint(&out.join("zod.key"), &wrong);
+        file.execute("UPDATE checkpoints SET body = ?1, signature = ?2", rusqlite::params![signed.body, signed.signature]).unwrap();
+    });
+    assert!(matches!(forged, Err(Error::BadShipFile(_))), "{forged:?}");
+    // The newest entries removed.
+    refused("cp-cut", "DELETE FROM log_entries WHERE seq > (SELECT seq FROM checkpoints)");
+    // Flags that are not flags.
+    refused("cp-flag", "UPDATE logs SET history = 2");
+}
+
+#[test]
+fn a_signature_for_one_kind_of_message_does_not_pass_for_another() {
+    let dir = TempDir::new("cp-kinds");
+    let rt = boot(&dir, checkpointing());
+    for _ in 0..8 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    let key = rt.public_key("~zod").unwrap();
+    let entries = rt.log_entries("~zod", "counter", "counter", dropped(&rt), NO_LIMIT).unwrap();
+    assert!(entries.len() >= 2);
+
+    // An entry and a checkpoint are laid out alike: an entry's link to the one before sits
+    // where a checkpoint keeps its hash, and its payload where a checkpoint keeps its state.
+    // So a genuine entry, handed over as a checkpoint, decodes perfectly well.
+    for entry in &entries {
+        let posing = SignedCheckpoint { body: entry.body.clone(), signature: entry.signature.clone() };
+        assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &posing).is_err());
+    }
+    // And the reverse: the checkpoint handed over as the entry after a position made to fit it.
+    use ship_proto::Message;
+    let signed = rt.log_checkpoint("~zod", "counter", "counter").unwrap().unwrap();
+    let stated = ship_proto::CheckpointBody::decode(&*signed.body).unwrap();
+    let before = (stated.seq - 1, <[u8; 32]>::try_from(stated.hash).unwrap());
+    let posing = runtime::SignedEntry { body: signed.body, signature: signed.signature };
+    assert!(verify_log(&key, "~zod", "counter", "counter", Some(before), &[posing]).is_err());
+}
+
+#[test]
+fn a_follower_that_cannot_take_a_checkpoint_is_not_moved_past_one() {
+    let dir = TempDir::new("cp-old");
+    let cfg = Config { max_queued_per_deliver: 0, ..checkpointing() };
+    let rt = boot_pair(&dir, cfg, counter_manifest(false), tally_manifest(true));
+    for _ in 0..20 {
+        send(&rt, "~zod", "counter", "log hits");
+        settle(&rt);
+    }
+    assert!(dropped(&rt) > 0);
+
+    // A follower built before checkpoints existed would not notice one in a reply. Rather than
+    // move it past entries it never saw, its rounds fail and its place stays where it was.
+    send(&rt, "~zod", "tally", "old");
+    send(&rt, "~zod", "tally", "follow");
+    settle(&rt);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "0");
+    assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(0));
+    assert!(audited(&rt, b"", false) >= 1, "the failed rounds are on record");
+
+    // Once it can take a checkpoint, asking to follow again starts it off and it catches up.
+    send(&rt, "~zod", "tally", "modern");
+    send(&rt, "~zod", "tally", "follow");
+    settle(&rt);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "20");
+    assert_eq!(read(&rt, "tally", "tally", "jumps"), "1");
+
+    // Such a follower is fine for as long as it keeps up.
+    let dir = TempDir::new("cp-old-keeping-up");
+    let rt = boot_pair(&dir, checkpointing(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "old");
+    send(&rt, "~zod", "tally", "follow");
+    for _ in 0..20 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    assert!(dropped(&rt) > 0);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "20");
+}
+
+#[test]
+fn a_tight_log_limit_cannot_wedge_a_checkpointed_log() {
+    // Three entries fit. A checkpoint by itself drops nothing the first time, so without more
+    // help no entry could ever be added again, and with no new entry no checkpoint would ever
+    // be asked for.
+    let dir = TempDir::new("cp-tight");
+    // The usual threshold for a checkpoint is far above what this log may hold, so one is only
+    // ever asked for because room is short.
+    let rt = boot_pair(&dir, Config { max_log_bytes: 600, ..fast() }, counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    for expected in 1..=60 {
+        assert_eq!(send(&rt, "~zod", "counter", "log hits"), expected.to_string());
+    }
+    // A follower that keeps up is, again and again, exactly at the point up to which entries
+    // have just been dropped. It still gets every entry, and never needs a checkpoint.
+    assert!(dropped(&rt) > 50);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "60");
+    assert_eq!(read(&rt, "tally", "tally", "jumps"), "0");
+    rt.sleep_idle(Duration::ZERO);
+    assert_eq!(send(&rt, "~zod", "counter", "log hits"), "61");
+    let cfg = Config { max_log_bytes: 600, ..checkpointing() };
+    // A reader can still get from the checkpoint to the log's end.
+    let key = rt.public_key("~zod").unwrap();
+    let (seq, hash, state) = checkpoint(&rt);
+    assert_eq!(state, format!("hits={seq}"));
+    let rest = rt.log_entries("~zod", "counter", "counter", seq, NO_LIMIT).unwrap();
+    let end = verify_log(&key, "~zod", "counter", "counter", Some((seq, hash)), &rest).unwrap();
+    assert_eq!(end.unwrap().0, 61);
+
+    // A log that filled up while no checkpoint could be taken recovers once one can.
+    let dir = TempDir::new("cp-recover");
+    let rt = boot(&dir, Config { max_queued_per_deliver: 0, ..cfg });
+    send(&rt, "~zod", "counter", "checkpoints broken");
+    let mut accepted = 0;
+    while accepted < 10 && rt.deliver("~zod", "counter", b"log hits").is_ok() {
+        accepted += 1;
+        settle(&rt);
+    }
+    assert!((1..10).contains(&accepted), "accepted {accepted}");
+    settle(&rt);
+    assert!(rt.log_checkpoint("~zod", "counter", "counter").unwrap().is_none());
+    send(&rt, "~zod", "counter", "checkpoints fine");
+    assert_eq!(rt.pending("~zod").unwrap(), 0);
+    // The append is still refused, but being refused is what asks for the checkpoint that
+    // makes room for the next one.
+    assert!(matches!(rejection(&rt, "counter", "log hits"), Rejection::Limit(_)));
+    assert_eq!(rt.pending("~zod").unwrap(), 1);
+    settle(&rt);
+    for n in 1..=20 {
+        assert_eq!(send(&rt, "~zod", "counter", "log hits"), (accepted + n).to_string());
+        settle(&rt);
+    }
+
+    // Nobody has to run the queue by hand for that. An entry too big for the room that is
+    // left is refused, and simply trying again works, because the refused call also ran the
+    // checkpoint request it gave rise to.
+    let dir = TempDir::new("cp-retry");
+    let rt = boot(&dir, Config { max_log_bytes: 600, ..checkpointing() });
+    send(&rt, "~zod", "counter", "log hits");
+    send(&rt, "~zod", "counter", "log hits");
+    assert!(rt.log_checkpoint("~zod", "counter", "counter").unwrap().is_none());
+    assert!(matches!(rejection(&rt, "counter", "log-big 150"), Rejection::Limit(_)));
+    assert_eq!(send(&rt, "~zod", "counter", "log-big 150"), "3");
+}
+
+#[test]
+fn a_checkpoint_request_for_a_module_that_cannot_answer_is_dropped() {
+    let dir = TempDir::new("cp-replaced");
+    let rt = boot(&dir, Config { max_queued_per_deliver: 0, ..checkpointing() });
+    for _ in 0..4 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    assert_eq!(rt.pending("~zod").unwrap(), 1);
+    // The agent is replaced, before the request runs, by a module with no checkpoint handler.
+    let tally = rt.add_module(&wasm("tally")).unwrap();
+    rt.install("~zod", "counter", &tally, &counter_manifest(false)).unwrap();
+    settle(&rt);
+    // The request is done with, without anything having failed, and the log is whole.
+    assert_eq!((audited(&rt, b"counter", true), audited(&rt, b"counter", false)), (1, 0));
+    assert!(rt.log_checkpoint("~zod", "counter", "counter").unwrap().is_none());
+    assert_eq!(rt.log_entries("~zod", "counter", "counter", 0, NO_LIMIT).unwrap().len(), 4);
+
+    // Nothing was left behind by that: with a module that can answer back in place, the next
+    // entry asks again and the checkpoint is taken.
+    let counter = rt.add_module(&counter_wasm()).unwrap();
+    rt.install("~zod", "counter", &counter, &counter_manifest(false)).unwrap();
+    assert_eq!(send(&rt, "~zod", "counter", "log hits"), "5");
+    assert_eq!(rt.pending("~zod").unwrap(), 1);
+    settle(&rt);
+    assert_eq!(checkpoint(&rt).0, 5);
+}
+
+#[test]
+fn a_waiting_checkpoint_request_survives_export_and_import() {
+    let (a, b, out) = (TempDir::new("cp-due-a"), TempDir::new("cp-due-b"), TempDir::new("cp-due-out"));
+    let cfg = Config { max_queued_per_deliver: 0, ..checkpointing() };
+    let rt = boot(&a, cfg.clone());
+    // Enough entries for a checkpoint to be asked for, and the request left waiting.
+    for _ in 0..4 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    assert_eq!(rt.pending("~zod").unwrap(), 1);
+    rt.export_ship("~zod", &out.0).unwrap();
+
+    // The request goes with the ship, like anything else that is waiting.
+    let other = Runtime::open(&b.0, cfg).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    assert!(other.log_checkpoint("~zod", "counter", "counter").unwrap().is_none());
+    assert_eq!(other.pending("~zod").unwrap(), 1);
+    // And the copy knows it is waiting: another entry does not ask a second time.
+    send(&other, "~zod", "counter", "log hits");
+    assert_eq!(other.pending("~zod").unwrap(), 1);
+    settle(&other);
+    assert_eq!(checkpoint(&other), (5, other.log_head("~zod", "counter", "counter").unwrap().unwrap().1, "hits=5".into()));
+
+    // The same for a request made because room was short, well before the usual threshold: one
+    // entry that takes more than half of what the log may hold.
+    let (a, b, out) = (TempDir::new("cp-short-a"), TempDir::new("cp-short-b"), TempDir::new("cp-short-out"));
+    let cfg = Config { max_log_bytes: 600, max_queued_per_deliver: 0, ..checkpointing() };
+    let rt = boot(&a, cfg.clone());
+    send(&rt, "~zod", "counter", "log-big 150");
+    assert_eq!(rt.pending("~zod").unwrap(), 1);
+    rt.export_ship("~zod", &out.0).unwrap();
+    let other = Runtime::open(&b.0, cfg).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    assert_eq!(other.pending("~zod").unwrap(), 1);
+    settle(&other);
+    assert_eq!(send(&other, "~zod", "counter", "log-big 150"), "2");
+}
+
+#[test]
+fn a_ship_has_a_bounded_number_of_logs() {
+    let dir = TempDir::new("cp-count");
+    let rt = boot_with_journal(&dir, Config { max_logs: 1, ..fast() });
+    assert_eq!(send(&rt, "~zod", "counter", "log hits"), "1");
+    assert!(matches!(rejection(&rt, "counter", "journal a second log"), Rejection::Limit(_)));
+    // The log that exists carries on.
+    assert_eq!(send(&rt, "~zod", "counter", "log hits"), "2");
+
+    // A file with more logs than a runtime allows is turned away on import.
+    let (a, b, out) = (TempDir::new("cp-count-a"), TempDir::new("cp-count-b"), TempDir::new("cp-count-out"));
+    let rt = boot_with_journal(&a, fast());
+    send(&rt, "~zod", "counter", "log hits");
+    send(&rt, "~zod", "counter", "journal a second log");
+    rt.export_ship("~zod", &out.0).unwrap();
+    let strict = Runtime::open(&b.0, Config { max_logs: 1, ..fast() }).unwrap();
+    assert!(matches!(strict.import_ship(&out.0, "~zod"), Err(Error::BadShipFile(_))));
+}
+
+#[test]
+fn a_large_checkpoint_at_the_logs_end_reaches_a_follower_whole() {
+    let dir = TempDir::new("cp-large");
+    let cfg = Config { max_queued_per_deliver: 0, ..checkpointing() };
+    let rt = boot_pair(&dir, cfg, counter_manifest(false), tally_manifest(true));
+    // Each checkpoint's state is some ten thousand bytes, more than the first buffer a
+    // follower offers. Stop at the moment a checkpoint has just dropped the log's start.
+    send(&rt, "~zod", "counter", "checkpoints padded");
+    let mut head = 0;
+    while dropped(&rt) == 0 {
+        assert!(head < 400, "nothing was ever dropped");
+        send(&rt, "~zod", "counter", "log hits");
+        settle(&rt);
+        head += 1;
+    }
+    let (seq, _, state) = checkpoint(&rt);
+    assert_eq!(seq, head, "the checkpoint is not at the log's end");
+    assert_eq!(state.len(), format!("hits={head}").len() + 10_000);
+
+    // One round takes the whole state and leaves the follower with nothing more to do.
+    send(&rt, "~zod", "tally", "follow");
+    assert_eq!(rt.run_pending("~zod", 10).unwrap(), 1);
+    assert_eq!(read(&rt, "tally", "tally", "jumps"), "1");
+    assert_eq!(read(&rt, "tally", "tally", "seen"), head.to_string());
+    assert_eq!(read(&rt, "tally", "tally", "last"), state);
+    assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(head));
+    assert_eq!(rt.pending("~zod").unwrap(), 0);
+}
+
+#[test]
+fn a_large_checkpoint_does_not_take_room_from_entries() {
+    let dir = TempDir::new("cp-roomy");
+    let rt = boot(&dir, Config { max_log_bytes: 1000, ..checkpointing() });
+    send(&rt, "~zod", "counter", "checkpoints padded");
+    for _ in 0..3 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    // The checkpoint is ten times what the log may hold in entries, and is not counted as any.
+    assert!(checkpoint(&rt).2.len() > 10_000);
+    // The next entry does not fit beside the three that are there. They are covered by the
+    // checkpoint, so they go, and it does fit.
+    assert_eq!(send(&rt, "~zod", "counter", "log-big 400"), "4");
+    // That entry left too little room for another like it, so a checkpoint was asked for at
+    // once. It covers everything, so an entry that needs nearly the whole log goes straight in.
+    assert_eq!(checkpoint(&rt).0, 4);
+    assert_eq!(send(&rt, "~zod", "counter", "log-big 800"), "5");
+    // An entry that could never fit is refused however often it is tried.
+    for _ in 0..3 {
+        assert!(matches!(rejection(&rt, "counter", "log-big 1000"), Rejection::Limit(_)));
+    }
+    assert_eq!(rt.log_head("~zod", "counter", "counter").unwrap().unwrap().0, 5);
+
+    // Nor does refusing it ask for a checkpoint, which could not help.
+    let dir = TempDir::new("cp-oversized");
+    let rt = boot(&dir, Config { max_log_bytes: 1000, max_queued_per_deliver: 0, ..fast() });
+    send(&rt, "~zod", "counter", "log hits");
+    assert!(matches!(rejection(&rt, "counter", "log-big 1000"), Rejection::Limit(_)));
+    assert_eq!(rt.pending("~zod").unwrap(), 0);
+}
+
+#[test]
+fn one_full_log_takes_no_room_from_another() {
+    let dir = TempDir::new("cp-separate");
+    let rt = boot_with_journal(&dir, Config { max_log_bytes: 600, ..fast() });
+    let mut accepted = 0;
+    while accepted < 100 && rt.deliver("~zod", "counter", b"journal a line").is_ok() {
+        accepted += 1;
+    }
+    assert!((1..10).contains(&accepted), "accepted {accepted}");
+    // The journal is full for good. The agent's other log is untouched by that.
+    for expected in 1..=10 {
+        assert_eq!(send(&rt, "~zod", "counter", "log hits"), expected.to_string());
+    }
+    assert!(matches!(rejection(&rt, "counter", "journal a line"), Rejection::Limit(_)));
+}
+
+#[test]
+fn import_keeps_the_queue_in_its_order() {
+    let (a, b, out) = (TempDir::new("cp-order-a"), TempDir::new("cp-order-b"), TempDir::new("cp-order-out"));
+    let cfg = Config { checkpoint_min_bytes: 0, max_log_bytes: 1000, max_queued_per_deliver: 0, ..fast() };
+    let rt = boot_pair(&a, cfg.clone(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "counter", "log hits");
+    settle(&rt);
+    assert_eq!(checkpoint(&rt).0, 1);
+    for _ in 0..3 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    // Waiting, in this order: a checkpoint request, then a command that appends an entry too
+    // big to fit unless that checkpoint has been taken first.
+    send(&rt, "~zod", "tally", "forward log-big 600");
+    assert_eq!(rt.pending("~zod").unwrap(), 2);
+    rt.export_ship("~zod", &out.0).unwrap();
+
+    let other = Runtime::open(&b.0, cfg).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    assert_eq!(other.pending("~zod").unwrap(), 2);
+    // A queued command that is refused is dropped for good, so the order matters. The copy
+    // ends up exactly where the original does.
+    for ship in [&rt, &other] {
+        settle(ship);
+        assert_eq!(ship.log_head("~zod", "counter", "counter").unwrap().unwrap().0, 5);
+    }
+
+    // A checkpoint request between two commands. The first command's entry is covered by the
+    // checkpoint only because the request runs after it, and the second only fits because the
+    // first's entry is covered. Moving the request either way would lose the second command.
+    let (a, b, out) = (TempDir::new("cp-between-a"), TempDir::new("cp-between-b"), TempDir::new("cp-between-out"));
+    let cfg = Config { checkpoint_min_bytes: 0, max_log_bytes: 1000, max_queued_per_deliver: 0, ..fast() };
+    let rt = boot_pair(&a, cfg.clone(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "counter", "log hits");
+    settle(&rt);
+    send(&rt, "~zod", "tally", "forward log-big 150");
+    for _ in 0..3 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    send(&rt, "~zod", "tally", "forward log-big 600");
+    assert_eq!(rt.pending("~zod").unwrap(), 3);
+    rt.export_ship("~zod", &out.0).unwrap();
+    let other = Runtime::open(&b.0, cfg).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    for ship in [&rt, &other] {
+        settle(ship);
+        assert_eq!(ship.log_head("~zod", "counter", "counter").unwrap().unwrap().0, 6);
+    }
+
+    // A request that exists only because an entry was refused for lack of room. Nothing about
+    // the log itself says one is wanted, so it has to be carried over, not worked out.
+    let (a, b, out) = (TempDir::new("cp-refused-a"), TempDir::new("cp-refused-b"), TempDir::new("cp-refused-out"));
+    let cfg = Config { max_log_bytes: 600, max_queued_per_deliver: 0, ..checkpointing() };
+    let rt = boot_pair(&a, cfg.clone(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "counter", "log hits");
+    send(&rt, "~zod", "counter", "log hits");
+    assert_eq!(rt.pending("~zod").unwrap(), 0);
+    assert!(matches!(rejection(&rt, "counter", "log-big 150"), Rejection::Limit(_)));
+    send(&rt, "~zod", "tally", "forward log-big 150");
+    assert_eq!(rt.pending("~zod").unwrap(), 2);
+    rt.export_ship("~zod", &out.0).unwrap();
+    let other = Runtime::open(&b.0, cfg).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    for ship in [&rt, &other] {
+        settle(ship);
+        assert_eq!(ship.log_head("~zod", "counter", "counter").unwrap().unwrap().0, 3);
+    }
+}
+
+#[test]
+fn a_checkpoint_is_asked_for_only_once_new_entries_outweigh_the_last_one() {
+    let dir = TempDir::new("cp-threshold");
+    let rt = boot(&dir, Config { checkpoint_min_bytes: 0, max_queued_per_deliver: 0, ..fast() });
+    send(&rt, "~zod", "counter", "log hits");
+    assert_eq!(rt.pending("~zod").unwrap(), 1);
+    settle(&rt);
+    assert_eq!(checkpoint(&rt).0, 1);
+    // One more entry counts for exactly what that checkpoint does, which is not more than it.
+    send(&rt, "~zod", "counter", "log hits");
+    assert_eq!(rt.pending("~zod").unwrap(), 0);
+    send(&rt, "~zod", "counter", "log hits");
+    assert_eq!(rt.pending("~zod").unwrap(), 1);
+}
+
+#[test]
+fn a_rejected_command_still_lets_queued_events_run() {
+    // One queued event runs after each delivery. The tally agent keeps one waiting.
+    let dir = TempDir::new("deliver-rejected");
+    let cfg = Config { max_queued_per_deliver: 1, ..fast() };
+    let rt = boot_pair(&dir, cfg, counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "ping 1");
+    assert_eq!(read(&rt, "tally", "tally", "pings"), "2");
+    // The rejected command changed nothing itself, but the call it came in on did run the
+    // event that was waiting. A rejection says the command did nothing, not that nothing ran.
+    assert!(matches!(rejection(&rt, "counter", "crash hits"), Rejection::Trap(_)));
+    assert_eq!(send(&rt, "~zod", "counter", "get hits"), "0");
+    assert_eq!(read(&rt, "tally", "tally", "pings"), "4");
+}
+
+#[test]
+fn import_refuses_queued_events_the_ship_would_not_have_made() {
+    // A ship with one log, one follower that is up to date, and nothing waiting.
+    let import = |label: &str, statement: &str| -> (Result<(), Error>, Runtime, TempDir) {
+        let (a, b, out) = (
+            TempDir::new(&format!("{label}-a")),
+            TempDir::new(&format!("{label}-b")),
+            TempDir::new(&format!("{label}-out")),
+        );
+        let rt = boot_pair(&a, fast(), counter_manifest(false), tally_manifest(true));
+        send(&rt, "~zod", "tally", "follow");
+        for _ in 0..3 {
+            send(&rt, "~zod", "counter", "log hits");
+        }
+        assert_eq!(rt.pending("~zod").unwrap(), 0);
+        rt.export_ship("~zod", &out.0).unwrap();
+        rusqlite::Connection::open(out.0.join("zod.ship")).unwrap().execute_batch(statement).unwrap();
+        let other = Runtime::open(&b.0, Config { max_queued_per_deliver: 0, ..fast() }).unwrap();
+        (other.import_ship(&out.0, "~zod"), other, b)
+    };
+    let queue = |rows: &str| format!("INSERT INTO inbox (kind, source, agent, interface, payload) VALUES {rows}");
+    let refused = |label: &str, rows: &str| {
+        let (result, _, _) = import(label, &queue(rows));
+        assert!(matches!(result, Err(Error::BadShipFile(_))), "{label}: {result:?}");
+    };
+    // A checkpoint request for a log that does not exist, one that does not come from the
+    // log's own publisher, and two for the same log.
+    refused("q-no-log", "(4, 'counter', 'counter', 'nothing', x'')");
+    refused("q-not-own", "(4, 'tally', 'counter', 'counter', x'')");
+    refused("q-twice", "(4, 'counter', 'counter', 'counter', x''), (4, 'counter', 'counter', 'counter', x'')");
+    // A notification for something the agent does not follow, and two for the same log.
+    refused("q-no-follow", "(3, 'counter', 'tally', 'nothing', x'')");
+    refused("q-told-twice", "(3, 'counter', 'tally', 'counter', x''), (3, 'counter', 'tally', 'counter', x'')");
+    // A kind of event this runtime does not have.
+    refused("q-unknown", "(9, 'counter', 'counter', 'counter', x'')");
+
+    // One of each that the ship could have made is accepted, with whatever payload it carried
+    // replaced by what the runtime would have written, and runs.
+    let (result, other, _dir) =
+        import("q-fine", &queue("(4, 'counter', 'counter', 'counter', x'ffff'), (3, 'counter', 'tally', 'counter', x'ffff')"));
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(other.pending("~zod").unwrap(), 2);
+    // The copy knows both are waiting: a new entry does not queue a second notification.
+    assert_eq!(send(&other, "~zod", "counter", "log hits"), "4");
+    assert_eq!(other.pending("~zod").unwrap(), 2);
+    settle(&other);
+    assert_eq!(checkpoint(&other).0, 4);
+    assert_eq!(audited(&other, b"counter", false) + audited(&other, b"", false), 0);
+    assert_eq!(read(&other, "tally", "tally", "seen"), "4");
+}
+
+#[test]
+fn a_full_ship_lets_go_of_log_entries_a_checkpoint_covers() {
+    // Entries are big and the usual threshold applies, so between checkpoints the log holds
+    // more than this ship's file has room for. Some of that is already covered by a checkpoint
+    // and only kept for followers that are a little behind.
+    let dir = TempDir::new("cp-storage");
+    let rt = boot(&dir, Config { max_ship_bytes: 200 << 10, ..fast() });
+    let mut refused = 0;
+    for expected in 1..=40 {
+        match rt.deliver("~zod", "counter", b"log-big 30000") {
+            Ok(outcome) => assert_eq!(outcome.reply, expected.to_string().into_bytes()),
+            Err(Error::Rejected(Rejection::Limit(why))) => {
+                assert!(why.contains("storage is full"), "{why}");
+                refused += 1;
+                // Being refused for want of room is what lets the covered entries go, so the
+                // same entry fits when it is tried again.
+                assert_eq!(send(&rt, "~zod", "counter", "log-big 30000"), expected.to_string());
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+    assert!(refused > 0, "the ship's file never filled, so this shows nothing");
+    // What is left still checks out from the checkpoint to the end.
+    let key = rt.public_key("~zod").unwrap();
+    let (seq, hash, _) = checkpoint(&rt);
+    let rest = rt.log_entries("~zod", "counter", "counter", seq, NO_LIMIT).unwrap();
+    assert_eq!(verify_log(&key, "~zod", "counter", "counter", Some((seq, hash)), &rest).unwrap().unwrap().0, 40);
+}
+
+#[test]
+fn a_full_ship_can_let_go_of_a_logs_only_entry() {
+    // One big entry, covered by a checkpoint taken straight after it. A second entry would fit
+    // in the log many times over, but not in what is left of this ship's file.
+    let (dir, b, out) = (TempDir::new("cp-last"), TempDir::new("cp-last-b"), TempDir::new("cp-last-out"));
+    let cfg = Config { max_ship_bytes: 128 << 10, checkpoint_min_bytes: 0, ..fast() };
+    let rt = boot(&dir, cfg.clone());
+    assert_eq!(send(&rt, "~zod", "counter", "log-big 60000"), "1");
+    let key = rt.public_key("~zod").unwrap();
+    let (seq, hash, _) = checkpoint(&rt);
+    assert_eq!(seq, 1);
+
+    match rejection(&rt, "counter", "log-big 30000") {
+        Rejection::Limit(why) => assert!(why.contains("storage is full"), "{why}"),
+        other => panic!("expected the storage limit, got {other:?}"),
+    }
+    // Being refused let the covered entry go, which leaves the log with no entries at all. It
+    // still knows where it ends, and that is where its checkpoint says.
+    assert_eq!(dropped(&rt), 1);
+    assert!(rt.log_entries("~zod", "counter", "counter", 1, NO_LIMIT).unwrap().is_empty());
+    assert_eq!(rt.log_head("~zod", "counter", "counter").unwrap(), Some((1, hash)));
+
+    // A ship in that state can be exported and imported, and both carry on the same chain.
+    rt.export_ship("~zod", &out.0).unwrap();
+    let other = Runtime::open(&b.0, cfg.clone()).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    for ship in [&rt, &other] {
+        assert_eq!(send(ship, "~zod", "counter", "log-big 30000"), "2");
+        let rest = ship.log_entries("~zod", "counter", "counter", seq, NO_LIMIT).unwrap();
+        assert_eq!(verify_log(&key, "~zod", "counter", "counter", Some((seq, hash)), &rest).unwrap().unwrap().0, 2);
+    }
+
+    // An entry-less log whose recorded end is not the one its checkpoint signed for is refused.
+    let c = TempDir::new("cp-last-c");
+    rusqlite::Connection::open(out.0.join("zod.ship")).unwrap().execute_batch("UPDATE logs SET head_hash = zeroblob(32)").unwrap();
+    assert!(matches!(Runtime::open(&c.0, cfg).unwrap().import_ship(&out.0, "~zod"), Err(Error::BadShipFile(_))));
 }

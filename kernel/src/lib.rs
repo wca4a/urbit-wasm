@@ -109,6 +109,14 @@ fn decide(request: &RouteRequest) -> RouteReply {
             }
             return allow(&registry, target);
         }
+        // The runtime asks an agent about one of its own logs.
+        Kind::Checkpoint => {
+            let own = source.owner || source.agent == target.name;
+            if !own || !provides(target).iter().any(|p| p.interface == request.interface) {
+                return deny(format!("{} has no log named {}", target.name, request.interface));
+            }
+            return allow(&registry, target);
+        }
         // An unrecognised kind must be refused, never treated as something harmless.
         Kind::Unspecified => return deny("unknown kind of call"),
     };

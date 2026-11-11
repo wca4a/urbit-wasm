@@ -5,14 +5,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rusqlite::Connection;
 use ship_proto::admin_request::Op;
-use ship_proto::{AdminReply, AdminRequest, Grant, Invocation, Kind, Message, RouteReply, RouteRequest, Source};
+use ship_proto::{
+    AdminReply, AdminRequest, CheckpointBody, CheckpointReply, Grant, Invocation, Kind, Message, RouteReply, RouteRequest,
+    Source,
+};
 use wasmtime::{Store, StoreLimitsBuilder, Trap};
 
-use crate::host::{Ctx, Denied, LimitExceeded};
-use crate::{check_target, lock, store, AgentModule, Error, Inner, Outcome, Rejection, EPOCH_TICK_MILLIS, WASM_STACK_BYTES};
+use crate::host::{Ctx, Denied, LimitExceeded, LogsFull};
+use crate::{
+    check_target, lock, signed_bytes, store, AgentModule, Error, Inner, Outcome, Rejection, CHECKPOINT_DOMAIN,
+    EPOCH_TICK_MILLIS, WASM_STACK_BYTES,
+};
 
 pub struct Ship {
     pub name: Arc<str>,
@@ -20,11 +26,10 @@ pub struct Ship {
     pub kernel: Arc<AgentModule>,
     /// Signs this ship's log entries.
     pub key: Arc<SigningKey>,
-    /// Bytes held in the outbox, inbox, and logs, kept in step with the file so quota checks
-    /// are cheap.
+    /// Bytes held in the outbox and inbox, kept in step with the file so quota checks are
+    /// cheap.
     pub outbox_bytes: u64,
     pub inbox_bytes: u64,
-    pub log_bytes: u64,
 }
 
 /// What every call on a ship needs, whether it is the event itself or a read nested inside it.
@@ -37,7 +42,8 @@ pub(crate) struct Env<'a> {
     pub deadline: Instant,
 }
 
-/// One thing for an agent to handle: a command, or a notice that a log it follows has grown.
+/// One thing for an agent to handle: a command, a notice that a log it follows has grown, or a
+/// request for a checkpoint of one of its own logs.
 struct Event<'a> {
     kind: Kind,
     source: &'a Source,
@@ -61,7 +67,6 @@ struct Invoke<'a> {
     fuel: u64,
     outbox_room: u64,
     inbox_room: u64,
-    log_room: u64,
     max_reply: usize,
 }
 
@@ -69,6 +74,7 @@ struct Invoke<'a> {
 /// limits itself to, so a small `max_reply_bytes` for agents cannot make a ship unroutable.
 const KERNEL_REPLY_BYTES: usize = 1 << 20;
 
+#[derive(Default)]
 struct Returned {
     reply: Vec<u8>,
     fuel_left: u64,
@@ -76,7 +82,6 @@ struct Returned {
     effect_bytes: u64,
     queued: u32,
     queued_bytes: u64,
-    log_bytes: u64,
 }
 
 /// Run one exported handler in a fresh instance, so nothing kept in memory outlives the call.
@@ -124,8 +129,7 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
         queued_bytes: 0,
         inbox_room: call.inbox_room,
         appended: 0,
-        log_bytes: 0,
-        log_room: call.log_room,
+        can_checkpoint: call.module.pre.module().get_export("checkpoint").is_some(),
     };
     let mut store = Store::new(&env.rt.engine, ctx);
     store.limiter(|ctx| &mut ctx.store_limits);
@@ -173,7 +177,6 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
         effect_bytes: ctx.effect_bytes,
         queued: ctx.queued,
         queued_bytes: ctx.queued_bytes,
-        log_bytes: ctx.log_bytes,
     })
 }
 
@@ -192,7 +195,6 @@ fn kernel_call(env: &Env, export: &str, input: &[u8], read_only: bool) -> anyhow
         fuel: env.rt.cfg.kernel_fuel,
         outbox_room: 0,
         inbox_room: 0,
-        log_room: 0,
         max_reply: KERNEL_REPLY_BYTES,
     };
     Ok(invoke(env, call)?.reply)
@@ -239,11 +241,34 @@ pub(crate) fn read_agent(
             fuel,
             outbox_room: 0,
             inbox_room: 0,
-            log_room: 0,
             max_reply: env.rt.cfg.max_reply_bytes,
         },
     )?;
     Ok((returned.reply, returned.fuel_left))
+}
+
+/// Store what an agent answered when asked for a checkpoint of one of its logs.
+fn keep_checkpoint(env: &Env, conn: &Connection, agent: &str, log: &str, reply: &[u8]) -> anyhow::Result<()> {
+    let Some(state) = CheckpointReply::decode(reply)?.state else {
+        // The agent says every entry of this log matters. It is never trimmed or asked again.
+        store::mark_history(conn, agent, log)?;
+        return Ok(());
+    };
+    let max = env.rt.cfg.max_checkpoint_bytes;
+    if state.len() > max {
+        return Err(LimitExceeded(format!("checkpoint is {} bytes, limit is {max}", state.len())).into());
+    }
+    // The agent answered inside this transaction, so its state is the state as of the log's
+    // present end. Nothing to do if there is already a checkpoint for exactly that entry.
+    let (head, hash) = store::log_head(conn, agent, log)?;
+    if head == 0 || store::checkpoint_seq(conn, agent, log)? == Some(head) {
+        return Ok(());
+    }
+    let body = CheckpointBody { ship: env.ship.to_string(), agent: agent.into(), log: log.into(), seq: head, hash, state }
+        .encode_to_vec();
+    let signature = env.key.sign(&signed_bytes(CHECKPOINT_DOMAIN, &body)).to_bytes();
+    store::checkpoint_write(conn, agent, log, head, &body, &signature)?;
+    Ok(())
 }
 
 impl Ship {
@@ -294,16 +319,22 @@ impl Ship {
         let Event { kind, source, agent, interface, payload, queued } = event;
         // For a notification: which log it is about, as (publisher, name).
         let notice = (kind == Kind::Notify).then_some((source.agent.as_str(), interface));
+        // For a checkpoint request: the log, one of the agent's own, that it is about.
+        let asking = (kind == Kind::Checkpoint).then_some(interface);
         // Each lock below is taken in a statement of its own, so it is released before
         // `rollback` takes it again.
         let opened = {
             let conn = lock(&self.conn);
             // The notification is off the queue, so the next new entry may queue another. This
             // sits outside the savepoint: it holds whether or not the handler succeeds.
-            notice
-                .map_or(Ok(None), |(publisher, log)| {
-                    store::clear_notified(&conn, agent, publisher, log)?;
-                    store::cursor(&conn, agent, publisher, log)
+            // Likewise a checkpoint request: once it is off the queue, another may be asked for.
+            asking
+                .map_or(Ok(()), |log| store::checkpoint_answered(&conn, agent, log))
+                .and_then(|()| {
+                    notice.map_or(Ok(None), |(publisher, log)| {
+                        store::clear_notified(&conn, agent, publisher, log)?;
+                        store::cursor(&conn, agent, publisher, log)
+                    })
                 })
                 .and_then(|before| conn.execute_batch("SAVEPOINT handler").map(|()| before))
         };
@@ -316,29 +347,45 @@ impl Ship {
             }
         };
         let env = self.env(rt);
+        // Whether the agent's module can be asked for a checkpoint, once that is known.
+        let mut can_checkpoint = false;
         let ran = (|| -> anyhow::Result<Returned> {
             let (module, grants) = route(&env, source, agent, kind, interface)?;
+            can_checkpoint = module.pre.module().get_export("checkpoint").is_some();
             let invocation = Invocation { kind: kind as i32, interface: interface.into(), source: Some(source.clone()) };
-            let returned = invoke(
+            // A checkpoint request for a module with no checkpoint handler is nothing to do. It
+            // can come about when the module is replaced, or a ship is imported, after asking.
+            let skipped = asking.is_some() && !can_checkpoint;
+            let mut returned = if skipped { Returned::default() } else { invoke(
                 &env,
                 Invoke {
                     module: &module,
-                    export: if kind == Kind::Notify { "notify" } else { "handle" },
+                    export: match kind {
+                        Kind::Notify => "notify",
+                        Kind::Checkpoint => "checkpoint",
+                        _ => "handle",
+                    },
                     agent,
                     invocation: invocation.encode_to_vec(),
                     input: payload,
-                    read_only: false,
+                    // An agent describing its state must not change it while doing so.
+                    read_only: asking.is_some(),
                     depth: 0,
                     reads: grants.reads,
-                    sends: grants.sends,
+                    sends: if asking.is_some() { Vec::new() } else { grants.sends },
                     fuel: rt.cfg.fuel_per_event,
                     outbox_room: rt.cfg.max_outbox_bytes.saturating_sub(self.outbox_bytes),
                     inbox_room: rt.cfg.max_inbox_bytes.saturating_sub(self.inbox_bytes),
-                    log_room: rt.cfg.max_log_bytes.saturating_sub(self.log_bytes),
-                    max_reply: rt.cfg.max_reply_bytes,
+                    // Room for the state itself plus the few bytes that wrap it.
+                    max_reply: if asking.is_some() { rt.cfg.max_checkpoint_bytes + 16 } else { rt.cfg.max_reply_bytes },
                 },
-            )?;
+            )? };
             let conn = lock(&self.conn);
+            // The checkpoint, and the entries it lets go of, land with the rest of this event.
+            if let Some(log) = asking.filter(|_| !skipped) {
+                keep_checkpoint(&env, &conn, agent, log, &returned.reply)?;
+                returned.reply.clear();
+            }
             // A follower that did not take everything is notified again, so it works through a
             // long log one event at a time without anyone having to prompt it.
             if let Some((publisher, log)) = notice {
@@ -362,11 +409,17 @@ impl Ship {
                 }
                 self.outbox_bytes += done.effect_bytes;
                 self.inbox_bytes += done.queued_bytes;
-                self.log_bytes += done.log_bytes;
                 Ok(Outcome { reply: done.reply, effects: done.effects, queued: done.queued })
             }
             Err(e) => {
                 let rejection = Error::Rejected(classify(&e));
+                // An append found the logs full. The append itself is undone like the rest of
+                // the event, but a checkpoint of that log is what would make room, and only an
+                // append ever asks for one. So ask here, or a full log could never recover.
+                let full = e.chain().find_map(|cause| cause.downcast_ref::<LogsFull>()).filter(|_| can_checkpoint);
+                let full = full.map(|full| full.0.as_str());
+                // The ship's file is full. Its logs may be holding entries they no longer need.
+                let storage_full = storage_full(&e);
                 let recorded = {
                     let conn = lock(&self.conn);
                     // SQLite abandons the whole transaction after some errors, such as a full disk.
@@ -375,6 +428,8 @@ impl Ship {
                     !conn.is_autocommit()
                         && conn.execute_batch("ROLLBACK TO handler; RELEASE handler").is_ok()
                         && notice.is_none_or(|(publisher, log)| store::notify_failed(&conn, agent, publisher, log).is_ok())
+                        && (!storage_full || store::reclaim(&conn).is_ok())
+                        && full.is_none_or(|log| store::ask_checkpoint_when_full(&conn, agent, log).is_ok())
                         && store::audit(&conn, agent, payload, false, rt.cfg.audit_rows).is_ok()
                         && conn.execute_batch("COMMIT").is_ok()
                 };
@@ -384,7 +439,17 @@ impl Ship {
                 // The transaction was lost. Record the rejection in a new one, and for a queued
                 // command take it off the queue in that same transaction.
                 self.rollback();
-                let retried = store::record_rejection(&lock(&self.conn), queued, notice, agent, payload, rt.cfg.audit_rows);
+                let retried = store::record_rejection(
+                    &lock(&self.conn),
+                    queued,
+                    notice,
+                    asking,
+                    full,
+                    storage_full,
+                    agent,
+                    payload,
+                    rt.cfg.audit_rows,
+                );
                 match (retried, queued) {
                     (Ok(()), _) | (Err(_), None) => Err(rejection),
                     // Its removal could not be saved, so the command is still queued. Say so,
@@ -415,9 +480,12 @@ impl Ship {
         // free for whatever its handler sends.
         self.inbox_bytes = self.inbox_bytes.saturating_sub(queued.cost());
         let source = Source { owner: false, agent: queued.source.clone() };
-        // Anything other than a notification is run as a command, which is also the safe reading
-        // of a kind this runtime does not know.
-        let kind = if queued.kind == Kind::Notify as i32 { Kind::Notify } else { Kind::Command };
+        // Anything else is run as a command, which is also the safe reading of a kind this
+        // runtime does not know.
+        let kind = match Kind::try_from(queued.kind) {
+            Ok(kind @ (Kind::Notify | Kind::Checkpoint)) => kind,
+            _ => Kind::Command,
+        };
         let event = Event {
             kind,
             source: &source,
@@ -482,6 +550,12 @@ impl Ship {
     }
 }
 
+/// Whether an event failed because the ship's file could not grow.
+fn storage_full(err: &anyhow::Error) -> bool {
+    let full = |cause: &rusqlite::Error| cause.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull);
+    err.chain().filter_map(|cause| cause.downcast_ref::<rusqlite::Error>()).any(full)
+}
+
 fn classify(err: &anyhow::Error) -> Rejection {
     if let Some(denied) = err.chain().find_map(|cause| cause.downcast_ref::<Denied>()) {
         return Rejection::Denied(denied.0.clone());
@@ -489,8 +563,10 @@ fn classify(err: &anyhow::Error) -> Rejection {
     if let Some(limit) = err.chain().find_map(|cause| cause.downcast_ref::<LimitExceeded>()) {
         return Rejection::Limit(limit.0.clone());
     }
-    let full = |cause: &rusqlite::Error| cause.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull);
-    if err.chain().filter_map(|cause| cause.downcast_ref::<rusqlite::Error>()).any(full) {
+    if err.chain().any(|cause| cause.downcast_ref::<LogsFull>().is_some()) {
+        return Rejection::Limit("the log is full".into());
+    }
+    if storage_full(err) {
         return Rejection::Limit("the ship's storage is full".into());
     }
     match err.downcast_ref::<Trap>() {

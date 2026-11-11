@@ -9,13 +9,13 @@ use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use ed25519_dalek::{Signer, SigningKey};
 use ship_proto::{
-    AppendRequest, Entry, EntryBody, FollowRequest, Grant, Kind, Message, NextReply, NextRequest, ReadRequest,
-    SendRequest, Source,
+    AppendRequest, Checkpoint, CheckpointBody, Entry, EntryBody, FollowRequest, Grant, Kind, Message, NextReply,
+    NextRequest, ReadRequest, SendRequest, Source,
 };
 use wasmtime::{Caller, Engine, Linker, Memory, StoreLimits, Trap};
 
 use crate::ship::{self, Env};
-use crate::{check_target, lock, sha256, store, AgentModule, Inner};
+use crate::{check_target, lock, sha256, signed_bytes, store, AgentModule, Inner, ENTRY_DOMAIN};
 
 /// Fuel charged per host call, plus one unit per byte moved, so host work is paid for like
 /// guest work and a cheap guest loop cannot buy unbounded host effort.
@@ -66,8 +66,8 @@ pub struct Ctx {
     pub queued_bytes: u64,
     pub inbox_room: u64,
     pub appended: u32,
-    pub log_bytes: u64,
-    pub log_room: u64,
+    /// Whether this agent's module has a checkpoint handler, and so can be asked for one.
+    pub can_checkpoint: bool,
 }
 
 #[derive(Debug)]
@@ -80,6 +80,19 @@ impl fmt::Display for LimitExceeded {
 }
 
 impl std::error::Error for LimitExceeded {}
+
+/// An append found its log full. Names the log, so that the runtime can ask for a checkpoint
+/// of it, which is what would make room.
+#[derive(Debug)]
+pub struct LogsFull(pub String);
+
+impl fmt::Display for LogsFull {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "limit exceeded: the log {:?} is full", self.0)
+    }
+}
+
+impl std::error::Error for LogsFull {}
 
 #[derive(Debug)]
 pub struct Denied(pub String);
@@ -329,9 +342,13 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
             return Err(LimitExceeded(format!("log entry is {} bytes, limit is {max_payload}", request.payload.len())).into());
         }
         let (conn, agent, ship, key) = (ctx.conn.clone(), ctx.agent.clone(), ctx.ship.clone(), ctx.key.clone());
-        let (appended, used, room) = (ctx.appended, ctx.log_bytes, ctx.log_room);
+        let (appended, can_checkpoint, min_tail) = (ctx.appended, ctx.can_checkpoint, ctx.rt.cfg.checkpoint_min_bytes);
+        let (max_logs, max_held) = (ctx.rt.cfg.max_logs, ctx.rt.cfg.max_log_bytes);
         let conn = lock(&conn);
         let (head, prev) = store::log_head(&conn, &agent, &request.log)?;
+        if head == 0 && store::log_count(&conn)? >= max_logs {
+            return Err(LimitExceeded(format!("a ship may have at most {max_logs} logs")).into());
+        }
         let body = EntryBody {
             ship: ship.to_string(),
             agent: agent.to_string(),
@@ -342,16 +359,40 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
         }
         .encode_to_vec();
         let cost = store::entry_cost(body.len());
-        if appended >= max_appends || used + cost > room {
-            return Err(LimitExceeded("the ship's logs are full".into()).into());
+        if appended >= max_appends {
+            return Err(LimitExceeded(format!("more than {max_appends} log entries in one event")).into());
         }
-        let signature = key.sign(&body).to_bytes();
+        if cost > max_held {
+            return Err(LimitExceeded(format!("a log entry of {cost} bytes is more than a log may hold")).into());
+        }
+        // No room in this log. Entries that its checkpoint already covers are normally kept a
+        // while for followers that are only a little behind. Room for new entries matters more,
+        // so they go now. If that is not enough, the append is refused.
+        let mut held = store::log_size(&conn, &agent, &request.log)?;
+        if held + cost > max_held {
+            store::trim_to_checkpoint(&conn, &agent, &request.log)?;
+            held = store::log_size(&conn, &agent, &request.log)?;
+            if held + cost > max_held {
+                return Err(LogsFull(request.log).into());
+            }
+        }
+        let signature = key.sign(&signed_bytes(ENTRY_DOMAIN, &body)).to_bytes();
         store::log_append(&conn, &agent, &request.log, head + 1, &body, &signature, &sha256(&body))?;
         store::notify_followers(&conn, &agent, &request.log)?;
+        // Once enough has been added since the log's last checkpoint, ask this agent for
+        // another. The request runs later as an event of its own, and only if this one commits.
+        if can_checkpoint {
+            if store::checkpoint_due(&conn, &agent, &request.log, min_tail)? {
+                store::ask_checkpoint(&conn, &agent, &request.log)?;
+            } else if held + cost + cost > max_held {
+                // Another entry like this one would not fit. Ask early, so that by the time it
+                // comes there is a checkpoint that lets older entries go.
+                store::ask_checkpoint_when_full(&conn, &agent, &request.log)?;
+            }
+        }
         drop(conn);
         let ctx = caller.data_mut();
         ctx.appended += 1;
-        ctx.log_bytes += cost;
         Ok((head + 1) as i64)
     })?;
 
@@ -380,6 +421,8 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
 
     // Take the entries after this agent's position in a log it follows, and move its position
     // past them. The move is part of this event: if the event fails, the entries come again.
+    // A follower so far behind that the entries it needs have been dropped is handed the log's
+    // checkpoint instead, and its position moves to the entry that checkpoint stands for.
     linker.func_wrap(
         "host",
         "log_next",
@@ -401,17 +444,35 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
                 };
                 // Asking for none is allowed: it takes nothing and only reports whether more remain.
                 let max = (request.max as usize).min(MAX_NEXT_ENTRIES);
-                let stored = match max {
-                    0 => Vec::new(),
-                    _ => store::log_range(&conn, &request.agent, &request.log, cursor, max, MAX_NEXT_BYTES)?,
-                };
                 let (head, _) = store::log_head(&conn, &request.agent, &request.log)?;
-                let last = stored.last().map_or(cursor, |entry| entry.seq);
-                let entries = stored
-                    .iter()
-                    .map(|entry| Ok(Entry { seq: entry.seq, payload: EntryBody::decode(&*entry.body)?.payload }))
-                    .collect::<Result<Vec<_>>>()?;
-                (NextReply { entries, more: last < head }.encode_to_vec(), cursor, last)
+                let trimmed = cursor < store::log_base(&conn, &request.agent, &request.log)?;
+                if max > 0 && trimmed {
+                    // The entries this follower needs are gone. One that has not said it can
+                    // take a checkpoint must not be moved past them as though it had seen them.
+                    if !request.checkpoints {
+                        return Err(anyhow!(
+                            "{follower} is too far behind {} on {} for its entries, and cannot take a checkpoint",
+                            request.log,
+                            request.agent
+                        ));
+                    }
+                    let stored = store::checkpoint(&conn, &request.agent, &request.log)?
+                        .ok_or_else(|| anyhow!("a log has lost its early entries but has no checkpoint"))?;
+                    let checkpoint = Checkpoint { seq: stored.seq, state: CheckpointBody::decode(&*stored.body)?.state };
+                    let reply = NextReply { entries: Vec::new(), more: stored.seq < head, checkpoint: Some(checkpoint) };
+                    (reply.encode_to_vec(), cursor, stored.seq)
+                } else {
+                    let stored = match max {
+                        0 => Vec::new(),
+                        _ => store::log_range(&conn, &request.agent, &request.log, cursor, max, MAX_NEXT_BYTES)?,
+                    };
+                    let last = stored.last().map_or(cursor, |entry| entry.seq);
+                    let entries = stored
+                        .iter()
+                        .map(|entry| Ok(Entry { seq: entry.seq, payload: EntryBody::decode(&*entry.body)?.payload }))
+                        .collect::<Result<Vec<_>>>()?;
+                    (NextReply { entries, more: last < head, checkpoint: None }.encode_to_vec(), cursor, last)
+                }
             };
             // The position moves only once the entries have been handed over. If they do not fit
             // the caller's buffer, that happens when the caller collects them, and never if it
