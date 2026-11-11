@@ -1,27 +1,42 @@
 //! One SQLite file per ship. The file is the ship's source of truth.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::VerifyingKey;
 use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 
-use crate::{AuditEntry, Config, Durability, Effect, Error};
+use ship_proto::Kind;
 
-const SCHEMA_VERSION: i64 = 2;
+use crate::{AuditEntry, ChainCheck, Config, Durability, Effect, Error};
+
+const SCHEMA_VERSION: i64 = 4;
 
 /// Each pending message counts as its payload plus this, so empty messages still use up quota.
 pub const MESSAGE_OVERHEAD: u64 = 64;
 
 const MAX_INTERFACE_BYTES: usize = 128;
 
-/// A command one agent sent another, waiting to run as its own event.
+/// How many logs one agent may follow. Notifications are not counted against the inbox quota;
+/// this is what bounds them, since at most one is ever queued per follower and log.
+pub const MAX_FOLLOWS: usize = 64;
+
+/// How many times in a row a follower's notify handler may fail before the runtime stops
+/// prompting it. A new entry in the log, or the follower asking to follow again, starts it off
+/// afresh.
+const MAX_NOTIFY_FAILURES: i64 = 3;
+
+/// A command one agent sent another, or a notification that a log has new entries, waiting to
+/// run as its own event.
 pub struct Queued {
     pub seq: i64,
+    /// `Kind::Command` or `Kind::Notify`, as a number.
+    pub kind: i32,
     pub source: String,
     pub agent: String,
     pub interface: String,
@@ -29,8 +44,9 @@ pub struct Queued {
 }
 
 impl Queued {
+    /// What this takes of the inbox quota. Only commands count; see `MAX_FOLLOWS`.
     pub fn cost(&self) -> u64 {
-        self.payload.len() as u64 + MESSAGE_OVERHEAD
+        if self.kind == Kind::Command as i32 { self.payload.len() as u64 + MESSAGE_OVERHEAD } else { 0 }
     }
 }
 
@@ -52,11 +68,37 @@ CREATE TABLE outbox (
 );
 CREATE TABLE inbox (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind INTEGER NOT NULL,
     source TEXT NOT NULL,
     agent TEXT NOT NULL,
     interface TEXT NOT NULL,
     payload BLOB NOT NULL
 );
+CREATE TABLE logs (
+    agent TEXT NOT NULL,
+    name TEXT NOT NULL,
+    head INTEGER NOT NULL,
+    head_hash BLOB NOT NULL,
+    bytes INTEGER NOT NULL,
+    PRIMARY KEY (agent, name)
+) WITHOUT ROWID;
+CREATE TABLE log_entries (
+    agent TEXT NOT NULL,
+    name TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    body BLOB NOT NULL,
+    signature BLOB NOT NULL,
+    PRIMARY KEY (agent, name, seq)
+) WITHOUT ROWID;
+CREATE TABLE follows (
+    follower TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    name TEXT NOT NULL,
+    cursor INTEGER NOT NULL,
+    notified INTEGER NOT NULL,
+    failures INTEGER NOT NULL,
+    PRIMARY KEY (follower, agent, name)
+) WITHOUT ROWID;
 CREATE TABLE audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     at_ms INTEGER NOT NULL,
@@ -147,9 +189,9 @@ pub fn kernel(conn: &Connection) -> Result<String, Error> {
     }
 }
 
-pub fn inbox_push(conn: &Connection, source: &str, agent: &str, interface: &str, payload: &[u8]) -> rusqlite::Result<()> {
-    conn.prepare_cached("INSERT INTO inbox (source, agent, interface, payload) VALUES (?1, ?2, ?3, ?4)")?
-        .execute(params![source, agent, interface, payload])
+pub fn inbox_push(conn: &Connection, kind: Kind, source: &str, agent: &str, interface: &str, payload: &[u8]) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT INTO inbox (kind, source, agent, interface, payload) VALUES (?1, ?2, ?3, ?4, ?5)")?
+        .execute(params![kind as i32, source, agent, interface, payload])
         .map(drop)
 }
 
@@ -157,9 +199,16 @@ pub fn inbox_push(conn: &Connection, source: &str, agent: &str, interface: &str,
 /// so that taking it and its effects land together.
 pub fn inbox_pop(conn: &Connection) -> rusqlite::Result<Option<Queued>> {
     let oldest = conn
-        .prepare_cached("SELECT seq, source, agent, interface, payload FROM inbox ORDER BY seq LIMIT 1")?
+        .prepare_cached("SELECT seq, kind, source, agent, interface, payload FROM inbox ORDER BY seq LIMIT 1")?
         .query_row([], |r| {
-            Ok(Queued { seq: r.get(0)?, source: r.get(1)?, agent: r.get(2)?, interface: r.get(3)?, payload: r.get(4)? })
+            Ok(Queued {
+                seq: r.get(0)?,
+                kind: r.get(1)?,
+                source: r.get(2)?,
+                agent: r.get(3)?,
+                interface: r.get(4)?,
+                payload: r.get(5)?,
+            })
         })
         .optional()?;
     if let Some(queued) = &oldest {
@@ -173,7 +222,187 @@ pub fn inbox_delete(conn: &Connection, seq: i64) -> rusqlite::Result<()> {
 }
 
 pub fn inbox_bytes(conn: &Connection) -> Result<u64, Error> {
-    Ok(conn.query_row("SELECT COALESCE(SUM(LENGTH(payload) + ?1), 0) FROM inbox", [MESSAGE_OVERHEAD as i64], |r| r.get::<_, i64>(0))? as u64)
+    let commands = conn.query_row(
+        "SELECT COALESCE(SUM(LENGTH(payload) + ?1), 0) FROM inbox WHERE kind = ?2",
+        params![MESSAGE_OVERHEAD as i64, Kind::Command as i32],
+        |r| r.get::<_, i64>(0),
+    )?;
+    Ok(commands as u64)
+}
+
+/// An entry as it sits in a log.
+pub struct StoredEntry {
+    pub seq: u64,
+    pub body: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+/// What an entry counts for against the ship's log quota.
+pub fn entry_cost(body_len: usize) -> u64 {
+    body_len as u64 + 64 + MESSAGE_OVERHEAD
+}
+
+/// A log's newest entry number and that entry's hash: `(0, empty)` while the log has no entries.
+pub fn log_head(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<(u64, Vec<u8>)> {
+    let head = conn
+        .prepare_cached("SELECT head, head_hash FROM logs WHERE agent = ?1 AND name = ?2")?
+        .query_row(params![agent, name], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)))
+        .optional()?;
+    Ok(head.unwrap_or_default())
+}
+
+pub fn log_append(conn: &Connection, agent: &str, name: &str, seq: u64, body: &[u8], signature: &[u8], hash: &[u8]) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT INTO log_entries VALUES (?1, ?2, ?3, ?4, ?5)")?
+        .execute(params![agent, name, seq as i64, body, signature])?;
+    conn.prepare_cached(
+        "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (agent, name) DO UPDATE
+         SET head = excluded.head, head_hash = excluded.head_hash, bytes = bytes + excluded.bytes",
+    )?
+    .execute(params![agent, name, seq as i64, hash, entry_cost(body.len()) as i64])
+    .map(drop)
+}
+
+/// Entries after `after`, oldest first: at most `max_entries`, and at most `max_bytes` of bodies
+/// in total, except that one entry is always returned if there is one.
+pub fn log_range(conn: &Connection, agent: &str, name: &str, after: u64, max_entries: usize, max_bytes: usize) -> rusqlite::Result<Vec<StoredEntry>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT seq, LENGTH(body), body, signature FROM log_entries WHERE agent = ?1 AND name = ?2 AND seq > ?3 ORDER BY seq",
+    )?;
+    // A position beyond what SQLite can hold is simply past the end.
+    let mut rows = stmt.query(params![agent, name, i64::try_from(after).unwrap_or(i64::MAX)])?;
+    let (mut entries, mut bytes) = (Vec::new(), 0usize);
+    while let Some(row) = rows.next()? {
+        let len = row.get::<_, i64>(1)? as usize;
+        if entries.len() >= max_entries || (!entries.is_empty() && bytes + len > max_bytes) {
+            break;
+        }
+        bytes += len;
+        entries.push(StoredEntry { seq: row.get::<_, i64>(0)? as u64, body: row.get(2)?, signature: row.get(3)? });
+    }
+    Ok(entries)
+}
+
+pub fn log_bytes(conn: &Connection) -> Result<u64, Error> {
+    Ok(conn.query_row("SELECT COALESCE(SUM(bytes), 0) FROM logs", [], |r| r.get::<_, i64>(0))? as u64)
+}
+
+/// Record that `follower` follows a log, starting before its first entry. Returns false if it
+/// already did.
+pub fn follow(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<bool> {
+    conn.prepare_cached("INSERT OR IGNORE INTO follows VALUES (?1, ?2, ?3, 0, 0, 0)")?
+        .execute(params![follower, agent, name])
+        .map(|added| added == 1)
+}
+
+pub fn follow_count(conn: &Connection, follower: &str) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM follows WHERE follower = ?1")?
+        .query_row([follower], |r| r.get::<_, i64>(0))
+        .map(|count| count as usize)
+}
+
+/// The number of the last entry `follower` has taken from a log, if it follows that log.
+pub fn cursor(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<Option<u64>> {
+    conn.prepare_cached("SELECT cursor FROM follows WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
+        .query_row(params![follower, agent, name], |r| r.get::<_, i64>(0))
+        .optional()
+        .map(|cursor| cursor.map(|seq| seq as u64))
+}
+
+pub fn set_cursor(conn: &Connection, follower: &str, agent: &str, name: &str, cursor: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE follows SET cursor = ?4 WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
+        .execute(params![follower, agent, name, cursor as i64])
+        .map(drop)
+}
+
+/// Queue a notification for one follower, unless one is already waiting. At most one is ever
+/// queued per follower and log, however many entries arrive and whatever the follower's own
+/// handler does; that bound is why notifications need no room in the command queue.
+pub fn notify(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<()> {
+    let marked = conn
+        .prepare_cached("UPDATE follows SET notified = 1 WHERE follower = ?1 AND agent = ?2 AND name = ?3 AND notified = 0")?
+        .execute(params![follower, agent, name])?;
+    if marked == 1 {
+        inbox_push(conn, Kind::Notify, agent, follower, name, &[])?;
+    }
+    Ok(())
+}
+
+/// How many events are waiting to run on this ship.
+pub fn inbox_len(conn: &Connection) -> Result<usize, Error> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM inbox", [], |r| r.get::<_, i64>(0))? as usize)
+}
+
+/// Notify every follower of a log that has no notification waiting. Returns how many.
+pub fn notify_followers(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<u32> {
+    let followers: Vec<String> = conn
+        .prepare_cached("SELECT follower FROM follows WHERE agent = ?1 AND name = ?2 AND notified = 0")?
+        .query_map(params![agent, name], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    // A new entry starts a follower off afresh, including one that had been given up on.
+    conn.prepare_cached("UPDATE follows SET failures = 0 WHERE agent = ?1 AND name = ?2 AND notified = 0")?
+        .execute(params![agent, name])?;
+    for follower in &followers {
+        notify(conn, follower, agent, name)?;
+    }
+    Ok(followers.len() as u32)
+}
+
+/// A follower's notification has been taken off the queue, so the next new entry may queue another.
+pub fn clear_notified(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE follows SET notified = 0 WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
+        .execute(params![follower, agent, name])
+        .map(drop)
+}
+
+/// A follower's notify handler failed. Its position has not moved, so it is still behind. Try it
+/// again a few times, in case the cause was passing, and then stop: an entry it can never
+/// handle must not be retried for ever.
+pub fn notify_failed(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE follows SET failures = failures + 1 WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
+        .execute(params![follower, agent, name])?;
+    let failures = conn
+        .prepare_cached("SELECT failures FROM follows WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
+        .query_row(params![follower, agent, name], |r| r.get::<_, i64>(0))
+        .optional()?;
+    if failures.is_some_and(|failures| failures < MAX_NOTIFY_FAILURES) {
+        notify(conn, follower, agent, name)?;
+    }
+    Ok(())
+}
+
+/// A follower's notify handler has finished without error. `before` is where it had got to
+/// when the handler started. If it is still behind and took nothing, prompting it again would
+/// go round for ever, so that counts as a failed round. Otherwise it is started off afresh.
+pub fn notify_handled(conn: &Connection, follower: &str, agent: &str, name: &str, before: Option<u64>) -> rusqlite::Result<()> {
+    let (head, _) = log_head(conn, agent, name)?;
+    match cursor(conn, follower, agent, name)? {
+        Some(now) if now < head && Some(now) == before => notify_failed(conn, follower, agent, name),
+        _ => resume(conn, follower, agent, name),
+    }
+}
+
+/// Start a follower off afresh: forget its past failures and prompt it if it is behind.
+pub fn resume(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE follows SET failures = 0 WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
+        .execute(params![follower, agent, name])?;
+    renotify_if_behind(conn, follower, agent, name).map(drop)
+}
+
+/// After a follower has handled a notification: if entries remain that it has not taken and
+/// nothing is queued, queue another. Returns whether it did.
+pub fn renotify_if_behind(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<bool> {
+    let behind = conn
+        .prepare_cached(
+            "SELECT 1 FROM follows f JOIN logs l ON l.agent = f.agent AND l.name = f.name
+             WHERE f.follower = ?1 AND f.agent = ?2 AND f.name = ?3 AND f.notified = 0 AND f.cursor < l.head",
+        )?
+        .query_row(params![follower, agent, name], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if behind {
+        notify(conn, follower, agent, name)?;
+    }
+    Ok(behind)
 }
 
 /// Returns the value's length, and the value itself only when it fits in `cap` bytes.
@@ -251,12 +480,20 @@ pub fn audit(conn: &Connection, agent: &str, event: &[u8], ok: bool, keep: u64) 
     Ok(())
 }
 
-/// Record a rejected input in a transaction of its own and, when it was a queued command, take
-/// it off the queue in that same transaction. Leaves no transaction open, whatever happens.
-pub fn record_rejection(conn: &Connection, queued: Option<i64>, agent: &str, event: &[u8], keep: u64) -> rusqlite::Result<()> {
+/// Record a rejected input in a transaction of its own and, when it was queued, take it off the
+/// queue in that same transaction. `notice` names the log (publisher, name) when the input was
+/// a notification to `agent`, so that the next new entry can notify it again. Leaves no
+/// transaction open, whatever happens.
+pub fn record_rejection(conn: &Connection, queued: Option<i64>, notice: Option<(&str, &str)>, agent: &str, event: &[u8], keep: u64) -> rusqlite::Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let saved = queued
         .map_or(Ok(()), |seq| inbox_delete(conn, seq))
+        .and_then(|()| {
+            notice.map_or(Ok(()), |(publisher, name)| {
+                clear_notified(conn, agent, publisher, name)?;
+                notify_failed(conn, agent, publisher, name)
+            })
+        })
         .and_then(|()| audit(conn, agent, event, false, keep))
         .and_then(|()| conn.execute_batch("COMMIT"));
     if saved.is_err() && !conn.is_autocommit() {
@@ -268,7 +505,7 @@ pub fn record_rejection(conn: &Connection, queued: Option<i64>, agent: &str, eve
 /// Record a rejected input that never reached a handler. Best effort: the caller's rejection
 /// is the result that matters, so a failure to log it is not reported.
 pub fn audit_failure(conn: &Connection, agent: &str, event: &[u8], keep: u64) {
-    let _ = record_rejection(conn, None, agent, event, keep);
+    let _ = record_rejection(conn, None, None, agent, event, keep);
 }
 
 /// The newest audit rows, newest first.
@@ -340,6 +577,7 @@ pub fn import(
     name: &str,
     cfg: &Config,
     deadline: Instant,
+    key: &VerifyingKey,
     check_agent: fn(&str) -> Result<(), Error>,
     check_hash: fn(&str) -> Result<(), Error>,
 ) -> Result<String, Error> {
@@ -417,7 +655,9 @@ pub fn import(
     }
 
     let mut pending = 0u64;
-    let mut stmt = from.prepare("SELECT seq, source, agent, interface, payload FROM inbox ORDER BY seq")?;
+    // Only commands are carried over. Notifications are worked out again below from where each
+    // follower has got to, so they can never disagree with the logs.
+    let mut stmt = from.prepare("SELECT seq, source, agent, interface, payload FROM inbox WHERE kind = 1 ORDER BY seq")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         in_time()?;
@@ -429,7 +669,92 @@ pub fn import(
         if seq == 0 || interface.len() > MAX_INTERFACE_BYTES || pending > cfg.max_inbox_bytes {
             return Err(bad_row("queued commands are larger than this runtime allows"));
         }
-        to.execute("INSERT INTO inbox VALUES (?1, ?2, ?3, ?4, ?5)", params![seq, source, agent, interface, payload])?;
+        to.execute(
+            "INSERT INTO inbox VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![seq, Kind::Command as i32, source, agent, interface, payload],
+        )?;
+    }
+
+    // Logs. Every entry must be signed by this ship's key and follow on from the one before it,
+    // and each log's summary row is rebuilt from its entries rather than copied.
+    let (mut heads, mut total) = (HashMap::new(), 0u64);
+    let mut open: Option<(ChainCheck, u64, [u8; 32], u64)> = None;
+    let close = |finished: Option<(ChainCheck, u64, [u8; 32], u64)>, heads: &mut HashMap<(String, String), u64>| -> Result<(), Error> {
+        if let Some((chain, head, hash, bytes)) = finished {
+            to.execute("INSERT INTO logs VALUES (?1, ?2, ?3, ?4, ?5)", params![chain.agent, chain.log, head as i64, &hash[..], bytes as i64])?;
+            heads.insert((chain.agent, chain.log), head);
+        }
+        Ok(())
+    };
+    let mut stmt = from.prepare("SELECT agent, name, seq, body, signature FROM log_entries ORDER BY agent, name, seq")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (agent, log, seq) = (text(row, 0)?, text(row, 1)?, integer(row, 2)? as u64);
+        let (body, signature) = (blob(row, 3, cfg.max_event_bytes + (4 << 10))?, blob(row, 4, 64)?);
+        if open.as_ref().is_none_or(|(chain, ..)| chain.agent != agent || chain.log != log) {
+            close(open.take(), &mut heads)?;
+            check_agent(&agent)?;
+            if log.len() > MAX_INTERFACE_BYTES || seq != 1 {
+                return Err(bad_row("a log does not start at its first entry"));
+            }
+            open = Some((ChainCheck::new(key, name, &agent, &log, None), 0, [0; 32], 0));
+        }
+        let (chain, head, hash, bytes) = open.as_mut().expect("opened above");
+        let (accepted, accepted_hash, payload_len) = chain.accept(&body, &signature).map_err(|why| bad_row(&why))?;
+        total += entry_cost(body.len());
+        if accepted != seq || payload_len > cfg.max_event_bytes || total > cfg.max_log_bytes {
+            return Err(bad_row("logs are numbered wrongly or larger than this runtime allows"));
+        }
+        (*head, *hash, *bytes) = (accepted, accepted_hash, *bytes + entry_cost(body.len()));
+        to.execute("INSERT INTO log_entries VALUES (?1, ?2, ?3, ?4, ?5)", params![agent, log, seq as i64, body, signature])?;
+    }
+    close(open.take(), &mut heads)?;
+
+    // The source's own record of where each log ends must agree with the entries that are
+    // actually there. Otherwise a file with its newest entries removed would be accepted, and
+    // the ship would go on to reuse their numbers.
+    let mut claimed = HashSet::new();
+    let mut stmt = from.prepare("SELECT agent, name, head, head_hash FROM logs")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (agent, log, head, hash) = (text(row, 0)?, text(row, 1)?, integer(row, 2)? as u64, blob(row, 3, 32)?);
+        let rebuilt: Option<Vec<u8>> = to
+            .query_row("SELECT head_hash FROM logs WHERE agent = ?1 AND name = ?2 AND head = ?3", params![agent, log, head as i64], |r| r.get(0))
+            .optional()?;
+        // A damaged file can list one log twice, so each must be seen once and only once.
+        if rebuilt != Some(hash) || !claimed.insert((agent, log)) {
+            return Err(bad_row("a log's entries do not reach where the log says it ends"));
+        }
+    }
+    if claimed.len() != heads.len() || !heads.keys().all(|log| claimed.contains(log)) {
+        return Err(bad_row("there are log entries for a log the file does not list"));
+    }
+
+    let mut behind = Vec::new();
+    let mut following: HashMap<String, usize> = HashMap::new();
+    let mut stmt = from.prepare("SELECT follower, agent, name, cursor FROM follows")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (follower, agent, log, cursor) = (text(row, 0)?, text(row, 1)?, text(row, 2)?, integer(row, 3)? as u64);
+        check_agent(&follower)?;
+        check_agent(&agent)?;
+        let head = heads.get(&(agent.clone(), log.clone())).copied().unwrap_or(0);
+        let count = following.entry(follower.clone()).or_default();
+        *count += 1;
+        if log.len() > MAX_INTERFACE_BYTES || cursor > head || *count > MAX_FOLLOWS {
+            return Err(bad_row("a follower is ahead of the log it follows, or follows too many"));
+        }
+        to.execute("INSERT INTO follows VALUES (?1, ?2, ?3, ?4, 0, 0)", params![follower, agent, log, cursor as i64])?;
+        if cursor < head {
+            behind.push((follower, agent, log));
+        }
+    }
+    for (follower, agent, log) in &behind {
+        in_time()?;
+        notify(&to, follower, agent, log)?;
     }
 
     let mut stmt = from.prepare("SELECT seq, at_ms, agent, event, ok FROM audit ORDER BY seq DESC LIMIT ?1")?;

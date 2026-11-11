@@ -13,6 +13,9 @@ enum Kind {
   KIND_COMMAND = 1;
   // Returns data and cannot change anything.
   KIND_READ = 2;
+  // Tells an agent that a log it follows has new entries. Carries no payload: the agent asks
+  // for the entries. Runs as its own event, like a command.
+  KIND_NOTIFY = 3;
 }
 
 // Who is asking.
@@ -104,6 +107,60 @@ message SendRequest {
   string agent = 1;
   string interface = 2;
   bytes payload = 3;
+}
+
+// A log is an append-only, numbered list of entries published by one agent under one of its
+// interfaces. Other agents, other ships, and the owner's clients follow it by number.
+
+// The signed part of a log entry.
+message EntryBody {
+  string ship = 1;
+  string agent = 2;
+  string log = 3;
+  // Entries are numbered from 1 with no gaps.
+  uint64 seq = 4;
+  // SHA-256 of the previous entry's body, so a missing or altered entry breaks the chain.
+  // Empty for entry 1.
+  bytes prev = 5;
+  bytes payload = 6;
+}
+
+// An entry as stored and sent. `body` is an encoded EntryBody, kept exactly as it was signed;
+// it is never re-encoded before the signature is checked.
+message SignedEntry {
+  bytes body = 1;
+  bytes signature = 2;
+}
+
+// Agent to runtime: add an entry to one of this agent's own logs.
+message AppendRequest {
+  string log = 1;
+  bytes payload = 2;
+}
+
+// Agent to runtime: start following another agent's log.
+message FollowRequest {
+  string agent = 1;
+  string log = 2;
+}
+
+// Agent to runtime: give me the entries after my position in a log I follow, and move my
+// position past them. The move is kept only if this event commits.
+message NextRequest {
+  string agent = 1;
+  string log = 2;
+  uint32 max = 3;
+}
+
+message Entry {
+  uint64 seq = 1;
+  bytes payload = 2;
+}
+
+message NextReply {
+  repeated Entry entries = 1;
+  // True when the log has entries beyond these.
+  bool more = 2;
 }
 
 // The kernel's own stored state. A kernel rewrites the whole registry when it changes, and

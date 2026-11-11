@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use runtime::{Config, Durability, Error, Limits, Manifest, Provide, Rejection, Runtime, Use};
+use runtime::{verify_log, Config, Durability, Error, Limits, Manifest, Provide, Rejection, Runtime, Use};
 
 const NO_LIMIT: usize = usize::MAX;
 
@@ -1228,24 +1228,34 @@ fn the_runtime_keeps_its_own_bounds_whatever_a_kernel_grants() {
     // prepared here. This kernel grants both, so only the runtime's own checks stand in the way.
     let send_request = SendRequest { agent: "../up".into(), interface: "x".into(), payload: b"p".to_vec() }.encode_to_vec();
     let read_request = ReadRequest { agent: "other".into(), interface: "x".into(), payload: vec![0; 100] }.encode_to_vec();
+    // A log name one byte longer than the runtime allows.
+    let long_name = "x".repeat(129);
+    let append_request = ship_proto::AppendRequest { log: long_name.clone(), payload: b"p".to_vec() }.encode_to_vec();
     let escaped = |bytes: &[u8]| bytes.iter().map(|b| format!("\\{b:02x}")).collect::<String>();
     let agent = format!(
         r#"(module
             (import "host" "send" (func $send (param i32 i32)))
             (import "host" "read" (func $read (param i32 i32 i32 i32) (result i64)))
+            (import "host" "log_append" (func $append (param i32 i32) (result i64)))
             (memory (export "memory") 1)
             (data (i32.const 0) "{}")
             (data (i32.const 512) "{}")
+            (data (i32.const 1024) "{}")
             (func (export "alloc") (param i32) (result i32) (i32.const 2048))
             (func (export "handle") (param i32 i32) (result i64)
                 (if (i32.eq (i32.load8_u (i32.const 2048)) (i32.const 1))
-                    (then (call $send (i32.const 0) (i32.const {})))
-                    (else (drop (call $read (i32.const 512) (i32.const {}) (i32.const 4096) (i32.const 16)))))
+                    (then (call $send (i32.const 0) (i32.const {}))))
+                (if (i32.eq (i32.load8_u (i32.const 2048)) (i32.const 2))
+                    (then (drop (call $read (i32.const 512) (i32.const {}) (i32.const 4096) (i32.const 16)))))
+                (if (i32.eq (i32.load8_u (i32.const 2048)) (i32.const 3))
+                    (then (drop (call $append (i32.const 1024) (i32.const {})))))
                 (i64.const 0)))"#,
         escaped(&send_request),
         escaped(&read_request),
+        escaped(&append_request),
         send_request.len(),
         read_request.len(),
+        append_request.len(),
     );
     let dir = TempDir::new("host-bounds");
     let rt = Runtime::open(&dir.0, Config { max_event_bytes: 16, ..fast() }).unwrap();
@@ -1253,7 +1263,7 @@ fn the_runtime_keeps_its_own_bounds_whatever_a_kernel_grants() {
     let route = RouteReply {
         allowed: true,
         module: hash,
-        reads: vec![Grant { agent: "other".into(), interface: "x".into() }],
+        reads: vec![Grant { agent: "other".into(), interface: "x".into() }, Grant { agent: "evil".into(), interface: long_name }],
         sends: vec![Grant { agent: "../up".into(), interface: "x".into() }],
         ..Default::default()
     };
@@ -1265,6 +1275,8 @@ fn the_runtime_keeps_its_own_bounds_whatever_a_kernel_grants() {
     assert_eq!(rt.run_pending("~zod", 10).unwrap(), 0);
     // A read request larger than an event may be.
     assert!(matches!(rt.deliver("~zod", "evil", &[2]), Err(Error::Rejected(Rejection::Limit(_)))));
+    // A log under a name too long for the runtime ever to read back or import.
+    assert!(matches!(rt.deliver("~zod", "evil", &[3]), Err(Error::Rejected(Rejection::Denied(_)))));
 }
 
 #[test]
@@ -1360,4 +1372,613 @@ fn an_uncollected_reply_cannot_be_collected_after_another_read() {
     };
     rt.install("~zod", "picky", &hash, &reads_tally).unwrap();
     assert_eq!(rt.deliver("~zod", "picky", b"x").unwrap().reply, [1]);
+}
+
+/// The payloads of a run of log entries, as text.
+fn payloads(entries: &[runtime::SignedEntry]) -> Vec<String> {
+    use ship_proto::Message;
+    entries
+        .iter()
+        .map(|entry| String::from_utf8(runtime::EntryBody::decode(&*entry.body).unwrap().payload).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_follower_gets_every_entry_once_and_in_order() {
+    let dir = TempDir::new("log-follow");
+    let rt = boot_pair(&dir, fast(), counter_manifest(false), tally_manifest(true));
+    assert_eq!(send(&rt, "~zod", "tally", "follow"), "following");
+    for expected in 1..=7 {
+        assert_eq!(send(&rt, "~zod", "counter", "log hits"), expected.to_string());
+    }
+    // The tally agent takes three entries a round and checks their numbers as it goes.
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "7");
+    assert_eq!(read(&rt, "tally", "tally", "last"), "hits=7");
+    assert_eq!(rt.run_pending("~zod", 10).unwrap(), 0);
+
+    // An agent that starts following later is simply behind by the whole log.
+    let dir = TempDir::new("log-late");
+    let rt = boot_pair(&dir, fast(), counter_manifest(false), tally_manifest(true));
+    for _ in 0..5 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    send(&rt, "~zod", "tally", "follow");
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "5");
+}
+
+#[test]
+fn entries_a_failed_round_took_are_offered_again() {
+    let dir = TempDir::new("log-retry");
+    let rt = boot_pair(&dir, fast(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    send(&rt, "~zod", "counter", "log hits");
+    send(&rt, "~zod", "counter", "log poison");
+    // The round that met the poisoned entry failed, so the follower's position did not move.
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
+    send(&rt, "~zod", "counter", "log hits");
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
+
+    // Once it can cope, the next new entry prompts it and it works through all it missed.
+    send(&rt, "~zod", "tally", "tolerate");
+    send(&rt, "~zod", "counter", "log hits");
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "4");
+    assert_eq!(read(&rt, "tally", "tally", "last"), "hits=3");
+}
+
+#[test]
+fn logs_need_the_same_permissions_as_reads() {
+    // Without a declared use of the counter's interface, the tally agent may not follow its log.
+    let dir = TempDir::new("log-perm");
+    let rt = boot_pair(&dir, fast(), counter_manifest(false), tally_manifest(false));
+    assert!(matches!(rejection(&rt, "tally", "follow"), Rejection::Denied(_)));
+
+    // An agent can only append to a log named after an interface it offers.
+    let dir = TempDir::new("log-own");
+    let rt = boot_pair(&dir, fast(), nothing(), tally_manifest(false));
+    assert!(matches!(rejection(&rt, "counter", "log hits"), Rejection::Denied(_)));
+
+    // A follower whose permission is taken away stops being told about new entries.
+    let dir = TempDir::new("log-revoked");
+    let rt = boot_pair(&dir, fast(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    send(&rt, "~zod", "counter", "log hits");
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
+    let tally = rt.add_module(&wasm("tally")).unwrap();
+    rt.install("~zod", "tally", &tally, &tally_manifest(false)).unwrap();
+    send(&rt, "~zod", "counter", "log hits");
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
+}
+
+#[test]
+fn a_client_can_read_a_log_and_check_it() {
+    let dir = TempDir::new("log-verify");
+    let rt = boot(&dir, fast());
+    for _ in 0..6 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    let key = rt.public_key("~zod").unwrap();
+    let all = rt.log_entries("~zod", "counter", "counter", 0, NO_LIMIT).unwrap();
+    assert_eq!(payloads(&all), ["hits=1", "hits=2", "hits=3", "hits=4", "hits=5", "hits=6"]);
+    let check = |after, entries: &[runtime::SignedEntry]| verify_log(&key, "~zod", "counter", "counter", after, entries);
+    // Checking from the start leaves the reader at the log's current end.
+    let end = check(None, &all).unwrap();
+    assert_eq!(end.map(|(seq, _)| seq), Some(6));
+    assert_eq!(rt.log_head("~zod", "counter", "counter").unwrap(), end);
+
+    // Reading on from a known position, in pieces.
+    let at_four = check(None, &all[..4]).unwrap();
+    let rest = rt.log_entries("~zod", "counter", "counter", 4, NO_LIMIT).unwrap();
+    assert_eq!(payloads(&rest), ["hits=5", "hits=6"]);
+    assert_eq!(check(at_four, &rest).unwrap(), end);
+    assert_eq!(rt.log_entries("~zod", "counter", "counter", 0, 1).unwrap().len(), 1);
+    assert!(rt.log_entries("~zod", "counter", "counter", 6, NO_LIMIT).unwrap().is_empty());
+    assert!(rt.log_entries("~zod", "counter", "counter", u64::MAX, NO_LIMIT).unwrap().is_empty());
+
+    // Entries that do not carry on from where the reader is: a run that starts later than it
+    // should, one that starts again from entry 1, and one handed over twice.
+    assert!(check(None, &rest).is_err());
+    assert!(check(at_four, &all).is_err());
+    assert!(check(end, &rest).is_err());
+
+    // A changed entry, a missing entry, a reordering, the wrong log, and the wrong key all fail.
+    let mut changed = all.clone();
+    let last = changed[2].body.len() - 1;
+    changed[2].body[last] ^= 1;
+    assert!(check(None, &changed).is_err());
+    let mut missing = all.clone();
+    missing.remove(3);
+    assert!(check(None, &missing).is_err());
+    let mut swapped = all.clone();
+    swapped.swap(1, 2);
+    assert!(check(None, &swapped).is_err());
+    assert!(verify_log(&key, "~zod", "counter", "other", None, &all).is_err());
+    assert!(verify_log(&key, "~bus", "counter", "counter", None, &all).is_err());
+    let mut other_key = key;
+    other_key[0] ^= 1;
+    assert!(verify_log(&other_key, "~zod", "counter", "counter", None, &all).is_err());
+}
+
+#[test]
+fn verification_covers_the_link_to_the_previous_entry_and_the_exact_bytes() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use ship_proto::Message;
+    let (dir, out) = (TempDir::new("log-forge"), TempDir::new("log-forge-out"));
+    let rt = boot(&dir, fast());
+    for _ in 0..3 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    let key = rt.public_key("~zod").unwrap();
+    let all = rt.log_entries("~zod", "counter", "counter", 0, NO_LIMIT).unwrap();
+    let check = |entries: &[runtime::SignedEntry]| verify_log(&key, "~zod", "counter", "counter", None, entries);
+    let (_, end_hash) = check(&all).unwrap().unwrap();
+
+    // Sign new entries with the ship's real key, as someone holding an export could.
+    rt.export_ship("~zod", &out.0).unwrap();
+    let seed: [u8; 32] = fs::read(out.0.join("zod.key")).unwrap().try_into().unwrap();
+    let signer = SigningKey::from_bytes(&seed);
+    let fourth = |prev: Vec<u8>| {
+        let body = runtime::EntryBody {
+            ship: "zod".into(),
+            agent: "counter".into(),
+            log: "counter".into(),
+            seq: 4,
+            prev,
+            payload: b"hits=4".to_vec(),
+        }
+        .encode_to_vec();
+        runtime::SignedEntry { signature: signer.sign(&body).to_bytes().to_vec(), body }
+    };
+    // Properly signed, properly numbered, and linked to the real third entry: accepted.
+    let mut extended = all.clone();
+    extended.push(fourth(end_hash.to_vec()));
+    assert!(check(&extended).is_ok());
+    // The same, but linked to something else: only the link check can catch this.
+    *extended.last_mut().unwrap() = fourth(vec![9; 32]);
+    assert!(check(&extended).is_err());
+
+    // A field added to an entry after signing still decodes to the same content, so it is only
+    // caught because the signature is checked against the bytes exactly as they arrive.
+    let mut padded = all.clone();
+    padded.last_mut().unwrap().body.extend([0x38, 0x01]);
+    assert!(runtime::EntryBody::decode(&*padded.last().unwrap().body).is_ok());
+    assert!(check(&padded).is_err());
+}
+
+#[test]
+fn logs_followers_and_the_key_survive_export_and_import() {
+    let (a, b, out) = (TempDir::new("log-export-a"), TempDir::new("log-export-b"), TempDir::new("log-export-out"));
+    // Nothing queued is run after a delivery, so the follower is still behind at export time.
+    let cfg = Config { max_queued_per_deliver: 0, ..fast() };
+    let rt = boot_pair(&a, cfg.clone(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    for _ in 0..3 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    let key = rt.public_key("~zod").unwrap();
+    rt.export_ship("~zod", &out.0).unwrap();
+
+    let other = Runtime::open(&b.0, cfg).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    assert_eq!(other.public_key("~zod").unwrap(), key);
+    // The follower is prompted afresh and catches up.
+    assert_eq!(read(&other, "tally", "tally", "seen"), "0");
+    while other.run_pending("~zod", 10).unwrap() > 0 {}
+    assert_eq!(read(&other, "tally", "tally", "seen"), "3");
+
+    // New entries carry on the same chain, under the same key.
+    send(&other, "~zod", "counter", "log hits");
+    let all = other.log_entries("~zod", "counter", "counter", 0, NO_LIMIT).unwrap();
+    assert_eq!(payloads(&all), ["hits=1", "hits=2", "hits=3", "hits=4"]);
+    verify_log(&key, "~zod", "counter", "counter", None, &all).unwrap();
+}
+
+#[test]
+fn import_refuses_logs_that_do_not_check_out() {
+    let import = |label: &str, damage: &dyn Fn(&Path)| -> Result<(), Error> {
+        let (a, b, out) = (
+            TempDir::new(&format!("{label}-a")),
+            TempDir::new(&format!("{label}-b")),
+            TempDir::new(&format!("{label}-out")),
+        );
+        let rt = boot(&a, fast());
+        for _ in 0..4 {
+            send(&rt, "~zod", "counter", "log hits");
+        }
+        rt.export_ship("~zod", &out.0).unwrap();
+        damage(&out.0);
+        Runtime::open(&b.0, fast()).unwrap().import_ship(&out.0, "~zod")
+    };
+    let sql = |statement: &'static str| {
+        move |out: &Path| rusqlite::Connection::open(out.join("zod.ship")).unwrap().execute_batch(statement).unwrap()
+    };
+    assert!(import("log-intact", &|_| {}).is_ok());
+    // An entry removed from the middle, an entry altered, and a log that claims the wrong owner.
+    assert!(matches!(import("log-gap", &sql("DELETE FROM log_entries WHERE seq = 2")), Err(Error::BadShipFile(_))));
+    // The last byte of an entry is the last byte of its payload, so this changes the content
+    // while leaving something that still decodes. Only the signature gives it away.
+    let altered = "UPDATE log_entries SET body = CAST(substr(body, 1, length(body) - 1) || x'7a' AS BLOB) WHERE seq = 3";
+    assert!(matches!(import("log-altered", &sql(altered)), Err(Error::BadShipFile(_))));
+    let padded = "UPDATE log_entries SET body = CAST(body || x'3801' AS BLOB) WHERE seq = 4";
+    assert!(matches!(import("log-padded", &sql(padded)), Err(Error::BadShipFile(_))));
+    // The newest entry removed, and every entry removed: each run that is left is genuine, but
+    // it does not reach where the log says it ends.
+    assert!(matches!(import("log-cut", &sql("DELETE FROM log_entries WHERE seq = 4")), Err(Error::BadShipFile(_))));
+    assert!(matches!(import("log-emptied", &sql("DELETE FROM log_entries")), Err(Error::BadShipFile(_))));
+    assert!(matches!(import("log-renamed", &sql("UPDATE log_entries SET agent = 'other'")), Err(Error::BadShipFile(_))));
+    // The right log with the wrong key, and no key at all.
+    assert!(matches!(import("log-wrong-key", &|out| fs::write(out.join("zod.key"), [7u8; 32]).unwrap()), Err(Error::BadShipFile(_))));
+    assert!(matches!(import("log-no-key", &|out| fs::remove_file(out.join("zod.key")).unwrap()), Err(Error::BadShipFile(_))));
+}
+
+#[test]
+fn logs_are_bounded() {
+    let dir = TempDir::new("log-quota");
+    let rt = boot(&dir, Config { max_log_bytes: 600, ..fast() });
+    let mut accepted = 0;
+    let refused = loop {
+        match rt.deliver("~zod", "counter", b"log hits") {
+            Ok(_) => accepted += 1,
+            Err(Error::Rejected(rejection)) => break rejection,
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    };
+    assert!(matches!(refused, Rejection::Limit(_)), "{refused:?}");
+    assert!((1..10).contains(&accepted), "accepted {accepted}");
+    // The refused append left nothing behind, and the count survives a sleep and wake.
+    assert_eq!(rt.log_entries("~zod", "counter", "counter", 0, NO_LIMIT).unwrap().len(), accepted);
+    rt.sleep_idle(Duration::ZERO);
+    assert!(matches!(rejection(&rt, "counter", "log hits"), Rejection::Limit(_)));
+}
+
+#[test]
+fn many_new_entries_queue_one_notification_not_many() {
+    // Nothing queued runs after a delivery, so five appends pile up before the follower is run.
+    let dir = TempDir::new("log-coalesce");
+    let rt = boot_pair(&dir, Config { max_queued_per_deliver: 0, ..fast() }, counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    for _ in 0..5 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    // The follower takes three entries a round, so five entries need two rounds, not five.
+    assert_eq!(rt.run_pending("~zod", 100).unwrap(), 2);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "5");
+}
+
+#[test]
+fn a_follower_that_fails_is_tried_again_and_then_left_until_it_asks() {
+    // A passing failure: by the time the notification is retried, the cause has gone. The
+    // tolerate command is queued behind the notification, so the first try fails and the retry,
+    // which goes to the back of the queue, succeeds. No new entry is needed.
+    let cfg = Config { max_queued_per_deliver: 0, ..fast() };
+    let dir = TempDir::new("log-transient");
+    let rt = boot_pair(&dir, cfg, counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    send(&rt, "~zod", "counter", "log poison");
+    send(&rt, "~zod", "tally", "later tolerate");
+    while rt.run_pending("~zod", 10).unwrap() > 0 {}
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
+
+    // A lasting failure: after a few tries the runtime stops, rather than retry for ever.
+    let dir = TempDir::new("log-suspended");
+    let rt = boot_pair(&dir, fast(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    send(&rt, "~zod", "counter", "log poison");
+    assert_eq!(rt.run_pending("~zod", 100).unwrap(), 0);
+    let failed = rt.audit("~zod", 100).unwrap().iter().filter(|entry| entry.agent == "tally" && !entry.ok).count();
+    assert_eq!(failed, 3);
+    // Fixing the cause does nothing by itself, but asking to follow again starts it off.
+    send(&rt, "~zod", "tally", "tolerate");
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "0");
+    send(&rt, "~zod", "tally", "follow");
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
+}
+
+#[test]
+fn an_append_by_a_failed_event_leaves_nothing() {
+    let dir = TempDir::new("log-rollback");
+    let rt = boot_pair(&dir, fast(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    assert!(matches!(rejection(&rt, "counter", "log-then-crash hits"), Rejection::Trap(_)));
+    // No entry, no notification, no change to the counter, and no number used up.
+    assert!(rt.log_entries("~zod", "counter", "counter", 0, NO_LIMIT).unwrap().is_empty());
+    assert_eq!(rt.log_head("~zod", "counter", "counter").unwrap(), None);
+    assert_eq!(rt.run_pending("~zod", 10).unwrap(), 0);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "0");
+    assert_eq!(send(&rt, "~zod", "counter", "log hits"), "1");
+    assert_eq!(payloads(&rt.log_entries("~zod", "counter", "counter", 0, NO_LIMIT).unwrap()), ["hits=1"]);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
+}
+
+#[test]
+fn large_entries_reach_a_follower_whole() {
+    // Three entries of 3,000 bytes are more than the follower's first buffer holds, so they are
+    // collected in a second step. Its position must move only once it has them.
+    // Nothing queued runs after a delivery, so all four are waiting when the follower first runs
+    // and its first round really does take three at once.
+    let dir = TempDir::new("log-large");
+    let rt = boot_pair(&dir, Config { max_queued_per_deliver: 0, ..fast() }, counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    for _ in 0..4 {
+        send(&rt, "~zod", "counter", "log-big 3000");
+    }
+    assert_eq!(rt.run_pending("~zod", 1).unwrap(), 1);
+    assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(3));
+    while rt.run_pending("~zod", 10).unwrap() > 0 {}
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "4");
+    assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(4));
+    assert_eq!(rt.read("~zod", "tally", "tally", b"last").unwrap(), vec![b'x'; 3000]);
+}
+
+#[test]
+fn a_follower_part_way_through_keeps_its_place() {
+    let (a, b, out) = (TempDir::new("log-part-a"), TempDir::new("log-part-b"), TempDir::new("log-part-out"));
+    let cfg = Config { max_queued_per_deliver: 0, ..fast() };
+    let rt = boot_pair(&a, cfg.clone(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    for _ in 0..5 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    // One round takes three of the five.
+    assert_eq!(rt.run_pending("~zod", 1).unwrap(), 1);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "3");
+    // Its place survives the ship being closed and reopened, and a move to another runtime.
+    rt.sleep_idle(Duration::ZERO);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "3");
+    rt.export_ship("~zod", &out.0).unwrap();
+
+    let other = Runtime::open(&b.0, cfg).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    assert_eq!(read(&other, "tally", "tally", "seen"), "3");
+    while other.run_pending("~zod", 10).unwrap() > 0 {}
+    assert_eq!(read(&other, "tally", "tally", "seen"), "5");
+    assert_eq!(read(&other, "tally", "tally", "last"), "hits=5");
+}
+
+#[test]
+fn the_kernel_decides_who_is_told_about_new_entries() {
+    use ship_proto::{FollowRequest, Message};
+    // This follower's notify handler only records that it was called. It never asks for the
+    // entries, so the only thing that can stop it being called is the kernel's own check.
+    let request = FollowRequest { agent: "counter".into(), log: "counter".into() }.encode_to_vec();
+    let source = format!(
+        r#"(module
+            (import "host" "log_follow" (func $follow (param i32 i32)))
+            (import "host" "kv_put" (func $put (param i32 i32 i32 i32)))
+            (import "host" "kv_get" (func $get (param i32 i32 i32 i32) (result i64)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "{}")
+            (data (i32.const 256) "p")
+            (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "handle") (param i32 i32) (result i64)
+                (call $follow (i32.const 0) (i32.const {}))
+                (i64.const 0))
+            (func (export "notify") (param i32 i32) (result i64)
+                (call $put (i32.const 256) (i32.const 1) (i32.const 256) (i32.const 1))
+                (i64.const 0))
+            (func (export "read") (param i32 i32) (result i64)
+                (if (result i64) (i64.eq (call $get (i32.const 256) (i32.const 1) (i32.const 512) (i32.const 8)) (i64.const 1))
+                    (then (i64.const 2199023255553))
+                    (else (i64.const 0)))))"#,
+        request.iter().map(|b| format!("\\{b:02x}")).collect::<String>(),
+        request.len(),
+    );
+    let may_read = |allowed| Manifest {
+        provides: vec![],
+        uses: if allowed { vec![Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false }] } else { vec![] },
+    };
+    for (label, still_allowed) in [("notify-allowed", true), ("notify-revoked", false)] {
+        let dir = TempDir::new(label);
+        let rt = boot(&dir, fast());
+        let hash = rt.add_module(&wat::parse_str(&source).unwrap()).unwrap();
+        rt.install("~zod", "watcher", &hash, &may_read(true)).unwrap();
+        rt.deliver("~zod", "watcher", b"x").unwrap();
+        // Replace its manifest before anything is published.
+        rt.install("~zod", "watcher", &hash, &may_read(still_allowed)).unwrap();
+        send(&rt, "~zod", "counter", "log hits");
+        let told = !rt.read("~zod", "watcher", "", b"").unwrap().is_empty();
+        assert_eq!(told, still_allowed, "{label}");
+    }
+}
+
+#[test]
+fn two_ships_with_the_same_name_cannot_be_mixed_up_on_import() {
+    // Two different ships that happen to share a name, each with its own key and its own log.
+    let (out_a, out_b, dest) = (TempDir::new("mix-out-a"), TempDir::new("mix-out-b"), TempDir::new("mix-dest"));
+    for (label, out, entries) in [("mix-a", &out_a, 2), ("mix-b", &out_b, 5)] {
+        let dir = TempDir::new(label);
+        let rt = boot(&dir, fast());
+        for _ in 0..entries {
+            send(&rt, "~zod", "counter", "log hits");
+        }
+        rt.export_ship("~zod", &out.0).unwrap();
+    }
+    let rt = Runtime::open(&dest.0, fast()).unwrap();
+    let won = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for attempt in 0..8 {
+            let (rt, won) = (&rt, &won);
+            let out = if attempt % 2 == 0 { &out_a } else { &out_b };
+            scope.spawn(move || match rt.import_ship(&out.0, "~zod") {
+                Ok(()) => drop(won.fetch_add(1, Ordering::SeqCst)),
+                Err(Error::ShipExists(_)) => {}
+                Err(e) => panic!("unexpected import error: {e}"),
+            });
+        }
+    });
+    assert_eq!(won.load(Ordering::SeqCst), 1);
+    // Whichever ship won, its entries check out against the key that was installed with it,
+    // and it can go on publishing under that key.
+    send(&rt, "~zod", "counter", "log hits");
+    let all = rt.log_entries("~zod", "counter", "counter", 0, NO_LIMIT).unwrap();
+    assert!(all.len() == 3 || all.len() == 6, "{}", all.len());
+    verify_log(&rt.public_key("~zod").unwrap(), "~zod", "counter", "counter", None, &all).unwrap();
+}
+
+#[test]
+fn an_exported_key_is_private_whatever_was_there_before() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, out) = (TempDir::new("key-perms"), TempDir::new("key-perms-out"));
+    let rt = boot(&dir, fast());
+    // Something already sits where the key will go, readable by everyone.
+    let key_file = out.0.join("zod.key");
+    fs::write(&key_file, b"old").unwrap();
+    fs::set_permissions(&key_file, fs::Permissions::from_mode(0o644)).unwrap();
+    rt.export_ship("~zod", &out.0).unwrap();
+    assert_eq!(fs::metadata(&key_file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::read(&key_file).unwrap().len(), 32);
+    assert_eq!(fs::read_dir(&out.0).unwrap().count(), 3, "export left scratch files behind");
+}
+
+#[test]
+fn a_new_entry_gives_a_stopped_follower_a_full_set_of_tries() {
+    // Stop the follower with an entry it cannot handle.
+    let cfg = Config { max_queued_per_deliver: 0, ..fast() };
+    let dir = TempDir::new("log-revive");
+    let rt = boot_pair(&dir, cfg, counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    send(&rt, "~zod", "counter", "log poison");
+    while rt.run_pending("~zod", 10).unwrap() > 0 {}
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "0");
+
+    // A new entry prompts it again. The fix is two steps behind that prompt in the queue, so
+    // the first two tries fail and only the third can succeed. It gets a third only because the
+    // new entry restored its full set of tries.
+    send(&rt, "~zod", "counter", "log hits");
+    send(&rt, "~zod", "tally", "later later tolerate");
+    while rt.run_pending("~zod", 10).unwrap() > 0 {}
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "2");
+}
+
+#[test]
+fn notifications_do_not_use_the_command_queues_room() {
+    // No room at all for commands between agents. Followers are still told about new entries.
+    let dir = TempDir::new("log-no-inbox");
+    let rt = boot_pair(&dir, Config { max_inbox_bytes: 0, ..fast() }, counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    send(&rt, "~zod", "counter", "log hits");
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
+    assert!(matches!(rejection(&rt, "tally", "poke hits"), Rejection::Limit(_)));
+
+    // Room for exactly one queued ping (6 bytes plus 64), with a notification waiting too.
+    let cfg = Config { max_inbox_bytes: 71, max_queued_per_deliver: 0, ..fast() };
+    let dir = TempDir::new("log-inbox-room");
+    let rt = boot_pair(&dir, cfg, counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    send(&rt, "~zod", "counter", "log hits");
+    // The waiting notification takes none of the room, so the ping still fits, and fills it.
+    send(&rt, "~zod", "tally", "ping 0");
+    assert_eq!(rt.pending("~zod").unwrap(), 2);
+    assert!(matches!(rejection(&rt, "tally", "later x"), Rejection::Limit(_)));
+    // The count is worked out again when the ship is reopened, and must still leave it out.
+    rt.sleep_idle(Duration::ZERO);
+    // Running the notification frees no room, because it never took any.
+    assert_eq!(rt.run_pending("~zod", 1).unwrap(), 1);
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
+    assert!(matches!(rejection(&rt, "tally", "later x"), Rejection::Limit(_)));
+    // Running the ping frees its room, which the ping it sends then takes.
+    assert_eq!(rt.run_pending("~zod", 1).unwrap(), 1);
+    assert_eq!(read(&rt, "tally", "tally", "pings"), "1");
+    assert_eq!(rt.pending("~zod").unwrap(), 1);
+}
+
+#[test]
+fn a_followers_place_moves_only_when_it_has_the_entries() {
+    use ship_proto::{FollowRequest, Message, NextRequest};
+    // This follower asks for entries with a buffer of no size at all, so they can never fit.
+    // One version stops there; the other goes on to collect what it asked for.
+    let follow = FollowRequest { agent: "counter".into(), log: "counter".into() }.encode_to_vec();
+    let next = NextRequest { agent: "counter".into(), log: "counter".into(), max: 10 }.encode_to_vec();
+    let escaped = |bytes: &[u8]| bytes.iter().map(|b| format!("\\{b:02x}")).collect::<String>();
+    let follower = |then: &str| {
+        format!(
+            r#"(module
+                (import "host" "log_follow" (func $follow (param i32 i32)))
+                (import "host" "log_next" (func $next (param i32 i32 i32 i32) (result i64)))
+                (import "host" "take_reply" (func $take (param i32 i32) (result i64)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{}")
+                (data (i32.const 256) "{}")
+                (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+                (func (export "handle") (param i32 i32) (result i64)
+                    (call $follow (i32.const 0) (i32.const {}))
+                    (i64.const 0))
+                (func (export "notify") (param i32 i32) (result i64)
+                    (if (i64.le_s (call $next (i32.const 256) (i32.const {}) (i32.const 4096) (i32.const 0)) (i64.const 0))
+                        (then unreachable))
+                    {then}
+                    (i64.const 0)))"#,
+            escaped(&follow),
+            escaped(&next),
+            follow.len(),
+            next.len(),
+        )
+    };
+    let reads_counter = Manifest {
+        provides: vec![],
+        uses: vec![Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false }],
+    };
+    let collect = "(drop (call $take (i32.const 4096) (i32.const 60000)))";
+    for (label, then, expected) in [("place-uncollected", "", 0), ("place-collected", collect, 4)] {
+        let dir = TempDir::new(label);
+        let rt = boot(&dir, fast());
+        let hash = rt.add_module(&wat::parse_str(follower(then)).unwrap()).unwrap();
+        rt.install("~zod", "lazy", &hash, &reads_counter).unwrap();
+        rt.deliver("~zod", "lazy", b"x").unwrap();
+        for _ in 0..4 {
+            send(&rt, "~zod", "counter", "log hits");
+        }
+        // Whatever it did, the runtime stops prompting it: either it caught up, or it kept
+        // finishing without taking anything.
+        assert_eq!(rt.run_pending("~zod", 100).unwrap(), 0);
+        assert_eq!(rt.log_position("~zod", "lazy", "counter", "counter").unwrap(), Some(expected), "{label}");
+    }
+}
+
+#[test]
+fn a_followers_own_handler_cannot_pile_up_notifications() {
+    use ship_proto::{AppendRequest, FollowRequest, Message};
+    // This agent follows its own log. When prompted it takes no entries; instead it either asks
+    // to follow again or appends another entry. Both would queue a second prompt on top of the
+    // one the runtime queues for a round that made no progress.
+    let follow = FollowRequest { agent: "echo".into(), log: "e".into() }.encode_to_vec();
+    let append = AppendRequest { log: "e".into(), payload: b"x".to_vec() }.encode_to_vec();
+    let escaped = |bytes: &[u8]| bytes.iter().map(|b| format!("\\{b:02x}")).collect::<String>();
+    let echo = |when_prompted: &str| {
+        format!(
+            r#"(module
+                (import "host" "log_follow" (func $follow (param i32 i32)))
+                (import "host" "log_append" (func $append (param i32 i32) (result i64)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{}")
+                (data (i32.const 256) "{}")
+                (func $refollow (call $follow (i32.const 0) (i32.const {})))
+                (func $again (drop (call $append (i32.const 256) (i32.const {}))))
+                (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+                (func (export "handle") (param i32 i32) (result i64)
+                    (call $refollow)
+                    (call $again)
+                    (i64.const 0))
+                (func (export "notify") (param i32 i32) (result i64)
+                    (call {when_prompted})
+                    (i64.const 0)))"#,
+            escaped(&follow),
+            escaped(&append),
+            follow.len(),
+            append.len(),
+        )
+    };
+    let offers_e = Manifest { provides: vec![Provide { interface: "e".into(), public: false }], uses: vec![] };
+    for (label, when_prompted) in [("pile-refollow", "$refollow"), ("pile-append", "$again")] {
+        let dir = TempDir::new(label);
+        let rt = boot(&dir, Config { max_queued_per_deliver: 0, ..fast() });
+        let hash = rt.add_module(&wat::parse_str(echo(when_prompted)).unwrap()).unwrap();
+        rt.install("~zod", "echo", &hash, &offers_e).unwrap();
+        rt.deliver("~zod", "echo", b"x").unwrap();
+        assert_eq!(rt.pending("~zod").unwrap(), 1, "{label}");
+        // However many rounds run, there is never more than one prompt waiting.
+        for round in 0..8 {
+            rt.run_pending("~zod", 1).unwrap();
+            assert!(rt.pending("~zod").unwrap() <= 1, "{label}: round {round}");
+        }
+    }
 }

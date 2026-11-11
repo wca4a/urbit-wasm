@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 
 pub use ship_proto as proto;
-use ship_proto::{Invocation, Message, ReadRequest, SendRequest};
+use ship_proto::{AppendRequest, FollowRequest, Invocation, Message, NextReply, NextRequest, ReadRequest, SendRequest};
 
 #[link(wasm_import_module = "host")]
 extern "C" {
@@ -20,6 +20,12 @@ extern "C" {
     fn host_take_reply(buf: *mut u8, buf_cap: u32) -> i64;
     #[link_name = "send"]
     fn host_send(req: *const u8, req_len: u32);
+    #[link_name = "log_append"]
+    fn host_log_append(req: *const u8, req_len: u32) -> i64;
+    #[link_name = "log_follow"]
+    fn host_log_follow(req: *const u8, req_len: u32);
+    #[link_name = "log_next"]
+    fn host_log_next(req: *const u8, req_len: u32, buf: *mut u8, buf_cap: u32) -> i64;
 }
 
 /// Call a host function that fills a buffer and reports the full length, growing the buffer and
@@ -71,17 +77,46 @@ pub fn invocation() -> Invocation {
 pub fn read(agent: &str, interface: &str, payload: &[u8]) -> Vec<u8> {
     let request =
         ReadRequest { agent: agent.into(), interface: interface.into(), payload: payload.to_vec() }.encode_to_vec();
-    // The read runs once. If its answer is bigger than the first buffer, the runtime keeps it
-    // and the second call only collects it.
+    once(|buf, cap| unsafe { host_read(request.as_ptr(), request.len() as u32, buf, cap) })
+}
+
+/// Make a host call that must run exactly once and returns a buffer. If its answer is bigger
+/// than the first buffer, the runtime keeps it and a second call only collects it.
+fn once(mut call: impl FnMut(*mut u8, u32) -> i64) -> Vec<u8> {
     let mut first = true;
-    fetch(4096, |buf, cap| unsafe {
-        if std::mem::take(&mut first) {
-            host_read(request.as_ptr(), request.len() as u32, buf, cap)
-        } else {
-            host_take_reply(buf, cap)
-        }
-    })
-    .unwrap_or_default()
+    fetch(4096, |buf, cap| if std::mem::take(&mut first) { call(buf, cap) } else { unsafe { host_take_reply(buf, cap) } })
+        .unwrap_or_default()
+}
+
+/// Logs: append-only, numbered lists that other agents, other ships, and the owner's clients
+/// follow. An agent has one log per interface it offers, named after that interface.
+pub mod log {
+    use super::*;
+    pub use ship_proto::Entry;
+
+    /// Add an entry to one of this agent's own logs and return its number. The runtime signs
+    /// it and tells every follower. Kept only if this event commits.
+    pub fn append(log: &str, payload: &[u8]) -> u64 {
+        let request = AppendRequest { log: log.into(), payload: payload.to_vec() }.encode_to_vec();
+        unsafe { host_log_append(request.as_ptr(), request.len() as u32) as u64 }
+    }
+
+    /// Start following another agent's log from its first entry. The agent's notify handler is
+    /// then called whenever the log has entries it has not taken. Following twice is harmless.
+    pub fn follow(agent: &str, log: &str) {
+        let request = FollowRequest { agent: agent.into(), log: log.into() }.encode_to_vec();
+        unsafe { host_log_follow(request.as_ptr(), request.len() as u32) }
+    }
+
+    /// Take up to `max` entries after this agent's position in a log it follows, and whether
+    /// more remain. The position moves past them only if this event commits, so an entry is
+    /// never lost and never handled twice.
+    pub fn next(agent: &str, log: &str, max: u32) -> (Vec<Entry>, bool) {
+        let request = NextRequest { agent: agent.into(), log: log.into(), max }.encode_to_vec();
+        let bytes = once(|buf, cap| unsafe { host_log_next(request.as_ptr(), request.len() as u32, buf, cap) });
+        let reply = NextReply::decode(&*bytes).expect("the runtime sent a malformed log reply");
+        (reply.entries, reply.more)
+    }
 }
 
 /// Send a command to another agent on this ship. It runs later, as that agent's own event, and
@@ -141,8 +176,9 @@ macro_rules! export_fn {
     };
 }
 
-/// Declare an agent: a command handler, and optionally a read handler. Both are
-/// `fn(&[u8]) -> Vec<u8>`. A read handler cannot write, send, or emit.
+/// Declare an agent: a command handler, and optionally a read handler and a notify handler. All
+/// are `fn(&[u8]) -> Vec<u8>`. A read handler cannot write, send, or emit. The notify handler is
+/// called when a log this agent follows has new entries; `invocation()` says which.
 #[macro_export]
 macro_rules! agent {
     ($command:path) => {
@@ -152,5 +188,9 @@ macro_rules! agent {
     ($command:path, read = $read:path) => {
         $crate::agent!($command);
         $crate::export_fn!("read", $read);
+    };
+    ($command:path, read = $read:path, notify = $notify:path) => {
+        $crate::agent!($command, read = $read);
+        $crate::export_fn!("notify", $notify);
     };
 }

@@ -1,4 +1,4 @@
-use ship_sdk::{agent, emit, kv};
+use ship_sdk::{agent, emit, kv, log};
 
 fn read(key: &str) -> i64 {
     kv::get(key.as_bytes())
@@ -21,6 +21,22 @@ fn handle(event: &[u8]) -> Vec<u8> {
             value.to_string()
         }
         (Some("get"), Some(key), None) => read(key).to_string(),
+        // Publish an entry and then fail, to check that the entry goes with everything else.
+        (Some("log-then-crash"), Some(key), None) => {
+            write(key, read(key) + 1);
+            log::append("counter", b"must never be seen");
+            panic!("crash requested");
+        }
+        // Publish an entry of a given size.
+        (Some("log-big"), Some(len), None) => {
+            log::append("counter", &vec![b'x'; len.parse().unwrap_or(0)]).to_string()
+        }
+        // Add one, and publish the new value in this agent's log for anyone following it.
+        (Some("log"), Some(key), None) => {
+            let value = read(key) + 1;
+            write(key, value);
+            log::append("counter", format!("{key}={value}").as_bytes()).to_string()
+        }
         (Some("del"), Some(key), None) => {
             kv::delete(key.as_bytes());
             "ok".to_string()

@@ -18,12 +18,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use ship_proto::admin_request::Op;
-use ship_proto::{AdminRequest, Install, Source};
+use ship_proto::{AdminRequest, Install, Message, Source};
 use wasmtime::{Engine, InstancePre, Linker, Module};
 
-pub use ship_proto::{Manifest, Provide, Use};
+pub use ship_proto::{EntryBody, Manifest, Provide, SignedEntry, Use};
 
 use host::Ctx;
 use ship::Ship;
@@ -76,6 +77,8 @@ pub struct Config {
     pub max_outbox_bytes: u64,
     /// Commands between agents that may be waiting to run, counted the same way.
     pub max_inbox_bytes: u64,
+    /// Log entries a ship may hold in total, counted the same way.
+    pub max_log_bytes: u64,
     /// Queued commands run straight after the event that caused them, up to this many. The rest
     /// wait for `run_pending`, so agents that keep sending to each other cannot hold a ship.
     pub max_queued_per_deliver: usize,
@@ -104,6 +107,7 @@ impl Default for Config {
             max_reply_bytes: 1 << 20,
             max_outbox_bytes: 64 << 20,
             max_inbox_bytes: 64 << 20,
+            max_log_bytes: 256 << 20,
             max_queued_per_deliver: 64,
             max_awake: 64,
             audit_rows: 10_000,
@@ -231,6 +235,7 @@ pub(crate) struct Inner {
     linker: Linker<Ctx>,
     ships_dir: PathBuf,
     blobs_dir: PathBuf,
+    keys_dir: PathBuf,
     tmp_dir: PathBuf,
     modules: Mutex<HashMap<String, Arc<AgentModule>>>,
     slots: Mutex<HashMap<String, SlotRef>>,
@@ -239,6 +244,9 @@ pub(crate) struct Inner {
     /// Lock order: a slot lock may be held while taking this lock. While holding this lock,
     /// slot locks are only ever tried, never waited on.
     awake: Mutex<HashMap<String, SlotRef>>,
+    /// Held while a ship's file and key are put in place together, and while a key is read, so
+    /// that nothing ever sees one without the matching other. Nothing else is locked under it.
+    lifecycle: Mutex<()>,
     awake_changed: Condvar,
 }
 
@@ -388,6 +396,98 @@ fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// Checks a run of log entries one at a time: each must be signed by the ship's key, belong to
+/// the expected log, and follow directly on from the one before.
+pub(crate) struct ChainCheck<'a> {
+    key: &'a VerifyingKey,
+    ship: &'a str,
+    pub agent: String,
+    pub log: String,
+    /// The entry already accepted, as (number, hash). `None` means none yet, so the next must
+    /// be entry 1.
+    last: Option<(u64, [u8; 32])>,
+}
+
+impl<'a> ChainCheck<'a> {
+    /// `after` is the last entry the caller already trusts, or `None` to start from entry 1.
+    pub fn new(key: &'a VerifyingKey, ship: &'a str, agent: &str, log: &str, after: Option<(u64, [u8; 32])>) -> Self {
+        ChainCheck { key, ship, agent: agent.to_string(), log: log.to_string(), last: after }
+    }
+
+    /// Accept the next entry, returning its number, its hash, and the size of its payload.
+    pub fn accept(&mut self, body: &[u8], signature: &[u8]) -> Result<(u64, [u8; 32], usize), String> {
+        let signature = Signature::from_slice(signature).map_err(|_| "an entry's signature is malformed")?;
+        // Checked over the bytes as stored, never over a re-encoding of them.
+        self.key.verify(body, &signature).map_err(|_| "an entry is not signed by this ship's key")?;
+        let entry = EntryBody::decode(body).map_err(|_| "an entry cannot be decoded")?;
+        if entry.ship != self.ship || entry.agent != self.agent || entry.log != self.log {
+            return Err("an entry belongs to a different log".into());
+        }
+        let follows_on = match &self.last {
+            Some((seq, hash)) => seq.checked_add(1) == Some(entry.seq) && entry.prev == hash,
+            None => entry.seq == 1 && entry.prev.is_empty(),
+        };
+        if !follows_on {
+            return Err(format!("entry {} does not follow on from the one before it", entry.seq));
+        }
+        let hash = sha256(body);
+        self.last = Some((entry.seq, hash));
+        Ok((entry.seq, hash, entry.payload.len()))
+    }
+}
+
+/// Where a reader has got to in a log: the number and hash of the last entry it accepted.
+pub type Position = (u64, [u8; 32]);
+
+/// Check entries read from a ship's log, as a client or another ship would. Each must be signed
+/// by `public_key`, belong to that log, and carry on directly from `after`: the last entry the
+/// reader already accepted, or `None` if it has none and these must start at entry 1. Returns
+/// the reader's new position.
+///
+/// This proves the entries are genuine and that none is missing between them. It cannot show
+/// that these are all the entries there are; for that the reader needs the log's current end
+/// from somewhere it trusts.
+pub fn verify_log(
+    public_key: &[u8; 32],
+    ship: &str,
+    agent: &str,
+    log: &str,
+    after: Option<Position>,
+    entries: &[SignedEntry],
+) -> Result<Option<Position>, String> {
+    let key = VerifyingKey::from_bytes(public_key).map_err(|_| "not a valid public key")?;
+    let ship = canonical_ship(ship).map_err(|e| e.to_string())?;
+    let mut chain = ChainCheck::new(&key, &ship, agent, log, after);
+    entries.iter().try_for_each(|entry| chain.accept(&entry.body, &entry.signature).map(drop))?;
+    Ok(chain.last)
+}
+
+/// Read a ship's signing key: 32 bytes in a regular file.
+fn load_key(path: &Path) -> Result<SigningKey, Error> {
+    let bad = || Error::BadShipFile(format!("{}: not a ship key", path.display()));
+    let mut seed = Vec::new();
+    open_regular(path).map_err(|_| bad())?.take(33).read_to_end(&mut seed)?;
+    Ok(SigningKey::from_bytes(&<[u8; 32]>::try_from(seed).map_err(|_| bad())?))
+}
+
+/// Put a key at `path`, replacing whatever is there. It is written to a new file that only its
+/// owner can read and then renamed into place, so the key is never in a file with looser
+/// permissions, is never half written under its real name, and an existing symlink at `path`
+/// is replaced rather than followed.
+fn write_key(path: &Path, key: &SigningKey) -> io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let scratch = Scratch::new(dir);
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&scratch.0)?;
+    file.write_all(&key.to_bytes())?;
+    file.sync_all()?;
+    fs::rename(&scratch.0, path)?;
+    sync_dir(dir)
+}
+
 /// A scratch file that no other call can share, removed (with any SQLite side files) on drop.
 struct Scratch(PathBuf);
 
@@ -412,7 +512,8 @@ impl Runtime {
     pub fn open(data_dir: impl AsRef<Path>, mut cfg: Config) -> Result<Runtime, Error> {
         let data_dir = data_dir.as_ref();
         let (ships_dir, blobs_dir, tmp_dir) = (data_dir.join("ships"), data_dir.join("blobs"), data_dir.join("tmp"));
-        for dir in [&ships_dir, &blobs_dir, &tmp_dir] {
+        let keys_dir = data_dir.join("keys");
+        for dir in [&ships_dir, &blobs_dir, &keys_dir, &tmp_dir] {
             fs::create_dir_all(dir)?;
         }
         cfg.max_awake = cfg.max_awake.max(1);
@@ -446,10 +547,12 @@ impl Runtime {
                 linker,
                 ships_dir,
                 blobs_dir,
+                keys_dir,
                 tmp_dir,
                 modules: Mutex::new(HashMap::new()),
                 slots: Mutex::new(HashMap::new()),
                 awake: Mutex::new(HashMap::new()),
+                lifecycle: Mutex::new(()),
                 awake_changed: Condvar::new(),
             }),
         })
@@ -474,19 +577,18 @@ impl Runtime {
     pub fn create_ship(&self, name: &str, kernel_hash: &str) -> Result<(), Error> {
         let name = canonical_ship(name)?;
         self.inner.kernel(kernel_hash)?;
-        let dest_file = self.inner.ship_path(&name);
-        if dest_file.exists() {
+        if self.inner.ship_path(&name).exists() {
             return Err(Error::ShipExists(name));
         }
+        // The ship's signing key, a stand-in for its Urbit ID networking key. It lives beside the
+        // ship file, not in it.
+        let mut seed = [0u8; 32];
+        fs::File::open("/dev/urandom")?.read_exact(&mut seed)?;
         // Built under a private name and then published, so a failure part way through cannot
         // leave a broken file sitting on the ship's name for ever.
         let fresh = Scratch::new(&self.inner.tmp_dir);
         store::create(&fresh.0, &name, kernel_hash, self.inner.cfg.max_ship_bytes)?;
-        match fs::hard_link(&fresh.0, &dest_file) {
-            Ok(()) => Ok(sync_dir(&self.inner.ships_dir)?),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::ShipExists(name)),
-            Err(e) => Err(e.into()),
-        }
+        self.inner.publish(&name, &fresh.0, &SigningKey::from_bytes(&seed))
     }
 
     /// Install an agent, or replace it. The manifest says which interfaces it offers and which
@@ -533,6 +635,11 @@ impl Runtime {
         })
     }
 
+    /// How many queued events are waiting to run on a ship.
+    pub fn pending(&self, ship: &str) -> Result<usize, Error> {
+        self.inner.with_ship(ship, |ship| store::inbox_len(&lock(&ship.conn)))
+    }
+
     /// Run up to `max` queued commands. Returns how many ran.
     pub fn run_pending(&self, ship: &str, max: usize) -> Result<usize, Error> {
         self.inner.with_ship(ship, |ship| {
@@ -564,12 +671,61 @@ impl Runtime {
         })
     }
 
+    /// Entries of a ship's log after number `after`, oldest first. `max_bytes` limits the total
+    /// size of the entries' bodies, not counting their 64-byte signatures, and at least one
+    /// entry is always returned if any exist. It does not run the agent. Check what comes back
+    /// with `verify_log`.
+    ///
+    /// This is the owner's view and checks no permissions. Anything that serves logs to other
+    /// people has to decide who may read which log before calling it.
+    pub fn log_entries(&self, ship: &str, agent: &str, log: &str, after: u64, max_bytes: usize) -> Result<Vec<SignedEntry>, Error> {
+        check_target(agent, log)?;
+        self.inner.with_ship(ship, |ship| {
+            let stored = store::log_range(&lock(&ship.conn), agent, log, after, 1024, max_bytes)?;
+            Ok(stored.into_iter().map(|entry| SignedEntry { body: entry.body, signature: entry.signature }).collect())
+        })
+    }
+
+    /// How far a follower has got in a log: the number of the last entry it has taken, or
+    /// `None` if it does not follow that log.
+    pub fn log_position(&self, ship: &str, follower: &str, agent: &str, log: &str) -> Result<Option<u64>, Error> {
+        check_agent_name(follower)?;
+        check_target(agent, log)?;
+        self.inner.with_ship(ship, |ship| Ok(store::cursor(&lock(&ship.conn), follower, agent, log)?))
+    }
+
+    /// The public half of a ship's signing key, for checking its log entries.
+    pub fn public_key(&self, ship: &str) -> Result<[u8; 32], Error> {
+        let name = canonical_ship(ship)?;
+        let _together = lock(&self.inner.lifecycle);
+        if !self.inner.ship_path(&name).exists() {
+            return Err(Error::UnknownShip(name));
+        }
+        Ok(load_key(&self.inner.key_path(&name))?.verifying_key().to_bytes())
+    }
+
+    /// Where a ship's log currently ends: the number and hash of its newest entry, or `None` if
+    /// it has no entries. A reader compares this with where its own copy ends to tell whether
+    /// it has everything.
+    pub fn log_head(&self, ship: &str, agent: &str, log: &str) -> Result<Option<Position>, Error> {
+        check_target(agent, log)?;
+        self.inner.with_ship(ship, |ship| {
+            let (head, hash) = store::log_head(&lock(&ship.conn), agent, log)?;
+            Ok(<[u8; 32]>::try_from(hash).ok().filter(|_| head > 0).map(|hash| (head, hash)))
+        })
+    }
+
     /// The newest audit entries, newest first.
     pub fn audit(&self, ship: &str, limit: usize) -> Result<Vec<AuditEntry>, Error> {
         self.inner.with_ship(ship, |ship| store::audit_tail(&lock(&ship.conn), limit))
     }
 
     /// Write `<dest>/<ship>.ship` plus the module blobs it needs under `<dest>/blobs`.
+    ///
+    /// The export includes the ship's private signing key, because a ship is its file plus its
+    /// key. It is a way to move or back up a ship, not something to hand to anyone else: whoever
+    /// holds it can sign as the ship. Running both the original and an imported copy would give
+    /// two writers of the same logs, which nothing here yet prevents.
     ///
     /// Which agent modules a ship needs is known only to its kernel, so the export contains the
     /// modules the kernel lists. A kernel that leaves one out produces a ship that imports
@@ -583,6 +739,8 @@ impl Runtime {
             let conn = lock(&ship.conn);
             hashes.push(store::kernel(&conn)?);
             store::snapshot_into(&conn, &dest.join(format!("{name}.ship")))?;
+            // A ship is its file plus its key, so the key travels with it.
+            write_key(&dest.join(format!("{name}.key")), &ship.key)?;
             for hash in hashes {
                 // Read, verify, then rename into place: copying a file onto itself (an export into
                 // this runtime's own directory) would truncate it.
@@ -616,14 +774,16 @@ impl Runtime {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::UnknownShip(name)),
             Err(e) => return Err(e.into()),
         };
+        let key = load_key(&src.join(format!("{name}.key")))?;
         let (copy, fresh) = (Scratch::new(&self.inner.tmp_dir), Scratch::new(&self.inner.tmp_dir));
         // Copy by bytes read, not by reported size, which a special file can misstate.
         let limit = self.inner.cfg.max_import_bytes;
         if io::copy(&mut source.take(limit + 1), &mut fs::File::create(&copy.0)?)? > limit {
             return Err(Error::BadShipFile(format!("{name}: larger than this runtime will import")));
         }
+        let public = key.verifying_key();
         let kernel_hash =
-            store::import(&copy.0, &fresh.0, &name, &self.inner.cfg, deadline, check_agent_name, check_hash)?;
+            store::import(&copy.0, &fresh.0, &name, &self.inner.cfg, deadline, &public, check_agent_name, check_hash)?;
         let fetch = |hash: &str| -> Result<(), Error> {
             // Check the bytes on disk, not the compiled cache, which could hide a damaged blob.
             if self.inner.read_blob(hash).is_err() {
@@ -639,7 +799,15 @@ impl Runtime {
         let hashes = {
             let conn = store::open_read_only(&fresh.0)?;
             let kernel = self.inner.kernel(&kernel_hash)?;
-            let mut staged = Ship { conn: Arc::new(Mutex::new(conn)), kernel, outbox_bytes: 0, inbox_bytes: 0 };
+            let mut staged = Ship {
+                name: name.as_str().into(),
+                conn: Arc::new(Mutex::new(conn)),
+                kernel,
+                key: Arc::new(key.clone()),
+                outbox_bytes: 0,
+                inbox_bytes: 0,
+                log_bytes: 0,
+            };
             staged.modules(&self.inner)?
         };
         for hash in hashes {
@@ -649,12 +817,7 @@ impl Runtime {
         if Instant::now() > deadline {
             return Err(Error::BadShipFile(format!("{name}: import took too long")));
         }
-        // A hard link publishes the finished file without ever replacing an existing ship.
-        match fs::hard_link(&fresh.0, &dest_file) {
-            Ok(()) => Ok(sync_dir(&self.inner.ships_dir)?),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::ShipExists(name)),
-            Err(e) => Err(e.into()),
-        }
+        self.inner.publish(&name, &fresh.0, &key)
     }
 
     /// Put to sleep every ship that has been idle for at least `idle`. Returns how many slept.
@@ -689,6 +852,30 @@ impl Runtime {
 impl Inner {
     fn ship_path(&self, name: &str) -> PathBuf {
         self.ships_dir.join(format!("{name}.ship"))
+    }
+
+    /// Make a finished ship file and its key appear together under the ship's name.
+    ///
+    /// Creating and importing both end here, one at a time, so two of them racing for the same
+    /// name cannot leave one's file with the other's key. The key goes in first: a key with no
+    /// ship is harmless and is replaced next time, while a ship with no key could not be woken.
+    /// The hard link never replaces an existing ship.
+    fn publish(&self, name: &str, staged: &Path, key: &SigningKey) -> Result<(), Error> {
+        let _together = lock(&self.lifecycle);
+        let dest_file = self.ship_path(name);
+        if dest_file.exists() {
+            return Err(Error::ShipExists(name.to_string()));
+        }
+        write_key(&self.key_path(name), key)?;
+        match fs::hard_link(staged, &dest_file) {
+            Ok(()) => Ok(sync_dir(&self.ships_dir)?),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::ShipExists(name.to_string())),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn key_path(&self, name: &str) -> PathBuf {
+        self.keys_dir.join(format!("{name}.key"))
     }
 
     fn blob_path(&self, hash: &str) -> PathBuf {
@@ -789,8 +976,13 @@ impl Inner {
         let conn = store::open(&self.ship_path(name), self.cfg.durability, self.cfg.max_ship_bytes)?;
         store::check_meta(&conn, name)?;
         let kernel = self.kernel(&store::kernel(&conn)?)?;
+        let key = {
+            let _together = lock(&self.lifecycle);
+            Arc::new(load_key(&self.key_path(name))?)
+        };
         let (outbox_bytes, inbox_bytes) = (store::outbox_bytes(&conn)?, store::inbox_bytes(&conn)?);
-        Ok(Ship { conn: Arc::new(Mutex::new(conn)), kernel, outbox_bytes, inbox_bytes })
+        let log_bytes = store::log_bytes(&conn)?;
+        Ok(Ship { name: name.into(), conn: Arc::new(Mutex::new(conn)), kernel, key, outbox_bytes, inbox_bytes, log_bytes })
     }
 
     fn with_ship<R>(&self, name: &str, f: impl FnOnce(&mut Ship) -> Result<R, Error>) -> Result<R, Error> {

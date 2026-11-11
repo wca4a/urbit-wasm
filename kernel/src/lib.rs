@@ -89,13 +89,29 @@ fn decide(request: &RouteRequest) -> RouteReply {
     let Some(target) = registry.agents.iter().find(|a| a.name == request.agent) else {
         return deny(format!("no agent named {}", request.agent));
     };
+    let source = request.source.clone().unwrap_or_default();
     let wants: fn(&Use) -> bool = match request.kind() {
         Kind::Command => |u| u.send,
         Kind::Read => |u| u.read,
+        // A notification goes from a log's publisher to one of its followers, so the question
+        // is the other way round: may the receiver read that interface of the sender?
+        Kind::Notify => {
+            let publisher = registry.agents.iter().find(|a| a.name == source.agent);
+            let allowed = publisher.is_some_and(|publisher| {
+                provides(publisher).iter().find(|p| p.interface == request.interface).is_some_and(|provide| {
+                    provide.public
+                        || publisher.name == target.name
+                        || declares(uses(target), &publisher.name, &request.interface, |u| u.read)
+                })
+            });
+            if !allowed {
+                return deny(format!("{} does not follow {} on {}", target.name, request.interface, source.agent));
+            }
+            return allow(&registry, target);
+        }
         // An unrecognised kind must be refused, never treated as something harmless.
         Kind::Unspecified => return deny("unknown kind of call"),
     };
-    let source = request.source.clone().unwrap_or_default();
     // The owner may call anything on their own ship. An agent needs the target to provide the
     // interface, and needs it to be public, its own, or a declared use.
     if !source.owner {
@@ -111,12 +127,16 @@ fn decide(request: &RouteRequest) -> RouteReply {
             return deny(format!("{} may not use {} on {}", caller.name, request.interface, target.name));
         }
     }
+    allow(&registry, target)
+}
+
+fn allow(registry: &Registry, target: &Registered) -> RouteReply {
     RouteReply {
         allowed: true,
         reason: String::new(),
         module: target.module.clone(),
-        reads: grants(&registry, target, |u| u.read),
-        sends: grants(&registry, target, |u| u.send),
+        reads: grants(registry, target, |u| u.read),
+        sends: grants(registry, target, |u| u.send),
     }
 }
 

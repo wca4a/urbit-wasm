@@ -1,7 +1,7 @@
 //! A test agent that depends on the counter agent: it reads a counter, and asks for it to be
 //! incremented. Used to exercise permissions and queued commands.
 
-use ship_sdk::{agent, emit, invocation, kv, read, send};
+use ship_sdk::{agent, emit, invocation, kv, log, read, send};
 
 /// Who is calling and through which interface, as the runtime reports it.
 fn caller() -> String {
@@ -44,6 +44,21 @@ fn handle(event: &[u8]) -> Vec<u8> {
             send("counter", "counter", b"crash x");
             "sent".to_string()
         }
+        // Follow the counter's log. From now on `notified` is called when it has new entries.
+        (Some("follow"), None) => {
+            log::follow("counter", "counter");
+            "following".to_string()
+        }
+        // Send ourselves whatever follows, as a command to run later.
+        (Some("later"), Some(_)) => {
+            send("tally", "tally", text.trim_start()["later".len()..].trim().as_bytes());
+            "sent".to_string()
+        }
+        // Stop refusing entries that mention poison.
+        (Some("tolerate"), None) => {
+            kv::put(b"tolerate", b"yes");
+            "ok".to_string()
+        }
         // Send the counter whatever follows, as a command.
         (Some("forward"), Some(_)) => {
             send("counter", "counter", text.trim_start()["forward".len()..].trim().as_bytes());
@@ -79,6 +94,9 @@ fn view(request: &[u8]) -> Vec<u8> {
             Vec::new()
         }
         (Some("via-counter"), Some(key)) => read("counter", "counter", key.as_bytes()),
+        // How many log entries this agent has taken, and the latest one.
+        (Some("seen"), None) => seen().to_string().into_bytes(),
+        (Some("last"), None) => kv::get(b"last").unwrap_or_default(),
         (Some("note"), None) => kv::get(b"note").unwrap_or_default(),
         (Some("who"), None) => caller().into_bytes(),
         // A read of ourselves, to see what a nested read is told about its caller.
@@ -96,4 +114,28 @@ fn view(request: &[u8]) -> Vec<u8> {
     }
 }
 
-agent!(handle, read = view);
+fn seen() -> u32 {
+    u32::from_le_bytes(kv::get(b"seen").unwrap_or_default().try_into().unwrap_or_default())
+}
+
+/// Called when a log this agent follows has new entries. It takes a few at a time on purpose,
+/// so that a longer log needs several rounds. An entry mentioning poison makes it fail until
+/// told to tolerate that, to show that entries a failed round took are offered again.
+fn notified(_: &[u8]) -> Vec<u8> {
+    let call = invocation();
+    let publisher = call.source.unwrap_or_default().agent;
+    let (entries, _more) = log::next(&publisher, &call.interface, 3);
+    let mut count = seen();
+    for entry in &entries {
+        if entry.payload.starts_with(b"poison") && kv::get(b"tolerate").is_none() {
+            panic!("refusing a poisoned entry");
+        }
+        count += 1;
+        assert_eq!(entry.seq, count as u64, "entries arrived out of order");
+        kv::put(b"last", &entry.payload);
+    }
+    kv::put(b"seen", &count.to_le_bytes());
+    Vec::new()
+}
+
+agent!(handle, read = view, notify = notified);

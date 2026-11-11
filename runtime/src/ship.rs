@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
+use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 use ship_proto::admin_request::Op;
 use ship_proto::{AdminReply, AdminRequest, Grant, Invocation, Kind, Message, RouteReply, RouteRequest, Source};
@@ -14,19 +15,37 @@ use crate::host::{Ctx, Denied, LimitExceeded};
 use crate::{check_target, lock, store, AgentModule, Error, Inner, Outcome, Rejection, EPOCH_TICK_MILLIS, WASM_STACK_BYTES};
 
 pub struct Ship {
+    pub name: Arc<str>,
     pub conn: Arc<Mutex<Connection>>,
     pub kernel: Arc<AgentModule>,
-    /// Bytes waiting in the outbox and inbox, kept in step with the file so quota checks are cheap.
+    /// Signs this ship's log entries.
+    pub key: Arc<SigningKey>,
+    /// Bytes held in the outbox, inbox, and logs, kept in step with the file so quota checks
+    /// are cheap.
     pub outbox_bytes: u64,
     pub inbox_bytes: u64,
+    pub log_bytes: u64,
 }
 
 /// What every call on a ship needs, whether it is the event itself or a read nested inside it.
 pub(crate) struct Env<'a> {
     pub rt: &'a Arc<Inner>,
+    pub ship: &'a Arc<str>,
     pub kernel: &'a Arc<AgentModule>,
     pub conn: &'a Arc<Mutex<Connection>>,
+    pub key: &'a Arc<SigningKey>,
     pub deadline: Instant,
+}
+
+/// One thing for an agent to handle: a command, or a notice that a log it follows has grown.
+struct Event<'a> {
+    kind: Kind,
+    source: &'a Source,
+    agent: &'a str,
+    interface: &'a str,
+    payload: &'a [u8],
+    /// The queue entry this came from, if it was queued.
+    queued: Option<i64>,
 }
 
 struct Invoke<'a> {
@@ -42,6 +61,7 @@ struct Invoke<'a> {
     fuel: u64,
     outbox_room: u64,
     inbox_room: u64,
+    log_room: u64,
     max_reply: usize,
 }
 
@@ -56,6 +76,7 @@ struct Returned {
     effect_bytes: u64,
     queued: u32,
     queued_bytes: u64,
+    log_bytes: u64,
 }
 
 /// Run one exported handler in a fresh instance, so nothing kept in memory outlives the call.
@@ -78,6 +99,8 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
         rt: env.rt.clone(),
         kernel: env.kernel.clone(),
         conn: env.conn.clone(),
+        ship: env.ship.clone(),
+        key: env.key.clone(),
         agent: call.agent.into(),
         store_limits: StoreLimitsBuilder::new()
             .memory_size(cfg.max_memory_bytes)
@@ -93,12 +116,16 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
         reads: call.reads,
         sends: call.sends,
         pending_reply: None,
+        pending_cursor: None,
         effects: 0,
         effect_bytes: 0,
         outbox_room: call.outbox_room,
         queued: 0,
         queued_bytes: 0,
         inbox_room: call.inbox_room,
+        appended: 0,
+        log_bytes: 0,
+        log_room: call.log_room,
     };
     let mut store = Store::new(&env.rt.engine, ctx);
     store.limiter(|ctx| &mut ctx.store_limits);
@@ -146,6 +173,7 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
         effect_bytes: ctx.effect_bytes,
         queued: ctx.queued,
         queued_bytes: ctx.queued_bytes,
+        log_bytes: ctx.log_bytes,
     })
 }
 
@@ -164,6 +192,7 @@ fn kernel_call(env: &Env, export: &str, input: &[u8], read_only: bool) -> anyhow
         fuel: env.rt.cfg.kernel_fuel,
         outbox_room: 0,
         inbox_room: 0,
+        log_room: 0,
         max_reply: KERNEL_REPLY_BYTES,
     };
     Ok(invoke(env, call)?.reply)
@@ -210,6 +239,7 @@ pub(crate) fn read_agent(
             fuel,
             outbox_room: 0,
             inbox_room: 0,
+            log_room: 0,
             max_reply: env.rt.cfg.max_reply_bytes,
         },
     )?;
@@ -236,8 +266,10 @@ impl Ship {
         }
     }
 
-    fn deadline(rt: &Inner) -> Instant {
-        Instant::now() + Duration::from_millis(rt.cfg.max_event_millis)
+    /// The setting for one operation, with its time limit starting now.
+    fn env<'a>(&'a self, rt: &'a Arc<Inner>) -> Env<'a> {
+        let deadline = Instant::now() + Duration::from_millis(rt.cfg.max_event_millis);
+        Env { rt, ship: &self.name, kernel: &self.kernel, conn: &self.conn, key: &self.key, deadline }
     }
 
     /// Run one command as one transaction: state, outbox, queued commands, and audit row land
@@ -247,44 +279,51 @@ impl Ship {
     /// as a separate, best-effort write, so that failures can be investigated.
     pub fn command(&mut self, rt: &Arc<Inner>, source: &Source, agent: &str, interface: &str, payload: &[u8]) -> Result<Outcome, Error> {
         self.begin("BEGIN IMMEDIATE")?;
-        self.execute(rt, source, agent, interface, payload, None)
+        self.execute(rt, Event { kind: Kind::Command, source, agent, interface, payload, queued: None })
     }
 
-    /// The body of a command. Expects a transaction to be open, and ends it.
+    /// The body of an event. Expects a transaction to be open, and ends it.
     ///
     /// The handler's work happens inside a savepoint. On rejection only that work is undone, so
     /// whatever the caller did first in the same transaction (taking a queued command off the
     /// queue) is committed together with the audit row that records the rejection.
     ///
-    /// `queued` is the queue entry being run, if any. `Error::Rejected` is only returned once
-    /// the rejection is settled: for a queued command, that means it is off the queue for good.
-    /// Any other error means nothing was committed.
-    fn execute(
-        &mut self,
-        rt: &Arc<Inner>,
-        source: &Source,
-        agent: &str,
-        interface: &str,
-        payload: &[u8],
-        queued: Option<i64>,
-    ) -> Result<Outcome, Error> {
+    /// `Error::Rejected` is only returned once the rejection is settled: for a queued event,
+    /// that means it is off the queue for good. Any other error means nothing was committed.
+    fn execute(&mut self, rt: &Arc<Inner>, event: Event) -> Result<Outcome, Error> {
+        let Event { kind, source, agent, interface, payload, queued } = event;
+        // For a notification: which log it is about, as (publisher, name).
+        let notice = (kind == Kind::Notify).then_some((source.agent.as_str(), interface));
         // Each lock below is taken in a statement of its own, so it is released before
         // `rollback` takes it again.
-        let opened = lock(&self.conn).execute_batch("SAVEPOINT handler");
-        if let Err(e) = opened {
-            self.rollback();
-            return Err(e.into());
-        }
-        let env = Env { rt, kernel: &self.kernel, conn: &self.conn, deadline: Self::deadline(rt) };
+        let opened = {
+            let conn = lock(&self.conn);
+            // The notification is off the queue, so the next new entry may queue another. This
+            // sits outside the savepoint: it holds whether or not the handler succeeds.
+            notice
+                .map_or(Ok(None), |(publisher, log)| {
+                    store::clear_notified(&conn, agent, publisher, log)?;
+                    store::cursor(&conn, agent, publisher, log)
+                })
+                .and_then(|before| conn.execute_batch("SAVEPOINT handler").map(|()| before))
+        };
+        // For a notification: where the follower had got to before its handler ran.
+        let before = match opened {
+            Ok(before) => before,
+            Err(e) => {
+                self.rollback();
+                return Err(e.into());
+            }
+        };
+        let env = self.env(rt);
         let ran = (|| -> anyhow::Result<Returned> {
-            let (module, grants) = route(&env, source, agent, Kind::Command, interface)?;
-            let invocation =
-                Invocation { kind: Kind::Command as i32, interface: interface.into(), source: Some(source.clone()) };
+            let (module, grants) = route(&env, source, agent, kind, interface)?;
+            let invocation = Invocation { kind: kind as i32, interface: interface.into(), source: Some(source.clone()) };
             let returned = invoke(
                 &env,
                 Invoke {
                     module: &module,
-                    export: "handle",
+                    export: if kind == Kind::Notify { "notify" } else { "handle" },
                     agent,
                     invocation: invocation.encode_to_vec(),
                     input: payload,
@@ -295,10 +334,17 @@ impl Ship {
                     fuel: rt.cfg.fuel_per_event,
                     outbox_room: rt.cfg.max_outbox_bytes.saturating_sub(self.outbox_bytes),
                     inbox_room: rt.cfg.max_inbox_bytes.saturating_sub(self.inbox_bytes),
+                    log_room: rt.cfg.max_log_bytes.saturating_sub(self.log_bytes),
                     max_reply: rt.cfg.max_reply_bytes,
                 },
             )?;
-            store::audit(&lock(&self.conn), agent, payload, true, rt.cfg.audit_rows)?;
+            let conn = lock(&self.conn);
+            // A follower that did not take everything is notified again, so it works through a
+            // long log one event at a time without anyone having to prompt it.
+            if let Some((publisher, log)) = notice {
+                store::notify_handled(&conn, agent, publisher, log, before)?;
+            }
+            store::audit(&conn, agent, payload, true, rt.cfg.audit_rows)?;
             // Checked last, so the limit covers everything up to the commit itself. The deadline
             // inside the guest is only checked at loops, calls, and bulk operations.
             if Instant::now() > env.deadline {
@@ -316,6 +362,7 @@ impl Ship {
                 }
                 self.outbox_bytes += done.effect_bytes;
                 self.inbox_bytes += done.queued_bytes;
+                self.log_bytes += done.log_bytes;
                 Ok(Outcome { reply: done.reply, effects: done.effects, queued: done.queued })
             }
             Err(e) => {
@@ -323,8 +370,11 @@ impl Ship {
                 let recorded = {
                     let conn = lock(&self.conn);
                     // SQLite abandons the whole transaction after some errors, such as a full disk.
+                    // A follower whose handler failed is still behind, so it is prompted again a
+                    // limited number of times, in the same transaction as everything else.
                     !conn.is_autocommit()
                         && conn.execute_batch("ROLLBACK TO handler; RELEASE handler").is_ok()
+                        && notice.is_none_or(|(publisher, log)| store::notify_failed(&conn, agent, publisher, log).is_ok())
                         && store::audit(&conn, agent, payload, false, rt.cfg.audit_rows).is_ok()
                         && conn.execute_batch("COMMIT").is_ok()
                 };
@@ -334,7 +384,7 @@ impl Ship {
                 // The transaction was lost. Record the rejection in a new one, and for a queued
                 // command take it off the queue in that same transaction.
                 self.rollback();
-                let retried = store::record_rejection(&lock(&self.conn), queued, agent, payload, rt.cfg.audit_rows);
+                let retried = store::record_rejection(&lock(&self.conn), queued, notice, agent, payload, rt.cfg.audit_rows);
                 match (retried, queued) {
                     (Ok(()), _) | (Err(_), None) => Err(rejection),
                     // Its removal could not be saved, so the command is still queued. Say so,
@@ -365,7 +415,18 @@ impl Ship {
         // free for whatever its handler sends.
         self.inbox_bytes = self.inbox_bytes.saturating_sub(queued.cost());
         let source = Source { owner: false, agent: queued.source.clone() };
-        match self.execute(rt, &source, &queued.agent, &queued.interface, &queued.payload, Some(queued.seq)) {
+        // Anything other than a notification is run as a command, which is also the safe reading
+        // of a kind this runtime does not know.
+        let kind = if queued.kind == Kind::Notify as i32 { Kind::Notify } else { Kind::Command };
+        let event = Event {
+            kind,
+            source: &source,
+            agent: &queued.agent,
+            interface: &queued.interface,
+            payload: &queued.payload,
+            queued: Some(queued.seq),
+        };
+        match self.execute(rt, event) {
             // Run, or rejected and removed: either way it is off the queue.
             Ok(_) | Err(Error::Rejected(_)) => Ok(true),
             // Nothing was committed, so it is still queued and still takes its room.
@@ -379,7 +440,7 @@ impl Ship {
     /// Run a read on the owner's behalf. Nothing it does is kept.
     pub fn read(&mut self, rt: &Arc<Inner>, agent: &str, interface: &str, payload: &[u8]) -> Result<Vec<u8>, Error> {
         self.begin("BEGIN")?;
-        let env = Env { rt, kernel: &self.kernel, conn: &self.conn, deadline: Self::deadline(rt) };
+        let env = self.env(rt);
         let source = Source { owner: true, agent: String::new() };
         let result = read_agent(&env, &source, agent, interface, payload, rt.cfg.fuel_per_event, 0);
         self.rollback();
@@ -397,7 +458,7 @@ impl Ship {
     /// is set and the kernel accepts the request.
     pub fn admin(&mut self, rt: &Arc<Inner>, request: &AdminRequest, write: bool) -> Result<AdminReply, Error> {
         self.begin(if write { "BEGIN IMMEDIATE" } else { "BEGIN" })?;
-        let env = Env { rt, kernel: &self.kernel, conn: &self.conn, deadline: Self::deadline(rt) };
+        let env = self.env(rt);
         let reply = kernel_call(&env, "admin", &request.encode_to_vec(), !write)
             .and_then(|bytes| Ok(AdminReply::decode(&*bytes)?));
         match reply {

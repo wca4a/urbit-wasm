@@ -4,8 +4,8 @@ A prototype event-based runtime. Multiple ships can run in one
 process. Each ship is one SQLite file, a kernel, and agents, all WASM modules
 written in Rust.
 
-Experimental. There is a runtime and a kernel. There is no networking,
-identity, or update mechanism yet.
+Experimental. There is a runtime, a kernel, and logs that agents on one ship
+can follow. There is no networking, identity, or update mechanism yet.
 
 ## What it does
 
@@ -23,6 +23,11 @@ identity, or update mechanism yet.
   anything. A command to another agent is queued and runs as its own event.
 - Messages are Protocol Buffers, so fields can be added without breaking older
   versions.
+- An agent can publish a log: a numbered, append-only list of entries. Other
+  agents follow it and are handed each entry exactly once, in order.
+- Every log entry is signed with the ship's key and carries the hash of the
+  entry before it, so anyone holding a copy can check that nothing was forged,
+  altered, or left out.
 
 ## Layout
 
