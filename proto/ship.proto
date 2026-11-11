@@ -269,3 +269,35 @@ message EntryList {
 message Trimmed {
   uint64 base = 1;
 }
+
+// Ship to ship. Two ships talk over an encrypted connection in which each has proved it holds
+// the key listed for its name. One request and one reply travel on each stream.
+
+message PeerRequest {
+  oneof body {
+    Ping ping = 1;
+  }
+}
+
+message PeerReply {
+  oneof body {
+    Pong pong = 1;
+  }
+  // Set, with no body, when the request was not one the other ship would answer.
+  string refused = 15;
+}
+
+// Asks the other ship to say who it is and who it takes the asker to be.
+message Ping {
+  bytes nonce = 1;
+}
+
+message Pong {
+  // Echoed from the Ping.
+  bytes nonce = 1;
+  // The ship that answered, as it names itself.
+  string ship = 2;
+  // The ship the answerer says it was shown proof of at the other end of the connection.
+  // This is the answerer's word. The asker cannot check it.
+  string caller = 3;
+}

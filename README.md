@@ -5,8 +5,9 @@ process. Each ship is one SQLite file, a kernel, and agents, all WASM modules
 written in Rust.
 
 Experimental. There is a runtime, a kernel, logs that agents on one ship can
-follow, and an HTTP server that lets an app or a browser sign in to a ship.
-There is no networking between ships, identity, or update mechanism yet.
+follow, an HTTP server that lets an app or a browser sign in to a ship, and an
+encrypted link between ships. Ships cannot yet send each other commands or
+follow each other's logs, and there is no identity or update mechanism yet.
 
 ## What it does
 
@@ -40,6 +41,10 @@ There is no networking between ships, identity, or update mechanism yet.
 - A sign-in code is either a one-time code issued on the machine the ship runs
   on, or the ship's reusable access code, which the owner types into the ship's
   sign-in page. The ship stores only hashes of codes and tokens.
+- Two ships reach each other over QUIC, which is encrypted. There is no
+  certificate authority: each end shows its key and proves it holds it, and the
+  other end checks that key against a directory of ships. The directory is a
+  fixed list for now, standing in for Urbit ID.
 
 ## Layout
 

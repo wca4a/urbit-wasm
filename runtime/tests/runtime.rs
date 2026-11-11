@@ -3831,3 +3831,734 @@ fn silent_clients_cannot_hold_the_server_or_stop_it_closing() {
     drop(server);
     assert!(started.elapsed() < Duration::from_secs(5), "stopping took {:?}", started.elapsed());
 }
+
+// Ships reaching each other over the network.
+
+use runtime::net::{Directory, NetConfig, NetError, Network};
+
+/// A runtime holding one ship, on the network and listed in the directory.
+fn networked(dir: &TempDir, ship: &str, directory: &Arc<Directory>) -> (Arc<Runtime>, Network) {
+    let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
+    rt.create_ship(ship, &kernel(&rt)).unwrap();
+    let net = Network::start(rt.clone(), directory.clone(), NetConfig::default()).unwrap();
+    directory.set(ship, rt.public_key(ship).unwrap(), net.addr()).unwrap();
+    (rt, net)
+}
+
+/// The same, with a say in how the network is set up.
+fn networked_with(dir: &TempDir, ship: &str, directory: &Arc<Directory>, cfg: NetConfig) -> (Arc<Runtime>, Network) {
+    let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
+    rt.create_ship(ship, &kernel(&rt)).unwrap();
+    let net = Network::start(rt.clone(), directory.clone(), cfg).unwrap();
+    directory.set(ship, rt.public_key(ship).unwrap(), net.addr()).unwrap();
+    (rt, net)
+}
+
+/// A network that gives up quickly, for tests where a call is meant to fail.
+fn impatient() -> NetConfig {
+    NetConfig { request_timeout: Duration::from_millis(1500), ..NetConfig::default() }
+}
+
+#[test]
+fn two_ships_reach_each_other_and_each_knows_who_the_other_is() {
+    let (a, b) = (TempDir::new("net-a"), TempDir::new("net-b"));
+    let directory = Directory::new();
+    let (_zod, zod_net) = networked(&a, "~zod", &directory);
+    let (_nec, nec_net) = networked(&b, "~nec", &directory);
+
+    // Each end was shown proof of the other's key: the caller reached the ship it meant to,
+    // and the ship that answered knows which ship called.
+    let answered = zod_net.ping("~zod", "~nec").unwrap();
+    assert_eq!((answered.ship.as_str(), answered.seen_as.as_str()), ("nec", "zod"));
+    let answered = nec_net.ping("~nec", "~zod").unwrap();
+    assert_eq!((answered.ship.as_str(), answered.seen_as.as_str()), ("zod", "nec"));
+
+    // A connection is kept and used again: more calls, no more connections.
+    let open = zod_net.open_connections();
+    for _ in 0..5 {
+        zod_net.ping("zod", "nec").unwrap();
+    }
+    assert_eq!(zod_net.open_connections(), open);
+
+    // What cannot be asked at all.
+    assert!(matches!(zod_net.ping("~nec", "~zod"), Err(NetError::NotHere(_))), "a ship can only call from its own runtime");
+    assert!(matches!(zod_net.ping("~zod", "~bus"), Err(NetError::Unlisted(_))));
+    assert!(matches!(zod_net.ping("Not A Ship", "~nec"), Err(NetError::NotHere(_))));
+}
+
+#[test]
+fn two_ships_in_one_runtime_talk_over_the_network_like_any_others() {
+    let dir = TempDir::new("net-shared");
+    let directory = Directory::new();
+    let (rt, net) = networked(&dir, "~zod", &directory);
+    rt.create_ship("~nec", &kernel(&rt)).unwrap();
+    directory.set("~nec", rt.public_key("~nec").unwrap(), net.addr()).unwrap();
+
+    // One address answers as whichever of its ships is asked for.
+    let answered = net.ping("~zod", "~nec").unwrap();
+    assert_eq!((answered.ship.as_str(), answered.seen_as.as_str()), ("nec", "zod"));
+    let answered = net.ping("~nec", "~zod").unwrap();
+    assert_eq!((answered.ship.as_str(), answered.seen_as.as_str()), ("zod", "nec"));
+    // A ship listed at this address that the runtime does not hold has no key to show.
+    directory.set("~bus", [7; 32], net.addr()).unwrap();
+    assert!(matches!(net.ping("~zod", "~bus"), Err(NetError::Unreachable(_))));
+}
+
+#[test]
+fn a_ship_that_cannot_prove_its_key_is_not_believed() {
+    let (a, b, c) = (TempDir::new("net-imp-a"), TempDir::new("net-imp-b"), TempDir::new("net-imp-c"));
+    let directory = Directory::new();
+    let (_zod, zod_net) = networked_with(&a, "~zod", &directory, impatient());
+    let (nec, nec_net) = networked_with(&b, "~nec", &directory, impatient());
+    let nec_key = nec.public_key("~nec").unwrap();
+
+    // Another runtime holds a ship it also calls ~nec, with a key of its own. It is not the
+    // ship the directory lists, whatever it calls itself.
+    let apart = Directory::new();
+    let (fake, fake_net) = networked_with(&c, "~nec", &apart, impatient());
+    apart.set("~zod", zod_net_key(&directory), zod_net.addr()).unwrap();
+    assert_ne!(fake.public_key("~nec").unwrap(), nec_key);
+
+    // Answering as ~nec: traffic for ~nec is sent to the impostor's address. It cannot show
+    // the listed key, so the caller does not take it for ~nec.
+    directory.set("~nec", nec_key, fake_net.addr()).unwrap();
+    assert!(matches!(zod_net.ping("~zod", "~nec"), Err(NetError::Unreachable(_))));
+    directory.set("~nec", nec_key, nec_net.addr()).unwrap();
+    assert_eq!(zod_net.ping("~zod", "~nec").unwrap().ship, "nec");
+
+    // Calling as ~nec: the impostor dials ~zod. Its key is listed for no ship, so ~zod does
+    // not answer it.
+    assert!(fake_net.ping("~nec", "~zod").is_err());
+    // A key is what a caller is known by. Listed under another name, the same runtime is
+    // answered, and is taken for that name, not the one it gives its own ship.
+    directory.set("~bus", fake.public_key("~nec").unwrap(), fake_net.addr()).unwrap();
+    assert_eq!(fake_net.ping("~nec", "~zod").unwrap().seen_as, "bus");
+    // One key cannot be listed for two ships.
+    assert!(directory.set("~doz", nec_key, nec_net.addr()).is_err());
+}
+
+/// The key the directory lists for ~zod.
+fn zod_net_key(directory: &Directory) -> [u8; 32] {
+    directory.lookup("~zod").unwrap().key
+}
+
+#[test]
+fn a_change_in_the_directory_ends_what_was_proved_before_it() {
+    let (a, b) = (TempDir::new("net-chg-a"), TempDir::new("net-chg-b"));
+    let directory = Directory::new();
+    let (zod, zod_net) = networked_with(&a, "~zod", &directory, impatient());
+    let (nec, nec_net) = networked_with(&b, "~nec", &directory, impatient());
+    let (zod_key, nec_key) = (zod.public_key("~zod").unwrap(), nec.public_key("~nec").unwrap());
+    zod_net.ping("~zod", "~nec").unwrap();
+
+    // The directory now lists a different key for ~nec. The connection already open was made
+    // with the old one, and is not used again: ~nec can no longer be reached as itself.
+    directory.set("~nec", [9; 32], nec_net.addr()).unwrap();
+    assert!(matches!(zod_net.ping("~zod", "~nec"), Err(NetError::Unreachable(_))));
+    directory.set("~nec", nec_key, nec_net.addr()).unwrap();
+    zod_net.ping("~zod", "~nec").unwrap();
+
+    // The directory drops the caller. Its open connection stops being answered.
+    directory.remove("~zod");
+    assert!(zod_net.ping("~zod", "~nec").is_err());
+    directory.set("~zod", zod_key, zod_net.addr()).unwrap();
+    assert_eq!(zod_net.ping("~zod", "~nec").unwrap().seen_as, "zod");
+}
+
+#[test]
+fn a_ship_that_went_away_and_came_back_is_reached_again() {
+    let (a, b) = (TempDir::new("net-back-a"), TempDir::new("net-back-b"));
+    let directory = Directory::new();
+    let (_zod, zod_net) = networked_with(&a, "~zod", &directory, impatient());
+    let (nec, nec_net) = networked_with(&b, "~nec", &directory, impatient());
+    zod_net.ping("~zod", "~nec").unwrap();
+
+    // Stopping is prompt, and a ship that is not there is given up on in the time allowed.
+    let started = Instant::now();
+    drop(nec_net);
+    assert!(started.elapsed() < Duration::from_secs(3), "stopping took {:?}", started.elapsed());
+    let started = Instant::now();
+    assert!(zod_net.ping("~zod", "~nec").is_err());
+    assert!(started.elapsed() < Duration::from_secs(4), "giving up took {:?}", started.elapsed());
+
+    // Back at a new address, with the same key.
+    let nec_net = Network::start(nec.clone(), directory.clone(), impatient()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    assert_eq!(zod_net.ping("~zod", "~nec").unwrap().ship, "nec");
+    assert_eq!(nec_net.ping("~nec", "~zod").unwrap().ship, "zod");
+}
+
+#[test]
+fn the_network_keeps_working_through_noise_and_refuses_what_is_too_big() {
+    let (a, b) = (TempDir::new("net-noise-a"), TempDir::new("net-noise-b"));
+    let directory = Directory::new();
+    let (_zod, zod_net) = networked_with(&a, "~zod", &directory, impatient());
+    let (_nec, nec_net) = networked_with(&b, "~nec", &directory, impatient());
+
+    // Packets that are not from this protocol at all.
+    let stray = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for size in [0usize, 1, 20, 1200, 1500] {
+        let noise: Vec<u8> = (0..size).map(|n| (n * 31 + size) as u8).collect();
+        for _ in 0..20 {
+            stray.send_to(&noise, nec_net.addr()).unwrap();
+        }
+    }
+    assert_eq!(zod_net.ping("~zod", "~nec").unwrap().ship, "nec");
+
+    // A ship that takes only tiny messages refuses a request that is larger, and says so.
+    let c = TempDir::new("net-noise-c");
+    let (_bus, bus_net) = networked_with(&c, "~bus", &directory, NetConfig { max_message_bytes: 8, ..impatient() });
+    assert!(matches!(zod_net.ping("~zod", "~bus"), Err(NetError::Refused(_))));
+    // And a reply larger than the caller takes is not taken.
+    assert!(bus_net.ping("~bus", "~nec").is_err());
+    assert_eq!(zod_net.ping("~zod", "~nec").unwrap().ship, "nec");
+}
+
+/// What one end of a connection shows of itself: the public key of `shown`, with the means to
+/// sign held for `held`. An honest party holds the key it shows.
+fn shown_key(provider: &rustls::crypto::CryptoProvider, shown: [u8; 32], held: [u8; 32]) -> Arc<rustls::sign::CertifiedKey> {
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    let (shown, held) = (ed25519_dalek::SigningKey::from_bytes(&shown), ed25519_dalek::SigningKey::from_bytes(&held));
+    let mut der = vec![0x30, 0x51, 0x02, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
+    der.extend_from_slice(&held.to_bytes());
+    der.extend_from_slice(&[0x81, 0x21, 0x00]);
+    der.extend_from_slice(&held.verifying_key().to_bytes());
+    let signer = provider.key_provider.load_private_key(PrivatePkcs8KeyDer::from(der).into()).unwrap();
+    let public = [&[0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00][..], &shown.verifying_key().to_bytes()].concat();
+    Arc::new(rustls::sign::CertifiedKey::new(vec![CertificateDer::from(public)], signer))
+}
+
+/// Whether a caller from outside gets an answer from a ship. The caller speaks QUIC and TLS
+/// correctly and accepts whatever key the ship shows; what it shows of itself, and which
+/// protocol it asks for, are up to the test.
+fn stranger_is_answered(ship_addr: std::net::SocketAddr, shows: Option<[u8; 32]>, protocol: &[u8]) -> bool {
+    stranger_showing(ship_addr, shows.map(|seed| (seed, seed)), protocol)
+}
+
+/// How a caller from outside connects: it speaks QUIC and TLS correctly and accepts whatever
+/// key the ship shows. What it shows of itself (the public key of one seed, signing with
+/// another), and which protocol it asks for, are up to the test.
+fn stranger_client(shows: Option<([u8; 32], [u8; 32])>, protocol: &[u8]) -> quinn::ClientConfig {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
+
+    #[derive(Debug)]
+    struct AnyKey(rustls::crypto::WebPkiSupportedAlgorithms);
+    impl ServerCertVerifier for AnyKey {
+        fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Err(rustls::Error::General("only TLS 1.3".into()))
+        }
+        fn verify_tls13_signature(&self, message: &[u8], shown: &CertificateDer<'_>, signed: &rustls::DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature_with_raw_key(message, &SubjectPublicKeyInfoDer::from(shown.as_ref()), signed, &self.0)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![rustls::SignatureScheme::ED25519]
+        }
+        fn requires_raw_public_keys(&self) -> bool {
+            true
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let wants = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyKey(provider.signature_verification_algorithms)));
+    let mut tls = match shows {
+        None => wants.with_no_client_auth(),
+        Some((shown, held)) => {
+            let shown = shown_key(&provider, shown, held);
+            wants.with_client_cert_resolver(Arc::new(rustls::client::AlwaysResolvesClientRawPublicKeys::new(shown)))
+        }
+    };
+    tls.alpn_protocols = vec![protocol.to_vec()];
+    quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap()))
+}
+
+/// A ping, as it goes over the wire.
+fn ping_bytes() -> Vec<u8> {
+    ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Ping(ship_proto::Ping { nonce: vec![1, 2, 3] })) }.encode_to_vec()
+}
+
+/// Send a request on a new stream of a connection and read the reply, if one comes in time.
+async fn exchange(connection: &quinn::Connection, request: &[u8]) -> Option<ship_proto::PeerReply> {
+    let attempt = async {
+        let (mut send, mut receive) = connection.open_bi().await.ok()?;
+        send.write_all(request).await.ok()?;
+        send.finish().ok()?;
+        ship_proto::PeerReply::decode(&*receive.read_to_end(4096).await.ok()?).ok()
+    };
+    tokio::time::timeout(Duration::from_secs(3), attempt).await.ok().flatten()
+}
+
+/// The same, where the caller may show the public key of one seed while signing with another.
+fn stranger_showing(ship_addr: std::net::SocketAddr, shows: Option<([u8; 32], [u8; 32])>, protocol: &[u8]) -> bool {
+    let client = stranger_client(shows, protocol);
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let attempt = async {
+            let connection = endpoint.connect_with(client, ship_addr, "nec").ok()?.await.ok()?;
+            exchange(&connection, &ping_bytes()).await?.body
+        };
+        matches!(tokio::time::timeout(Duration::from_secs(3), attempt).await, Ok(Some(_)))
+    })
+}
+
+#[test]
+fn a_caller_is_answered_only_if_the_directory_lists_its_key() {
+    let dir = TempDir::new("net-stranger");
+    let directory = Directory::new();
+    let (_nec, nec_net) = networked(&dir, "~nec", &directory);
+    let seed = [5u8; 32];
+
+    // A caller that shows no key, and one that shows a key the directory does not list.
+    assert!(!stranger_is_answered(nec_net.addr(), None, b"ship/1"));
+    assert!(!stranger_is_answered(nec_net.addr(), Some(seed), b"ship/1"));
+    // Once that key is listed for a ship, the same caller is answered: the key is the whole
+    // of what it had to prove.
+    let public = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    directory.set("~bus", public, "127.0.0.1:9".parse().unwrap()).unwrap();
+    assert!(stranger_is_answered(nec_net.addr(), Some(seed), b"ship/1"));
+    // A listed caller that asks for some other protocol is not speaking to ships.
+    assert!(!stranger_is_answered(nec_net.addr(), Some(seed), b"h3"));
+    // Showing a listed key is not enough. The caller has to sign with it, and one that shows
+    // that key while holding a different one is found out.
+    assert!(!stranger_showing(nec_net.addr(), Some((seed, [6; 32])), b"ship/1"));
+}
+
+/// Something at an address that answers as a ship would, showing the public key of `shown`
+/// and signing with `held`. It runs until the returned handle is dropped.
+fn stand_in_ship(shown: [u8; 32], held: [u8; 32]) -> (std::net::SocketAddr, tokio::runtime::Runtime, Arc<AtomicBool>) {
+    stand_in_ship_that(shown, held, true)
+}
+
+/// The same, where the stand-in may take requests and never answer them.
+fn stand_in_ship_that(shown: [u8; 32], held: [u8; 32], answers: bool) -> (std::net::SocketAddr, tokio::runtime::Runtime, Arc<AtomicBool>) {
+    use rustls::pki_types::{CertificateDer, SubjectPublicKeyInfoDer, UnixTime};
+    use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+
+    /// Takes any caller that holds the key it shows, listed or not.
+    #[derive(Debug)]
+    struct AnyCaller(rustls::crypto::WebPkiSupportedAlgorithms);
+    impl ClientCertVerifier for AnyCaller {
+        fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+            &[]
+        }
+        fn verify_client_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: UnixTime) -> Result<ClientCertVerified, rustls::Error> {
+            Ok(ClientCertVerified::assertion())
+        }
+        fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Err(rustls::Error::General("only TLS 1.3".into()))
+        }
+        fn verify_tls13_signature(&self, message: &[u8], shown: &CertificateDer<'_>, signed: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature_with_raw_key(message, &SubjectPublicKeyInfoDer::from(shown.as_ref()), signed, &self.0)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![rustls::SignatureScheme::ED25519]
+        }
+        fn requires_raw_public_keys(&self) -> bool {
+            true
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_client_cert_verifier(Arc::new(AnyCaller(provider.signature_verification_algorithms)))
+        .with_cert_resolver(Arc::new(rustls::server::AlwaysResolvesServerRawPublicKeys::new(shown_key(&provider, shown, held))));
+    tls.alpn_protocols = vec![b"ship/1".to_vec()];
+    let config = quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap()));
+    let tokio = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+    let endpoint = {
+        let _entered = tokio.enter();
+        quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap()
+    };
+    let addr = endpoint.local_addr().unwrap();
+    // Set if the stand-in manages to start a request of its own on a connection made to it.
+    let started_one = Arc::new(AtomicBool::new(false));
+    let started = started_one.clone();
+    tokio.spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let started = started.clone();
+            tokio::spawn(async move {
+                let Ok(connection) = incoming.await else { return };
+                let back = connection.clone();
+                tokio::spawn(async move {
+                    if let Ok(Ok((mut send, _))) = tokio::time::timeout(Duration::from_millis(600), back.open_bi()).await {
+                        started.store(send.write_all(b"unasked").await.is_ok(), Ordering::SeqCst);
+                    }
+                });
+                while let Ok((mut send, mut receive)) = connection.accept_bi().await {
+                    let Ok(bytes) = receive.read_to_end(4096).await else { return };
+                    if !answers {
+                        // Keep the stream open and say nothing.
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            drop(send);
+                        });
+                        continue;
+                    }
+                    let Ok(ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Ping(ping)) }) = ship_proto::PeerRequest::decode(&*bytes) else { return };
+                    let pong = ship_proto::Pong { nonce: ping.nonce, ship: "nec".into(), caller: "zod".into() };
+                    let reply = ship_proto::PeerReply { body: Some(ship_proto::peer_reply::Body::Pong(pong)), refused: String::new() };
+                    let _ = send.write_all(&reply.encode_to_vec()).await;
+                    let _ = send.finish();
+                    let _ = send.stopped().await;
+                }
+            });
+        }
+    });
+    (addr, tokio, started_one)
+}
+
+#[test]
+fn a_ship_that_answers_must_hold_the_key_it_shows() {
+    let dir = TempDir::new("net-held");
+    let directory = Directory::new();
+    let (_zod, zod_net) = networked_with(&dir, "~zod", &directory, impatient());
+    let (listed, other) = ([5u8; 32], [6u8; 32]);
+    let public = ed25519_dalek::SigningKey::from_bytes(&listed).verifying_key().to_bytes();
+
+    // Something answers at ~nec's address and shows ~nec's listed key, which anyone can copy
+    // out of the directory. It signs with a key of its own. The caller does not take it for ~nec.
+    let (addr, _running, _) = stand_in_ship(listed, other);
+    directory.set("~nec", public, addr).unwrap();
+    assert!(matches!(zod_net.ping("~zod", "~nec"), Err(NetError::Unreachable(_))));
+
+    // The same stand-in holding the listed key is taken for ~nec. So what made the difference
+    // above was the signature, and nothing else about the stand-in.
+    let (addr, _running, started_one) = stand_in_ship(listed, listed);
+    directory.set("~nec", public, addr).unwrap();
+    let answered = zod_net.ping("~zod", "~nec").unwrap();
+    // The ship that answered is known for certain. What it says about who called is its word:
+    // this stand-in always says ~zod.
+    assert_eq!((answered.ship.as_str(), answered.seen_as.as_str()), ("nec", "zod"));
+    // Requests go one way on a connection. The ship that was called cannot start any of its
+    // own on it, which nothing here would be reading.
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(!started_one.load(Ordering::SeqCst), "the ship that was called started a request of its own");
+}
+
+#[test]
+fn only_so_many_ships_may_be_connected_at_once() {
+    let (a, b, c) = (TempDir::new("net-cap-a"), TempDir::new("net-cap-b"), TempDir::new("net-cap-c"));
+    let directory = Directory::new();
+    let (_nec, nec_net) = networked_with(&a, "~nec", &directory, NetConfig { max_connections: 1, ..impatient() });
+    let (_zod, zod_net) = networked_with(&b, "~zod", &directory, impatient());
+    let (_bus, bus_net) = networked_with(&c, "~bus", &directory, impatient());
+
+    // The first caller takes the one place. The second is turned away while it is taken.
+    zod_net.ping("~zod", "~nec").unwrap();
+    assert!(bus_net.ping("~bus", "~nec").is_err());
+    zod_net.ping("~zod", "~nec").unwrap();
+    // When the first goes, the place is free again.
+    drop(zod_net);
+    let freed = (0..20).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        bus_net.ping("~bus", "~nec").is_ok()
+    });
+    assert!(freed, "the place was never given up");
+    assert_eq!(nec_net.open_connections(), 1);
+}
+
+#[test]
+fn each_calling_ship_has_its_own_connection_and_is_seen_as_itself() {
+    let (a, b) = (TempDir::new("net-two-a"), TempDir::new("net-two-b"));
+    let directory = Directory::new();
+    let (rt, net) = networked(&a, "~zod", &directory);
+    rt.create_ship("~bus", &kernel(&rt)).unwrap();
+    directory.set("~bus", rt.public_key("~bus").unwrap(), net.addr()).unwrap();
+    let (_nec, _nec_net) = networked(&b, "~nec", &directory);
+
+    // Two ships of one runtime call the same ship. Each is known there by its own key, and a
+    // connection made for one is never used for the other.
+    for _ in 0..3 {
+        assert_eq!(net.ping("~zod", "~nec").unwrap().seen_as, "zod");
+        assert_eq!(net.ping("~bus", "~nec").unwrap().seen_as, "bus");
+    }
+    assert_eq!(net.open_connections(), 2);
+}
+
+#[test]
+fn a_request_is_not_acted_on_once_its_sender_is_no_longer_listed() {
+    let dir = TempDir::new("net-late");
+    let directory = Directory::new();
+    let (_nec, nec_net) = networked(&dir, "~nec", &directory);
+    let seed = [5u8; 32];
+    let public = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    directory.set("~bus", public, "127.0.0.1:9".parse().unwrap()).unwrap();
+
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+        assert!(exchange(&connection, &ping_bytes()).await.is_some_and(|reply| reply.body.is_some()));
+
+        // A request is begun while its sender is listed, and finished after it has been
+        // dropped from the directory. It is the whole request that is acted on, so it is at
+        // that moment that the sender has to be listed.
+        let request = ping_bytes();
+        let (mut send, mut receive) = connection.open_bi().await.unwrap();
+        send.write_all(&request[..1]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        directory.remove("~bus");
+        let _ = send.write_all(&request[1..]).await;
+        let _ = send.finish();
+        let late = tokio::time::timeout(Duration::from_secs(3), receive.read_to_end(4096)).await;
+        let answered = matches!(late, Ok(Ok(bytes)) if ship_proto::PeerReply::decode(&*bytes).is_ok_and(|reply| reply.body.is_some()));
+        assert!(!answered, "a request from a ship no longer listed was answered");
+        // And the connection it came on is closed.
+        assert!(exchange(&connection, &ping_bytes()).await.is_none());
+    });
+}
+
+#[test]
+fn callers_arriving_together_cannot_get_past_the_limit() {
+    let dir = TempDir::new("net-rush");
+    let directory = Directory::new();
+    let (_nec, nec_net) = networked_with(&dir, "~nec", &directory, NetConfig { max_connections: 2, ..NetConfig::default() });
+    let names = ["bus", "doz", "fen", "hul", "lyn", "mer", "nup", "pes"];
+    for (n, name) in names.iter().enumerate() {
+        let public = ed25519_dalek::SigningKey::from_bytes(&[n as u8 + 10; 32]).verifying_key().to_bytes();
+        directory.set(name, public, "127.0.0.1:9".parse().unwrap()).unwrap();
+    }
+    // Eight ships call at the same moment and each holds on to its connection. Two are let in.
+    let (addr, gate) = (nec_net.addr(), std::sync::Barrier::new(names.len()));
+    let answered: usize = std::thread::scope(|scope| {
+        let callers: Vec<_> = (0..names.len())
+            .map(|n| {
+                let gate = &gate;
+                scope.spawn(move || {
+                    let seed = [n as u8 + 10; 32];
+                    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    tokio.block_on(async {
+                        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+                        gate.wait();
+                        let connecting = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), addr, "nec").unwrap();
+                        let Ok(Ok(connection)) = tokio::time::timeout(Duration::from_secs(3), connecting).await else { return false };
+                        let answered = exchange(&connection, &ping_bytes()).await.is_some_and(|reply| reply.body.is_some());
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        answered
+                    })
+                })
+            })
+            .collect();
+        callers.into_iter().map(|caller| caller.join().unwrap() as usize).sum()
+    });
+    assert_eq!(answered, 2, "{answered} callers were answered with room for two");
+}
+
+#[test]
+fn a_ship_reads_only_so_many_requests_at_once() {
+    let dir = TempDir::new("net-busy");
+    let directory = Directory::new();
+    // Room to read one request at a time.
+    let cfg = NetConfig { max_message_bytes: 4096, max_reading_bytes: 4096, ..NetConfig::default() };
+    let (_nec, nec_net) = networked_with(&dir, "~nec", &directory, cfg);
+    let seed = [5u8; 32];
+    let public = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    directory.set("~bus", public, "127.0.0.1:9".parse().unwrap()).unwrap();
+
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+        // One request is begun and left unfinished. It holds the room.
+        let request = ping_bytes();
+        let (mut slow, mut slow_reply) = connection.open_bi().await.unwrap();
+        slow.write_all(&request[..1]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // A second is told to try again, at once, and is not read.
+        let busy = exchange(&connection, &request).await.expect("an answer");
+        assert!(busy.body.is_none() && busy.refused.contains("busy"), "{busy:?}");
+        // When the first is finished it is answered, and then there is room again.
+        slow.write_all(&request[1..]).await.unwrap();
+        slow.finish().unwrap();
+        let answer = slow_reply.read_to_end(4096).await.unwrap();
+        assert!(ship_proto::PeerReply::decode(&*answer).unwrap().body.is_some());
+        assert!(exchange(&connection, &request).await.is_some_and(|reply| reply.body.is_some()));
+    });
+
+    // A request that arrives a byte at a time is the same request, and one that is too long
+    // is refused however it arrives.
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+        let (mut send, mut receive) = connection.open_bi().await.unwrap();
+        for byte in ping_bytes() {
+            send.write_all(&[byte]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send.finish().unwrap();
+        assert!(ship_proto::PeerReply::decode(&*receive.read_to_end(4096).await.unwrap()).unwrap().body.is_some());
+
+        let long = ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Ping(ship_proto::Ping { nonce: vec![0; 5000] })) };
+        let (mut send, mut receive) = connection.open_bi().await.unwrap();
+        for piece in long.encode_to_vec().chunks(700) {
+            if send.write_all(piece).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = send.finish();
+        let reply = tokio::time::timeout(Duration::from_secs(3), receive.read_to_end(4096)).await;
+        let answered = matches!(reply, Ok(Ok(bytes)) if ship_proto::PeerReply::decode(&*bytes).is_ok_and(|reply| reply.body.is_some()));
+        assert!(!answered, "a request over the limit was answered");
+    });
+
+    // Limits that cannot hold are refused when the network starts, without bringing it down.
+    let impossible = NetConfig { max_message_bytes: 4096, max_reading_bytes: 100, ..NetConfig::default() };
+    assert!(Network::start(_nec.clone(), directory.clone(), impossible).is_err());
+    let absurd = NetConfig { max_reading_bytes: usize::MAX, ..NetConfig::default() };
+    assert!(Network::start(_nec.clone(), directory.clone(), absurd).is_err());
+    // A time limit has to be one a clock can keep: not none, not endless, and not so long that
+    // it is no limit.
+    for limit in [Duration::ZERO, Duration::MAX, Duration::from_secs(100 * 365 * 24 * 60 * 60), Duration::from_secs(24 * 60 * 60 + 1)] {
+        let request = NetConfig { request_timeout: limit, ..NetConfig::default() };
+        assert!(Network::start(_nec.clone(), directory.clone(), request).is_err(), "{limit:?}");
+        let idle = NetConfig { idle_timeout: limit, ..NetConfig::default() };
+        assert!(Network::start(_nec.clone(), directory.clone(), idle).is_err(), "{limit:?}");
+    }
+    let day = NetConfig { request_timeout: Duration::from_secs(24 * 60 * 60), ..NetConfig::default() };
+    assert!(Network::start(_nec.clone(), directory.clone(), day).is_ok());
+}
+
+#[test]
+fn the_network_can_be_used_and_stopped_from_inside_async_code() {
+    let (a, b) = (TempDir::new("net-async-a"), TempDir::new("net-async-b"));
+    let directory = Directory::new();
+    let (_zod, zod_net) = networked(&a, "~zod", &directory);
+    let (_nec, nec_net) = networked(&b, "~nec", &directory);
+    // Code that is itself running on an async runtime, of its own, calls and then lets go of
+    // the network. Neither may bring that code down.
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let (taken, zod) = (nec_net.addr().to_string(), _zod.clone());
+    tokio.block_on(async move {
+        assert_eq!(zod_net.ping("~zod", "~nec").unwrap().ship, "nec");
+        // A network that fails to start, here because its address is in use, fails with an
+        // error. It has threads of its own by then, and giving them up must not bring this
+        // code down either.
+        let clash = Network::start(zod, directory.clone(), NetConfig { addr: taken, ..NetConfig::default() });
+        assert!(clash.is_err());
+        drop(zod_net);
+        drop(nec_net);
+    });
+}
+
+#[test]
+fn a_ship_that_never_answers_is_given_up_on_and_cannot_tie_up_every_request() {
+    let dir = TempDir::new("net-mute");
+    let directory = Directory::new();
+    let cfg = NetConfig { max_requests: 2, request_timeout: Duration::from_millis(1500), ..NetConfig::default() };
+    let (_zod, zod_net) = networked_with(&dir, "~zod", &directory, cfg);
+    let listed = [5u8; 32];
+    let public = ed25519_dalek::SigningKey::from_bytes(&listed).verifying_key().to_bytes();
+    // A ship that proves who it is, takes requests, and never answers them.
+    let (addr, _running, _) = stand_in_ship_that(listed, listed, false);
+    directory.set("~nec", public, addr).unwrap();
+
+    std::thread::scope(|scope| {
+        // Two requests go out and wait. That is as many as this runtime may have out at once.
+        let waiting: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    let started = Instant::now();
+                    (zod_net.ping("~zod", "~nec"), started.elapsed())
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(500));
+        // A third is turned down at once, without waiting its turn behind them.
+        let started = Instant::now();
+        assert!(matches!(zod_net.ping("~zod", "~nec"), Err(NetError::Unreachable(_))));
+        assert!(started.elapsed() < Duration::from_millis(400), "{:?}", started.elapsed());
+        // The two are given up on when their time is up, and not before or long after.
+        for request in waiting {
+            let (outcome, took) = request.join().unwrap();
+            assert!(matches!(outcome, Err(NetError::TimedOut)), "{outcome:?}");
+            assert!(took >= Duration::from_millis(1400) && took < Duration::from_secs(4), "{took:?}");
+        }
+    });
+    // Their places are free again once they have ended.
+    assert!(matches!(zod_net.ping("~zod", "~nec"), Err(NetError::TimedOut)));
+
+    // With room for one request at a time, one after another is always in turn: the place is
+    // given up before the caller hears its answer.
+    let (b, c) = (TempDir::new("net-turn-b"), TempDir::new("net-turn-c"));
+    let (_bus, bus_net) = networked_with(&b, "~bus", &directory, NetConfig { max_requests: 1, ..NetConfig::default() });
+    let (_doz, _doz_net) = networked(&c, "~doz", &directory);
+    for _ in 0..200 {
+        bus_net.ping("~bus", "~doz").unwrap();
+    }
+}
+
+#[test]
+fn a_newer_connection_from_a_ship_takes_the_place_of_its_older_one() {
+    let dir = TempDir::new("net-replace");
+    let directory = Directory::new();
+    let (_nec, nec_net) = networked(&dir, "~nec", &directory);
+    let seed = [5u8; 32];
+    let public = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    directory.set("~bus", public, "127.0.0.1:9".parse().unwrap()).unwrap();
+
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connect = || endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap();
+        let first = connect().await.unwrap();
+        assert!(exchange(&first, &ping_bytes()).await.is_some());
+        // The same ship connects again, to the same ship. It holds one place, not two: the
+        // first connection is closed, so connecting over and over gains it nothing.
+        let second = connect().await.unwrap();
+        assert!(exchange(&second, &ping_bytes()).await.is_some());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(first.close_reason().is_some(), "the older connection was left open");
+        assert!(exchange(&second, &ping_bytes()).await.is_some());
+        // And again. The first connection's ending must not have upset the record of the
+        // second, or the second would now be left open beside the third.
+        let third = connect().await.unwrap();
+        assert!(exchange(&third, &ping_bytes()).await.is_some());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(second.close_reason().is_some(), "the second connection was left open beside the third");
+        assert!(exchange(&third, &ping_bytes()).await.is_some());
+        assert_eq!(nec_net.open_connections(), 1);
+    });
+}
+
+#[test]
+fn a_runtime_calls_only_so_many_ships_at_once() {
+    let (a, b, c) = (TempDir::new("net-calls-a"), TempDir::new("net-calls-b"), TempDir::new("net-calls-c"));
+    let directory = Directory::new();
+    let (_zod, zod_net) = networked_with(&a, "~zod", &directory, NetConfig { max_calls: 1, ..impatient() });
+    let (_nec, nec_net) = networked_with(&b, "~nec", &directory, impatient());
+    let (_bus, _bus_net) = networked_with(&c, "~bus", &directory, impatient());
+
+    // One ship may be called at a time. A second is not, while the first connection lives.
+    zod_net.ping("~zod", "~nec").unwrap();
+    assert!(matches!(zod_net.ping("~zod", "~bus"), Err(NetError::Unreachable(_))));
+    zod_net.ping("~zod", "~nec").unwrap();
+    // Once that connection has closed, its place is free for another.
+    drop(nec_net);
+    let freed = (0..20).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        zod_net.ping("~zod", "~bus").is_ok()
+    });
+    assert!(freed, "the place was never given up");
+
+    // A ship dropped from the directory gives up its place at once, though its connection is
+    // still open and the ship itself is still there.
+    let d = TempDir::new("net-calls-d");
+    let (_doz, _doz_net) = networked_with(&d, "~doz", &directory, impatient());
+    directory.remove("~bus");
+    assert_eq!(zod_net.ping("~zod", "~doz").unwrap().ship, "doz");
+    // Asking for the ship that was dropped says so, and closes what was open to it.
+    assert!(matches!(zod_net.ping("~zod", "~bus"), Err(NetError::Unlisted(_))));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(zod_net.open_connections(), 1);
+}

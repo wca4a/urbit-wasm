@@ -3,6 +3,7 @@
 //! each event is one transaction.
 
 mod host;
+pub mod net;
 pub mod server;
 mod ship;
 mod store;
@@ -286,8 +287,14 @@ pub(crate) struct Inner {
     /// slot locks are only ever tried, never waited on.
     awake: Mutex<HashMap<String, SlotRef>>,
     /// Held while a ship's file and key are put in place together, and while a key is read, so
-    /// that nothing ever sees one without the matching other. Nothing else is locked under it.
+    /// that nothing ever sees one without the matching other. Only `identities` is locked
+    /// under it.
     lifecycle: Mutex<()>,
+    /// The signing keys of the ships this runtime holds, kept in memory once the network has
+    /// started. The network asks on every connection and every request, from places that must
+    /// not wait on a disk. A ship's key does not change while the runtime runs: nothing here
+    /// replaces one, and the files of a running runtime must not be swapped underneath it.
+    identities: std::sync::RwLock<Option<HashMap<String, Arc<SigningKey>>>>,
     awake_changed: Condvar,
     /// For each ship, how many events have added to its logs since the runtime started. A
     /// reader waiting for new entries sleeps on `logs_changed` until this moves. Nothing else
@@ -707,6 +714,7 @@ impl Runtime {
                 slots: Mutex::new(HashMap::new()),
                 awake: Mutex::new(HashMap::new()),
                 lifecycle: Mutex::new(()),
+                identities: std::sync::RwLock::new(None),
                 awake_changed: Condvar::new(),
                 log_growth: Mutex::new(HashMap::new()),
                 logs_changed: Condvar::new(),
@@ -887,6 +895,41 @@ impl Runtime {
             return Err(Error::UnknownShip(name));
         }
         Ok(load_key(&self.inner.key_path(&name))?.verifying_key().to_bytes())
+    }
+
+    /// A ship's signing key, for proving to other ships that this runtime speaks for it. It
+    /// never leaves the runtime.
+    pub(crate) fn signing_key(&self, ship: &str) -> Result<Arc<SigningKey>, Error> {
+        let name = canonical_ship(ship)?;
+        // Memory only. This is called from inside connections being made, where waiting on a
+        // disk or on another thread's lock would hold up the whole network.
+        let identities = self.inner.identities.read().unwrap_or_else(PoisonError::into_inner);
+        identities.as_ref().and_then(|held| held.get(&name).cloned()).ok_or(Error::UnknownShip(name))
+    }
+
+    /// Read every ship's signing key into memory, if that has not been done. The network calls
+    /// this once as it starts, and fails to start if the keys cannot be read. From then on new
+    /// ships are added as they are made. A ship whose key file cannot be read is left out: it
+    /// cannot speak on the network until the runtime is restarted with the file repaired.
+    pub(crate) fn load_identities(&self) -> Result<(), Error> {
+        // Nothing can be published while this runs.
+        let _together = lock(&self.inner.lifecycle);
+        let mut identities = self.inner.identities.write().unwrap_or_else(PoisonError::into_inner);
+        if identities.is_some() {
+            return Ok(());
+        }
+        let mut held = HashMap::new();
+        for entry in fs::read_dir(&self.inner.ships_dir)? {
+            let file = entry?.file_name();
+            let Some(ship) = file.to_str().and_then(|file| file.strip_suffix(".ship")).and_then(|ship| canonical_ship(ship).ok()) else {
+                continue;
+            };
+            if let Ok(key) = load_key(&self.inner.key_path(&ship)) {
+                held.insert(ship, Arc::new(key));
+            }
+        }
+        *identities = Some(held);
+        Ok(())
     }
 
     /// Where a ship's log currently ends: the number and hash of its newest entry, or `None` if
@@ -1195,7 +1238,15 @@ impl Inner {
         }
         write_key(&self.key_path(name), key)?;
         match fs::hard_link(staged, &dest_file) {
-            Ok(()) => Ok(sync_dir(&self.ships_dir)?),
+            Ok(()) => {
+                // The network learns of a new ship here, the one place a ship comes to be. The
+                // ship is in place from this moment, so this comes before anything that can
+                // still fail: a ship that exists is never unknown to the network.
+                if let Some(held) = self.identities.write().unwrap_or_else(PoisonError::into_inner).as_mut() {
+                    held.insert(name.to_string(), Arc::new(key.clone()));
+                }
+                Ok(sync_dir(&self.ships_dir)?)
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::ShipExists(name.to_string())),
             Err(e) => Err(e.into()),
         }
