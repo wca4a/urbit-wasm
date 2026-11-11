@@ -9,6 +9,8 @@ anyhow = "1"
 libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled", "limits"] }
 sha2 = "0.10"
+stacker = "0.1"
+ship-proto = { path = "../proto" }
 wasm-encoder = "0.226"
 wasmparser = "0.226"
 wasmtime = { version = "31", default-features = false, features = ["cranelift", "runtime", "std"] }

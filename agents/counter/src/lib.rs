@@ -58,4 +58,9 @@ fn handle(event: &[u8]) -> Vec<u8> {
     reply.into_bytes()
 }
 
-agent!(handle);
+/// Read handler: the payload is a key, the reply its current value.
+fn value(key: &[u8]) -> Vec<u8> {
+    read(&String::from_utf8_lossy(key)).to_string().into_bytes()
+}
+
+agent!(handle, read = value);

@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use runtime::{Config, Durability, Runtime};
+use runtime::{Config, Durability, Manifest, Runtime};
 
 struct Args {
     ships: usize,
@@ -15,6 +15,7 @@ struct Args {
     max_awake: usize,
     durability: Durability,
     wasm: PathBuf,
+    kernel: PathBuf,
     dir: PathBuf,
 }
 
@@ -27,6 +28,7 @@ fn parse_args() -> Args {
         max_awake: 64,
         durability: Durability::Full,
         wasm: PathBuf::from("target/wasm/wasm32-unknown-unknown/release/counter.wasm"),
+        kernel: PathBuf::from("target/wasm/wasm32-unknown-unknown/release/kernel.wasm"),
         dir: std::env::temp_dir().join(format!("urbit-wasm-loadtest-{}", std::process::id())),
     };
     let mut raw = std::env::args().skip(1);
@@ -47,6 +49,7 @@ fn parse_args() -> Args {
                 }
             }
             "--wasm" => args.wasm = PathBuf::from(&value),
+            "--kernel" => args.kernel = PathBuf::from(&value),
             "--dir" => args.dir = PathBuf::from(&value),
             _ => panic!("unknown flag {flag}"),
         }
@@ -91,13 +94,16 @@ fn percentile(sorted: &[u32], p: f64) -> f64 {
 
 fn main() {
     let args = parse_args();
-    let wasm = std::fs::read(&args.wasm).unwrap_or_else(|_| {
-        panic!(
-            "agent not found at {}; build it with: cargo build -p counter --release \
-             --target wasm32-unknown-unknown --target-dir target/wasm",
-            args.wasm.display()
-        )
-    });
+    let load = |path: &Path| {
+        std::fs::read(path).unwrap_or_else(|_| {
+            panic!(
+                "module not found at {}; build it with: cargo build -p kernel -p counter --release \
+                 --target wasm32-unknown-unknown --target-dir target/wasm",
+                path.display()
+            )
+        })
+    };
+    let (wasm, kernel) = (load(&args.wasm), load(&args.kernel));
     // Only ever delete a directory this run created.
     std::fs::create_dir(&args.dir)
         .unwrap_or_else(|e| panic!("{} must not already exist: {e}", args.dir.display()));
@@ -107,10 +113,11 @@ fn main() {
 
     let started = Instant::now();
     let hash = rt.add_module(&wasm).expect("add module");
+    let kernel = rt.add_module(&kernel).expect("add kernel");
     let names: Vec<String> = (0..args.ships).map(ship_name).collect();
     for name in &names {
-        rt.create_ship(name).expect("create ship");
-        rt.install(name, "counter", &hash).expect("install");
+        rt.create_ship(name, &kernel).expect("create ship");
+        rt.install(name, "counter", &hash, &Manifest::default()).expect("install");
     }
     let setup = started.elapsed();
     rt.sleep_idle(Duration::ZERO);

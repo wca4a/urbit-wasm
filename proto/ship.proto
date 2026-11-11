@@ -1,0 +1,120 @@
+// Messages exchanged between the runtime, the kernel, and agents.
+//
+// Evolution rule: fields are only ever added. A field number is never reused or given a new
+// meaning, and a new field must be safe for an old reader to ignore and for a new reader to
+// find absent. Anything else gets a new message or interface name.
+syntax = "proto3";
+
+package ship.v1;
+
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  // Changes state. Runs as its own event and transaction.
+  KIND_COMMAND = 1;
+  // Returns data and cannot change anything.
+  KIND_READ = 2;
+}
+
+// Who is asking.
+message Source {
+  // The ship's owner, through a client or the runtime's API.
+  bool owner = 1;
+  // Otherwise, the local agent making the request.
+  string agent = 2;
+}
+
+// What an agent is told about the call it is handling.
+message Invocation {
+  Kind kind = 1;
+  string interface = 2;
+  Source source = 3;
+}
+
+// Permission to use one interface of one agent.
+message Grant {
+  string agent = 1;
+  string interface = 2;
+}
+
+message Provide {
+  string interface = 1;
+  // Any agent on the ship may use a public interface without declaring it.
+  bool public = 2;
+}
+
+message Use {
+  string agent = 1;
+  string interface = 2;
+  bool read = 3;
+  bool send = 4;
+}
+
+// What an agent offers and what it needs. Approved by the owner at install.
+message Manifest {
+  repeated Provide provides = 1;
+  repeated Use uses = 2;
+}
+
+// Runtime to kernel: may this call go ahead, and with what permissions?
+message RouteRequest {
+  Source source = 1;
+  string agent = 2;
+  Kind kind = 3;
+  string interface = 4;
+}
+
+message RouteReply {
+  bool allowed = 1;
+  string reason = 2;
+  // Content hash of the module to run.
+  string module = 3;
+  // What the called agent may read and send while handling this call.
+  repeated Grant reads = 4;
+  repeated Grant sends = 5;
+}
+
+message Install {
+  string agent = 1;
+  string module = 2;
+  Manifest manifest = 3;
+}
+
+// Runtime to kernel, on the owner's behalf.
+message AdminRequest {
+  oneof op {
+    Install install = 1;
+    bool list_modules = 2;
+  }
+}
+
+message AdminReply {
+  bool ok = 1;
+  string error = 2;
+  repeated string modules = 3;
+}
+
+// Agent to runtime.
+message ReadRequest {
+  string agent = 1;
+  string interface = 2;
+  bytes payload = 3;
+}
+
+message SendRequest {
+  string agent = 1;
+  string interface = 2;
+  bytes payload = 3;
+}
+
+// The kernel's own stored state. A kernel rewrites the whole registry when it changes, and
+// fields it does not know are lost in the rewrite, so a kernel must never be run against a
+// registry written by a newer one. A kernel upgrade migrates the registry forward.
+message Registered {
+  string name = 1;
+  string module = 2;
+  Manifest manifest = 3;
+}
+
+message Registry {
+  repeated Registered agents = 1;
+}

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["runtime", "sdk", "agents/counter"]
-# The SDK and agents only link for wasm32, so plain `cargo build` / `cargo test` cover the runtime.
+members = ["runtime", "proto", "sdk", "kernel", "agents/counter", "agents/tally"]
+# The SDK, kernel, and agents only link for wasm32, so plain `cargo build` / `cargo test` cover the runtime.
 default-members = ["runtime"]
 
 [workspace.package]

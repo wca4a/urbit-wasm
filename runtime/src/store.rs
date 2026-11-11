@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
@@ -12,17 +12,33 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 
 use crate::{AuditEntry, Config, Durability, Effect, Error};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Each pending message counts as its payload plus this, so empty messages still use up quota.
-pub const OUTBOX_MESSAGE_OVERHEAD: u64 = 64;
+pub const MESSAGE_OVERHEAD: u64 = 64;
+
+const MAX_INTERFACE_BYTES: usize = 128;
+
+/// A command one agent sent another, waiting to run as its own event.
+pub struct Queued {
+    pub seq: i64,
+    pub source: String,
+    pub agent: String,
+    pub interface: String,
+    pub payload: Vec<u8>,
+}
+
+impl Queued {
+    pub fn cost(&self) -> u64 {
+        self.payload.len() as u64 + MESSAGE_OVERHEAD
+    }
+}
 
 /// Far below the point where SQLite refuses to hand out another AUTOINCREMENT value.
 const MAX_SEQ: i64 = 1 << 62;
 
 const SCHEMA: &str = "
 CREATE TABLE meta (key TEXT PRIMARY KEY, value) WITHOUT ROWID;
-CREATE TABLE agents (name TEXT PRIMARY KEY, module TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE kv (
     agent TEXT NOT NULL,
     key BLOB NOT NULL,
@@ -34,6 +50,13 @@ CREATE TABLE outbox (
     agent TEXT NOT NULL,
     payload BLOB NOT NULL
 );
+CREATE TABLE inbox (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    interface TEXT NOT NULL,
+    payload BLOB NOT NULL
+);
 CREATE TABLE audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     at_ms INTEGER NOT NULL,
@@ -43,7 +66,9 @@ CREATE TABLE audit (
 );
 ";
 
-pub fn create(path: &Path, name: &str) -> Result<(), Error> {
+/// Create a ship file at `path`, which must not exist. The caller creates it under a private
+/// name and publishes it afterwards, so a failure here never leaves a half-made ship behind.
+pub fn create(path: &Path, name: &str, kernel: &str, max_bytes: u64) -> Result<(), Error> {
     // create_new makes "does this ship already exist" atomic.
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(_) => {}
@@ -52,19 +77,32 @@ pub fn create(path: &Path, name: &str) -> Result<(), Error> {
         }
         Err(e) => return Err(e.into()),
     }
-    let conn = open(path, Durability::Full)?;
+    let conn = open(path, Durability::Full, max_bytes)?;
+    // Not WAL while the file is being built: a commit must put the data in the file itself,
+    // because only that file is published.
+    let mode: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+    if mode != "delete" {
+        return Err(Error::BadShipFile(format!("{name}: could not prepare a new ship file")));
+    }
     conn.execute_batch("BEGIN")?;
     conn.execute_batch(SCHEMA)?;
-    conn.execute("INSERT INTO meta VALUES ('schema', ?1), ('name', ?2)", params![SCHEMA_VERSION, name])?;
+    conn.execute(
+        "INSERT INTO meta VALUES ('schema', ?1), ('name', ?2), ('kernel', ?3)",
+        params![SCHEMA_VERSION, name, kernel],
+    )?;
     conn.execute_batch("COMMIT")?;
     Ok(())
 }
 
-pub fn open(path: &Path, durability: Durability) -> Result<Connection, Error> {
+pub fn open(path: &Path, durability: Durability, max_bytes: u64) -> Result<Connection, Error> {
     // NO_MUTEX: the runtime guarantees one thread at a time per ship.
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
+    // The ship's storage limit. A write that would grow the file past it fails as "full".
+    let page: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let pages = (max_bytes / page.max(1) as u64).clamp(1, u32::MAX as u64);
+    conn.query_row(&format!("PRAGMA max_page_count = {pages}"), [], |r| r.get::<_, i64>(0))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     match durability {
         Durability::Full => {
@@ -92,15 +130,50 @@ pub fn check_meta(conn: &Connection, name: &str) -> Result<(), Error> {
     }
 }
 
-pub fn agents(conn: &Connection) -> Result<Vec<(String, String)>, Error> {
-    let mut stmt = conn.prepare("SELECT name, module FROM agents")?;
-    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<Result<_, _>>()?)
+/// Open a ship file without changing anything about it, not even its journal mode.
+pub fn open_read_only(path: &Path) -> Result<Connection, Error> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    Ok(conn)
 }
 
-pub fn set_agent(conn: &Connection, agent: &str, module: &str) -> Result<(), Error> {
-    conn.execute("INSERT OR REPLACE INTO agents VALUES (?1, ?2)", params![agent, module])?;
-    Ok(())
+/// The content hash of the ship's kernel module.
+pub fn kernel(conn: &Connection) -> Result<String, Error> {
+    let stored = conn.query_row("SELECT value FROM meta WHERE key = 'kernel'", [], |r| r.get(0)).optional()?;
+    match stored {
+        Some(rusqlite::types::Value::Text(hash)) => Ok(hash),
+        _ => Err(Error::BadShipFile("ship file names no kernel".into())),
+    }
+}
+
+pub fn inbox_push(conn: &Connection, source: &str, agent: &str, interface: &str, payload: &[u8]) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT INTO inbox (source, agent, interface, payload) VALUES (?1, ?2, ?3, ?4)")?
+        .execute(params![source, agent, interface, payload])
+        .map(drop)
+}
+
+/// Remove and return the oldest queued command. Call inside the transaction that will run it,
+/// so that taking it and its effects land together.
+pub fn inbox_pop(conn: &Connection) -> rusqlite::Result<Option<Queued>> {
+    let oldest = conn
+        .prepare_cached("SELECT seq, source, agent, interface, payload FROM inbox ORDER BY seq LIMIT 1")?
+        .query_row([], |r| {
+            Ok(Queued { seq: r.get(0)?, source: r.get(1)?, agent: r.get(2)?, interface: r.get(3)?, payload: r.get(4)? })
+        })
+        .optional()?;
+    if let Some(queued) = &oldest {
+        inbox_delete(conn, queued.seq)?;
+    }
+    Ok(oldest)
+}
+
+pub fn inbox_delete(conn: &Connection, seq: i64) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM inbox WHERE seq = ?1")?.execute([seq]).map(drop)
+}
+
+pub fn inbox_bytes(conn: &Connection) -> Result<u64, Error> {
+    Ok(conn.query_row("SELECT COALESCE(SUM(LENGTH(payload) + ?1), 0) FROM inbox", [MESSAGE_OVERHEAD as i64], |r| r.get::<_, i64>(0))? as u64)
 }
 
 /// Returns the value's length, and the value itself only when it fits in `cap` bytes.
@@ -131,7 +204,7 @@ pub fn outbox_push(conn: &Connection, agent: &str, payload: &[u8]) -> rusqlite::
 }
 
 pub fn outbox_bytes(conn: &Connection) -> Result<u64, Error> {
-    Ok(conn.query_row("SELECT COALESCE(SUM(LENGTH(payload) + ?1), 0) FROM outbox", [OUTBOX_MESSAGE_OVERHEAD as i64], |r| r.get::<_, i64>(0))? as u64)
+    Ok(conn.query_row("SELECT COALESCE(SUM(LENGTH(payload) + ?1), 0) FROM outbox", [MESSAGE_OVERHEAD as i64], |r| r.get::<_, i64>(0))? as u64)
 }
 
 /// Remove and return the oldest messages: at most `max_messages`, and at most `max_bytes` in
@@ -156,13 +229,13 @@ pub fn outbox_drain(conn: &Connection, max_messages: usize, max_bytes: usize) ->
         }
         Ok(effects)
     })();
-    match drained {
-        Ok(effects) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(effects)
-        }
+    // A failed commit can leave the transaction open, so every failure ends in a rollback.
+    match drained.and_then(|effects| conn.execute_batch("COMMIT").map(|()| effects)) {
+        Ok(effects) => Ok(effects),
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            if !conn.is_autocommit() {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
             Err(e.into())
         }
     }
@@ -178,13 +251,24 @@ pub fn audit(conn: &Connection, agent: &str, event: &[u8], ok: bool, keep: u64) 
     Ok(())
 }
 
-/// Record a rejected input in a transaction of its own. Best effort: the caller's rejection is
-/// the result that matters, so a failure to log it is not reported.
-pub fn audit_failure(conn: &Connection, agent: &str, event: &[u8], keep: u64) {
-    if conn.execute_batch("BEGIN IMMEDIATE").is_ok() {
-        let logged = audit(conn, agent, event, false, keep);
-        let _ = conn.execute_batch(if logged.is_ok() { "COMMIT" } else { "ROLLBACK" });
+/// Record a rejected input in a transaction of its own and, when it was a queued command, take
+/// it off the queue in that same transaction. Leaves no transaction open, whatever happens.
+pub fn record_rejection(conn: &Connection, queued: Option<i64>, agent: &str, event: &[u8], keep: u64) -> rusqlite::Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let saved = queued
+        .map_or(Ok(()), |seq| inbox_delete(conn, seq))
+        .and_then(|()| audit(conn, agent, event, false, keep))
+        .and_then(|()| conn.execute_batch("COMMIT"));
+    if saved.is_err() && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
     }
+    saved
+}
+
+/// Record a rejected input that never reached a handler. Best effort: the caller's rejection
+/// is the result that matters, so a failure to log it is not reported.
+pub fn audit_failure(conn: &Connection, agent: &str, event: &[u8], keep: u64) {
+    let _ = record_rejection(conn, None, agent, event, keep);
 }
 
 /// The newest audit rows, newest first.
@@ -249,15 +333,16 @@ fn bad_row(why: &str) -> Error {
 /// Copy a ship file from an untrusted source into a freshly created file at `dest`.
 ///
 /// The source must have exactly this runtime's schema, so it cannot carry triggers or views, and
-/// every row is re-validated on the way across. Returns the module hashes the ship needs.
+/// every row is re-validated on the way across. Returns the hash of the ship's kernel module.
 pub fn import(
     src: &Path,
     dest: &Path,
     name: &str,
     cfg: &Config,
+    deadline: Instant,
     check_agent: fn(&str) -> Result<(), Error>,
     check_hash: fn(&str) -> Result<(), Error>,
-) -> Result<Vec<String>, Error> {
+) -> Result<String, Error> {
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA)?;
     let expected = schema_objects(&reference, usize::MAX)?;
@@ -288,12 +373,14 @@ pub fn import(
     if verdict != "ok" {
         return Err(bad_row("file is damaged"));
     }
-    let deadline = Instant::now() + Duration::from_millis(cfg.max_import_millis);
     let in_time = || if Instant::now() > deadline { Err(bad_row("took too long")) } else { Ok(()) };
+    in_time()?;
     check_meta(&from, name)?;
+    let kernel_hash = kernel(&from)?;
+    check_hash(&kernel_hash)?;
 
-    create(dest, name)?;
-    let to = open(dest, Durability::Full)?;
+    create(dest, name, &kernel_hash, cfg.max_ship_bytes)?;
+    let to = open(dest, Durability::Full, cfg.max_ship_bytes)?;
     // Leave WAL mode so that a commit means the data is in the main file, which is the only
     // file that gets published. The switch itself fails if earlier writes cannot be folded in.
     let mode: String = to.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
@@ -301,20 +388,6 @@ pub fn import(
         return Err(bad_row("could not finalize the imported file"));
     }
     to.execute_batch("BEGIN IMMEDIATE")?;
-    let mut hashes = Vec::new();
-
-    let mut stmt = from.prepare("SELECT name, module FROM agents")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let (agent, hash) = (text(row, 0)?, text(row, 1)?);
-        check_agent(&agent)?;
-        check_hash(&hash)?;
-        if hashes.len() >= cfg.max_agents_per_ship {
-            return Err(bad_row("more agents than this runtime allows"));
-        }
-        set_agent(&to, &agent, &hash)?;
-        hashes.push(hash);
-    }
 
     let mut stmt = from.prepare("SELECT agent, key, value FROM kv")?;
     let mut rows = stmt.query([])?;
@@ -336,11 +409,27 @@ pub fn import(
         let (seq, agent) = (integer(row, 0)?, text(row, 1)?);
         check_agent(&agent)?;
         let payload = blob(row, 2, cfg.limits.max_effect_bytes)?;
-        pending += payload.len() as u64 + OUTBOX_MESSAGE_OVERHEAD;
+        pending += payload.len() as u64 + MESSAGE_OVERHEAD;
         if seq == 0 || pending > cfg.max_outbox_bytes {
             return Err(bad_row("outbox is larger than this runtime allows"));
         }
         to.execute("INSERT INTO outbox VALUES (?1, ?2, ?3)", params![seq, agent, payload])?;
+    }
+
+    let mut pending = 0u64;
+    let mut stmt = from.prepare("SELECT seq, source, agent, interface, payload FROM inbox ORDER BY seq")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (seq, source, agent, interface) = (integer(row, 0)?, text(row, 1)?, text(row, 2)?, text(row, 3)?);
+        check_agent(&source)?;
+        check_agent(&agent)?;
+        let payload = blob(row, 4, cfg.max_event_bytes)?;
+        pending += payload.len() as u64 + MESSAGE_OVERHEAD;
+        if seq == 0 || interface.len() > MAX_INTERFACE_BYTES || pending > cfg.max_inbox_bytes {
+            return Err(bad_row("queued commands are larger than this runtime allows"));
+        }
+        to.execute("INSERT INTO inbox VALUES (?1, ?2, ?3, ?4, ?5)", params![seq, source, agent, interface, payload])?;
     }
 
     let mut stmt = from.prepare("SELECT seq, at_ms, agent, event, ok FROM audit ORDER BY seq DESC LIMIT ?1")?;
@@ -355,7 +444,7 @@ pub fn import(
 
     // Carry the counters across so sequence numbers are never reused after an import. `integer`
     // bounds them, so a source cannot hand over a counter that is already exhausted.
-    let mut counters = [("outbox", None), ("audit", None)];
+    let mut counters = [("outbox", None), ("inbox", None), ("audit", None)];
     let mut stmt = from.prepare("SELECT name, seq FROM sqlite_sequence")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -373,5 +462,5 @@ pub fn import(
     }
 
     to.execute_batch("COMMIT")?;
-    Ok(hashes)
+    Ok(kernel_hash)
 }

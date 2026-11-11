@@ -1,5 +1,6 @@
-//! A runtime that holds many ships. Each ship is one SQLite file plus the WASM agents installed
-//! on it; it handles one event at a time, and each event is one transaction.
+//! A runtime that holds many ships. Each ship is one SQLite file, a kernel module that decides
+//! what may run, and the WASM agents installed on it. A ship handles one event at a time, and
+//! each event is one transaction.
 
 mod host;
 mod ship;
@@ -18,13 +19,22 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+use ship_proto::admin_request::Op;
+use ship_proto::{AdminRequest, Install, Source};
 use wasmtime::{Engine, InstancePre, Linker, Module};
+
+pub use ship_proto::{Manifest, Provide, Use};
 
 use host::Ctx;
 use ship::Ship;
 
 /// How often the watchdog advances the clock that event deadlines are measured against.
 pub(crate) const EPOCH_TICK_MILLIS: u64 = 10;
+
+/// Native stack each WASM instance may use.
+pub(crate) const WASM_STACK_BYTES: usize = 512 << 10;
+
+const MAX_INTERFACE_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Durability {
@@ -46,11 +56,15 @@ pub struct Limits {
 pub struct Config {
     /// Compute budget for one event, shared by guest instructions and host calls.
     pub fuel_per_event: u64,
+    /// Compute budget for each decision the kernel makes, separate from the agent's.
+    pub kernel_fuel: u64,
     /// Wall-clock cap on one event. Fuel cannot see how large a bulk memory operation is.
     pub max_event_millis: u64,
     pub max_memory_bytes: usize,
+    /// How large a ship's file may grow. A write that would pass it is rejected, like any other
+    /// event that breaks a limit.
+    pub max_ship_bytes: u64,
     pub max_module_bytes: usize,
-    pub max_agents_per_ship: usize,
     /// Largest ship file `import_ship` will read, and the longest it will spend reading one.
     pub max_import_bytes: u64,
     pub max_import_millis: u64,
@@ -60,6 +74,11 @@ pub struct Config {
     /// Undelivered outgoing messages a ship may hold, counting each as its payload plus a fixed
     /// overhead; events that would exceed it are rejected.
     pub max_outbox_bytes: u64,
+    /// Commands between agents that may be waiting to run, counted the same way.
+    pub max_inbox_bytes: u64,
+    /// Queued commands run straight after the event that caused them, up to this many. The rest
+    /// wait for `run_pending`, so agents that keep sending to each other cannot hold a ship.
+    pub max_queued_per_deliver: usize,
     /// Ships kept open for events at once. Beyond this the least recently used idle ship is put
     /// to sleep first. Creating, importing, and exporting ships open their own files outside
     /// this limit.
@@ -73,16 +92,19 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             fuel_per_event: 100_000_000,
+            kernel_fuel: 50_000_000,
             max_event_millis: 5_000,
             max_memory_bytes: 64 << 20,
+            max_ship_bytes: 1 << 30,
             max_module_bytes: 16 << 20,
-            max_agents_per_ship: 256,
             max_import_bytes: 256 << 20,
             max_import_millis: 60_000,
             max_table_elements: 100_000,
             max_event_bytes: 1 << 20,
             max_reply_bytes: 1 << 20,
             max_outbox_bytes: 64 << 20,
+            max_inbox_bytes: 64 << 20,
+            max_queued_per_deliver: 64,
             max_awake: 64,
             audit_rows: 10_000,
             durability: Durability::Full,
@@ -101,6 +123,8 @@ pub struct Outcome {
     pub reply: Vec<u8>,
     /// Messages this event queued in the ship's outbox.
     pub effects: u32,
+    /// Commands this event sent to other agents on the ship.
+    pub queued: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -123,6 +147,8 @@ pub struct AuditEntry {
 pub enum Rejection {
     OutOfFuel,
     Timeout,
+    /// The kernel refused the call, or a read handler tried to change something.
+    Denied(String),
     Limit(String),
     Trap(String),
 }
@@ -136,7 +162,8 @@ pub enum Error {
     UnknownModule(String),
     BadModule(String),
     BadShipFile(String),
-    TooManyAgents,
+    /// The kernel would not install the agent.
+    InstallRefused(String),
     /// Another runtime already has this data directory open.
     DataDirInUse,
     /// The event was refused. It changed no state and queued no messages. The audit log records
@@ -156,10 +183,11 @@ impl fmt::Display for Error {
             Error::UnknownModule(hash) => write!(f, "no such module: {hash}"),
             Error::BadModule(why) => write!(f, "bad module: {why}"),
             Error::BadShipFile(why) => write!(f, "bad ship file: {why}"),
-            Error::TooManyAgents => write!(f, "ship already has the most agents this runtime allows"),
+            Error::InstallRefused(why) => write!(f, "install refused: {why}"),
             Error::DataDirInUse => write!(f, "another runtime is using this data directory"),
             Error::Rejected(Rejection::OutOfFuel) => write!(f, "event rejected: compute budget exhausted"),
             Error::Rejected(Rejection::Timeout) => write!(f, "event rejected: ran too long"),
+            Error::Rejected(Rejection::Denied(why)) => write!(f, "event rejected: not permitted: {why}"),
             Error::Rejected(Rejection::Limit(why)) => write!(f, "event rejected: limit exceeded: {why}"),
             Error::Rejected(Rejection::Trap(why)) => write!(f, "event rejected: {why}"),
             Error::Store(e) => write!(f, "store error: {e}"),
@@ -215,7 +243,7 @@ pub(crate) struct Inner {
 }
 
 pub struct Runtime {
-    inner: Inner,
+    inner: Arc<Inner>,
     watchdog: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     /// Holds an exclusive lock on the data directory for as long as the runtime lives.
@@ -332,9 +360,28 @@ fn check_agent_name(name: &str) -> Result<(), Error> {
     if ok { Ok(()) } else { Err(Error::InvalidName(name.to_string())) }
 }
 
+fn require_exports(module: &AgentModule, names: &[&str]) -> Result<(), Error> {
+    for name in names {
+        if module.pre.module().get_export(name).and_then(|export| export.func().cloned()).is_none() {
+            return Err(Error::BadModule(format!("missing exported function `{name}`")));
+        }
+    }
+    Ok(())
+}
+
 fn check_hash(hash: &str) -> Result<(), Error> {
     let ok = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if ok { Ok(()) } else { Err(Error::UnknownModule(hash.to_string())) }
+    if ok { Ok(()) } else { Err(Error::BadModule(format!("{hash:?} is not a module hash"))) }
+}
+
+/// The runtime's own rules for what may be called, whatever a ship's kernel says. The name
+/// `kernel` is where the kernel keeps its keys, so nothing else may ever run under it.
+pub(crate) fn check_target(agent: &str, interface: &str) -> Result<(), Error> {
+    check_agent_name(agent)?;
+    if agent == "kernel" || interface.len() > MAX_INTERFACE_BYTES {
+        return Err(Error::InvalidName(format!("{agent} {interface}")));
+    }
+    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -374,6 +421,7 @@ impl Runtime {
         let mut wasm_cfg = wasmtime::Config::new();
         wasm_cfg.consume_fuel(true);
         wasm_cfg.epoch_interruption(true);
+        wasm_cfg.max_wasm_stack(WASM_STACK_BYTES);
         let engine = Engine::new(&wasm_cfg).map_err(|e| Error::BadModule(format!("{e:#}")))?;
         let linker = host::linker(&engine).map_err(|e| Error::BadModule(format!("{e:#}")))?;
 
@@ -392,7 +440,7 @@ impl Runtime {
             watchdog: Some(watchdog),
             stop,
             _dir_lock: dir_lock,
-            inner: Inner {
+            inner: Arc::new(Inner {
                 engine,
                 cfg,
                 linker,
@@ -403,7 +451,7 @@ impl Runtime {
                 slots: Mutex::new(HashMap::new()),
                 awake: Mutex::new(HashMap::new()),
                 awake_changed: Condvar::new(),
-            },
+            }),
         })
     }
 
@@ -422,43 +470,87 @@ impl Runtime {
         Ok(hash)
     }
 
-    pub fn create_ship(&self, name: &str) -> Result<(), Error> {
+    /// Create a ship whose policy is the kernel module with the given hash.
+    pub fn create_ship(&self, name: &str, kernel_hash: &str) -> Result<(), Error> {
         let name = canonical_ship(name)?;
-        store::create(&self.inner.ship_path(&name), &name)?;
-        Ok(sync_dir(&self.inner.ships_dir)?)
+        self.inner.kernel(kernel_hash)?;
+        let dest_file = self.inner.ship_path(&name);
+        if dest_file.exists() {
+            return Err(Error::ShipExists(name));
+        }
+        // Built under a private name and then published, so a failure part way through cannot
+        // leave a broken file sitting on the ship's name for ever.
+        let fresh = Scratch::new(&self.inner.tmp_dir);
+        store::create(&fresh.0, &name, kernel_hash, self.inner.cfg.max_ship_bytes)?;
+        match fs::hard_link(&fresh.0, &dest_file) {
+            Ok(()) => Ok(sync_dir(&self.inner.ships_dir)?),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::ShipExists(name)),
+            Err(e) => Err(e.into()),
+        }
     }
 
-    pub fn install(&self, ship: &str, agent: &str, module_hash: &str) -> Result<(), Error> {
+    /// Install an agent, or replace it. The manifest says which interfaces it offers and which
+    /// it may use; passing it here is the owner's approval. The ship's kernel has the final say.
+    pub fn install(&self, ship: &str, agent: &str, module_hash: &str, manifest: &Manifest) -> Result<(), Error> {
         check_agent_name(agent)?;
-        check_hash(module_hash)?;
         let module = self.inner.module(module_hash)?;
+        require_exports(&module, &["handle"])?;
+        let install = Install { agent: agent.into(), module: module_hash.into(), manifest: Some(manifest.clone()) };
+        let request = AdminRequest { op: Some(Op::Install(install)) };
         self.inner.with_ship(ship, |ship| {
-            if !ship.agents.contains_key(agent) && ship.agents.len() >= self.inner.cfg.max_agents_per_ship {
-                return Err(Error::TooManyAgents);
-            }
-            store::set_agent(&lock(&ship.conn), agent, module_hash)?;
-            ship.agents.insert(agent.to_string(), module);
-            Ok(())
+            let reply = ship.admin(&self.inner, &request, true)?;
+            if reply.ok { Ok(()) } else { Err(Error::InstallRefused(reply.error)) }
         })
     }
 
-    /// Deliver one event. Events for the same ship run one at a time; different ships run in parallel.
+    /// Deliver a command from the ship's owner, then run the commands it caused agents to send
+    /// each other. Events for the same ship run one at a time; different ships run in parallel.
     ///
-    /// An event over the size limit is rejected without running, and only its first bytes are
+    /// A command over the size limit is rejected without running, and only its first bytes are
     /// kept in the audit log.
     pub fn deliver(&self, ship: &str, agent: &str, event: &[u8]) -> Result<Outcome, Error> {
-        if event.len() > self.inner.cfg.max_event_bytes {
-            let why = format!("event is {} bytes, limit is {}", event.len(), self.inner.cfg.max_event_bytes);
-            return self.inner.with_ship(ship, |ship| {
-                if !ship.agents.contains_key(agent) {
-                    return Err(Error::UnknownAgent(agent.to_string()));
+        check_agent_name(agent)?;
+        let cfg = &self.inner.cfg;
+        self.inner.with_ship(ship, |ship| {
+            if event.len() > cfg.max_event_bytes {
+                let why = format!("event is {} bytes, limit is {}", event.len(), cfg.max_event_bytes);
+                // Never more than a normal event may hold, or this ship's own export would be
+                // refused on import.
+                let kept = &event[..OVERSIZED_AUDIT_BYTES.min(cfg.max_event_bytes)];
+                store::audit_failure(&lock(&ship.conn), agent, kept, cfg.audit_rows);
+                return Err(Error::Rejected(Rejection::Limit(why)));
+            }
+            let source = Source { owner: true, agent: String::new() };
+            let outcome = ship.command(&self.inner, &source, agent, "", event)?;
+            // The owner's command has committed, so a problem while running what it queued must
+            // not be reported as that command failing. Whatever is left runs on a later call.
+            for _ in 0..cfg.max_queued_per_deliver {
+                if !matches!(ship.run_queued(&self.inner), Ok(true)) {
+                    break;
                 }
-                let kept = &event[..OVERSIZED_AUDIT_BYTES.min(event.len())];
-                store::audit_failure(&lock(&ship.conn), agent, kept, self.inner.cfg.audit_rows);
-                Err(Error::Rejected(Rejection::Limit(why)))
-            });
+            }
+            Ok(outcome)
+        })
+    }
+
+    /// Run up to `max` queued commands. Returns how many ran.
+    pub fn run_pending(&self, ship: &str, max: usize) -> Result<usize, Error> {
+        self.inner.with_ship(ship, |ship| {
+            let mut ran = 0;
+            while ran < max && ship.run_queued(&self.inner)? {
+                ran += 1;
+            }
+            Ok(ran)
+        })
+    }
+
+    /// Read from an agent on the owner's behalf. A read cannot change anything.
+    pub fn read(&self, ship: &str, agent: &str, interface: &str, request: &[u8]) -> Result<Vec<u8>, Error> {
+        check_agent_name(agent)?;
+        if request.len() > self.inner.cfg.max_event_bytes {
+            return Err(Error::Rejected(Rejection::Limit("read request is too large".into())));
         }
-        self.inner.with_ship(ship, |ship| ship.run(&self.inner, agent, event))
+        self.inner.with_ship(ship, |ship| ship.read(&self.inner, agent, interface, request))
     }
 
     /// Take the oldest committed outgoing messages, up to `max_bytes` in total (always at least
@@ -466,8 +558,7 @@ impl Runtime {
     pub fn drain_outbox(&self, ship: &str, max_bytes: usize) -> Result<Vec<Effect>, Error> {
         self.inner.with_ship(ship, |ship| {
             let effects = store::outbox_drain(&lock(&ship.conn), 1024, max_bytes)?;
-            let drained: u64 =
-                effects.iter().map(|e| e.payload.len() as u64 + store::OUTBOX_MESSAGE_OVERHEAD).sum();
+            let drained: u64 = effects.iter().map(|e| e.payload.len() as u64 + store::MESSAGE_OVERHEAD).sum();
             ship.outbox_bytes = ship.outbox_bytes.saturating_sub(drained);
             Ok(effects)
         })
@@ -479,14 +570,20 @@ impl Runtime {
     }
 
     /// Write `<dest>/<ship>.ship` plus the module blobs it needs under `<dest>/blobs`.
+    ///
+    /// Which agent modules a ship needs is known only to its kernel, so the export contains the
+    /// modules the kernel lists. A kernel that leaves one out produces a ship that imports
+    /// cleanly and then fails when that agent is first called.
     pub fn export_ship(&self, ship: &str, dest: impl AsRef<Path>) -> Result<(), Error> {
         let name = canonical_ship(ship)?;
         let dest = dest.as_ref();
         fs::create_dir_all(dest.join("blobs"))?;
         self.inner.with_ship(&name, |ship| {
+            let mut hashes = ship.modules(&self.inner)?;
             let conn = lock(&ship.conn);
+            hashes.push(store::kernel(&conn)?);
             store::snapshot_into(&conn, &dest.join(format!("{name}.ship")))?;
-            for (_, hash) in store::agents(&conn)? {
+            for hash in hashes {
                 // Read, verify, then rename into place: copying a file onto itself (an export into
                 // this runtime's own directory) would truncate it.
                 let bytes = self.inner.read_blob(&hash)?;
@@ -501,7 +598,9 @@ impl Runtime {
     /// Bring in a ship exported by `export_ship`, from this or another runtime.
     ///
     /// The source is treated as untrusted: its rows are copied into a freshly created file, and
-    /// every module it names is verified against its hash.
+    /// every module it names is verified against its hash. The ship brings its own kernel, which
+    /// decides policy for that ship only; the runtime's limits and the separation between ships
+    /// do not depend on it.
     pub fn import_ship(&self, src: impl AsRef<Path>, ship: &str) -> Result<(), Error> {
         let name = canonical_ship(ship)?;
         let src = src.as_ref();
@@ -509,6 +608,8 @@ impl Runtime {
         if dest_file.exists() {
             return Err(Error::ShipExists(name));
         }
+        // Timed from here, so the limit covers copying and checking the file as well as reading it.
+        let deadline = Instant::now() + Duration::from_millis(self.inner.cfg.max_import_millis);
 
         let source = match open_regular(&src.join(format!("{name}.ship"))) {
             Ok(file) => file,
@@ -521,14 +622,32 @@ impl Runtime {
         if io::copy(&mut source.take(limit + 1), &mut fs::File::create(&copy.0)?)? > limit {
             return Err(Error::BadShipFile(format!("{name}: larger than this runtime will import")));
         }
-        let hashes = store::import(&copy.0, &fresh.0, &name, &self.inner.cfg, check_agent_name, check_hash)?;
-        for hash in hashes {
+        let kernel_hash =
+            store::import(&copy.0, &fresh.0, &name, &self.inner.cfg, deadline, check_agent_name, check_hash)?;
+        let fetch = |hash: &str| -> Result<(), Error> {
             // Check the bytes on disk, not the compiled cache, which could hide a damaged blob.
-            if self.inner.read_blob(&hash).is_err() {
-                let bytes = self.inner.read_verified(&src.join("blobs").join(format!("{hash}.wasm")), &hash)?;
+            if self.inner.read_blob(hash).is_err() {
+                let bytes = self.inner.read_verified(&src.join("blobs").join(format!("{hash}.wasm")), hash)?;
                 self.inner.compile(&bytes)?;
-                self.inner.store_blob(&hash, &bytes)?;
+                self.inner.store_blob(hash, &bytes)?;
             }
+            Ok(())
+        };
+        fetch(&kernel_hash)?;
+        // Only the ship's kernel knows which agent modules it needs, so ask it, reading the new
+        // file without changing it.
+        let hashes = {
+            let conn = store::open_read_only(&fresh.0)?;
+            let kernel = self.inner.kernel(&kernel_hash)?;
+            let mut staged = Ship { conn: Arc::new(Mutex::new(conn)), kernel, outbox_bytes: 0, inbox_bytes: 0 };
+            staged.modules(&self.inner)?
+        };
+        for hash in hashes {
+            check_hash(&hash)?;
+            fetch(&hash)?;
+        }
+        if Instant::now() > deadline {
+            return Err(Error::BadShipFile(format!("{name}: import took too long")));
         }
         // A hard link publishes the finished file without ever replacing an existing ship.
         match fs::hard_link(&fresh.0, &dest_file) {
@@ -596,12 +715,16 @@ impl Inner {
     }
 
     fn read_blob(&self, hash: &str) -> Result<Vec<u8>, Error> {
+        // Checked here, at the one place a hash turns into a path, because hashes can come from
+        // a ship's own kernel.
+        check_hash(hash)?;
         self.read_verified(&self.blob_path(hash), hash)
     }
 
     /// Write a verified blob, replacing whatever is at its path. A rename means readers see
     /// either the old file or the whole new one.
     fn store_blob(&self, hash: &str, bytes: &[u8]) -> Result<(), Error> {
+        check_hash(hash)?;
         let path = self.blob_path(hash);
         // read_blob refuses anything but an intact regular file, so a damaged entry is replaced
         // without ever being read in full.
@@ -622,19 +745,24 @@ impl Inner {
         Module::validate(&self.engine, wasm).map_err(bad)?;
         let checked = add_bulk_checks(wasm).map_err(|e| Error::BadModule(e.to_string()))?;
         let module = Module::new(&self.engine, &checked).map_err(bad)?;
-        for name in ["alloc", "handle"] {
-            if module.get_export(name).and_then(|export| export.func().cloned()).is_none() {
-                return Err(Error::BadModule(format!("missing exported function `{name}`")));
-            }
-        }
         if module.get_export("memory").and_then(|export| export.memory().cloned()).is_none() {
             return Err(Error::BadModule("missing exported memory".into()));
         }
-        Ok(AgentModule { pre: self.linker.instantiate_pre(&module).map_err(bad)? })
+        let compiled = AgentModule { pre: self.linker.instantiate_pre(&module).map_err(bad)? };
+        require_exports(&compiled, &["alloc"])?;
+        Ok(compiled)
+    }
+
+    /// The compiled kernel module for `hash`.
+    fn kernel(&self, hash: &str) -> Result<Arc<AgentModule>, Error> {
+        let module = self.module(hash)?;
+        require_exports(&module, &["route", "admin"])?;
+        Ok(module)
     }
 
     /// The compiled module for `hash`, loading and verifying its blob on first use.
-    fn module(&self, hash: &str) -> Result<Arc<AgentModule>, Error> {
+    pub(crate) fn module(&self, hash: &str) -> Result<Arc<AgentModule>, Error> {
+        check_hash(hash)?;
         let mut modules = lock(&self.modules);
         if let Some(module) = modules.get(hash) {
             return Ok(module.clone());
@@ -658,14 +786,11 @@ impl Inner {
     }
 
     fn wake(&self, name: &str) -> Result<Ship, Error> {
-        let conn = store::open(&self.ship_path(name), self.cfg.durability)?;
+        let conn = store::open(&self.ship_path(name), self.cfg.durability, self.cfg.max_ship_bytes)?;
         store::check_meta(&conn, name)?;
-        let mut agents = HashMap::new();
-        for (agent, hash) in store::agents(&conn)? {
-            agents.insert(agent, self.module(&hash)?);
-        }
-        let outbox_bytes = store::outbox_bytes(&conn)?;
-        Ok(Ship { conn: Arc::new(Mutex::new(conn)), agents, outbox_bytes })
+        let kernel = self.kernel(&store::kernel(&conn)?)?;
+        let (outbox_bytes, inbox_bytes) = (store::outbox_bytes(&conn)?, store::inbox_bytes(&conn)?);
+        Ok(Ship { conn: Arc::new(Mutex::new(conn)), kernel, outbox_bytes, inbox_bytes })
     }
 
     fn with_ship<R>(&self, name: &str, f: impl FnOnce(&mut Ship) -> Result<R, Error>) -> Result<R, Error> {
@@ -684,7 +809,15 @@ impl Inner {
                     }
                 }
             }
-            let result = f(guard.ship.as_mut().expect("woken above"));
+            let ship = guard.ship.as_mut().expect("woken above");
+            let result = f(ship);
+            // Every operation is meant to end with no transaction open. If one is still open,
+            // the cleanup itself failed, so close the file and reopen it on the next call
+            // rather than carry on with a connection in an unknown state.
+            if !lock(&ship.conn).is_autocommit() {
+                drop(guard.ship.take());
+                lock(&self.awake).remove(&name);
+            }
             // Stamped after the work, so a long event does not make its ship look long idle.
             guard.last_used = Instant::now();
             result
