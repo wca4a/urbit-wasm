@@ -1859,26 +1859,28 @@ fn notifications_do_not_use_the_command_queues_room() {
     assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
     assert!(matches!(rejection(&rt, "tally", "poke hits"), Rejection::Limit(_)));
 
-    // Room for exactly one queued ping (6 bytes plus 64), with a notification waiting too.
-    let cfg = Config { max_inbox_bytes: 71, max_queued_per_deliver: 0, ..fast() };
+    // Room for exactly two queued pings (6 bytes plus 64 each), with a notification waiting too.
+    let cfg = Config { max_inbox_bytes: 141, max_queued_per_deliver: 0, ..fast() };
     let dir = TempDir::new("log-inbox-room");
     let rt = boot_pair(&dir, cfg, counter_manifest(false), tally_manifest(true));
     send(&rt, "~zod", "tally", "follow");
     send(&rt, "~zod", "counter", "log hits");
-    // The waiting notification takes none of the room, so the ping still fits, and fills it.
     send(&rt, "~zod", "tally", "ping 0");
     assert_eq!(rt.pending("~zod").unwrap(), 2);
-    assert!(matches!(rejection(&rt, "tally", "later x"), Rejection::Limit(_)));
-    // The count is worked out again when the ship is reopened, and must still leave it out.
+    // The count is worked out again when the ship is reopened. If it wrongly included the
+    // waiting notification, this second ping would not fit.
     rt.sleep_idle(Duration::ZERO);
+    send(&rt, "~zod", "tally", "ping 0");
+    assert_eq!(rt.pending("~zod").unwrap(), 3);
+    assert!(matches!(rejection(&rt, "tally", "later x"), Rejection::Limit(_)));
     // Running the notification frees no room, because it never took any.
     assert_eq!(rt.run_pending("~zod", 1).unwrap(), 1);
     assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
     assert!(matches!(rejection(&rt, "tally", "later x"), Rejection::Limit(_)));
-    // Running the ping frees its room, which the ping it sends then takes.
+    // Running a ping frees its room, which the ping it sends then takes.
     assert_eq!(rt.run_pending("~zod", 1).unwrap(), 1);
     assert_eq!(read(&rt, "tally", "tally", "pings"), "1");
-    assert_eq!(rt.pending("~zod").unwrap(), 1);
+    assert_eq!(rt.pending("~zod").unwrap(), 2);
 }
 
 #[test]
@@ -1975,10 +1977,41 @@ fn a_followers_own_handler_cannot_pile_up_notifications() {
         rt.install("~zod", "echo", &hash, &offers_e).unwrap();
         rt.deliver("~zod", "echo", b"x").unwrap();
         assert_eq!(rt.pending("~zod").unwrap(), 1, "{label}");
-        // However many rounds run, there is never more than one prompt waiting.
+        // However many rounds run, there is always exactly one prompt waiting: never two, and
+        // never none, since this follower keeps asking for more.
         for round in 0..8 {
-            rt.run_pending("~zod", 1).unwrap();
-            assert!(rt.pending("~zod").unwrap() <= 1, "{label}: round {round}");
+            assert_eq!(rt.run_pending("~zod", 1).unwrap(), 1, "{label}: round {round}");
+            assert_eq!(rt.pending("~zod").unwrap(), 1, "{label}: round {round}");
         }
     }
+
+    // The same follower, except that after asking to follow again its handler fails. The
+    // failure undoes that request along with everything else, so it is retried three times and
+    // then left alone, with nothing waiting.
+    let failing = echo("$refollow").replace("(call $refollow)\n                    (i64.const 0)))", "(call $refollow)\n                    unreachable))");
+    assert!(failing.contains("unreachable"), "the failing variant was not built");
+    let dir = TempDir::new("pile-trap");
+    let rt = boot(&dir, Config { max_queued_per_deliver: 0, ..fast() });
+    let hash = rt.add_module(&wat::parse_str(&failing).unwrap()).unwrap();
+    rt.install("~zod", "echo", &hash, &offers_e).unwrap();
+    rt.deliver("~zod", "echo", b"x").unwrap();
+    assert_eq!(rt.pending("~zod").unwrap(), 1);
+    assert_eq!(rt.run_pending("~zod", 100).unwrap(), 3);
+    assert_eq!(rt.pending("~zod").unwrap(), 0);
+    let failed = rt.audit("~zod", 100).unwrap().iter().filter(|entry| entry.agent == "echo" && !entry.ok).count();
+    assert_eq!(failed, 3);
+}
+
+#[test]
+fn asking_a_log_for_no_entries_takes_none() {
+    let dir = TempDir::new("log-none");
+    let rt = boot_pair(&dir, Config { max_queued_per_deliver: 0, ..fast() }, counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "tally", "follow");
+    assert_eq!(send(&rt, "~zod", "tally", "glance"), "0 false");
+    send(&rt, "~zod", "counter", "log hits");
+    // One entry is waiting. Asking for none returns none, says more remain, and moves nothing.
+    assert_eq!(send(&rt, "~zod", "tally", "glance"), "0 true");
+    assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(0));
+    while rt.run_pending("~zod", 10).unwrap() > 0 {}
+    assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(1));
 }

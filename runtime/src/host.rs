@@ -399,8 +399,12 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
                 let Some(cursor) = store::cursor(&conn, &follower, &request.agent, &request.log)? else {
                     return Err(Denied(format!("{} does not follow {} on {}", follower, request.log, request.agent)).into());
                 };
-                let max = (request.max as usize).clamp(1, MAX_NEXT_ENTRIES);
-                let stored = store::log_range(&conn, &request.agent, &request.log, cursor, max, MAX_NEXT_BYTES)?;
+                // Asking for none is allowed: it takes nothing and only reports whether more remain.
+                let max = (request.max as usize).min(MAX_NEXT_ENTRIES);
+                let stored = match max {
+                    0 => Vec::new(),
+                    _ => store::log_range(&conn, &request.agent, &request.log, cursor, max, MAX_NEXT_BYTES)?,
+                };
                 let (head, _) = store::log_head(&conn, &request.agent, &request.log)?;
                 let last = stored.last().map_or(cursor, |entry| entry.seq);
                 let entries = stored

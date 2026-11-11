@@ -54,6 +54,11 @@ fn handle(event: &[u8]) -> Vec<u8> {
             send("tally", "tally", text.trim_start()["later".len()..].trim().as_bytes());
             "sent".to_string()
         }
+        // Ask the counter's log for no entries at all: how many came back, and whether more remain.
+        (Some("glance"), None) => {
+            let (entries, more) = log::next("counter", "counter", 0);
+            format!("{} {more}", entries.len())
+        }
         // Stop refusing entries that mention poison.
         (Some("tolerate"), None) => {
             kv::put(b"tolerate", b"yes");
