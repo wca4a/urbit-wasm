@@ -3010,3 +3010,824 @@ fn a_full_ship_can_let_go_of_a_logs_only_entry() {
     rusqlite::Connection::open(out.0.join("zod.ship")).unwrap().execute_batch("UPDATE logs SET head_hash = zeroblob(32)").unwrap();
     assert!(matches!(Runtime::open(&c.0, cfg).unwrap().import_ship(&out.0, "~zod"), Err(Error::BadShipFile(_))));
 }
+
+// Signing in, and reaching a ship over HTTP.
+
+use runtime::server::{Server, ServerConfig};
+use ship_proto::Message as _;
+use std::sync::Arc;
+
+/// Sign a new device in with a fresh one-time code, and return its token.
+fn sign_in(rt: &Runtime, label: &str) -> String {
+    let code = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    rt.sign_in("~zod", &code, label).unwrap().0
+}
+
+#[test]
+fn each_device_signs_in_with_a_code_and_gets_its_own_token() {
+    let dir = TempDir::new("signin");
+    let rt = boot(&dir, fast());
+    rt.create_ship("~nec", &kernel(&rt)).unwrap();
+
+    let code = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    let (phone, device) = rt.sign_in("~zod", &code, "Bill's phone").unwrap();
+    assert_eq!(device.label, "Bill's phone");
+    assert_eq!(rt.authenticate("~zod", &phone).unwrap(), device);
+    // The code was good for one use.
+    assert!(matches!(rt.sign_in("~zod", &code, "again"), Err(Error::SignInRefused)));
+
+    let laptop = sign_in(&rt, "Laptop");
+    assert_ne!(phone, laptop);
+    let labels: Vec<String> = rt.devices("~zod").unwrap().into_iter().map(|device| device.label).collect();
+    assert_eq!(labels, ["Bill's phone", "Laptop"]);
+
+    // One device signed out leaves the other signed in.
+    assert!(rt.revoke_device("~zod", device.id).unwrap());
+    assert!(matches!(rt.authenticate("~zod", &phone), Err(Error::NotSignedIn)));
+    assert!(rt.authenticate("~zod", &laptop).is_ok());
+    assert!(!rt.revoke_device("~zod", device.id).unwrap());
+    assert!(!rt.revoke_device("~zod", u64::MAX).unwrap());
+
+    // A token is for one ship, a token is not a sign-in code, and a code is not a token.
+    assert!(matches!(rt.authenticate("~nec", &laptop), Err(Error::NotSignedIn)));
+    assert!(matches!(rt.sign_in("~zod", &laptop, "token as code"), Err(Error::SignInRefused)));
+    let unused = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    assert!(matches!(rt.authenticate("~zod", &unused), Err(Error::NotSignedIn)));
+    assert!(matches!(rt.sign_in("~nec", &unused, "wrong ship"), Err(Error::SignInRefused)));
+
+    // A code that has run out of time is refused, and tokens survive a sleep and wake.
+    let brief = rt.new_signin_code("~zod", Duration::from_millis(1)).unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(matches!(rt.sign_in("~zod", &brief, "late"), Err(Error::SignInRefused)));
+    rt.sleep_idle(Duration::ZERO);
+    assert_eq!(rt.authenticate("~zod", &laptop).unwrap().label, "Laptop");
+
+    // A label is cleaned up before it is kept: no control characters, not too long, not empty.
+    let odd = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    let (_, device) = rt.sign_in("~zod", &odd, &format!("  tab\there\n{}", "x".repeat(200))).unwrap();
+    assert!(device.label.starts_with("tabherexxx") && device.label.len() == 64, "{:?}", device.label);
+    let blank = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    assert_eq!(rt.sign_in("~zod", &blank, " \n ").unwrap().1.label, "device");
+}
+
+#[test]
+fn a_ships_access_code_can_be_used_again_and_changed() {
+    let dir = TempDir::new("access-code");
+    let rt = boot(&dir, fast());
+    // No access code until one is set.
+    assert!(matches!(rt.sign_in("~zod", "", "nothing"), Err(Error::SignInRefused)));
+
+    let code = rt.set_access_code("~zod").unwrap();
+    let groups: Vec<&str> = code.split('-').collect();
+    assert!(groups.len() == 4 && groups.iter().all(|group| group.len() == 5), "{code}");
+    // It works any number of times, and however it is typed.
+    let (first, _) = rt.sign_in("~zod", &code, "one").unwrap();
+    let (second, _) = rt.sign_in("~zod", &code.to_uppercase().replace('-', " "), "two").unwrap();
+    assert!(matches!(rt.sign_in("~zod", &code[1..], "wrong"), Err(Error::SignInRefused)));
+    // It is this ship's code and no other's.
+    rt.create_ship("~nec", &kernel(&rt)).unwrap();
+    assert!(matches!(rt.sign_in("~nec", &code, "wrong ship"), Err(Error::SignInRefused)));
+    // Where only a one-time code will do, it is refused like any wrong code.
+    assert!(matches!(rt.sign_in_once("~zod", &code, "as a link"), Err(Error::SignInRefused)));
+    let once = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    assert!(rt.sign_in_once("~zod", &once, "by link").is_ok());
+    assert!(rt.revoke_device("~zod", 3).unwrap());
+
+    // Changing it stops the old one. Devices that are signed in stay signed in.
+    let changed = rt.set_access_code("~zod").unwrap();
+    assert_ne!(code, changed);
+    assert!(matches!(rt.sign_in("~zod", &code, "old code"), Err(Error::SignInRefused)));
+    assert!(rt.sign_in("~zod", &changed, "three").is_ok());
+    assert!(rt.authenticate("~zod", &first).is_ok() && rt.authenticate("~zod", &second).is_ok());
+
+    // With none set, one-time codes still work.
+    rt.clear_access_code("~zod").unwrap();
+    assert!(matches!(rt.sign_in("~zod", &changed, "cleared"), Err(Error::SignInRefused)));
+    sign_in(&rt, "four");
+    assert_eq!(rt.devices("~zod").unwrap().len(), 4);
+}
+
+#[test]
+fn wrong_sign_in_codes_lock_sign_in_for_a_while() {
+    let dir = TempDir::new("signin-lock");
+    let rt = boot(&dir, Config { signin_max_failures: 3, signin_lock_millis: 400, ..fast() });
+    let device = sign_in(&rt, "already here");
+    let code = rt.set_access_code("~zod").unwrap();
+
+    // A good code in between wrong ones starts the count again.
+    for _ in 0..2 {
+        assert!(matches!(rt.sign_in("~zod", "guess", "x"), Err(Error::SignInRefused)));
+    }
+    rt.sign_in("~zod", &code, "good").unwrap();
+    for _ in 0..3 {
+        assert!(matches!(rt.sign_in("~zod", "guess", "x"), Err(Error::SignInRefused)));
+    }
+    // Locked: even the right code is refused, and a one-time code offered now is not used up.
+    let once = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    assert!(matches!(rt.sign_in("~zod", &code, "x"), Err(Error::SignInLocked(left)) if left <= 400));
+    assert!(matches!(rt.sign_in("~zod", &once, "x"), Err(Error::SignInLocked(_))));
+    // A device that is already signed in is not affected, and the lock survives a sleep.
+    assert!(rt.authenticate("~zod", &device).is_ok());
+    rt.sleep_idle(Duration::ZERO);
+    assert!(matches!(rt.sign_in("~zod", &code, "x"), Err(Error::SignInLocked(_))));
+
+    std::thread::sleep(Duration::from_millis(450));
+    rt.sign_in("~zod", &once, "after the lock").unwrap();
+    rt.sign_in("~zod", &code, "after the lock").unwrap();
+}
+
+#[test]
+fn devices_and_waiting_codes_are_bounded() {
+    let dir = TempDir::new("signin-bounds");
+    let rt = boot(&dir, Config { max_devices: 2, max_signin_codes: 2, ..fast() });
+    let first = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    let second = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    assert!(matches!(rt.new_signin_code("~zod", Duration::from_secs(60)), Err(Error::TooMany(_))));
+    // A code that is used or has run out makes room for another.
+    let (token, device) = rt.sign_in("~zod", &first, "one").unwrap();
+    let brief = rt.new_signin_code("~zod", Duration::from_millis(1)).unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    let third = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    assert!(matches!(rt.sign_in("~zod", &brief, "late"), Err(Error::SignInRefused)));
+
+    rt.sign_in("~zod", &second, "two").unwrap();
+    // With the ship full of devices a good code is turned away, but not used up or counted as
+    // a wrong guess.
+    for _ in 0..10 {
+        assert!(matches!(rt.sign_in("~zod", &third, "three"), Err(Error::TooMany(_))));
+    }
+    // Only a good code is told so. A guess learns nothing about how full the ship is.
+    assert!(matches!(rt.sign_in("~zod", "guess", "x"), Err(Error::SignInRefused)));
+    assert!(rt.revoke_device("~zod", device.id).unwrap());
+    assert!(matches!(rt.authenticate("~zod", &token), Err(Error::NotSignedIn)));
+    rt.sign_in("~zod", &third, "three").unwrap();
+}
+
+#[test]
+fn signed_in_devices_go_with_the_ship() {
+    let (a, b, c, out) = (TempDir::new("dev-a"), TempDir::new("dev-b"), TempDir::new("dev-c"), TempDir::new("dev-out"));
+    let cfg = Config { signin_max_failures: 1, signin_lock_millis: 60_000, ..fast() };
+    let rt = boot(&a, cfg.clone());
+    let (phone, laptop) = (sign_in(&rt, "phone"), sign_in(&rt, "laptop"));
+    // A third device, signed out again before the ship moves. Its number must stay retired.
+    let gone = sign_in(&rt, "gone");
+    assert!(rt.revoke_device("~zod", 3).unwrap());
+    let code = rt.set_access_code("~zod").unwrap();
+    let once = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    // Lock sign-in on the original. That is about guesses made against it, and stays behind.
+    assert!(matches!(rt.sign_in("~zod", "guess", "x"), Err(Error::SignInRefused)));
+    assert!(matches!(rt.sign_in("~zod", &code, "x"), Err(Error::SignInLocked(_))));
+    rt.export_ship("~zod", &out.0).unwrap();
+
+    let other = Runtime::open(&b.0, cfg.clone()).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    assert_eq!(other.authenticate("~zod", &phone).unwrap().label, "phone");
+    assert_eq!(other.authenticate("~zod", &laptop).unwrap().label, "laptop");
+    let (_, third) = other.sign_in("~zod", &code, "tablet").unwrap();
+    let (_, fourth) = other.sign_in("~zod", &once, "watch").unwrap();
+    // Device numbers carry on from where the original left off, so none is ever reused, not
+    // even that of a device that had been signed out.
+    assert_eq!((third.id, fourth.id), (4, 5));
+    assert!(matches!(other.authenticate("~zod", &gone), Err(Error::NotSignedIn)));
+
+    // A file that records devices or codes wrongly is not a ship file.
+    let tampered = |label: &str, statement: &str, cfg: Config| {
+        let dir = TempDir::new(label);
+        fs::remove_dir_all(&c.0).ok();
+        fs::create_dir_all(&c.0).unwrap();
+        rt.export_ship("~zod", &c.0).unwrap();
+        rusqlite::Connection::open(c.0.join("zod.ship")).unwrap().execute_batch(statement).unwrap();
+        let result = Runtime::open(&dir.0, cfg).unwrap().import_ship(&c.0, "~zod");
+        assert!(matches!(result, Err(Error::BadShipFile(_))), "{label}: {result:?}");
+    };
+    tampered("dev-short", "UPDATE devices SET token_hash = x'0102030405' WHERE seq = 1", cfg.clone());
+    tampered("dev-label", "UPDATE devices SET label = hex(zeroblob(100)) WHERE seq = 1", cfg.clone());
+    tampered("dev-many", "SELECT 1", Config { max_devices: 1, ..cfg.clone() });
+    tampered("code-short", "UPDATE signin_codes SET code_hash = x'0102' WHERE reusable = 1", cfg.clone());
+    tampered("code-two", "INSERT INTO signin_codes VALUES (zeroblob(32), 0, 1)", cfg.clone());
+    tampered("code-flag", "UPDATE signin_codes SET reusable = 2", cfg.clone());
+    tampered("code-many", "SELECT 1", Config { max_signin_codes: 0, ..cfg.clone() });
+    // The access code is not counted among the one-time codes, nor they in its place.
+    tampered("code-once", "DELETE FROM signin_codes WHERE reusable = 1", Config { max_signin_codes: 0, ..cfg });
+}
+
+#[test]
+fn waiting_for_a_log_returns_as_soon_as_it_grows() {
+    let dir = TempDir::new("wait-log");
+    let rt = boot_with_journal(&dir, fast());
+    send(&rt, "~zod", "counter", "log hits");
+
+    // Nothing new: the wait runs its course and reports where the log still ends.
+    let started = Instant::now();
+    let head = rt.wait_log("~zod", "counter", "counter", 1, Duration::from_millis(300)).unwrap();
+    assert_eq!(head.unwrap().0, 1);
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    // Already past what was asked for: no waiting at all.
+    let started = Instant::now();
+    assert_eq!(rt.wait_log("~zod", "counter", "counter", 0, Duration::from_secs(10)).unwrap().unwrap().0, 1);
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // A waiter is woken by the entry it was waiting for, long before its time is up. Growth in
+    // another of the ship's logs wakes it too, and it goes back to waiting.
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            let started = Instant::now();
+            let head = rt.wait_log("~zod", "counter", "counter", 1, Duration::from_secs(20)).unwrap();
+            (head.unwrap().0, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(send(&rt, "~zod", "counter", "journal a line elsewhere"), "1");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!waiter.is_finished(), "growth in another log ended the wait");
+        send(&rt, "~zod", "counter", "log hits");
+        let (seq, took) = waiter.join().unwrap();
+        assert_eq!(seq, 2);
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+    });
+}
+
+struct Answer {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Answer {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+/// Make one HTTP request and read the whole answer.
+fn http(server: &Server, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Answer {
+    use std::io::Write;
+    let mut stream = std::net::TcpStream::connect(server.addr()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    // HTTP/1.0, so the answer is never sent in chunks and the connection closes after it.
+    let mut head = format!("{method} {path} HTTP/1.0\r\n");
+    if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host")) {
+        head += &format!("Host: {}\r\n", server.addr());
+    }
+    for (name, value) in headers {
+        head += &format!("{name}: {value}\r\n");
+    }
+    head += &format!("Content-Length: {}\r\n\r\n", body.len());
+    stream.write_all(head.as_bytes()).unwrap();
+    // A server may refuse a request on its headers and stop listening to the rest of it.
+    let _ = stream.write_all(body);
+    read_answer(stream)
+}
+
+fn read_answer(mut stream: std::net::TcpStream) -> Answer {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let split = raw.windows(4).position(|window| window == b"\r\n\r\n").expect("an HTTP answer");
+    let top = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let mut lines = top.split("\r\n");
+    let status = lines.next().unwrap().split(' ').nth(1).unwrap().parse().unwrap();
+    let headers = lines.filter_map(|line| line.split_once(": ")).map(|(name, value)| (name.to_string(), value.to_string())).collect();
+    Answer { status, headers, body: raw[split + 4..].to_vec() }
+}
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// A runtime with `~zod` running the counter agent, and a server in front of it.
+fn serve(dir: &TempDir, cfg: Config, server: ServerConfig) -> (Arc<Runtime>, Server) {
+    let rt = Arc::new(boot(dir, cfg));
+    let server = Server::start(rt.clone(), server).unwrap();
+    (rt, server)
+}
+
+#[test]
+fn an_app_signs_in_over_http_reads_a_log_and_sends_commands() {
+    let dir = TempDir::new("http-app");
+    let (rt, server) = serve(&dir, fast(), ServerConfig::default());
+    rt.create_ship("~nec", &kernel(&rt)).unwrap();
+    for _ in 0..3 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+
+    // Sign in with a one-time code, as an app would.
+    let code = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    let asked = ship_proto::SignInRequest { code, label: "Phone".into() }.encode_to_vec();
+    let proto = [("Content-Type", "application/x-protobuf")];
+    let answer = http(&server, "POST", "/ships/zod/signin", &proto, &asked);
+    assert_eq!(answer.status, 200, "{}", answer.text());
+    let signed_in = ship_proto::SignInReply::decode(&*answer.body).unwrap();
+    assert_eq!(signed_in.device.unwrap().label, "Phone");
+    assert!(answer.header("Set-Cookie").is_none());
+    // The same code again is refused.
+    assert_eq!(http(&server, "POST", "/ships/zod/signin", &proto, &asked).status, 401);
+    let auth = bearer(&signed_in.token);
+    let auth = [("Authorization", auth.as_str())];
+
+    // Read the log and check it against the ship's key, all over HTTP.
+    let key: [u8; 32] = http(&server, "GET", "/ships/zod/key", &auth, b"").body.try_into().unwrap();
+    assert_eq!(key, rt.public_key("~zod").unwrap());
+    let answer = http(&server, "GET", "/ships/zod/logs/counter/counter/entries?after=0", &auth, b"");
+    assert_eq!(answer.status, 200);
+    let list = ship_proto::EntryList::decode(&*answer.body).unwrap();
+    assert_eq!(payloads(&list.entries), ["hits=1", "hits=2", "hits=3"]);
+    let position = verify_log(&key, "~zod", "counter", "counter", None, &list.entries).unwrap().unwrap();
+    let head = list.head.unwrap();
+    assert_eq!((head.seq, &head.hash[..]), (position.0, &position.1[..]));
+    let head = http(&server, "GET", "/ships/zod/logs/counter/counter/head", &auth, b"");
+    assert_eq!(ship_proto::LogHead::decode(&*head.body).unwrap().seq, 3);
+    // A name in an address may be written with escapes. It is the same name.
+    let head = http(&server, "GET", "/ships/zod/logs/c%6Funter/coun%74er/head", &auth, b"");
+    assert_eq!(ship_proto::LogHead::decode(&*head.body).unwrap().seq, 3);
+    // An escaped slash is part of a name, not a way to change which thing is asked for.
+    assert_eq!(http(&server, "GET", "/ships/zod/logs/counter%2Fcounter/head", &auth, b"").status, 404);
+    assert_eq!(http(&server, "GET", "/ships/zod/logs/counter/counter/he%ZZad", &auth, b"").status, 400);
+
+    // Send a command as the owner, then read on from where the reader had got to.
+    let answer = http(&server, "POST", "/ships/zod/agents/counter/command", &auth, b"log hits");
+    assert_eq!((answer.status, answer.text().as_str()), (200, "4"));
+    let answer = http(&server, "GET", "/ships/~zod/logs/counter/counter/entries?after=3", &auth, b"");
+    let more = ship_proto::EntryList::decode(&*answer.body).unwrap().entries;
+    assert_eq!(payloads(&more), ["hits=4"]);
+    assert_eq!(verify_log(&key, "~zod", "counter", "counter", Some(position), &more).unwrap().unwrap().0, 4);
+    // A command the agent rejects says so, without saying how it failed inside.
+    let answer = http(&server, "POST", "/ships/zod/agents/counter/command", &auth, b"crash hits");
+    assert_eq!((answer.status, answer.text().as_str()), (422, "the command failed"));
+    assert_eq!(http(&server, "GET", "/ships/zod/logs/counter/counter/checkpoint", &auth, b"").status, 404);
+
+    // Without a token, with a wrong one, with this ship's token on another ship, and on a ship
+    // that does not exist: all the same answer, so nothing is learned about which ships exist.
+    let wrong = bearer(&"0".repeat(64));
+    for (path, headers) in [
+        ("/ships/zod/logs/counter/counter/head", &[][..]),
+        ("/ships/zod/logs/counter/counter/head", &[("Authorization", wrong.as_str())][..]),
+        ("/ships/nec/logs/counter/counter/head", &auth[..]),
+        ("/ships/bus/logs/counter/counter/head", &auth[..]),
+    ] {
+        let answer = http(&server, "GET", path, headers, b"");
+        assert_eq!((answer.status, answer.text().as_str()), (401, "not signed in"), "{path}");
+    }
+    let nowhere = http(&server, "POST", "/ships/bus/signin", &proto, &asked);
+    assert_eq!((nowhere.status, nowhere.text()), (401, "that sign-in code is not accepted".to_string()));
+    assert_eq!(http(&server, "POST", "/ships/zod/agents/counter/command", &[], b"log hits").status, 401);
+
+    // Other things a request can get wrong.
+    assert_eq!(http(&server, "GET", "/ships/zod/nothing/here", &auth, b"").status, 404);
+    assert_eq!(http(&server, "GET", "/elsewhere", &auth, b"").status, 404);
+    assert_eq!(http(&server, "GET", "/ships/Not%20A%20Ship/key", &auth, b"").status, 404);
+    assert_eq!(http(&server, "GET", "/ships/zod/logs/Bad%20Name/counter/head", &auth, b"").status, 400);
+    assert_eq!(http(&server, "PUT", "/ships/zod/key", &auth, b"").status, 405);
+    let huge = vec![b'x'; (1 << 20) + 1];
+    assert_eq!(http(&server, "POST", "/ships/zod/agents/counter/command", &auth, &huge).status, 413);
+    assert_eq!(rt.log_head("~zod", "counter", "counter").unwrap().unwrap().0, 4);
+}
+
+#[test]
+fn devices_are_listed_and_signed_out_over_http() {
+    let dir = TempDir::new("http-devices");
+    let (rt, server) = serve(&dir, fast(), ServerConfig::default());
+    let (phone, laptop) = (sign_in(&rt, "Phone"), sign_in(&rt, "Laptop"));
+    let (phone_auth, laptop_auth) = (bearer(&phone), bearer(&laptop));
+    let (phone_auth, laptop_auth) = ([("Authorization", phone_auth.as_str())], [("Authorization", laptop_auth.as_str())]);
+
+    let answer = http(&server, "GET", "/ships/zod/devices", &laptop_auth, b"");
+    let list = ship_proto::DeviceList::decode(&*answer.body).unwrap();
+    let labels: Vec<&str> = list.devices.iter().map(|device| device.label.as_str()).collect();
+    assert_eq!((labels, list.current), (vec!["Phone", "Laptop"], 2));
+
+    // The laptop signs the phone out. The phone's token stops working; the laptop's does not.
+    assert_eq!(http(&server, "DELETE", "/ships/zod/devices/1", &laptop_auth, b"").status, 204);
+    assert_eq!(http(&server, "GET", "/ships/zod/devices", &phone_auth, b"").status, 401);
+    assert_eq!(http(&server, "DELETE", "/ships/zod/devices/1", &laptop_auth, b"").status, 404);
+    assert_eq!(http(&server, "DELETE", "/ships/zod/devices/one", &laptop_auth, b"").status, 400);
+    // And then signs itself out.
+    assert_eq!(http(&server, "POST", "/ships/zod/signout", &laptop_auth, b"").status, 204);
+    assert_eq!(http(&server, "GET", "/ships/zod/devices", &laptop_auth, b"").status, 401);
+    assert!(rt.devices("~zod").unwrap().is_empty());
+}
+
+#[test]
+fn a_trimmed_log_is_read_over_http_from_its_checkpoint() {
+    let dir = TempDir::new("http-trimmed");
+    let (rt, server) = serve(&dir, checkpointing(), ServerConfig::default());
+    for _ in 0..20 {
+        send(&rt, "~zod", "counter", "log hits");
+    }
+    let token = bearer(&sign_in(&rt, "Phone"));
+    let auth = [("Authorization", token.as_str())];
+    let key = rt.public_key("~zod").unwrap();
+
+    // Asking for the start is answered with where the log now starts, not with a gap.
+    let answer = http(&server, "GET", "/ships/zod/logs/counter/counter/entries?after=0", &auth, b"");
+    assert_eq!(answer.status, 410);
+    assert_eq!(ship_proto::Trimmed::decode(&*answer.body).unwrap().base, dropped(&rt));
+
+    let answer = http(&server, "GET", "/ships/zod/logs/counter/counter/checkpoint", &auth, b"");
+    let signed = SignedCheckpoint::decode(&*answer.body).unwrap();
+    let ((seq, hash), state) = verify_checkpoint(&key, "~zod", "counter", "counter", &signed).unwrap();
+    assert_eq!(state, format!("hits={seq}").into_bytes());
+    let answer = http(&server, "GET", &format!("/ships/zod/logs/counter/counter/entries?after={seq}"), &auth, b"");
+    let list = ship_proto::EntryList::decode(&*answer.body).unwrap();
+    let end = verify_log(&key, "~zod", "counter", "counter", Some((seq, hash)), &list.entries).unwrap().unwrap();
+    assert_eq!((end.0, list.head.unwrap().seq), (20, 20));
+
+    // A reader can ask for a little at a time.
+    let answer = http(&server, "GET", &format!("/ships/zod/logs/counter/counter/entries?after={seq}&max_bytes=1"), &auth, b"");
+    assert!(seq < 19, "the checkpoint is too near the end for this to show anything");
+    let list = ship_proto::EntryList::decode(&*answer.body).unwrap();
+    assert_eq!((list.entries.len(), list.head.unwrap().seq), (1, 20));
+}
+
+#[test]
+fn a_reader_can_wait_over_http_for_new_entries() {
+    let dir = TempDir::new("http-wait");
+    let (rt, server) = serve(&dir, fast(), ServerConfig { workers: 4, max_wait: Duration::from_secs(20), ..ServerConfig::default() });
+    send(&rt, "~zod", "counter", "log hits");
+    let token = bearer(&sign_in(&rt, "Phone"));
+    let auth = [("Authorization", token.as_str())];
+    let entries = |answer: &Answer| payloads(&ship_proto::EntryList::decode(&*answer.body).unwrap().entries);
+
+    // Nothing new within the time asked for: an empty answer, after about that long.
+    let started = Instant::now();
+    let answer = http(&server, "GET", "/ships/zod/logs/counter/counter/entries?after=1&wait=1", &auth, b"");
+    assert!(entries(&answer).is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(900), "{:?}", started.elapsed());
+
+    // The answer comes as soon as there is an entry, well inside the time asked for.
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            let started = Instant::now();
+            let answer = http(&server, "GET", "/ships/zod/logs/counter/counter/entries?after=1&wait=20", &auth, b"");
+            (entries(&answer), started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(http(&server, "POST", "/ships/zod/agents/counter/command", &auth, b"log hits").text(), "2");
+        let (seen, took) = waiter.join().unwrap();
+        assert_eq!(seen, ["hits=2"]);
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+    });
+
+    // Only half the server's threads may be held by waiters. With two already waiting, a third
+    // is answered at once with what there is, and other requests are still served.
+    std::thread::scope(|scope| {
+        let waiters: Vec<_> = (0..2)
+            .map(|_| scope.spawn(|| entries(&http(&server, "GET", "/ships/zod/logs/counter/counter/entries?after=2&wait=15", &auth, b""))))
+            .collect();
+        std::thread::sleep(Duration::from_millis(500));
+        let started = Instant::now();
+        let third = http(&server, "GET", "/ships/zod/logs/counter/counter/entries?after=2&wait=15", &auth, b"");
+        assert!(entries(&third).is_empty());
+        assert!(started.elapsed() < Duration::from_millis(1500), "{:?}", started.elapsed());
+        assert_eq!(http(&server, "GET", "/ships/zod/logs/counter/counter/head", &auth, b"").status, 200);
+        // Both of the first two were let wait: each is still there to be handed the next entry.
+        assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
+        assert_eq!(http(&server, "POST", "/ships/zod/agents/counter/command", &auth, b"log hits").text(), "3");
+        for waiter in waiters {
+            assert_eq!(waiter.join().unwrap(), ["hits=3"]);
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    });
+}
+
+#[test]
+fn a_browser_signs_in_with_the_access_code_and_keeps_a_cookie() {
+    let dir = TempDir::new("http-browser");
+    let (rt, server) = serve(&dir, fast(), ServerConfig::default());
+    let code = rt.set_access_code("~zod").unwrap();
+    let form = [("Content-Type", "application/x-www-form-urlencoded")];
+
+    // Opening the ship without being signed in leads to its sign-in page.
+    let answer = http(&server, "GET", "/ships/zod/", &[], b"");
+    assert_eq!((answer.status, answer.header("Location")), (303, Some("/ships/zod/signin")));
+    let page = http(&server, "GET", "/ships/zod/signin", &[], b"");
+    assert!(page.status == 200 && page.text().contains("Sign in to ~zod"));
+    assert!(page.header("Content-Security-Policy").is_some_and(|policy| policy.contains("frame-ancestors 'none'")));
+    // With `no-referrer` a browser would report the page's own forms as coming from nowhere,
+    // and the ship would refuse its own buttons.
+    assert_eq!(page.header("Referrer-Policy"), Some("same-origin"));
+
+    // A wrong code shows the page again and says why.
+    let answer = http(&server, "POST", "/ships/zod/signin", &form, b"code=nope&label=Laptop");
+    assert!(answer.status == 401 && answer.text().contains("not accepted") && answer.header("Set-Cookie").is_none());
+
+    // The right one, typed with spaces, sets a cookie the page's scripts cannot read and that
+    // is sent only to this ship, then moves on to the ship's page.
+    let typed = format!("code={}&label=%3Cscript%3Ealert(1)%3C%2Fscript%3E", code.replace('-', "+"));
+    let answer = http(&server, "POST", "/ships/zod/signin", &form, typed.as_bytes());
+    assert_eq!((answer.status, answer.header("Location")), (303, Some("/ships/zod/")));
+    let set = answer.header("Set-Cookie").unwrap().to_string();
+    assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict") && set.contains("Path=/ships/zod;"), "{set}");
+    assert!(!set.contains("Secure"));
+    let cookie = set.split(';').next().unwrap().to_string();
+    let cookies = [("Cookie", cookie.as_str())];
+
+    // The ship's page lists the device. Its label is shown as text, never run as markup.
+    let home = http(&server, "GET", "/ships/zod/", &cookies, b"");
+    assert_eq!(home.status, 200);
+    assert!(home.text().contains("&lt;script&gt;alert(1)&lt;/script&gt;") && !home.text().contains("<script>"), "{}", home.text());
+    // The cookie works for reading, like a token in a header.
+    assert_eq!(http(&server, "GET", "/ships/zod/devices", &cookies, b"").status, 200);
+
+    // A browser can hold several cookies of this name, from other paths or a parent domain,
+    // and sends them all. The good one is found among them.
+    let several = format!("other=1; ship_token=stale; {cookie}");
+    assert_eq!(http(&server, "GET", "/ships/zod/devices", &[("Cookie", several.as_str())], b"").status, 200);
+
+    // The access code is for typing into the page. Put in an address it would stay in
+    // histories and logs for as long as it works, so there it is refused like a wrong code.
+    let link = format!("/ships/zod/signin?code={code}");
+    let answer = http(&server, "GET", &link, &[], b"");
+    assert!(answer.status == 401 && answer.header("Set-Cookie").is_none());
+    assert_eq!(rt.devices("~zod").unwrap().len(), 1);
+
+    // A one-time sign-in link does the same in one step.
+    let once = rt.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    let answer = http(&server, "GET", &format!("/ships/zod/signin?code={once}"), &[], b"");
+    assert_eq!((answer.status, answer.header("Location")), (303, Some("/ships/zod/")));
+    assert!(answer.header("Set-Cookie").is_some());
+    let again = http(&server, "GET", &format!("/ships/zod/signin?code={once}"), &[], b"");
+    assert!(again.status == 401 && again.header("Set-Cookie").is_none());
+    let labels: Vec<String> = rt.devices("~zod").unwrap().into_iter().map(|device| device.label).collect();
+    assert_eq!(labels, ["<script>alert(1)</script>", "Browser"]);
+
+    // The ship's page signs another device out with a button.
+    let origin = format!("http://{}", server.addr());
+    let own = [("Cookie", cookie.as_str()), ("Origin", origin.as_str())];
+    let answer = http(&server, "POST", "/ships/zod/devices/2/revoke", &own, b"");
+    assert_eq!((answer.status, answer.header("Location")), (303, Some("/ships/zod/")));
+    assert_eq!(rt.devices("~zod").unwrap().len(), 1);
+
+    // Signing out forgets the device and tells the browser to drop the cookie.
+    let answer = http(&server, "POST", "/ships/zod/signout", &own, b"");
+    assert_eq!((answer.status, answer.header("Location")), (303, Some("/ships/zod/signin")));
+    assert!(answer.header("Set-Cookie").unwrap().contains("Max-Age=0"));
+    assert_eq!(http(&server, "GET", "/ships/zod/", &cookies, b"").status, 303);
+    assert_eq!(http(&server, "GET", "/ships/zod/devices", &cookies, b"").status, 401);
+}
+
+#[test]
+fn another_site_cannot_use_a_browsers_cookie_to_act_on_the_ship() {
+    let dir = TempDir::new("http-csrf");
+    let (rt, server) = serve(&dir, fast(), ServerConfig::default());
+    let token = sign_in(&rt, "Browser");
+    let cookie = format!("ship_token={token}");
+    let own = format!("http://{}", server.addr());
+    let command = |headers: &[(&str, &str)]| http(&server, "POST", "/ships/zod/agents/counter/command", headers, b"inc hits");
+
+    // A browser attaches the cookie to any request for the ship, whoever's page asked for it.
+    // Only a request that says it came from the ship's own page may change anything.
+    assert_eq!(command(&[("Cookie", &cookie)]).status, 403);
+    assert_eq!(command(&[("Cookie", &cookie), ("Origin", "http://elsewhere.example")]).status, 403);
+    assert_eq!(command(&[("Cookie", &cookie), ("Origin", "null")]).status, 403);
+    assert_eq!(http(&server, "POST", "/ships/zod/signout", &[("Cookie", &cookie)], b"").status, 403);
+    assert_eq!(http(&server, "DELETE", "/ships/zod/devices/1", &[("Cookie", &cookie)], b"").status, 403);
+    assert_eq!(send(&rt, "~zod", "counter", "get hits"), "0");
+    assert_eq!(rt.devices("~zod").unwrap().len(), 1);
+
+    // A browser that says outright whether the request is the ship's own is believed, either way.
+    assert_eq!(command(&[("Cookie", &cookie), ("Sec-Fetch-Site", "cross-site")]).status, 403);
+    assert_eq!(command(&[("Cookie", &cookie), ("Sec-Fetch-Site", "same-site"), ("Origin", &own)]).status, 403);
+    assert_eq!(send(&rt, "~zod", "counter", "get hits"), "0");
+
+    let answer = command(&[("Cookie", &cookie), ("Origin", &own)]);
+    assert_eq!((answer.status, answer.text().as_str()), (200, "1"));
+    assert_eq!(command(&[("Cookie", &cookie), ("Sec-Fetch-Site", "same-origin"), ("Origin", "null")]).text(), "2");
+    // An app sends its token itself, in a header no other site can add, so it needs no such check.
+    let auth = bearer(&token);
+    assert_eq!(command(&[("Authorization", &auth)]).text(), "3");
+    // A header wins over a cookie, so a bad header is not rescued by a good cookie.
+    assert_eq!(command(&[("Authorization", "Bearer nope"), ("Cookie", &cookie), ("Origin", &own)]).status, 401);
+}
+
+#[test]
+fn a_hostname_can_name_the_ship() {
+    let dir = TempDir::new("http-host");
+    let config = ServerConfig { ship_host_suffix: Some(".ships.test".into()), secure_cookies: true, ..ServerConfig::default() };
+    let (rt, server) = serve(&dir, fast(), config);
+    let code = rt.set_access_code("~zod").unwrap();
+    let host = [("Host", "zod.ships.test:8443"), ("Content-Type", "application/x-www-form-urlencoded")];
+
+    // The ship is the first part of the hostname, and paths start at the ship.
+    let answer = http(&server, "GET", "/", &host, b"");
+    assert_eq!((answer.status, answer.header("Location")), (303, Some("/signin")));
+    let answer = http(&server, "POST", "/signin", &host, format!("code={code}").as_bytes());
+    assert_eq!((answer.status, answer.header("Location")), (303, Some("/")));
+    let set = answer.header("Set-Cookie").unwrap();
+    assert!(set.contains("Path=/;") && set.contains("; Secure"), "{set}");
+    let cookie = set.split(';').next().unwrap().to_string();
+    let with_cookie = [("Host", "ZOD.ships.test"), ("Cookie", cookie.as_str())];
+    assert!(http(&server, "GET", "/", &with_cookie, b"").text().contains("~zod"));
+
+    // A name that merely ends in the ship's is a different ship, here one that does not exist.
+    assert_eq!(http(&server, "GET", "/devices", &[("Host", "evilzod.ships.test"), ("Cookie", cookie.as_str())], b"").status, 401);
+    // Without its dot the suffix would match in the middle of a name, so it is not accepted.
+    let dotless = ServerConfig { ship_host_suffix: Some("ships.test".into()), ..ServerConfig::default() };
+    assert!(Server::start(rt.clone(), dotless).is_err());
+
+    // A hostname that names no ship, and one outside the suffix, fall back to the path.
+    assert_eq!(http(&server, "GET", "/signin", &[("Host", "nec.ships.test")], b"").status, 200);
+    assert_eq!(http(&server, "GET", "/devices", &[("Host", "nec.ships.test"), ("Cookie", cookie.as_str())], b"").status, 401);
+    assert_eq!(http(&server, "GET", "/signin", &[("Host", "zod.elsewhere.test")], b"").status, 404);
+    assert_eq!(http(&server, "GET", "/ships/zod/signin", &[("Host", "zod.elsewhere.test")], b"").status, 200);
+}
+
+#[test]
+fn guessing_sign_in_codes_over_http_is_slowed_down() {
+    let dir = TempDir::new("http-lock");
+    let (rt, server) = serve(&dir, Config { signin_max_failures: 3, signin_lock_millis: 60_000, ..fast() }, ServerConfig::default());
+    let code = rt.set_access_code("~zod").unwrap();
+    let form = [("Content-Type", "application/x-www-form-urlencoded")];
+    for _ in 0..3 {
+        assert_eq!(http(&server, "POST", "/ships/zod/signin", &form, b"code=guess").status, 401);
+    }
+    let answer = http(&server, "POST", "/ships/zod/signin", &form, format!("code={code}").as_bytes());
+    assert_eq!(answer.status, 429);
+    let wait: u64 = answer.header("Retry-After").unwrap().parse().unwrap();
+    assert!((1..=60).contains(&wait), "{wait}");
+    assert!(answer.header("Set-Cookie").is_none() && answer.text().contains("too many"));
+    let asked = ship_proto::SignInRequest { code, label: "Phone".into() }.encode_to_vec();
+    assert_eq!(http(&server, "POST", "/ships/zod/signin", &[("Content-Type", "application/x-protobuf")], &asked).status, 429);
+    assert!(rt.devices("~zod").unwrap().is_empty());
+}
+
+/// Send bytes exactly as given and read whatever comes back.
+fn raw_http(server: &Server, request: &[u8]) -> Answer {
+    use std::io::Write;
+    let mut stream = std::net::TcpStream::connect(server.addr()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let _ = stream.write_all(request);
+    read_answer(stream)
+}
+
+#[test]
+fn requests_the_server_will_not_take_are_refused_without_harm() {
+    let dir = TempDir::new("http-refused");
+    let (rt, server) = serve(&dir, fast(), ServerConfig { workers: 4, ..ServerConfig::default() });
+    let token = bearer(&sign_in(&rt, "Phone"));
+    let auth = [("Authorization", token.as_str())];
+
+    // A request that claims an enormous body is refused on the claim, before anything is read
+    // or set aside for it, and without being signed in. Far more of them than there are
+    // threads leave the server working.
+    for _ in 0..40 {
+        let claim = b"GET /ships/zod/devices HTTP/1.1\r\nHost: x\r\nContent-Length: 18446744073709551615\r\n\r\n";
+        assert_eq!(raw_http(&server, claim).status, 413);
+    }
+    assert_eq!(raw_http(&server, b"POST /ships/zod/signin HTTP/1.1\r\nHost: x\r\nContent-Length: 1048577\r\n\r\n").status, 413);
+    assert_eq!(http(&server, "GET", "/ships/zod/devices", &auth, b"").status, 200);
+
+    // A body is taken only with one plain statement of its length.
+    let refused = |request: &str| raw_http(&server, request.as_bytes()).status;
+    assert_eq!(refused("POST /ships/zod/signin HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"), 501);
+    assert_eq!(refused("POST /ships/zod/signin HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n"), 400);
+    assert_eq!(refused("POST /ships/zod/signin HTTP/1.1\r\nHost: x\r\nContent-Length: many\r\n\r\n"), 400);
+    assert_eq!(refused("POST /ships/zod/signin HTTP/1.1\r\nHost: x\r\nContent-Length: +0\r\n\r\n"), 400);
+    assert_eq!(refused("POST /ships/zod/signin HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999999\r\n\r\n"), 413);
+    assert_eq!(refused("POST /ships/zod/signin HTTP/1.1\r\nHost: x\r\nExpect: something-else\r\n\r\n"), 417);
+    // Other things that are not a request this server reads.
+    assert_eq!(refused("GET /ships/zod/signin HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"), 400);
+    assert_eq!(refused("GET /ships/zod/signin HTTP/1.1\r\n\r\n"), 400);
+    assert_eq!(refused("GET /ships/zod/signin HTTP/1.7\r\nHost: x\r\n\r\n"), 400);
+    assert_eq!(refused("hello there\r\n\r\n"), 400);
+    assert_eq!(refused("GET ships/zod/signin HTTP/1.1\r\nHost: x\r\n\r\n"), 400);
+    assert_eq!(refused("GET /ships/zod/signin HTTP/1.1\r\nHost: x\r\nno colon here\r\n\r\n"), 400);
+    assert_eq!(refused("GET /ships/zod/signin HTTP/1.1\r\nHost: x\r\nX-Tab\t: 1\r\n\r\n"), 400);
+    assert_eq!(refused("GET /ships/zod/signin HTTP/1.1\r\nHost: x\r\nX-Break: a\nb\r\n\r\n"), 400);
+    assert_eq!(refused("GET /ships/zod/signin HTTP/1.1\r\nHost: x\r\nX-Null: a\0b\r\n\r\n"), 400);
+    assert_eq!(refused(&format!("GET /ships/zod/signin HTTP/1.1\r\nHost: x\r\nX-Padding: {}\r\n\r\n", "x".repeat(20_000))), 431);
+
+    // An answer to a method this server does not have says which it does, and an answer to
+    // HEAD carries nothing after its headers.
+    let head = raw_http(&server, b"HEAD /ships/zod/signin HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!((head.status, head.header("Allow"), head.body.len()), (405, Some("GET, POST"), 0));
+    // That holds when the request is refused before it is even looked at closely.
+    let head = raw_http(&server, b"HEAD /ships/zod/signin HTTP/1.1\r\nHost: x\r\nExpect: something-else\r\n\r\n");
+    assert_eq!((head.status, head.body.len()), (417, 0));
+    let head = raw_http(&server, b"HEAD /ships/zod/signin HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999\r\n\r\n");
+    assert_eq!((head.status, head.body.len()), (413, 0));
+    let padded = format!("HEAD /ships/zod/signin HTTP/1.1\r\nHost: x\r\nX-Padding: {}\r\n\r\n", "x".repeat(20_000));
+    let head = raw_http(&server, padded.as_bytes());
+    assert_eq!((head.status, head.body.len()), (431, 0));
+    let head = raw_http(&server, b"HEAD /ships/zod/signin HTTP/1.1\r\nHost: x\r\nX-Odd: \xff\xfe\r\n\r\n");
+    assert_eq!((head.status, head.body.len()), (400, 0));
+    // An address written with escapes is the same address for every purpose: which methods it
+    // takes, and what it does.
+    let escaped = http(&server, "DELETE", "/ships/zod/s%69gnin", &[], b"");
+    assert_eq!((escaped.status, escaped.header("Allow")), (405, Some("GET, POST")));
+    let escaped = http(&server, "GET", "/ships/zod/s%69gnin", &[], b"");
+    assert!(escaped.status == 200 && escaped.text().contains("Sign in to ~zod"));
+    // The methods named are the ones that address takes, not every method the server knows.
+    assert_eq!(http(&server, "PUT", "/ships/zod/key", &auth, b"").header("Allow"), Some("GET"));
+    let wrong = http(&server, "DELETE", "/ships/zod/signin", &[], b"");
+    assert_eq!((wrong.status, wrong.header("Allow")), (405, Some("GET, POST")));
+    let wrong = http(&server, "GET", "/ships/zod/agents/counter/command", &auth, b"");
+    assert_eq!((wrong.status, wrong.header("Allow")), (405, Some("POST")));
+    // An answer that says there is no content does not give a length for it either.
+    let extra = sign_in(&rt, "Extra");
+    let gone = http(&server, "POST", "/ships/zod/signout", &[("Authorization", bearer(&extra).as_str())], b"");
+    assert_eq!((gone.status, gone.header("Content-Length"), gone.body.len()), (204, None, 0));
+
+    // Whatever follows a request on the same connection is never run as another request.
+    let both = format!(
+        "GET /ships/zod/key HTTP/1.1\r\nHost: x\r\nAuthorization: {token}\r\n\r\n\
+         POST /ships/zod/agents/counter/command HTTP/1.1\r\nHost: x\r\nAuthorization: {token}\r\nContent-Length: 8\r\n\r\ninc hits"
+    );
+    assert!(matches!(refused(&both), 200 | 400));
+    assert_eq!(send(&rt, "~zod", "counter", "get hits"), "0");
+
+    // A name that an address cannot carry is not a name. A browser rewrites `..` away, so a
+    // log called that could never be asked for; the runtime does not let one exist.
+    assert!(matches!(rt.log_head("~zod", "counter", ".."), Err(Error::InvalidName(_))));
+    assert_eq!(http(&server, "GET", "/ships/zod/logs/counter/%2E%2E/head", &auth, b"").status, 400);
+    assert_eq!(http(&server, "GET", "/ships/zod/logs/counter/%2E/head", &auth, b"").status, 400);
+    // And one that is, to show the ones above did no lasting harm.
+    assert_eq!(refused("GET /ships/zod/signin HTTP/1.1\r\nHost: x\r\n\r\n"), 200);
+    assert_eq!(http(&server, "GET", "/ships/zod/devices", &auth, b"").status, 200);
+}
+
+#[test]
+fn silent_clients_cannot_hold_the_server_or_stop_it_closing() {
+    use std::io::Write;
+    let dir = TempDir::new("http-stalled");
+    let config = ServerConfig { workers: 2, io_timeout: Duration::from_millis(400), ..ServerConfig::default() };
+    let (rt, server) = serve(&dir, fast(), config);
+    let token = bearer(&sign_in(&rt, "Phone"));
+    let auth = [("Authorization", token.as_str())];
+
+    // More clients than there are threads, each of which starts a request and then says
+    // nothing more: some stop in the headers, some promise a body and never send it.
+    let stalled: Vec<std::net::TcpStream> = (0..6)
+        .map(|n| {
+            let mut stream = std::net::TcpStream::connect(server.addr()).unwrap();
+            let start: &[u8] = if n % 2 == 0 { b"GET /ships/zod/devices HTTP/1.1\r\nHost: x\r\n" } else { b"POST /ships/zod/signin HTTP/1.1\r\nHost: x\r\nContent-Length: 2048\r\n\r\n" };
+            stream.write_all(start).unwrap();
+            stream
+        })
+        .collect();
+    // Each is given up on after its allowance, so a real request gets through soon after.
+    let started = Instant::now();
+    assert_eq!(http(&server, "GET", "/ships/zod/devices", &auth, b"").status, 200);
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    drop(stalled);
+    drop(server);
+
+    // The allowance is for the whole request, not for each piece of it. A client that keeps
+    // sending, a byte at a time, is given up on just the same.
+    let server = Server::start(rt.clone(), ServerConfig { workers: 2, io_timeout: Duration::from_millis(400), ..ServerConfig::default() }).unwrap();
+    let mut trickle = std::net::TcpStream::connect(server.addr()).unwrap();
+    trickle.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+    let (started, mut cut_off) = (Instant::now(), None);
+    for byte in b"GET /ships/zod/devices HTTP/1.1\r\nHost: x\r\nX-Slow: ".iter().chain([b'x'; 200].iter()) {
+        use std::io::Read;
+        // Closed from the other end: a write fails, or a read finds the end of the stream.
+        if trickle.write_all(&[*byte]).is_err() || matches!(trickle.read(&mut [0u8; 1]), Ok(0)) {
+            cut_off = Some(started.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let cut_off = cut_off.expect("a client that never finished its request was never given up on");
+    assert!(cut_off < Duration::from_secs(3), "{cut_off:?}");
+
+    // More waiting connections than the threads and their queue can hold are turned away at
+    // the door, not kept. With two threads there is room for ten; of sixteen, some are closed
+    // straight away, long before any allowance runs out.
+    let patient = Server::start(rt.clone(), ServerConfig { workers: 2, io_timeout: Duration::from_secs(30), ..ServerConfig::default() }).unwrap();
+    let crowd: Vec<std::net::TcpStream> = (0..16).map(|_| std::net::TcpStream::connect(patient.addr()).unwrap()).collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let closed = crowd
+        .iter()
+        .filter(|stream| {
+            use std::io::Read;
+            stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            let mut stream: &std::net::TcpStream = stream;
+            !matches!(stream.read(&mut [0u8; 1]), Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+        })
+        .count();
+    assert!((4..=8).contains(&closed), "{closed} of sixteen were turned away");
+    drop(crowd);
+    drop(patient);
+    drop(server);
+
+    // A server with a long allowance, stopped while clients are silent mid-request, and while
+    // a reader is waiting on a log, still stops at once: it cuts them off.
+    let server = Server::start(rt.clone(), ServerConfig { workers: 4, io_timeout: Duration::from_secs(60), ..ServerConfig::default() }).unwrap();
+    let addr = server.addr();
+    let _stalled: Vec<std::net::TcpStream> = (0..2)
+        .map(|_| {
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream.write_all(b"POST /ships/zod/signin HTTP/1.1\r\nHost: x\r\nContent-Length: 2048\r\n\r\n").unwrap();
+            stream
+        })
+        .collect();
+    let mut waiting = std::net::TcpStream::connect(addr).unwrap();
+    waiting.write_all(format!("GET /ships/zod/logs/counter/counter/entries?wait=30 HTTP/1.1\r\nHost: x\r\nAuthorization: {token}\r\n\r\n").as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    drop(server);
+    assert!(started.elapsed() < Duration::from_secs(5), "stopping took {:?}", started.elapsed());
+}

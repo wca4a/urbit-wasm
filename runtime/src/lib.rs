@@ -3,6 +3,7 @@
 //! each event is one transaction.
 
 mod host;
+pub mod server;
 mod ship;
 mod store;
 
@@ -24,7 +25,7 @@ use ship_proto::admin_request::Op;
 use ship_proto::{AdminRequest, CheckpointBody, Install, Message, Source};
 use wasmtime::{Engine, InstancePre, Linker, Module};
 
-pub use ship_proto::{EntryBody, Manifest, Provide, SignedCheckpoint, SignedEntry, Use};
+pub use ship_proto::{Device, EntryBody, Manifest, Provide, SignedCheckpoint, SignedEntry, Use};
 
 use host::Ctx;
 use ship::Ship;
@@ -34,8 +35,6 @@ pub(crate) const EPOCH_TICK_MILLIS: u64 = 10;
 
 /// Native stack each WASM instance may use.
 pub(crate) const WASM_STACK_BYTES: usize = 512 << 10;
-
-const MAX_INTERFACE_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Durability {
@@ -98,6 +97,14 @@ pub struct Config {
     /// this limit.
     pub max_awake: usize,
     pub audit_rows: u64,
+    /// How many devices may be signed in to a ship at once, and how many one-time sign-in codes
+    /// may be waiting to be used.
+    pub max_devices: usize,
+    pub max_signin_codes: usize,
+    /// After this many wrong sign-in codes in a row, nothing can sign in to the ship for
+    /// `signin_lock_millis`. Devices that are already signed in are not affected.
+    pub signin_max_failures: u32,
+    pub signin_lock_millis: u64,
     pub durability: Durability,
     pub limits: Limits,
 }
@@ -125,6 +132,10 @@ impl Default for Config {
             max_queued_per_deliver: 64,
             max_awake: 64,
             audit_rows: 10_000,
+            max_devices: 64,
+            max_signin_codes: 32,
+            signin_max_failures: 5,
+            signin_lock_millis: 60_000,
             durability: Durability::Full,
             limits: Limits {
                 max_key_bytes: 1024,
@@ -187,6 +198,14 @@ pub enum Error {
     /// The entries asked for have been dropped: the log now starts after this entry number. The
     /// reader should fetch the log's checkpoint and carry on from there.
     LogTrimmed(u64),
+    /// The sign-in code was not one this ship accepts: wrong, already used, or out of date.
+    SignInRefused,
+    /// Too many wrong sign-in codes. Nothing can sign in for this many more milliseconds.
+    SignInLocked(u64),
+    /// The token is not one of this ship's signed-in devices.
+    NotSignedIn,
+    /// The ship already has as many devices or waiting sign-in codes as it may.
+    TooMany(&'static str),
     /// The event was refused. It changed no state and queued no messages. The audit log records
     /// it on a best-effort basis.
     Rejected(Rejection),
@@ -207,6 +226,10 @@ impl fmt::Display for Error {
             Error::InstallRefused(why) => write!(f, "install refused: {why}"),
             Error::DataDirInUse => write!(f, "another runtime is using this data directory"),
             Error::LogTrimmed(base) => write!(f, "the log no longer holds entries up to {base}; fetch its checkpoint"),
+            Error::SignInRefused => write!(f, "that sign-in code is not accepted"),
+            Error::SignInLocked(millis) => write!(f, "too many wrong sign-in codes; try again in {} seconds", millis.div_ceil(1000)),
+            Error::NotSignedIn => write!(f, "not signed in"),
+            Error::TooMany(what) => write!(f, "this ship already has as many {what} as it may"),
             Error::Rejected(Rejection::OutOfFuel) => write!(f, "event rejected: compute budget exhausted"),
             Error::Rejected(Rejection::Timeout) => write!(f, "event rejected: ran too long"),
             Error::Rejected(Rejection::Denied(why)) => write!(f, "event rejected: not permitted: {why}"),
@@ -266,6 +289,11 @@ pub(crate) struct Inner {
     /// that nothing ever sees one without the matching other. Nothing else is locked under it.
     lifecycle: Mutex<()>,
     awake_changed: Condvar,
+    /// For each ship, how many events have added to its logs since the runtime started. A
+    /// reader waiting for new entries sleeps on `logs_changed` until this moves. Nothing else
+    /// is locked while this is held.
+    log_growth: Mutex<HashMap<String, u64>>,
+    logs_changed: Condvar,
 }
 
 pub struct Runtime {
@@ -404,7 +432,7 @@ fn check_hash(hash: &str) -> Result<(), Error> {
 /// `kernel` is where the kernel keeps its keys, so nothing else may ever run under it.
 pub(crate) fn check_target(agent: &str, interface: &str) -> Result<(), Error> {
     check_agent_name(agent)?;
-    if agent == "kernel" || interface.len() > MAX_INTERFACE_BYTES {
+    if agent == "kernel" || !store::interface_ok(interface) {
         return Err(Error::InvalidName(format!("{agent} {interface}")));
     }
     Ok(())
@@ -548,6 +576,50 @@ pub fn verify_checkpoint(
     Ok(((body.seq, hash), body.state))
 }
 
+/// Labels for the two kinds of secret a ship hashes, so that a device's token can never be
+/// offered as a sign-in code or the other way round.
+const SIGNIN_DOMAIN: &[u8] = b"ship.v1.signin\n";
+const DEVICE_DOMAIN: &[u8] = b"ship.v1.device\n";
+
+/// What the ship stores in place of a secret. The secrets are long and random, so a plain
+/// hash is enough: there is nothing to guess that a slow hash would slow down.
+fn secret_hash(domain: &[u8], secret: &str) -> [u8; 32] {
+    sha256(&[domain, secret.as_bytes()].concat())
+}
+
+fn random_bytes<const N: usize>() -> io::Result<[u8; N]> {
+    let mut bytes = [0u8; N];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An access code as its owner sees it: 100 random bits as twenty letters and digits in four
+/// groups, from an alphabet with no pairs that look alike (no i, l, o, or u).
+fn access_code(random: &[u8; 13]) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+    let bits = random.iter().fold(0u128, |all, byte| (all << 8) | *byte as u128);
+    let letters: Vec<u8> = (0..20).map(|i| ALPHABET[((bits >> (99 - 5 * (i + 1) + 1)) & 31) as usize]).collect();
+    letters.chunks(5).map(|group| String::from_utf8_lossy(group).into_owned()).collect::<Vec<_>>().join("-")
+}
+
+/// A sign-in code as typed, without the dashes, spaces, and capitals people add.
+fn normal_code(code: &str) -> String {
+    code.chars().filter(|c| !c.is_whitespace() && *c != '-').flat_map(char::to_lowercase).collect()
+}
+
+/// A device's label, made safe to store and show: no control characters, not too long, not empty.
+fn clean_label(label: &str) -> String {
+    let mut clean: String = label.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string();
+    while clean.len() > store::MAX_LABEL_BYTES {
+        clean.pop();
+    }
+    if clean.is_empty() { "device".to_string() } else { clean }
+}
+
 /// Read a ship's signing key: 32 bytes in a regular file.
 fn load_key(path: &Path) -> Result<SigningKey, Error> {
     let bad = || Error::BadShipFile(format!("{}: not a ship key", path.display()));
@@ -636,6 +708,8 @@ impl Runtime {
                 awake: Mutex::new(HashMap::new()),
                 lifecycle: Mutex::new(()),
                 awake_changed: Condvar::new(),
+                log_growth: Mutex::new(HashMap::new()),
+                logs_changed: Condvar::new(),
             }),
         })
     }
@@ -664,8 +738,7 @@ impl Runtime {
         }
         // The ship's signing key, a stand-in for its Urbit ID networking key. It lives beside the
         // ship file, not in it.
-        let mut seed = [0u8; 32];
-        fs::File::open("/dev/urandom")?.read_exact(&mut seed)?;
+        let seed = random_bytes::<32>()?;
         // Built under a private name and then published, so a failure part way through cannot
         // leave a broken file sitting on the ship's name for ever.
         let fresh = Scratch::new(&self.inner.tmp_dir);
@@ -827,6 +900,143 @@ impl Runtime {
         })
     }
 
+    /// Where a log ends, waiting up to `timeout` for it to grow past entry `after`. Returns as
+    /// soon as it has, or with whatever its end is when the time is up. A client uses this to
+    /// hear of new entries without asking over and over. It does not keep the ship awake.
+    pub fn wait_log(&self, ship: &str, agent: &str, log: &str, after: u64, timeout: Duration) -> Result<Option<Position>, Error> {
+        let name = canonical_ship(ship)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Read before looking at the log, so growth between the look and the sleep is seen.
+            let seen = lock(&self.inner.log_growth).get(&name).copied().unwrap_or(0);
+            let head = self.log_head(ship, agent, log)?;
+            if head.is_some_and(|(seq, _)| seq > after) || Instant::now() >= deadline {
+                return Ok(head);
+            }
+            let mut growth = lock(&self.inner.log_growth);
+            while growth.get(&name).copied().unwrap_or(0) == seen {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                growth = self.inner.logs_changed.wait_timeout(growth, left).unwrap_or_else(PoisonError::into_inner).0;
+            }
+        }
+    }
+
+    /// Make a one-time sign-in code for a ship, good for a single use within `valid_for`. Being
+    /// able to call this is what approves the device that ends up using the code: it is for
+    /// whoever controls the machine the ship runs on, such as a hosting service after the owner
+    /// has logged in to it, or the owner at the command line. The code is returned this once;
+    /// the ship keeps only a hash of it.
+    pub fn new_signin_code(&self, ship: &str, valid_for: Duration) -> Result<String, Error> {
+        let code = hex(&random_bytes::<16>()?);
+        let (hash, max) = (secret_hash(SIGNIN_DOMAIN, &code), self.inner.cfg.max_signin_codes);
+        self.inner.with_ship(ship, |ship| {
+            ship.transact(|conn| {
+                let now = store::now_ms();
+                store::codes_purge(conn, now)?;
+                if store::code_count(conn)? >= max {
+                    return Err(Error::TooMany("sign-in codes waiting"));
+                }
+                Ok(store::code_add(conn, &hash, now.saturating_add(valid_for.as_millis() as u64))?)
+            })
+        })?;
+        Ok(code)
+    }
+
+    /// Give a ship a new reusable access code, replacing any it had, and return it this once.
+    /// The owner keeps it somewhere safe and types it into the ship's sign-in page from any
+    /// new device. Changing it stops the old one from signing anything new in; devices that
+    /// are already signed in stay signed in.
+    pub fn set_access_code(&self, ship: &str) -> Result<String, Error> {
+        let code = access_code(&random_bytes::<13>()?);
+        let hash = secret_hash(SIGNIN_DOMAIN, &normal_code(&code));
+        self.inner.with_ship(ship, |ship| ship.transact(|conn| Ok(store::access_code_set(conn, Some(&hash))?)))?;
+        Ok(code)
+    }
+
+    /// Leave a ship with no reusable access code. One-time codes still work.
+    pub fn clear_access_code(&self, ship: &str) -> Result<(), Error> {
+        self.inner.with_ship(ship, |ship| ship.transact(|conn| Ok(store::access_code_set(conn, None)?)))
+    }
+
+    /// Sign a device in: trade a sign-in code for a token of the device's own. The token is
+    /// returned this once and the ship keeps only a hash of it. `label` is what the device is
+    /// called in the owner's list.
+    ///
+    /// A wrong code is `Error::SignInRefused`. After several in a row the ship refuses every
+    /// sign-in for a while with `Error::SignInLocked`, good codes included, so that codes
+    /// cannot be guessed at speed.
+    pub fn sign_in(&self, ship: &str, code: &str, label: &str) -> Result<(String, Device), Error> {
+        self.sign_in_with(ship, code, label, true)
+    }
+
+    /// Sign a device in with a one-time code only. The ship's reusable access code is refused
+    /// here, as a wrong code would be. This is for sign-in links, where the code is part of an
+    /// address and may be kept in histories and logs. A one-time code found there later has
+    /// been used or has run out; an access code would still work. Until it is used a one-time
+    /// code is as sensitive as any other, and a link is only as private as the way it is sent.
+    pub fn sign_in_once(&self, ship: &str, code: &str, label: &str) -> Result<(String, Device), Error> {
+        self.sign_in_with(ship, code, label, false)
+    }
+
+    fn sign_in_with(&self, ship: &str, code: &str, label: &str, access_code_ok: bool) -> Result<(String, Device), Error> {
+        let cfg = &self.inner.cfg;
+        let (code_hash, label) = (secret_hash(SIGNIN_DOMAIN, &normal_code(code)), clean_label(label));
+        let token = hex(&random_bytes::<32>()?);
+        let token_hash = secret_hash(DEVICE_DOMAIN, &token);
+        let outcome = self.inner.with_ship(ship, |ship| {
+            // What a wrong code changes has to be kept, so it is this transaction's result,
+            // not an error that would undo it.
+            ship.transact(|conn| -> Result<Result<Device, Error>, Error> {
+                let now = store::now_ms();
+                let locked_until = store::signin_locked_until(conn)?;
+                if now < locked_until {
+                    return Ok(Err(Error::SignInLocked(locked_until - now)));
+                }
+                store::codes_purge(conn, now)?;
+                let good = match store::code_find(conn, &code_hash, now)? {
+                    Some(reusable) => access_code_ok || !reusable,
+                    None => false,
+                };
+                if !good {
+                    store::signin_failed(conn, now, cfg.signin_max_failures, cfg.signin_lock_millis)?;
+                    return Ok(Err(Error::SignInRefused));
+                }
+                store::signin_succeeded(conn)?;
+                // Only someone holding a good code is told the ship is full of devices, and the
+                // code is not used up by finding that out.
+                if store::device_count(conn)? >= cfg.max_devices {
+                    return Ok(Err(Error::TooMany("devices signed in")));
+                }
+                store::code_use(conn, &code_hash)?;
+                let id = store::device_add(conn, &token_hash, &label, now)?;
+                Ok(Ok(Device { id, label: label.clone(), created_ms: now }))
+            })
+        })?;
+        outcome.map(|device| (token, device))
+    }
+
+    /// Which device a token belongs to, or `Error::NotSignedIn`. Whoever holds a device's
+    /// token acts as the ship's owner.
+    pub fn authenticate(&self, ship: &str, token: &str) -> Result<Device, Error> {
+        let hash = secret_hash(DEVICE_DOMAIN, token);
+        self.inner
+            .with_ship(ship, |ship| Ok(store::device_by_token(&lock(&ship.conn), &hash)?))?
+            .ok_or(Error::NotSignedIn)
+    }
+
+    /// The devices signed in to a ship, oldest first.
+    pub fn devices(&self, ship: &str) -> Result<Vec<Device>, Error> {
+        self.inner.with_ship(ship, |ship| Ok(store::devices(&lock(&ship.conn))?))
+    }
+
+    /// Sign one device out, so its token stops working. Returns whether there was such a device.
+    pub fn revoke_device(&self, ship: &str, id: u64) -> Result<bool, Error> {
+        self.inner.with_ship(ship, |ship| ship.transact(|conn| Ok(store::device_revoke(conn, id)?)))
+    }
+
     /// The newest audit entries, newest first.
     pub fn audit(&self, ship: &str, limit: usize) -> Result<Vec<AuditEntry>, Error> {
         self.inner.with_ship(ship, |ship| store::audit_tail(&lock(&ship.conn), limit))
@@ -961,6 +1171,12 @@ impl Runtime {
 }
 
 impl Inner {
+    /// An event on this ship has added to its logs.
+    pub(crate) fn logs_grew(&self, ship: &str) {
+        *lock(&self.log_growth).entry(ship.to_string()).or_default() += 1;
+        self.logs_changed.notify_all();
+    }
+
     fn ship_path(&self, name: &str) -> PathBuf {
         self.ships_dir.join(format!("{name}.ship"))
     }

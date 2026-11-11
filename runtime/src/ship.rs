@@ -76,6 +76,8 @@ const KERNEL_REPLY_BYTES: usize = 1 << 20;
 
 #[derive(Default)]
 struct Returned {
+    /// How many log entries the event added.
+    appended: u32,
     reply: Vec<u8>,
     fuel_left: u64,
     effects: u32,
@@ -171,6 +173,7 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
         .to_vec();
     let ctx = store.into_data();
     Ok(Returned {
+        appended: ctx.appended,
         reply,
         fuel_left,
         effects: ctx.effects,
@@ -291,6 +294,24 @@ impl Ship {
         }
     }
 
+    /// Run `work` as a transaction of its own, outside any event: all of it is kept, or none.
+    pub fn transact<R>(&mut self, work: impl FnOnce(&Connection) -> Result<R, Error>) -> Result<R, Error> {
+        self.begin("BEGIN IMMEDIATE")?;
+        // Each lock is taken in a statement of its own, so it is released before the next.
+        let ran = {
+            let conn = lock(&self.conn);
+            work(&conn)
+        };
+        let done = ran.and_then(|value| {
+            let committed = lock(&self.conn).execute_batch("COMMIT");
+            committed.map(|()| value).map_err(Error::from)
+        });
+        if done.is_err() {
+            self.rollback();
+        }
+        done
+    }
+
     /// The setting for one operation, with its time limit starting now.
     fn env<'a>(&'a self, rt: &'a Arc<Inner>) -> Env<'a> {
         let deadline = Instant::now() + Duration::from_millis(rt.cfg.max_event_millis);
@@ -406,6 +427,10 @@ impl Ship {
                 if let Err(e) = committed {
                     self.rollback();
                     return Err(e.into());
+                }
+                // Anything waiting for one of this ship's logs to grow can look again.
+                if done.appended > 0 {
+                    rt.logs_grew(&self.name);
                 }
                 self.outbox_bytes += done.effect_bytes;
                 self.inbox_bytes += done.queued_bytes;

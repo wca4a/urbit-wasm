@@ -11,16 +11,23 @@ use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 
-use ship_proto::{CheckpointBody, Kind, Message};
+use ship_proto::{CheckpointBody, Device, Kind, Message};
 
 use crate::{signed_bytes, AuditEntry, ChainCheck, Config, Durability, Effect, Error, CHECKPOINT_DOMAIN};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Each pending message counts as its payload plus this, so empty messages still use up quota.
 pub const MESSAGE_OVERHEAD: u64 = 64;
 
 const MAX_INTERFACE_BYTES: usize = 128;
+
+/// Whether this can be the name of an interface, and so of a log. Not too long, and not `.` or
+/// `..`: those mean "here" and "up one" in an address, so a browser rewrites any address that
+/// contains them and a log by that name could never be asked for.
+pub fn interface_ok(name: &str) -> bool {
+    name.len() <= MAX_INTERFACE_BYTES && name != "." && name != ".."
+}
 
 /// How many logs one agent may follow. Notifications are not counted against the inbox quota;
 /// this is what bounds them, since at most one is ever queued per follower and log.
@@ -118,7 +125,21 @@ CREATE TABLE audit (
     event BLOB NOT NULL,
     ok INTEGER NOT NULL
 );
+CREATE TABLE devices (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash BLOB NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+CREATE TABLE signin_codes (
+    code_hash BLOB PRIMARY KEY,
+    expires_ms INTEGER NOT NULL,
+    reusable INTEGER NOT NULL
+) WITHOUT ROWID;
 ";
+
+/// The longest label a device may carry.
+pub const MAX_LABEL_BYTES: usize = 64;
 
 /// Create a ship file at `path`, which must not exist. The caller creates it under a private
 /// name and publishes it afterwards, so a failure here never leaves a half-made ship behind.
@@ -479,6 +500,126 @@ pub fn reclaim(conn: &Connection) -> rusqlite::Result<()> {
         recount(conn, agent, name)?;
     }
     Ok(())
+}
+
+/// The time now, in milliseconds since 1970.
+pub fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+// Signing in. A device proves the owner wants it connected by presenting a sign-in code, and is
+// given a token of its own. The ship keeps only hashes: of each device's token, of each
+// one-time code until it is used or expires, and of the one reusable access code.
+
+/// Record a new device and return its number. Numbers are never reused.
+pub fn device_add(conn: &Connection, token_hash: &[u8; 32], label: &str, now: u64) -> rusqlite::Result<u64> {
+    conn.prepare_cached("INSERT INTO devices (token_hash, label, created_ms) VALUES (?1, ?2, ?3)")?
+        .execute(params![&token_hash[..], label, now as i64])?;
+    Ok(conn.last_insert_rowid() as u64)
+}
+
+fn device_row(r: &Row) -> rusqlite::Result<Device> {
+    Ok(Device { id: r.get::<_, i64>(0)? as u64, label: r.get(1)?, created_ms: r.get::<_, i64>(2)? as u64 })
+}
+
+/// The device that holds the token with this hash, if any does.
+pub fn device_by_token(conn: &Connection, token_hash: &[u8; 32]) -> rusqlite::Result<Option<Device>> {
+    conn.prepare_cached("SELECT seq, label, created_ms FROM devices WHERE token_hash = ?1")?
+        .query_row([&token_hash[..]], device_row)
+        .optional()
+}
+
+pub fn devices(conn: &Connection) -> rusqlite::Result<Vec<Device>> {
+    conn.prepare_cached("SELECT seq, label, created_ms FROM devices ORDER BY seq")?.query_map([], device_row)?.collect()
+}
+
+pub fn device_count(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM devices")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+}
+
+/// Forget a device, so its token stops working. Returns whether there was one.
+pub fn device_revoke(conn: &Connection, id: u64) -> rusqlite::Result<bool> {
+    // A number too large for SQLite to hold names no device.
+    let Ok(id) = i64::try_from(id) else { return Ok(false) };
+    conn.prepare_cached("DELETE FROM devices WHERE seq = ?1")?.execute([id]).map(|gone| gone == 1)
+}
+
+/// Drop the one-time codes whose time has passed.
+pub fn codes_purge(conn: &Connection, now: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM signin_codes WHERE reusable = 0 AND expires_ms <= ?1")?.execute([now as i64]).map(drop)
+}
+
+/// How many one-time codes are waiting to be used.
+pub fn code_count(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM signin_codes WHERE reusable = 0")?
+        .query_row([], |r| r.get::<_, i64>(0))
+        .map(|n| n as usize)
+}
+
+/// Keep a one-time code until `expires`.
+pub fn code_add(conn: &Connection, code_hash: &[u8; 32], expires: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT INTO signin_codes VALUES (?1, ?2, 0)")?
+        .execute(params![&code_hash[..], i64::try_from(expires).unwrap_or(i64::MAX)])
+        .map(drop)
+}
+
+/// Replace the ship's reusable access code, or with `None` leave it with none.
+pub fn access_code_set(conn: &Connection, code_hash: Option<&[u8; 32]>) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM signin_codes WHERE reusable = 1")?.execute([])?;
+    if let Some(hash) = code_hash {
+        conn.prepare_cached("INSERT INTO signin_codes VALUES (?1, 0, 1)")?.execute([&hash[..]])?;
+    }
+    Ok(())
+}
+
+/// Whether a sign-in code is good at this moment, and if so whether it is the reusable access
+/// code (`Some(true)`) or a one-time code (`Some(false)`). Nothing is used up by asking.
+pub fn code_find(conn: &Connection, code_hash: &[u8; 32], now: u64) -> rusqlite::Result<Option<bool>> {
+    let found = conn
+        .prepare_cached("SELECT expires_ms, reusable FROM signin_codes WHERE code_hash = ?1")?
+        .query_row([&code_hash[..]], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? != 0)))
+        .optional()?;
+    Ok(match found {
+        Some((_, true)) => Some(true),
+        Some((expires, false)) if now < expires => Some(false),
+        _ => None,
+    })
+}
+
+/// A one-time code has been used, so it is gone. The reusable access code stays.
+pub fn code_use(conn: &Connection, code_hash: &[u8; 32]) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM signin_codes WHERE code_hash = ?1 AND reusable = 0")?.execute([&code_hash[..]]).map(drop)
+}
+
+fn meta_number(conn: &Connection, key: &str) -> rusqlite::Result<u64> {
+    let value = conn.prepare_cached("SELECT value FROM meta WHERE key = ?1")?.query_row([key], |r| r.get::<_, i64>(0)).optional()?;
+    Ok(value.unwrap_or(0) as u64)
+}
+
+fn meta_set(conn: &Connection, key: &str, value: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO meta VALUES (?1, ?2)")?
+        .execute(params![key, i64::try_from(value).unwrap_or(i64::MAX)])
+        .map(drop)
+}
+
+/// Until when signing in to this ship is locked after too many wrong codes, or 0.
+pub fn signin_locked_until(conn: &Connection) -> rusqlite::Result<u64> {
+    meta_number(conn, "signin_locked_until")
+}
+
+/// A wrong code was offered. After `max` in a row, nothing can sign in for `lock_ms`.
+pub fn signin_failed(conn: &Connection, now: u64, max: u32, lock_ms: u64) -> rusqlite::Result<()> {
+    let failures = meta_number(conn, "signin_failures")? + 1;
+    if failures >= max as u64 {
+        meta_set(conn, "signin_locked_until", now.saturating_add(lock_ms))?;
+        return meta_set(conn, "signin_failures", 0);
+    }
+    meta_set(conn, "signin_failures", failures)
+}
+
+/// A good code was offered, so the count of wrong ones starts again.
+pub fn signin_succeeded(conn: &Connection) -> rusqlite::Result<()> {
+    meta_set(conn, "signin_failures", 0)
 }
 
 /// Record that `follower` follows a log, starting before its first entry. Returns false if it
@@ -898,7 +1039,7 @@ pub fn import(
         if claims.len() >= cfg.max_logs {
             return Err(bad_row("more logs than this runtime allows"));
         }
-        if log.len() > MAX_INTERFACE_BYTES || head == 0 || base > head || history > 1 || claims.insert((agent, log), fresh).is_some() {
+        if !interface_ok(&log) || head == 0 || base > head || history > 1 || claims.insert((agent, log), fresh).is_some() {
             return Err(bad_row("a log is described wrongly or twice"));
         }
     }
@@ -1057,7 +1198,7 @@ pub fn import(
         let head = heads.get(&(agent.clone(), log.clone())).map_or(0, |(head, _)| *head);
         let count = following.entry(follower.clone()).or_default();
         *count += 1;
-        if log.len() > MAX_INTERFACE_BYTES || cursor > head || *count > MAX_FOLLOWS {
+        if !interface_ok(&log) || cursor > head || *count > MAX_FOLLOWS {
             return Err(bad_row("a follower is ahead of the log it follows, or follows too many"));
         }
         to.execute("INSERT INTO follows VALUES (?1, ?2, ?3, ?4, 0, 0)", params![follower, agent, log, cursor as i64])?;
@@ -1086,7 +1227,7 @@ pub fn import(
         let (source, agent, interface) = (text(row, 2)?, text(row, 3)?, text(row, 4)?);
         check_agent(&source)?;
         check_agent(&agent)?;
-        if seq == 0 || interface.len() > MAX_INTERFACE_BYTES {
+        if seq == 0 || !interface_ok(&interface) {
             return Err(bad_row("a queued event is numbered or named wrongly"));
         }
         let payload = if kind == Kind::Command as i64 {
@@ -1137,9 +1278,41 @@ pub fn import(
         to.execute("INSERT INTO audit VALUES (?1, ?2, ?3, ?4, ?5)", params![seq, at_ms, agent, event, integer(row, 4)? != 0])?;
     }
 
+    // Signed-in devices and sign-in codes go with the ship, so a ship that moves keeps its
+    // owner's phone and browser. Only hashes are stored, and each must be the right size. The
+    // count of wrong sign-in codes does not travel: the copy starts with a clean slate.
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut stmt = from.prepare("SELECT seq, token_hash, label, created_ms FROM devices ORDER BY seq")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (seq, hash, label, created) = (integer(row, 0)?, blob(row, 1, 32)?, text(row, 2)?, integer(row, 3)?);
+        if seq == 0 || hash.len() != 32 || label.len() > MAX_LABEL_BYTES || seen.len() >= cfg.max_devices || !seen.insert(hash.clone()) {
+            return Err(bad_row("a signed-in device is recorded wrongly, or there are too many"));
+        }
+        to.execute("INSERT INTO devices VALUES (?1, ?2, ?3, ?4)", params![seq, hash, label, created])?;
+    }
+    let (mut codes, mut access_codes, mut once_codes) = (HashSet::new(), 0, 0);
+    let mut stmt = from.prepare("SELECT code_hash, expires_ms, reusable FROM signin_codes")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (hash, expires, reusable) = (blob(row, 0, 32)?, integer(row, 1)?, integer(row, 2)?);
+        // Counted by kind: at most one access code, and no more one-time codes than may wait.
+        if reusable == 0 {
+            once_codes += 1;
+        }
+        access_codes += reusable;
+        let too_many = once_codes > cfg.max_signin_codes || access_codes > 1;
+        if hash.len() != 32 || reusable > 1 || too_many || !codes.insert(hash.clone()) {
+            return Err(bad_row("a sign-in code is recorded wrongly, or there are too many"));
+        }
+        to.execute("INSERT INTO signin_codes VALUES (?1, ?2, ?3)", params![hash, expires, reusable])?;
+    }
+
     // Carry the counters across so sequence numbers are never reused after an import. `integer`
     // bounds them, so a source cannot hand over a counter that is already exhausted.
-    let mut counters = [("outbox", None), ("inbox", None), ("audit", None)];
+    let mut counters = [("outbox", None), ("inbox", None), ("audit", None), ("devices", None)];
     let mut stmt = from.prepare("SELECT name, seq FROM sqlite_sequence")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {

@@ -222,3 +222,50 @@ message Registered {
 message Registry {
   repeated Registered agents = 1;
 }
+
+// Clients: phones and browsers that sign in to a ship and use it over HTTP.
+
+// Client to ship: trade a sign-in code for a token of this device's own. The code is either a
+// one-time code, good for a single use and a short while, or the ship's reusable access code.
+message SignInRequest {
+  string code = 1;
+  // What to call this device in the owner's list, such as "Bill's phone".
+  string label = 2;
+}
+
+message SignInReply {
+  // Sent with every later request. The ship keeps only a hash of it, so it is shown this once.
+  string token = 1;
+  Device device = 2;
+}
+
+// One signed-in device.
+message Device {
+  uint64 id = 1;
+  string label = 2;
+  uint64 created_ms = 3;
+}
+
+message DeviceList {
+  repeated Device devices = 1;
+  // The device that asked.
+  uint64 current = 2;
+}
+
+// Where a log ends: the number and hash of its newest entry. `seq` is 0 for a log with none.
+message LogHead {
+  uint64 seq = 1;
+  bytes hash = 2;
+}
+
+message EntryList {
+  repeated SignedEntry entries = 1;
+  // Where the log ended when this was answered, so a reader can tell whether it has caught up.
+  LogHead head = 2;
+}
+
+// The entries asked for have been dropped. The log now starts after entry `base`; the reader
+// takes the log's checkpoint and carries on from there.
+message Trimmed {
+  uint64 base = 1;
+}

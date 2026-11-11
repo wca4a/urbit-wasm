@@ -4,8 +4,9 @@ A prototype event-based runtime. Multiple ships can run in one
 process. Each ship is one SQLite file, a kernel, and agents, all WASM modules
 written in Rust.
 
-Experimental. There is a runtime, a kernel, and logs that agents on one ship
-can follow. There is no networking, identity, or update mechanism yet.
+Experimental. There is a runtime, a kernel, logs that agents on one ship can
+follow, and an HTTP server that lets an app or a browser sign in to a ship.
+There is no networking between ships, identity, or update mechanism yet.
 
 ## What it does
 
@@ -32,6 +33,13 @@ can follow. There is no networking, identity, or update mechanism yet.
   agent for a checkpoint: its state as of the newest entry. Older entries are
   then dropped, and a follower that is far behind is handed the checkpoint in
   their place. An agent can say a log is a history, and it is then kept whole.
+- A phone app or a browser signs in to a ship over HTTP with a sign-in code and
+  gets a token of its own. With it, the device reads the ship's logs, waits for
+  new entries, and sends commands as the owner. Each device can be signed out
+  alone.
+- A sign-in code is either a one-time code issued on the machine the ship runs
+  on, or the ship's reusable access code, which the owner types into the ship's
+  sign-in page. The ship stores only hashes of codes and tokens.
 
 ## Layout
 
@@ -64,6 +72,19 @@ Load test:
 cargo build -p kernel -p counter --release --target wasm32-unknown-unknown --target-dir target/wasm
 cargo run -p runtime --release --bin loadtest -- --ships 500 --active 50 --sync normal
 ```
+
+Serve a demo ship over HTTP. This prints an access code and a one-time sign-in
+link; open the link in a browser:
+
+```sh
+cargo build -p kernel -p counter --release --target wasm32-unknown-unknown --target-dir target/wasm
+cargo run -p runtime --release --bin serve -- --dir /tmp/ships --demo
+```
+
+The server speaks plain HTTP on localhost. Before reaching it from anywhere
+else, put it behind a proxy that provides TLS, buffers request bodies, passes
+addresses through unchanged, and limits how fast one caller may ask. Serve
+nothing else on the same origin.
 
 On a Mac laptop with a toy agent, 5,000 idle ships take about 80 MB of memory,
 and busy ships handle about 15,000 events per second in total.
