@@ -24,7 +24,13 @@ fn old_next(agent: &str, log: &str, max: u32) -> log::Batch {
 fn caller() -> String {
     let call = invocation();
     let source = call.source.unwrap_or_default();
-    format!("{} {}", if source.owner { "owner" } else { source.agent.as_str() }, call.interface)
+    let who = match (source.owner, source.ship.is_empty()) {
+        (true, _) => "owner".to_string(),
+        (false, true) => source.agent,
+        // An agent on another ship.
+        (false, false) => format!("~{}/{}", source.ship, source.agent),
+    };
+    format!("{who} {}", call.interface)
 }
 
 fn handle(event: &[u8]) -> Vec<u8> {
@@ -75,6 +81,35 @@ fn handle(event: &[u8]) -> Vec<u8> {
         (Some("glance"), None) => {
             let batch = log::next("counter", "counter", 0);
             format!("{} {}", batch.entries.len() + batch.checkpoint.iter().count(), batch.more)
+        }
+        // Send the counter on another ship whatever follows the ship's name, as a command.
+        (Some("tell"), Some(ship)) => {
+            let rest = text.trim_start()["tell".len()..].trim_start()[ship.len()..].trim();
+            let number = ship_sdk::send_to(ship, "counter", "counter", rest.as_bytes());
+            kv::put(b"last-sent", number.to_string().as_bytes());
+            "sent".to_string()
+        }
+        // Send any agent on another ship whatever follows its name, through the interface
+        // named after it.
+        (Some("far"), Some(ship)) => {
+            let rest = text.trim_start()["far".len()..].trim_start()[ship.len()..].trim_start();
+            let (agent, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+            ship_sdk::send_to(ship, agent, agent, rest.trim().as_bytes()).to_string()
+        }
+        // Keep a value of a given size, which is let go of when the next receipt comes.
+        (Some("ballast"), Some(len)) => {
+            kv::put(b"ballast", &vec![b'b'; len.parse().unwrap_or(0)]);
+            "ok".to_string()
+        }
+        // Send the tally agent on another ship a command that records who it came from.
+        (Some("hail"), Some(ship)) => {
+            ship_sdk::send_to(ship, "tally", "tally", b"note");
+            "sent".to_string()
+        }
+        // Send to another ship and then fail, to check the command goes with everything else.
+        (Some("tell-then-crash"), Some(ship)) => {
+            ship_sdk::send_to(ship, "counter", "counter", b"inc hits");
+            panic!("crash requested");
         }
         // Behave like an agent built before checkpoints existed, or stop doing so.
         (Some("old"), None) => {
@@ -131,6 +166,10 @@ fn view(request: &[u8]) -> Vec<u8> {
         // How many times this agent was handed a checkpoint in place of entries.
         (Some("jumps"), None) => kv::get(b"jumps").map_or(0, |jumps| jumps.len()).to_string().into_bytes(),
         (Some("note"), None) => kv::get(b"note").unwrap_or_default(),
+        // The number the last command sent to another ship went under, and every receipt
+        // that has come back, one to a line.
+        (Some("last-sent"), None) => kv::get(b"last-sent").unwrap_or_default(),
+        (Some("receipts"), None) => kv::get(b"receipts").unwrap_or_default(),
         (Some("who"), None) => caller().into_bytes(),
         // A read of ourselves, to see what a nested read is told about its caller.
         (Some("via-self"), None) => read("tally", "tally", b"who"),
@@ -183,4 +222,30 @@ fn notified(_: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
-agent!(handle, read = view, notify = notified);
+/// Called with what became of each command this agent sent to another ship. Keeps them all,
+/// with who the runtime says the receipt is from.
+fn receipted(receipt: &ship_sdk::Receipt) {
+    let verdict = match receipt.verdict() {
+        ship_sdk::Verdict::Ran => "ran",
+        ship_sdk::Verdict::Denied => "denied",
+        ship_sdk::Verdict::Failed => "failed",
+        ship_sdk::Verdict::Limit => "limit",
+        ship_sdk::Verdict::Malformed => "malformed",
+        ship_sdk::Verdict::Unspecified => "unknown",
+    };
+    let line = format!(
+        "{} ~{}/{} {} {verdict} [{}] from {}\n",
+        receipt.about,
+        receipt.ship,
+        receipt.agent,
+        receipt.interface,
+        receipt.reason,
+        caller()
+    );
+    kv::delete(b"ballast");
+    let mut all = kv::get(b"receipts").unwrap_or_default();
+    all.extend_from_slice(line.as_bytes());
+    kv::put(b"receipts", &all);
+}
+
+agent!(handle, read = view, notify = notified, receipt = receipted);

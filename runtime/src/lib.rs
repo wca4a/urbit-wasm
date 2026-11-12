@@ -77,6 +77,18 @@ pub struct Config {
     pub max_outbox_bytes: u64,
     /// Commands between agents that may be waiting to run, counted the same way.
     pub max_inbox_bytes: u64,
+    /// Commands that may be waiting to go to any one other ship, counted the same way. A
+    /// send that would pass it is rejected. Each other ship has its own allowance, so one
+    /// that cannot be reached does not stop commands to the rest.
+    pub max_peer_out_bytes: u64,
+    /// How many other ships a ship may exchange commands with.
+    pub max_peers: usize,
+    /// How many commands a ship may have sent to any one other ship without yet having a
+    /// receipt for them. A send that would pass it is rejected. The same number bounds the
+    /// other direction: a ship takes no more commands from another while it owes it this
+    /// many receipts, counting commands still queued, so a ship that will not take its
+    /// receipts cannot make this one hold them without end.
+    pub max_unanswered: usize,
     /// Entries one log may hold, counted the same way. When an append has no room, the entries
     /// that log's checkpoint already covers are dropped to make some. Each log has its own
     /// limit, so one log can never use up another's room. A log's checkpoint is not counted:
@@ -126,6 +138,9 @@ impl Default for Config {
             max_reply_bytes: 1 << 20,
             max_outbox_bytes: 64 << 20,
             max_inbox_bytes: 64 << 20,
+            max_peer_out_bytes: 16 << 20,
+            max_peers: 4096,
+            max_unanswered: 4096,
             max_log_bytes: 64 << 20,
             max_logs: 16_384,
             checkpoint_min_bytes: 64 << 10,
@@ -207,6 +222,11 @@ pub enum Error {
     NotSignedIn,
     /// The ship already has as many devices or waiting sign-in codes as it may.
     TooMany(&'static str),
+    /// Another ship's count of the commands between it and this one cannot be squared with
+    /// this ship's own. One of the two has gone back to an earlier state, such as a restored
+    /// backup. Nothing more is sent to it until that is sorted out, since carrying on could
+    /// lose commands or deliver them twice.
+    OutOfStep(String),
     /// The event was refused. It changed no state and queued no messages. The audit log records
     /// it on a best-effort basis.
     Rejected(Rejection),
@@ -231,6 +251,7 @@ impl fmt::Display for Error {
             Error::SignInLocked(millis) => write!(f, "too many wrong sign-in codes; try again in {} seconds", millis.div_ceil(1000)),
             Error::NotSignedIn => write!(f, "not signed in"),
             Error::TooMany(what) => write!(f, "this ship already has as many {what} as it may"),
+            Error::OutOfStep(peer) => write!(f, "this ship and {peer} disagree about the commands between them"),
             Error::Rejected(Rejection::OutOfFuel) => write!(f, "event rejected: compute budget exhausted"),
             Error::Rejected(Rejection::Timeout) => write!(f, "event rejected: ran too long"),
             Error::Rejected(Rejection::Denied(why)) => write!(f, "event rejected: not permitted: {why}"),
@@ -301,7 +322,17 @@ pub(crate) struct Inner {
     /// is locked while this is held.
     log_growth: Mutex<HashMap<String, u64>>,
     logs_changed: Condvar,
+    /// Called with a ship's name when an event on it has queued commands for other ships.
+    /// The network sets it, to learn there is something to send. It must not block.
+    outbound_hook: std::sync::RwLock<Option<OutboundHook>>,
+    /// Whether a network is running for this runtime. There is one at most: it alone carries
+    /// what the ships here have waiting for other ships.
+    networked: AtomicBool,
 }
+
+/// Called with a ship's name when it has something waiting to go to other ships. The second
+/// argument says the ship may also have events queued that nothing is about to run.
+type OutboundHook = Arc<dyn Fn(&str, bool) + Send + Sync>;
 
 pub struct Runtime {
     inner: Arc<Inner>,
@@ -718,6 +749,8 @@ impl Runtime {
                 awake_changed: Condvar::new(),
                 log_growth: Mutex::new(HashMap::new()),
                 logs_changed: Condvar::new(),
+                outbound_hook: std::sync::RwLock::new(None),
+                networked: AtomicBool::new(false),
             }),
         })
     }
@@ -790,7 +823,7 @@ impl Runtime {
                 store::audit_failure(&lock(&ship.conn), agent, kept, cfg.audit_rows);
                 return Err(Error::Rejected(Rejection::Limit(why)));
             }
-            let source = Source { owner: true, agent: String::new() };
+            let source = Source { owner: true, agent: String::new(), ship: String::new() };
             let outcome = ship.command(&self.inner, &source, agent, "", event);
             // The owner's command has committed or been rejected: either way it is settled, so
             // a problem while running what is queued must not change what is reported for it.
@@ -811,6 +844,29 @@ impl Runtime {
     /// How many queued events are waiting to run on a ship.
     pub fn pending(&self, ship: &str) -> Result<usize, Error> {
         self.inner.with_ship(ship, |ship| store::inbox_len(&lock(&ship.conn)))
+    }
+
+    /// The number of the newest event queued on a ship, or 0 if none is.
+    pub(crate) fn inbox_newest(&self, ship: &str) -> Result<i64, Error> {
+        self.inner.with_ship(ship, |ship| Ok(store::inbox_newest(&lock(&ship.conn))?))
+    }
+
+    /// Run up to `max` queued events, but none numbered after `through`. Returns how many
+    /// ran, and whether any numbered up to `through` are still queued.
+    pub(crate) fn run_pending_through(&self, ship: &str, max: usize, through: i64) -> Result<(usize, bool), Error> {
+        self.inner.with_ship(ship, |ship| {
+            let mut ran = 0;
+            loop {
+                let due = store::inbox_oldest(&lock(&ship.conn))?.is_some_and(|oldest| oldest <= through);
+                if !due || ran >= max {
+                    return Ok((ran, due));
+                }
+                if !ship.run_queued(&self.inner)? {
+                    return Ok((ran, false));
+                }
+                ran += 1;
+            }
+        })
     }
 
     /// Run up to `max` queued commands. Returns how many ran.
@@ -1080,6 +1136,81 @@ impl Runtime {
         self.inner.with_ship(ship, |ship| ship.transact(|conn| Ok(store::device_revoke(conn, id)?)))
     }
 
+    /// How many messages are waiting to go from a ship to other ships: commands its agents
+    /// have sent, and receipts for commands other ships sent it.
+    pub fn outbound_pending(&self, ship: &str) -> Result<usize, Error> {
+        self.inner.with_ship(ship, |ship| Ok(store::peer_out_len(&lock(&ship.conn))?))
+    }
+
+    /// How many commands a ship has sent to other ships and has had no receipt for yet.
+    pub fn unanswered(&self, ship: &str) -> Result<usize, Error> {
+        self.inner.with_ship(ship, |ship| Ok(store::peer_wait_len(&lock(&ship.conn))?))
+    }
+
+    /// Take this runtime for a network, if it has none. A runtime has one network at most.
+    pub(crate) fn claim_network(&self) -> bool {
+        !self.inner.networked.swap(true, Ordering::SeqCst)
+    }
+
+    /// The network that claimed this runtime has stopped.
+    pub(crate) fn release_network(&self) {
+        self.inner.networked.store(false, Ordering::SeqCst);
+    }
+
+    /// Have `hook` called with a ship's name whenever an event on it queues commands for
+    /// other ships, or with `None` stop that.
+    pub(crate) fn set_outbound_hook(&self, hook: Option<OutboundHook>) {
+        *self.inner.outbound_hook.write().unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// The ships that have messages waiting to go to other ships, or events queued. Looks in
+    /// every ship's file, so it is for when the network starts, not for every moment.
+    pub(crate) fn ships_with_work(&self) -> Result<Vec<String>, Error> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(&self.inner.ships_dir)? {
+            let file = entry?.file_name();
+            let Some(ship) = file.to_str().and_then(|file| file.strip_suffix(".ship")).and_then(|ship| canonical_ship(ship).ok()) else {
+                continue;
+            };
+            // Asked of the ship itself if it is awake, so a write in progress is not read around.
+            let has_work = |ship: &mut ship::Ship| {
+                let conn = lock(&ship.conn);
+                Ok(!store::peers_waiting(&conn)?.is_empty() || store::inbox_len(&conn)? > 0)
+            };
+            if self.inner.with_ship(&ship, has_work).unwrap_or(false) {
+                found.push(ship);
+            }
+        }
+        Ok(found)
+    }
+
+    /// The other ships that a ship has commands waiting to go to.
+    pub(crate) fn outbound_peers(&self, ship: &str) -> Result<Vec<String>, Error> {
+        self.inner.with_ship(ship, |ship| Ok(store::peers_waiting(&lock(&ship.conn))?))
+    }
+
+    /// The oldest commands waiting to go from a ship to `peer`.
+    pub(crate) fn outbound_batch(&self, ship: &str, peer: &str, max_bytes: usize) -> Result<Vec<ship_proto::PeerMessage>, Error> {
+        self.inner.with_ship(ship, |ship| Ok(store::peer_batch(&lock(&ship.conn), peer, max_bytes)?))
+    }
+
+    /// `peer` says it holds every command from this ship up to `last`, so those are done with.
+    pub(crate) fn outbound_acked(&self, ship: &str, peer: &str, last: u64) -> Result<(), Error> {
+        self.inner.with_ship(ship, |ship| {
+            ship.transact(|conn| store::peer_acked(conn, peer, last)?.ok_or_else(|| Error::OutOfStep(peer.to_string())))
+        })
+    }
+
+    /// Take messages that `peer` has sent to a ship here, and return the number of the last
+    /// one this ship now holds. Each is taken once, in order: a command into the ship's
+    /// queue, a receipt to the agent whose command it answers. One that has been taken before
+    /// is passed over. If there is no room for some, the number returned says how far it
+    /// got, and the rest are for the sender to send again.
+    pub(crate) fn accept_commands(&self, ship: &str, peer: &str, messages: &[ship_proto::PeerMessage]) -> Result<u64, Error> {
+        let peer = canonical_ship(peer)?;
+        self.inner.with_ship(ship, |ship| ship.accept(&self.inner, &peer, messages))
+    }
+
     /// The newest audit entries, newest first.
     pub fn audit(&self, ship: &str, limit: usize) -> Result<Vec<AuditEntry>, Error> {
         self.inner.with_ship(ship, |ship| store::audit_tail(&lock(&ship.conn), limit))
@@ -1181,7 +1312,11 @@ impl Runtime {
         if Instant::now() > deadline {
             return Err(Error::BadShipFile(format!("{name}: import took too long")));
         }
-        self.inner.publish(&name, &fresh.0, &key)
+        self.inner.publish(&name, &fresh.0, &key)?;
+        // The ship may have arrived with messages waiting to go to other ships, and with
+        // events queued.
+        self.inner.work_ready(&name);
+        Ok(())
     }
 
     /// Put to sleep every ship that has been idle for at least `idle`. Returns how many slept.
@@ -1214,6 +1349,20 @@ impl Runtime {
 }
 
 impl Inner {
+    /// An event on this ship has queued commands for other ships.
+    pub(crate) fn outbound_ready(&self, ship: &str) {
+        if let Some(hook) = self.outbound_hook.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            hook(ship, false);
+        }
+    }
+
+    /// A ship has appeared that may have messages for other ships and events queued.
+    pub(crate) fn work_ready(&self, ship: &str) {
+        if let Some(hook) = self.outbound_hook.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            hook(ship, true);
+        }
+    }
+
     /// An event on this ship has added to its logs.
     pub(crate) fn logs_grew(&self, ship: &str) {
         *lock(&self.log_growth).entry(ship.to_string()).or_default() += 1;

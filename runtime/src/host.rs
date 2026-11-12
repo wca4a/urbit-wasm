@@ -66,8 +66,13 @@ pub struct Ctx {
     pub queued_bytes: u64,
     pub inbox_room: u64,
     pub appended: u32,
+    /// How many commands this event has queued for other ships.
+    pub sent: u32,
     /// Whether this agent's module has a checkpoint handler, and so can be asked for one.
     pub can_checkpoint: bool,
+    /// Whether the module running has a receipt handler, and so is told what becomes of the
+    /// commands it sends to other ships.
+    pub takes_receipts: bool,
 }
 
 #[derive(Debug)]
@@ -122,8 +127,88 @@ fn writable(caller: &Caller<'_, Ctx>) -> Result<()> {
     Ok(())
 }
 
+/// Whether a grant covers an interface of an agent on this ship. A grant that names another
+/// ship is about that ship's agent, and says nothing about a local agent of the same name.
 fn granted(grants: &[Grant], agent: &str, interface: &str) -> bool {
-    grants.iter().any(|grant| grant.agent == agent && grant.interface == interface)
+    grants.iter().any(|grant| grant.ship.is_empty() && grant.agent == agent && grant.interface == interface)
+}
+
+/// Whether a grant covers an interface of an agent on another ship: one that names that ship,
+/// or any ship.
+fn granted_elsewhere(grants: &[Grant], ship: &str, agent: &str, interface: &str) -> bool {
+    grants.iter().any(|grant| (grant.ship == ship || grant.ship == "*") && grant.agent == agent && grant.interface == interface)
+}
+
+/// Send a command to another agent: it is queued, and runs as its own event after this one
+/// commits. For an agent on another ship, returns the number the command goes under, which
+/// its receipt will carry; otherwise 0.
+fn send_command(mut caller: Caller<'_, Ctx>, req_ptr: u32, req_len: u32) -> Result<i64> {
+    charge(&mut caller, req_len as u64)?;
+    writable(&caller)?;
+    let cfg = &caller.data().rt.cfg;
+    let (max_payload, max_queued) = (cfg.max_event_bytes, cfg.limits.max_effects_per_event);
+    let request = read_guest(&mut caller, req_ptr, req_len, max_payload + REQUEST_ENVELOPE_BYTES, "send request")?;
+    let request = SendRequest::decode(&*request)?;
+    let ctx = caller.data();
+    // A command for an agent on another ship. It is queued for that ship, numbered, and
+    // kept until that ship has it. A ship's own name means the ship itself.
+    let elsewhere = match request.ship.as_str() {
+        "" => None,
+        ship => {
+            let ship = crate::canonical_ship(ship).map_err(|_| Denied(format!("{ship:?} is not a ship's name")))?;
+            (ship != *ctx.ship).then_some(ship)
+        }
+    };
+    if let Some(ship) = elsewhere {
+        if !granted_elsewhere(&ctx.sends, &ship, &request.agent, &request.interface) {
+            return Err(Denied(format!("{} may not send {} to {} on ~{ship}", ctx.agent, request.interface, request.agent)).into());
+        }
+        if check_target(&request.agent, &request.interface).is_err() {
+            return Err(Denied(format!("{:?} cannot be sent to", request.agent)).into());
+        }
+        if request.payload.len() > max_payload {
+            return Err(LimitExceeded(format!("command is {} bytes, limit is {max_payload}", request.payload.len())).into());
+        }
+        let (max_waiting, max_peers, max_unanswered) = (ctx.rt.cfg.max_peer_out_bytes, ctx.rt.cfg.max_peers, ctx.rt.cfg.max_unanswered);
+        let cost = request.payload.len() as u64 + store::MESSAGE_OVERHEAD;
+        let (conn, agent, sent, tell) = (ctx.conn.clone(), ctx.agent.clone(), ctx.sent, ctx.takes_receipts);
+        let conn = lock(&conn);
+        if !store::peer_known(&conn, &ship)? && store::peer_count(&conn)? >= max_peers {
+            return Err(LimitExceeded(format!("a ship may exchange commands with at most {max_peers} others")).into());
+        }
+        if sent >= max_queued || store::peer_out_bytes(&conn, &ship)? + cost > max_waiting {
+            return Err(LimitExceeded(format!("too many commands are waiting to go to ~{ship}")).into());
+        }
+        // Each command sent is remembered until its receipt comes, so only so many may be
+        // outstanding with a ship that does not answer.
+        if store::peer_unanswered(&conn, &ship)? >= max_unanswered {
+            return Err(LimitExceeded(format!("{max_unanswered} commands to ~{ship} are still unanswered")).into());
+        }
+        let number = store::peer_send(&conn, &ship, &agent, &request.agent, &request.interface, &request.payload, tell)?;
+        drop(conn);
+        caller.data_mut().sent += 1;
+        return Ok(number as i64);
+    }
+    if !granted(&ctx.sends, &request.agent, &request.interface) {
+        return Err(Denied(format!("{} may not send {} to {}", ctx.agent, request.interface, request.agent)).into());
+    }
+    // The runtime's own bounds on names, so what it stores is always something it will import.
+    if check_target(&request.agent, &request.interface).is_err() {
+        return Err(Denied(format!("{:?} cannot be sent to", request.agent)).into());
+    }
+    if request.payload.len() > max_payload {
+        return Err(LimitExceeded(format!("command is {} bytes, limit is {max_payload}", request.payload.len())).into());
+    }
+    let cost = request.payload.len() as u64 + store::MESSAGE_OVERHEAD;
+    if ctx.queued >= max_queued || ctx.queued_bytes + cost > ctx.inbox_room {
+        return Err(LimitExceeded("too many commands are queued on this ship".into()).into());
+    }
+    let (conn, agent) = (ctx.conn.clone(), ctx.agent.clone());
+    store::inbox_push(&lock(&conn), Kind::Command, &agent, &request.agent, &request.interface, &request.payload)?;
+    let ctx = caller.data_mut();
+    ctx.queued += 1;
+    ctx.queued_bytes += cost;
+    Ok(0)
 }
 
 fn memory(caller: &mut Caller<'_, Ctx>) -> Result<Memory> {
@@ -256,7 +341,7 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
             }
             let (rt, kernel, conn) = (ctx.rt.clone(), ctx.kernel.clone(), ctx.conn.clone());
             let (ship, key) = (ctx.ship.clone(), ctx.key.clone());
-            let (source, depth) = (Source { owner: false, agent: ctx.agent.to_string() }, ctx.depth + 1);
+            let (source, depth) = (Source { owner: false, agent: ctx.agent.to_string(), ship: String::new() }, ctx.depth + 1);
             let env = Env { rt: &rt, ship: &ship, kernel: &kernel, conn: &conn, key: &key, deadline: ctx.deadline };
             // The reader's remaining fuel pays for the read, and what is left comes back.
             let fuel = caller.get_fuel()?;
@@ -291,36 +376,12 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
         Ok(len)
     })?;
 
-    // Send a command to another agent: it is queued, and runs as its own event after this one commits.
-    linker.func_wrap("host", "send", |mut caller: Caller<'_, Ctx>, req_ptr: u32, req_len: u32| -> Result<()> {
-        charge(&mut caller, req_len as u64)?;
-        writable(&caller)?;
-        let cfg = &caller.data().rt.cfg;
-        let (max_payload, max_queued) = (cfg.max_event_bytes, cfg.limits.max_effects_per_event);
-        let request = read_guest(&mut caller, req_ptr, req_len, max_payload + REQUEST_ENVELOPE_BYTES, "send request")?;
-        let request = SendRequest::decode(&*request)?;
-        let ctx = caller.data();
-        if !granted(&ctx.sends, &request.agent, &request.interface) {
-            return Err(Denied(format!("{} may not send {} to {}", ctx.agent, request.interface, request.agent)).into());
-        }
-        // The runtime's own bounds on names, so what it stores is always something it will import.
-        if check_target(&request.agent, &request.interface).is_err() {
-            return Err(Denied(format!("{:?} cannot be sent to", request.agent)).into());
-        }
-        if request.payload.len() > max_payload {
-            return Err(LimitExceeded(format!("command is {} bytes, limit is {max_payload}", request.payload.len())).into());
-        }
-        let cost = request.payload.len() as u64 + store::MESSAGE_OVERHEAD;
-        if ctx.queued >= max_queued || ctx.queued_bytes + cost > ctx.inbox_room {
-            return Err(LimitExceeded("too many commands are queued on this ship".into()).into());
-        }
-        let (conn, agent) = (ctx.conn.clone(), ctx.agent.clone());
-        store::inbox_push(&lock(&conn), Kind::Command, &agent, &request.agent, &request.interface, &request.payload)?;
-        let ctx = caller.data_mut();
-        ctx.queued += 1;
-        ctx.queued_bytes += cost;
-        Ok(())
+    // Send a command to another agent. `send` is the older form, which returns nothing;
+    // `send_to` also says what number a command for another ship goes under.
+    linker.func_wrap("host", "send", |caller: Caller<'_, Ctx>, req_ptr: u32, req_len: u32| -> Result<()> {
+        send_command(caller, req_ptr, req_len).map(drop)
     })?;
+    linker.func_wrap("host", "send_to", send_command)?;
 
     // Add an entry to one of this agent's own logs. The runtime numbers it, links it to the
     // entry before, signs it, and queues a notification for each follower. Returns its number.

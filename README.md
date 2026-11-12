@@ -6,7 +6,7 @@ written in Rust.
 
 Experimental. There is a runtime, a kernel, logs that agents on one ship can
 follow, an HTTP server that lets an app or a browser sign in to a ship, and an
-encrypted link between ships. Ships cannot yet send each other commands or
+encrypted link over which ships send each other commands. Ships cannot yet
 follow each other's logs, and there is no identity or update mechanism yet.
 
 ## What it does
@@ -45,6 +45,16 @@ follow each other's logs, and there is no identity or update mechanism yet.
   certificate authority: each end shows its key and proves it holds it, and the
   other end checks that key against a directory of ships. The directory is a
   fixed list for now, standing in for Urbit ID.
+- An agent can send a command to an agent on another ship. The command is saved
+  with the event that sent it and kept until the other ship has it, through
+  restarts and lost connections at either end. It arrives exactly once, in the
+  order sent.
+- Both owners have to agree. The sender's manifest names the ship and agent it
+  may send to, and the receiver's manifest opens an interface to other ships.
+  The receiving agent is told which ship and agent the command came from.
+- Every command sent to another ship is answered with one receipt: it ran, or
+  it did not and why. A refusal is written to the sender's audit log, and an
+  agent can ask to be handed its receipts.
 
 ## Layout
 

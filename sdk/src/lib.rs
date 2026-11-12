@@ -22,6 +22,8 @@ extern "C" {
     fn host_take_reply(buf: *mut u8, buf_cap: u32) -> i64;
     #[link_name = "send"]
     fn host_send(req: *const u8, req_len: u32);
+    #[link_name = "send_to"]
+    fn host_send_to(req: *const u8, req_len: u32) -> i64;
     #[link_name = "log_append"]
     fn host_log_append(req: *const u8, req_len: u32) -> i64;
     #[link_name = "log_follow"]
@@ -136,10 +138,30 @@ pub mod log {
 /// Send a command to another agent on this ship. It runs later, as that agent's own event, and
 /// only if this event commits. The event is rejected if this agent has no permission.
 pub fn send(agent: &str, interface: &str, payload: &[u8]) {
-    let request =
-        SendRequest { agent: agent.into(), interface: interface.into(), payload: payload.to_vec() }.encode_to_vec();
+    let request = SendRequest { ship: String::new(), agent: agent.into(), interface: interface.into(), payload: payload.to_vec() };
+    let request = request.encode_to_vec();
     unsafe { host_send(request.as_ptr(), request.len() as u32) }
 }
+
+/// Send a command to an agent on another ship, and return the number it goes under. It is
+/// kept until that ship has it, through restarts and lost connections at either end, and
+/// reaches that ship exactly once, in the order sent. It is only sent if this event commits.
+/// The event is rejected if this agent's manifest does not name that ship and agent.
+///
+/// Reaching the other ship is not the same as running there: the other agent may refuse the
+/// command, or fail. Either way that ship sends back one receipt, which also arrives exactly
+/// once. A refusal is written to this ship's audit log. An agent declared with `receipt = f`
+/// is also handed each receipt, carrying the number returned here.
+///
+/// Naming this ship itself is the same as `send`: the command is queued here, the number
+/// returned is 0, and there is no receipt.
+pub fn send_to(ship: &str, agent: &str, interface: &str, payload: &[u8]) -> u64 {
+    let request = SendRequest { ship: ship.into(), agent: agent.into(), interface: interface.into(), payload: payload.to_vec() };
+    let request = request.encode_to_vec();
+    unsafe { host_send_to(request.as_ptr(), request.len() as u32) as u64 }
+}
+
+pub use ship_proto::{Receipt, Verdict};
 
 thread_local! {
     static REPLY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -161,6 +183,12 @@ pub unsafe fn __handle(ptr: *mut u8, len: u32, handler: fn(&[u8]) -> Vec<u8>) ->
         let reply = slot.borrow();
         ((reply.as_ptr() as u64) << 32) | reply.len() as u64
     })
+}
+
+#[doc(hidden)]
+pub fn __receipt(bytes: &[u8], handler: fn(&Receipt)) -> Vec<u8> {
+    handler(&Receipt::decode(bytes).expect("the runtime sent a malformed receipt"));
+    Vec::new()
 }
 
 #[doc(hidden)]
@@ -195,7 +223,12 @@ macro_rules! export_fn {
     };
 }
 
-/// Declare an agent: a command handler, then any of `read = f`, `notify = f`, `checkpoint = f`.
+/// Declare an agent: a command handler, then any of `read = f`, `notify = f`, `checkpoint = f`,
+/// `receipt = f`.
+///
+/// The receipt handler is `fn(&Receipt)`. It is called once for each command this agent sent
+/// to another ship with `send_to`, when that ship says what became of it: whether it ran, and
+/// if not, why. It runs as an event of its own and may do anything a command handler may.
 ///
 /// The command, read, and notify handlers are `fn(&[u8]) -> Vec<u8>`. A read handler cannot
 /// write, send, or emit. The notify handler is called when a log this agent follows has new
@@ -233,6 +266,14 @@ macro_rules! __export_role {
             #[export_name = "checkpoint"]
             pub unsafe extern "C" fn __ship_export(ptr: *mut u8, len: u32) -> u64 {
                 $crate::__handle(ptr, len, |log| $crate::__checkpoint(log, $handler))
+            }
+        };
+    };
+    (receipt, $handler:path) => {
+        const _: () = {
+            #[export_name = "receipt"]
+            pub unsafe extern "C" fn __ship_export(ptr: *mut u8, len: u32) -> u64 {
+                $crate::__handle(ptr, len, |receipt| $crate::__receipt(receipt, $handler))
             }
         };
     };

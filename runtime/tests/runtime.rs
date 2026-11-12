@@ -47,15 +47,15 @@ fn nothing() -> Manifest {
 
 /// The counter agent offers one interface, `counter`.
 fn counter_manifest(public: bool) -> Manifest {
-    Manifest { provides: vec![Provide { interface: "counter".into(), public }], uses: vec![] }
+    Manifest { provides: vec![Provide { interface: "counter".into(), public, remote: false }], uses: vec![] }
 }
 
 /// The tally agent offers `tally` and, when `uses_counter` is set, declares that it reads from
 /// and sends to the counter.
 fn tally_manifest(uses_counter: bool) -> Manifest {
-    let uses = Use { agent: "counter".into(), interface: "counter".into(), read: true, send: true };
+    let uses = Use { agent: "counter".into(), interface: "counter".into(), read: true, send: true, ship: String::new() };
     Manifest {
-        provides: vec![Provide { interface: "tally".into(), public: false }],
+        provides: vec![Provide { interface: "tally".into(), public: false, remote: false }],
         uses: if uses_counter { vec![uses] } else { vec![] },
     }
 }
@@ -1002,7 +1002,7 @@ fn deeply_nested_reads_do_not_overflow_the_thread_stack() {
     };
     let dir = TempDir::new("stack");
     let rt = Runtime::open(&dir.0, fast()).unwrap();
-    let offers_x = Manifest { provides: vec![Provide { interface: "x".into(), public: false }], uses: vec![] };
+    let offers_x = Manifest { provides: vec![Provide { interface: "x".into(), public: false, remote: false }], uses: vec![] };
     for (ship, at_the_bottom) in [("~zod", "nop"), ("~bus", "unreachable")] {
         let hash = rt.add_module(&wat::parse_str(nesting(at_the_bottom)).unwrap()).unwrap();
         rt.create_ship(ship, &kernel(&rt)).unwrap();
@@ -1030,8 +1030,8 @@ fn deeply_nested_reads_do_not_overflow_the_thread_stack() {
 #[test]
 fn reading_and_sending_are_separate_permissions() {
     let uses = |read, send| Manifest {
-        provides: vec![Provide { interface: "tally".into(), public: false }],
-        uses: vec![Use { agent: "counter".into(), interface: "counter".into(), read, send }],
+        provides: vec![Provide { interface: "tally".into(), public: false, remote: false }],
+        uses: vec![Use { agent: "counter".into(), interface: "counter".into(), read, send, ship: String::new() }],
     };
     let dir = TempDir::new("read-only-grant");
     let rt = boot_pair(&dir, fast(), counter_manifest(false), uses(true, false));
@@ -1137,20 +1137,20 @@ fn the_kernel_refuses_manifests_that_would_leave_the_ship_unroutable() {
     // The same interface listed twice, once private and once public.
     let twice = Manifest {
         provides: vec![
-            Provide { interface: "x".into(), public: false },
-            Provide { interface: "x".into(), public: true },
+            Provide { interface: "x".into(), public: false, remote: false },
+            Provide { interface: "x".into(), public: true, remote: false },
         ],
         uses: vec![],
     };
     assert!(matches!(rt.install("~zod", "twice", &hash, &twice), Err(Error::InstallRefused(_))));
-    let same_use = Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false };
+    let same_use = Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false, ship: String::new() };
     let twice = Manifest { provides: vec![], uses: vec![same_use.clone(), Use { send: true, ..same_use }] };
     assert!(matches!(rt.install("~zod", "twice", &hash, &twice), Err(Error::InstallRefused(_))));
 
     // Every public interface is visible to every agent. Keep adding agents that each offer many
     // until the kernel says no, then check that what it accepted still works.
     let wide = |agent: usize| Manifest {
-        provides: (0..64).map(|i| Provide { interface: format!("{}-{agent}-{i}", "x".repeat(100)), public: true }).collect(),
+        provides: (0..64).map(|i| Provide { interface: format!("{}-{agent}-{i}", "x".repeat(100)), public: true, remote: false }).collect(),
         uses: vec![],
     };
     let mut accepted = 0;
@@ -1170,7 +1170,7 @@ fn the_kernel_refuses_manifests_that_would_leave_the_ship_unroutable() {
     let dir = TempDir::new("registry-limit");
     let rt = boot(&dir, fast());
     let private = |agent: usize| Manifest {
-        provides: (0..64).map(|i| Provide { interface: format!("{}-{agent}-{i}", "x".repeat(100)), public: false }).collect(),
+        provides: (0..64).map(|i| Provide { interface: format!("{}-{agent}-{i}", "x".repeat(100)), public: false, remote: false }).collect(),
         uses: vec![],
     };
     let mut accepted = 0;
@@ -1202,7 +1202,7 @@ fn a_read_whose_answer_is_large_still_runs_only_once() {
     let dir = TempDir::new("read-once");
     let rt = boot_pair(&dir, fast(), nothing(), tally_manifest(false));
     let hash = rt.add_module(&wat::parse_str(slow).unwrap()).unwrap();
-    let public = Manifest { provides: vec![Provide { interface: "slow".into(), public: true }], uses: vec![] };
+    let public = Manifest { provides: vec![Provide { interface: "slow".into(), public: true, remote: false }], uses: vec![] };
     rt.install("~zod", "slow", &hash, &public).unwrap();
     drop(rt);
 
@@ -1229,7 +1229,7 @@ fn the_runtime_keeps_its_own_bounds_whatever_a_kernel_grants() {
     use ship_proto::{AdminReply, Grant, Message, ReadRequest, RouteReply, SendRequest};
     // The agent's command sends when its input is 1 and reads when it is 2, using requests
     // prepared here. This kernel grants both, so only the runtime's own checks stand in the way.
-    let send_request = SendRequest { agent: "../up".into(), interface: "x".into(), payload: b"p".to_vec() }.encode_to_vec();
+    let send_request = SendRequest { agent: "../up".into(), interface: "x".into(), payload: b"p".to_vec(), ship: String::new() }.encode_to_vec();
     let read_request = ReadRequest { agent: "other".into(), interface: "x".into(), payload: vec![0; 100] }.encode_to_vec();
     // A log name one byte longer than the runtime allows.
     let long_name = "x".repeat(129);
@@ -1266,8 +1266,8 @@ fn the_runtime_keeps_its_own_bounds_whatever_a_kernel_grants() {
     let route = RouteReply {
         allowed: true,
         module: hash,
-        reads: vec![Grant { agent: "other".into(), interface: "x".into() }, Grant { agent: "evil".into(), interface: long_name }],
-        sends: vec![Grant { agent: "../up".into(), interface: "x".into() }],
+        reads: vec![Grant { agent: "other".into(), interface: "x".into(), ship: String::new() }, Grant { agent: "evil".into(), interface: long_name, ship: String::new() }],
+        sends: vec![Grant { agent: "../up".into(), interface: "x".into(), ship: String::new() }],
         ..Default::default()
     };
     let permissive = rt.add_module(&fixed_kernel(&route, &AdminReply { ok: true, ..Default::default() })).unwrap();
@@ -1371,7 +1371,7 @@ fn an_uncollected_reply_cannot_be_collected_after_another_read() {
     let hash = rt.add_module(&wat::parse_str(&source).unwrap()).unwrap();
     let reads_tally = Manifest {
         provides: vec![],
-        uses: vec![Use { agent: "tally".into(), interface: "tally".into(), read: true, send: false }],
+        uses: vec![Use { agent: "tally".into(), interface: "tally".into(), read: true, send: false, ship: String::new() }],
     };
     rt.install("~zod", "picky", &hash, &reads_tally).unwrap();
     assert_eq!(rt.deliver("~zod", "picky", b"x").unwrap().reply, [1]);
@@ -1772,7 +1772,7 @@ fn the_kernel_decides_who_is_told_about_new_entries() {
     );
     let may_read = |allowed| Manifest {
         provides: vec![],
-        uses: if allowed { vec![Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false }] } else { vec![] },
+        uses: if allowed { vec![Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false, ship: String::new() }] } else { vec![] },
     };
     for (label, still_allowed) in [("notify-allowed", true), ("notify-revoked", false)] {
         let dir = TempDir::new(label);
@@ -1925,7 +1925,7 @@ fn a_followers_place_moves_only_when_it_has_the_entries() {
     };
     let reads_counter = Manifest {
         provides: vec![],
-        uses: vec![Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false }],
+        uses: vec![Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false, ship: String::new() }],
     };
     let collect = "(drop (call $take (i32.const 4096) (i32.const 60000)))";
     for (label, then, expected) in [("place-uncollected", "", 0), ("place-collected", collect, 4)] {
@@ -1977,7 +1977,7 @@ fn a_followers_own_handler_cannot_pile_up_notifications() {
             append.len(),
         )
     };
-    let offers_e = Manifest { provides: vec![Provide { interface: "e".into(), public: false }], uses: vec![] };
+    let offers_e = Manifest { provides: vec![Provide { interface: "e".into(), public: false, remote: false }], uses: vec![] };
     for (label, when_prompted) in [("pile-refollow", "$refollow"), ("pile-append", "$again")] {
         let dir = TempDir::new(label);
         let rt = boot(&dir, Config { max_queued_per_deliver: 0, ..fast() });
@@ -2031,7 +2031,7 @@ fn checkpointing() -> Config {
 
 /// The counter agent offering both its state log and its journal, which is a history.
 fn counter_with_journal() -> Manifest {
-    let provide = |interface: &str| Provide { interface: interface.into(), public: false };
+    let provide = |interface: &str| Provide { interface: interface.into(), public: false, remote: false };
     Manifest { provides: vec![provide("counter"), provide("journal")], uses: vec![] }
 }
 
@@ -2978,7 +2978,7 @@ fn a_full_ship_can_let_go_of_a_logs_only_entry() {
     // One big entry, covered by a checkpoint taken straight after it. A second entry would fit
     // in the log many times over, but not in what is left of this ship's file.
     let (dir, b, out) = (TempDir::new("cp-last"), TempDir::new("cp-last-b"), TempDir::new("cp-last-out"));
-    let cfg = Config { max_ship_bytes: 128 << 10, checkpoint_min_bytes: 0, ..fast() };
+    let cfg = Config { max_ship_bytes: 136 << 10, checkpoint_min_bytes: 0, ..fast() };
     let rt = boot(&dir, cfg.clone());
     assert_eq!(send(&rt, "~zod", "counter", "log-big 60000"), "1");
     let key = rt.public_key("~zod").unwrap();
@@ -3847,7 +3847,10 @@ fn networked(dir: &TempDir, ship: &str, directory: &Arc<Directory>) -> (Arc<Runt
 
 /// The same, with a say in how the network is set up.
 fn networked_with(dir: &TempDir, ship: &str, directory: &Arc<Directory>, cfg: NetConfig) -> (Arc<Runtime>, Network) {
-    let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
+    // A network has to be able to carry the largest command its ships may send, so a test
+    // that makes messages small makes events small to match.
+    let events = Config { max_event_bytes: cfg.max_message_bytes.saturating_sub(4096).min(1 << 20), ..fast() };
+    let rt = Arc::new(Runtime::open(&dir.0, events).unwrap());
     rt.create_ship(ship, &kernel(&rt)).unwrap();
     let net = Network::start(rt.clone(), directory.clone(), cfg).unwrap();
     directory.set(ship, rt.public_key(ship).unwrap(), net.addr()).unwrap();
@@ -4005,12 +4008,27 @@ fn the_network_keeps_working_through_noise_and_refuses_what_is_too_big() {
     }
     assert_eq!(zod_net.ping("~zod", "~nec").unwrap().ship, "nec");
 
-    // A ship that takes only tiny messages refuses a request that is larger, and says so.
+    // A ship that takes only small messages refuses a request that is larger, and says so.
     let c = TempDir::new("net-noise-c");
-    let (_bus, bus_net) = networked_with(&c, "~bus", &directory, NetConfig { max_message_bytes: 8, ..impatient() });
-    assert!(matches!(zod_net.ping("~zod", "~bus"), Err(NetError::Refused(_))));
-    // And a reply larger than the caller takes is not taken.
-    assert!(bus_net.ping("~bus", "~nec").is_err());
+    let (_bus, bus_net) = networked_with(&c, "~bus", &directory, NetConfig { max_message_bytes: 4096, ..impatient() });
+    assert_eq!(zod_net.ping("~zod", "~bus").unwrap().ship, "bus");
+    let (doz, pad) = ([5u8; 32], [9u8; 32]);
+    let public = |seed: &[u8; 32]| ed25519_dalek::SigningKey::from_bytes(seed).verifying_key().to_bytes();
+    directory.set("~doz", public(&doz), "127.0.0.1:9".parse().unwrap()).unwrap();
+    let large = ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Ping(ship_proto::Ping { nonce: vec![1; 6000] })) }.encode_to_vec();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let reply = tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = endpoint.connect_with(stranger_client(Some((doz, doz)), b"ship/1"), bus_net.addr(), "bus").unwrap().await.unwrap();
+        exchange(&connection, &large).await.unwrap()
+    });
+    assert!(reply.body.is_none() && reply.refused.contains("too large"), "{reply:?}");
+    // And a reply larger than the caller takes is not taken. ~pad answers at great length:
+    // a caller with room for that hears it, and ~bus does not.
+    let (addr, _running, _) = stand_in(pad, pad, true, 8000);
+    directory.set("~pad", public(&pad), addr).unwrap();
+    assert!(zod_net.ping("~zod", "~pad").is_ok());
+    assert!(bus_net.ping("~bus", "~pad").is_err());
     assert_eq!(zod_net.ping("~zod", "~nec").unwrap().ship, "nec");
 }
 
@@ -4139,6 +4157,11 @@ fn stand_in_ship(shown: [u8; 32], held: [u8; 32]) -> (std::net::SocketAddr, toki
 
 /// The same, where the stand-in may take requests and never answer them.
 fn stand_in_ship_that(shown: [u8; 32], held: [u8; 32], answers: bool) -> (std::net::SocketAddr, tokio::runtime::Runtime, Arc<AtomicBool>) {
+    stand_in(shown, held, answers, 0)
+}
+
+/// The same, saying when commands are delivered to it that it holds every one up to `claims`.
+fn stand_in(shown: [u8; 32], held: [u8; 32], answers: bool, claims: u64) -> (std::net::SocketAddr, tokio::runtime::Runtime, Arc<AtomicBool>) {
     use rustls::pki_types::{CertificateDer, SubjectPublicKeyInfoDer, UnixTime};
     use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 
@@ -4204,9 +4227,16 @@ fn stand_in_ship_that(shown: [u8; 32], held: [u8; 32], answers: bool) -> (std::n
                         });
                         continue;
                     }
-                    let Ok(ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Ping(ping)) }) = ship_proto::PeerRequest::decode(&*bytes) else { return };
-                    let pong = ship_proto::Pong { nonce: ping.nonce, ship: "nec".into(), caller: "zod".into() };
-                    let reply = ship_proto::PeerReply { body: Some(ship_proto::peer_reply::Body::Pong(pong)), refused: String::new() };
+                    let body = match ship_proto::PeerRequest::decode(&*bytes).ok().and_then(|request| request.body) {
+                        Some(ship_proto::peer_request::Body::Ping(ping)) => {
+                            // (`claims` also sets how much longer than need be the answer to a ping is.)
+                            let ship = format!("nec{}", "x".repeat(claims as usize));
+                            ship_proto::peer_reply::Body::Pong(ship_proto::Pong { nonce: ping.nonce, ship, caller: "zod".into() })
+                        }
+                        Some(ship_proto::peer_request::Body::Deliver(_)) => ship_proto::peer_reply::Body::Delivered(ship_proto::Delivered { last: claims }),
+                        None => return,
+                    };
+                    let reply = ship_proto::PeerReply { body: Some(body), refused: String::new() };
                     let _ = send.write_all(&reply.encode_to_vec()).await;
                     let _ = send.finish();
                     let _ = send.stopped().await;
@@ -4425,8 +4455,11 @@ fn a_ship_reads_only_so_many_requests_at_once() {
         let idle = NetConfig { idle_timeout: limit, ..NetConfig::default() };
         assert!(Network::start(_nec.clone(), directory.clone(), idle).is_err(), "{limit:?}");
     }
+    // (On a runtime of its own: this one starts, and a runtime has one network at a time.)
+    let spare_dir = TempDir::new("net-day");
+    let spare = Arc::new(Runtime::open(&spare_dir.0, fast()).unwrap());
     let day = NetConfig { request_timeout: Duration::from_secs(24 * 60 * 60), ..NetConfig::default() };
-    assert!(Network::start(_nec.clone(), directory.clone(), day).is_ok());
+    assert!(Network::start(spare, directory.clone(), day).is_ok());
 }
 
 #[test]
@@ -4561,4 +4594,1272 @@ fn a_runtime_calls_only_so_many_ships_at_once() {
     assert!(matches!(zod_net.ping("~zod", "~bus"), Err(NetError::Unlisted(_))));
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(zod_net.open_connections(), 1);
+}
+
+// Commands from one ship to another.
+
+/// The counter agent, with its interface open to commands from other ships.
+fn open_counter() -> Manifest {
+    Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true }], uses: vec![] }
+}
+
+/// The tally agent, open to other ships, and allowed to send to the counter and tally agents
+/// on `ship`: one ship by name, or "*" for any.
+fn far_tally(ship: &str) -> Manifest {
+    let to = |agent: &str| Use { ship: ship.into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
+    Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true }], uses: vec![to("counter"), to("tally")] }
+}
+
+/// A network that tries again soon, for tests where ships come and go.
+fn eager() -> NetConfig {
+    NetConfig {
+        request_timeout: Duration::from_millis(1500),
+        retry_delay: Duration::from_millis(50),
+        max_retry_delay: Duration::from_millis(300),
+        ..NetConfig::default()
+    }
+}
+
+/// A runtime with one ship running the counter and tally agents, on the network.
+fn crewed(dir: &TempDir, ship: &str, directory: &Arc<Directory>, cfg: Config, counter: Manifest, tally: Manifest) -> (Arc<Runtime>, Network) {
+    crewed_on(dir, ship, directory, cfg, eager(), counter, tally)
+}
+
+/// The same, with a say in how the network is set up.
+fn crewed_on(dir: &TempDir, ship: &str, directory: &Arc<Directory>, cfg: Config, net: NetConfig, counter: Manifest, tally: Manifest) -> (Arc<Runtime>, Network) {
+    let rt = Arc::new(Runtime::open(&dir.0, cfg).unwrap());
+    let (counter_hash, tally_hash) = (rt.add_module(&counter_wasm()).unwrap(), rt.add_module(&wasm("tally")).unwrap());
+    rt.create_ship(ship, &kernel(&rt)).unwrap();
+    rt.install(ship, "counter", &counter_hash, &counter).unwrap();
+    rt.install(ship, "tally", &tally_hash, &tally).unwrap();
+    let net = Network::start(rt.clone(), directory.clone(), net).unwrap();
+    directory.set(ship, rt.public_key(ship).unwrap(), net.addr()).unwrap();
+    (rt, net)
+}
+
+/// Wait for something that happens on its own time, such as a command reaching another ship.
+fn eventually(what: &str, holds: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !holds() {
+        assert!(started.elapsed() < Duration::from_secs(15), "never happened: {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The value of one of a ship's counters.
+fn count(rt: &Runtime, ship: &str, key: &str) -> String {
+    String::from_utf8(rt.read(ship, "counter", "counter", key.as_bytes()).unwrap()).unwrap()
+}
+
+/// Stop a runtime and its network, and wait until nothing of them is left running, so that
+/// the data directory can be opened again.
+fn stopped(net: Network, rt: Arc<Runtime>) {
+    drop(net);
+    eventually("the network lets go of the runtime", || Arc::strong_count(&rt) == 1);
+}
+
+/// What one of a ship's agents answers to a read.
+fn view(rt: &Runtime, ship: &str, agent: &str, what: &str) -> String {
+    String::from_utf8(rt.read(ship, agent, agent, what.as_bytes()).unwrap()).unwrap()
+}
+
+/// What a ship's audit log says other ships refused of the commands `agent` sent them,
+/// oldest first.
+fn refusals(rt: &Runtime, ship: &str, agent: &str) -> Vec<String> {
+    let mut found: Vec<String> = rt
+        .audit(ship, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.agent == agent && !entry.ok)
+        .map(|entry| String::from_utf8_lossy(&entry.event).into_owned())
+        .filter(|line| line.starts_with('~'))
+        .collect();
+    found.reverse();
+    found
+}
+
+/// A receipt as it travels: message `seq`, about the command numbered `about`.
+fn receipt(seq: u64, about: u64, verdict: ship_proto::Verdict, reason: &str) -> ship_proto::PeerMessage {
+    let receipt = ship_proto::Receipt { about, verdict: verdict as i32, reason: reason.into(), ..Default::default() };
+    ship_proto::PeerMessage { seq, receipt: Some(receipt), ..Default::default() }
+}
+
+/// Deliver messages to the ship `called` at `addr` as whoever holds `seed`, and return the
+/// number it says it now holds up to.
+fn hand_over(addr: std::net::SocketAddr, called: &str, seed: [u8; 32], messages: Vec<ship_proto::PeerMessage>) -> u64 {
+    let request = ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Deliver(ship_proto::Deliver { messages })) }.encode_to_vec();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), addr, called).unwrap().await.unwrap();
+        match exchange(&connection, &request).await.and_then(|reply| reply.body) {
+            Some(ship_proto::peer_reply::Body::Delivered(delivered)) => delivered.last,
+            other => panic!("not a delivery receipt: {other:?}"),
+        }
+    })
+}
+
+/// What a stand-in caller sends to deliver commands: each `(number, target agent, payload)`.
+fn delivery(messages: &[(u64, &str, &str)]) -> Vec<u8> {
+    let messages = messages
+        .iter()
+        .map(|(seq, agent, payload)| ship_proto::PeerMessage {
+            seq: *seq,
+            from_agent: "tally".into(),
+            agent: agent.to_string(),
+            interface: "counter".into(),
+            payload: payload.as_bytes().to_vec(),
+            receipt: None,
+        })
+        .collect();
+    ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Deliver(ship_proto::Deliver { messages })) }.encode_to_vec()
+}
+
+#[test]
+fn a_command_sent_to_another_ship_arrives_once_and_in_order() {
+    let (a, b) = (TempDir::new("cmd-a"), TempDir::new("cmd-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+
+    // An agent on ~zod sends commands to an agent on ~nec. Each makes the counter there add
+    // one and publish the new value, so order and count both show.
+    for _ in 0..12 {
+        assert_eq!(send(&zod, "~zod", "tally", "tell nec log hits"), "sent");
+    }
+    eventually("the commands reach ~nec", || nec.log_head("~nec", "counter", "counter").unwrap().is_some_and(|(seq, _)| seq == 12));
+    let published = nec.log_entries("~nec", "counter", "counter", 0, NO_LIMIT).unwrap();
+    let expected: Vec<String> = (1..=12).map(|n| format!("hits={n}")).collect();
+    assert_eq!(payloads(&published), expected);
+    // Once the other ship has them, the sender lets go of them.
+    eventually("~zod lets go of what was delivered", || zod.outbound_pending("~zod").unwrap() == 0);
+    assert_eq!(count(&zod, "~zod", "hits"), "0", "the command ran on the wrong ship");
+
+    // The agent that receives a command is told which ship and which agent sent it.
+    send(&zod, "~zod", "tally", "hail nec");
+    eventually("the hail reaches ~nec", || nec.read("~nec", "tally", "tally", b"note").unwrap() == b"~zod/tally tally");
+    // And the other way.
+    send(&nec, "~nec", "tally", "hail zod");
+    eventually("the hail reaches ~zod", || zod.read("~zod", "tally", "tally", b"note").unwrap() == b"~nec/tally tally");
+}
+
+#[test]
+fn commands_wait_for_a_ship_that_is_away_and_arrive_once_when_it_is_back() {
+    let (a, b) = (TempDir::new("cmd-away-a"), TempDir::new("cmd-away-b"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("the first command arrives", || count(&nec, "~nec", "hits") == "1");
+
+    // ~nec goes away. Commands for it are kept, however many tries fail.
+    drop(nec_net);
+    for _ in 0..5 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(zod.outbound_pending("~zod").unwrap(), 5);
+    // It comes back, at a new address. They arrive, each once.
+    let nec_net = Network::start(nec.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    eventually("the kept commands arrive", || count(&nec, "~nec", "hits") == "6");
+    eventually("~zod lets go of them", || zod.outbound_pending("~zod").unwrap() == 0);
+
+    // The sender goes away with commands still in hand: its whole runtime stops. They are in
+    // the ship's file, so a new runtime finds them when its network starts.
+    drop(nec_net);
+    for _ in 0..3 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    stopped(zod_net, zod);
+    let nec_net = Network::start(nec.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    let zod = Arc::new(Runtime::open(&a.0, fast()).unwrap());
+    assert_eq!(zod.outbound_pending("~zod").unwrap(), 3);
+    let zod_net = Network::start(zod.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~zod", zod.public_key("~zod").unwrap(), zod_net.addr()).unwrap();
+    eventually("the commands a stopped runtime left arrive", || count(&nec, "~nec", "hits") == "9");
+    eventually("the new runtime lets go of them", || zod.outbound_pending("~zod").unwrap() == 0);
+    // Nothing arrives late or twice.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(count(&nec, "~nec", "hits"), "9");
+}
+
+#[test]
+fn a_command_delivered_twice_is_taken_once_and_one_out_of_turn_is_not_taken() {
+    let dir = TempDir::new("cmd-twice");
+    let directory = Directory::new();
+    let (nec, nec_net) = crewed(&dir, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    let seed = [5u8; 32];
+    directory.set("~bus", ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(), "127.0.0.1:9".parse().unwrap()).unwrap();
+
+    // A caller that is ~bus, as far as its key goes, delivers commands by hand.
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let deliver = |messages: &[(u64, &str, &str)]| {
+        let request = delivery(messages);
+        tokio.block_on(async {
+            let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+            match exchange(&connection, &request).await.and_then(|reply| reply.body) {
+                Some(ship_proto::peer_reply::Body::Delivered(delivered)) => delivered.last,
+                other => panic!("not a delivery receipt: {other:?}"),
+            }
+        })
+    };
+    let hits = || count(&nec, "~nec", "hits");
+
+    assert_eq!(deliver(&[(1, "counter", "inc hits"), (2, "counter", "inc hits")]), 2);
+    eventually("the first two run", || hits() == "2");
+    // The same two again, as after a lost receipt. They are passed over.
+    assert_eq!(deliver(&[(1, "counter", "inc hits"), (2, "counter", "inc hits")]), 2);
+    // One from further ahead. Something is missing before it, so it is not taken.
+    assert_eq!(deliver(&[(5, "counter", "inc hits")]), 2);
+    // The next in turn is taken. Then a batch that overlaps what is held: only the new one.
+    assert_eq!(deliver(&[(3, "counter", "inc hits")]), 3);
+    assert_eq!(deliver(&[(2, "counter", "inc hits"), (3, "counter", "inc hits"), (4, "counter", "inc hits")]), 4);
+    eventually("four have run", || hits() == "4");
+
+    // A command that could never be run, here for an agent whose name is not a name. It is
+    // taken off the sender's hands and dropped, on record, so it cannot hold up what follows.
+    assert_eq!(deliver(&[(5, "Not A Name", "inc hits"), (6, "counter", "inc hits")]), 6);
+    eventually("the one after it runs", || hits() == "5");
+    assert!(nec.audit("~nec", 100).unwrap().iter().any(|entry| entry.agent == "network" && !entry.ok));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(hits(), "5");
+    // Each of the six is owed one receipt, the one that could not be run included. ~bus is
+    // not there to take them, so they wait.
+    assert_eq!(nec.outbound_pending("~nec").unwrap(), 6);
+
+    // What ~bus has delivered survives a sleep and wake: an old command is still old.
+    nec.sleep_idle(Duration::ZERO);
+    assert_eq!(deliver(&[(6, "counter", "inc hits")]), 6);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(hits(), "5");
+}
+
+#[test]
+fn sending_to_another_ship_needs_both_owners_to_have_agreed() {
+    // The sender's manifest has to name the other ship and agent.
+    let (a, b) = (TempDir::new("cmd-perm-a"), TempDir::new("cmd-perm-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), tally_manifest(true));
+    assert!(matches!(rejection(&zod, "tally", "tell nec inc hits"), Rejection::Denied(_)));
+    assert_eq!(zod.outbound_pending("~zod").unwrap(), 0);
+
+    // Naming one ship is not naming another.
+    let tally = zod.add_module(&wasm("tally")).unwrap();
+    zod.install("~zod", "tally", &tally, &far_tally("bus")).unwrap();
+    assert!(matches!(rejection(&zod, "tally", "tell nec inc hits"), Rejection::Denied(_)));
+    assert_eq!(send(&zod, "~zod", "tally", "tell bus inc hits"), "sent");
+    assert_eq!(zod.outbound_pending("~zod").unwrap(), 1);
+    // Being allowed to send to an agent on other ships says nothing about the agent of that
+    // name on this one.
+    assert!(matches!(rejection(&zod, "tally", "poke hits"), Rejection::Denied(_)));
+    // A ship's own name means the ship itself, so that is a local send, and needs local leave.
+    zod.install("~zod", "tally", &tally, &far_tally("*")).unwrap();
+    assert!(matches!(rejection(&zod, "tally", "tell zod inc hits"), Rejection::Denied(_)));
+    assert!(matches!(rejection(&zod, "tally", "tell Not-A-Ship inc hits"), Rejection::Denied(_)));
+
+    // The receiver's manifest has to open the interface to other ships. Without that the
+    // command still arrives, is refused when its turn comes, and is on record there. And
+    // the sender is told: the refusal, with the reason, is in its own audit log too.
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), counter_manifest(false), far_tally("*"));
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("the refused command is on record", || nec.audit("~nec", 100).unwrap().iter().any(|entry| entry.event == b"inc hits" && !entry.ok));
+    assert_eq!(count(&nec, "~nec", "hits"), "0");
+    eventually("~zod is done with it", || zod.outbound_pending("~zod").unwrap() == 1);
+    eventually("~zod is told", || {
+        refusals(&zod, "~zod", "tally") == ["~nec did not run command 1 to counter counter: it was not allowed: counter on counter is not open to other ships"]
+    });
+    // Once the owner of ~nec opens it, later commands run.
+    let counter = nec.add_module(&counter_wasm()).unwrap();
+    nec.install("~nec", "counter", &counter, &open_counter()).unwrap();
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("the command runs", || count(&nec, "~nec", "hits") == "1");
+}
+
+#[test]
+fn a_ship_with_no_room_holds_commands_back_without_losing_any() {
+    let (a, b) = (TempDir::new("cmd-room-a"), TempDir::new("cmd-room-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    // ~nec has room for two or three commands in its queue, and runs none by itself.
+    let cramped = Config { max_inbox_bytes: 200, max_queued_per_deliver: 0, ..fast() };
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, cramped, open_counter(), far_tally("*"));
+
+    for _ in 0..30 {
+        send(&zod, "~zod", "tally", "tell nec log hits");
+    }
+    // Only what fits is taken. The rest stay with the sender.
+    std::thread::sleep(Duration::from_millis(600));
+    let taken = nec.pending("~nec").unwrap();
+    assert!((1..=3).contains(&taken), "{taken} were taken");
+    assert_eq!(zod.outbound_pending("~zod").unwrap(), 30 - taken);
+    // As ~nec works through its queue, the rest follow, in order, none twice.
+    eventually("all thirty arrive", || {
+        nec.run_pending("~nec", 10).unwrap();
+        nec.log_head("~nec", "counter", "counter").unwrap().is_some_and(|(seq, _)| seq == 30)
+    });
+    let expected: Vec<String> = (1..=30).map(|n| format!("hits={n}")).collect();
+    assert_eq!(payloads(&nec.log_entries("~nec", "counter", "counter", 0, NO_LIMIT).unwrap()), expected);
+    eventually("~zod lets go of them all", || zod.outbound_pending("~zod").unwrap() == 0);
+}
+
+#[test]
+fn only_so_much_may_wait_to_go_to_one_ship() {
+    let dir = TempDir::new("cmd-quota");
+    let directory = Directory::new();
+    let cfg = Config { max_peer_out_bytes: 300, max_peers: 2, ..fast() };
+    let (zod, _zod_net) = crewed(&dir, "~zod", &directory, cfg, open_counter(), far_tally("*"));
+
+    // ~nec is not listed, so nothing sent to it can go.
+    let mut kept = 0;
+    while kept < 50 && zod.deliver("~zod", "tally", b"tell nec inc hits").is_ok() {
+        kept += 1;
+    }
+    assert!((2..6).contains(&kept), "{kept} were kept");
+    assert!(matches!(rejection(&zod, "tally", "tell nec inc hits"), Rejection::Limit(_)));
+    assert_eq!(zod.outbound_pending("~zod").unwrap(), kept);
+    // Another ship has its own allowance, so one that cannot be reached does not block it.
+    assert_eq!(send(&zod, "~zod", "tally", "tell bus inc hits"), "sent");
+    // But only so many other ships.
+    assert!(matches!(rejection(&zod, "tally", "tell doz inc hits"), Rejection::Limit(_)));
+    // A command for another ship goes only if the event that sent it commits.
+    assert!(matches!(rejection(&zod, "tally", "tell-then-crash bus"), Rejection::Trap(_)));
+    assert_eq!(zod.outbound_pending("~zod").unwrap(), kept + 1);
+    // The count survives a sleep and wake.
+    zod.sleep_idle(Duration::ZERO);
+    assert!(matches!(rejection(&zod, "tally", "tell nec inc hits"), Rejection::Limit(_)));
+}
+
+#[test]
+fn two_ships_in_one_runtime_send_each_other_commands() {
+    let dir = TempDir::new("cmd-shared");
+    let directory = Directory::new();
+    let (rt, net) = crewed(&dir, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (counter, tally) = (rt.add_module(&counter_wasm()).unwrap(), rt.add_module(&wasm("tally")).unwrap());
+    rt.create_ship("~nec", &kernel(&rt)).unwrap();
+    rt.install("~nec", "counter", &counter, &open_counter()).unwrap();
+    rt.install("~nec", "tally", &tally, &far_tally("*")).unwrap();
+    directory.set("~nec", rt.public_key("~nec").unwrap(), net.addr()).unwrap();
+
+    send(&rt, "~zod", "tally", "tell nec inc hits 3");
+    send(&rt, "~nec", "tally", "tell zod inc hits 5");
+    eventually("each has the other's command", || count(&rt, "~nec", "hits") == "3" && count(&rt, "~zod", "hits") == "5");
+}
+
+#[test]
+fn ships_that_disagree_about_what_has_passed_between_them_stop_and_say_so() {
+    let (a, b) = (TempDir::new("cmd-step-a"), TempDir::new("cmd-step-b"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let listed = [5u8; 32];
+    let public = ed25519_dalek::SigningKey::from_bytes(&listed).verifying_key().to_bytes();
+
+    // Something that is ~nec, as far as its key goes, says it already holds ninety-nine
+    // commands from ~zod, which has sent one. One of the two has lost its place. Carrying on
+    // would lose commands, so ~zod stops, keeps what it has, and says so.
+    let (addr, _running, _) = stand_in(listed, listed, true, 99);
+    directory.set("~nec", public, addr).unwrap();
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("~zod notices", || zod_net.stalled() == [("zod".to_string(), "nec".to_string())]);
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(zod.outbound_pending("~zod").unwrap(), 2);
+
+    // The other way round: a ship that says it holds fewer than have been delivered and let
+    // go of. ~bus first delivers three to a real ship, then finds a stand-in in its place
+    // that says it holds none.
+    let (bus, bus_net) = crewed(&b, "~bus", &directory, fast(), open_counter(), far_tally("*"));
+    let c = TempDir::new("cmd-step-c");
+    let (doz, doz_net) = crewed(&c, "~doz", &directory, fast(), open_counter(), far_tally("*"));
+    for _ in 0..3 {
+        send(&bus, "~bus", "tally", "tell doz inc hits");
+    }
+    eventually("three arrive", || count(&doz, "~doz", "hits") == "3");
+    eventually("~bus lets go of them", || bus.outbound_pending("~bus").unwrap() == 0);
+    let doz_key = doz.public_key("~doz").unwrap();
+    drop(doz_net);
+    drop(doz);
+    let seed: [u8; 32] = fs::read(c.0.join("keys").join("doz.key")).unwrap().try_into().unwrap();
+    let (addr, _stand_in, _) = stand_in(seed, seed, true, 0);
+    directory.set("~doz", doz_key, addr).unwrap();
+    send(&bus, "~bus", "tally", "tell doz inc hits");
+    eventually("~bus notices", || bus_net.stalled() == [("bus".to_string(), "doz".to_string())]);
+    assert_eq!(bus.outbound_pending("~bus").unwrap(), 1);
+}
+
+#[test]
+fn commands_in_hand_and_what_has_been_taken_go_with_a_ship_that_moves() {
+    let (a, b, c, out) = (TempDir::new("cmd-move-a"), TempDir::new("cmd-move-b"), TempDir::new("cmd-move-c"), TempDir::new("cmd-move-out"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    for _ in 0..2 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    eventually("two arrive", || count(&nec, "~nec", "hits") == "2");
+    eventually("~zod lets go of them", || zod.outbound_pending("~zod").unwrap() == 0);
+    eventually("~zod has both receipts", || zod.unanswered("~zod").unwrap() == 0);
+    // (~zod's counter also has a log, for the checks on tampered files further down.)
+    send(&zod, "~zod", "counter", "log local");
+    // ~nec goes away, and ~zod is moved to another runtime with three commands still in hand.
+    drop(nec_net);
+    for _ in 0..3 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    drop(zod_net);
+    zod.export_ship("~zod", &out.0).unwrap();
+    drop(zod);
+
+    // The runtime it moves to has its network up and running already, with nothing to carry.
+    // Importing the ship is what tells the network there is now something.
+    let moved = Arc::new(Runtime::open(&c.0, fast()).unwrap());
+    let moved_net = Network::start(moved.clone(), directory.clone(), eager()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    moved.import_ship(&out.0, "~zod").unwrap();
+    assert_eq!(moved.outbound_pending("~zod").unwrap(), 3);
+    assert_eq!(moved.unanswered("~zod").unwrap(), 3);
+    directory.set("~zod", moved.public_key("~zod").unwrap(), moved_net.addr()).unwrap();
+    let nec_net = Network::start(nec.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    // They arrive from the ship's new home, and its numbering carries on from where it was:
+    // ~nec, which has taken two, takes these as the third to fifth, and the next as the sixth.
+    eventually("the three arrive", || count(&nec, "~nec", "hits") == "5");
+    send(&moved, "~zod", "tally", "tell nec inc hits");
+    eventually("and one more", || count(&nec, "~nec", "hits") == "6");
+    eventually("the moved ship lets go of them", || moved.outbound_pending("~zod").unwrap() == 0);
+    // The receipts for commands sent before the move find the ship in its new home: all six
+    // are answered, each once.
+    eventually("every command is answered", || moved.unanswered("~zod").unwrap() == 0 && view(&moved, "~zod", "tally", "receipts").lines().count() == 6);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(count(&nec, "~nec", "hits"), "6");
+    let answers = view(&moved, "~zod", "tally", "receipts");
+    let about: Vec<&str> = answers.lines().map(|line| line.split(' ').next().unwrap()).collect();
+    assert_eq!(about, ["1", "2", "3", "4", "5", "6"], "{answers}");
+
+    // A file that records what has passed between ships wrongly is not a ship file.
+    let tampered_in = |label: &str, statement: &str, cfg: Config| {
+        let (dir, copy) = (TempDir::new(label), TempDir::new(&format!("{label}-out")));
+        for entry in fs::read_dir(&out.0).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                fs::copy(entry.path(), copy.0.join(entry.file_name())).unwrap();
+            }
+        }
+        fs::create_dir_all(copy.0.join("blobs")).unwrap();
+        for entry in fs::read_dir(out.0.join("blobs")).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), copy.0.join("blobs").join(entry.file_name())).unwrap();
+        }
+        rusqlite::Connection::open(copy.0.join("zod.ship")).unwrap().execute_batch(statement).unwrap();
+        let rt = Runtime::open(&dir.0, cfg).unwrap();
+        let imported = rt.import_ship(&copy.0, "~zod");
+        (rt, dir, imported)
+    };
+    let tampered_for = |label: &str, statement: &str, cfg: Config| tampered_in(label, statement, cfg).2;
+    let tampered = |label: &str, statement: &str| tampered_for(label, statement, fast());
+    let refused = |label: &str, statement: &str| {
+        let result = tampered(label, statement);
+        assert!(matches!(result, Err(Error::BadShipFile(_))), "{label}: {result:?}");
+    };
+    let accepted = |label: &str, statement: &str| {
+        let result = tampered(label, statement);
+        assert!(result.is_ok(), "{label}: {result:?}");
+    };
+    accepted("cmd-intact", "SELECT 1");
+    // What is recorded as waiting is counted afresh, so a wrong figure there does no harm.
+    assert!(tampered("cmd-recount", "UPDATE peers SET out_bytes = 0").is_ok());
+    // A command numbered past the last one sent, a gap in the numbers, the newest missing,
+    // and one for a ship there is no record of.
+    refused("cmd-ahead", "UPDATE peer_out SET seq = seq + 10");
+    refused("cmd-gap", "DELETE FROM peer_out WHERE seq = 4");
+    refused("cmd-short", "DELETE FROM peer_out WHERE seq = 5");
+    refused("cmd-nowhere", "UPDATE peer_out SET peer = 'bus'");
+    let renamed = |name: &str| format!("UPDATE peers SET peer = '{name}'; UPDATE peer_out SET peer = '{name}'; UPDATE peer_wait SET peer = '{name}'");
+    accepted("cmd-renamed", &renamed("bus"));
+    refused("cmd-name", &renamed("Not A Ship"));
+    refused("cmd-self", &renamed("zod"));
+    // A queued command from another ship carries the number that ship gave it. ~zod has taken
+    // two messages from ~nec, so the number is 1 or 2, and no two queued commands share one.
+    let queued = |ship: &str, kind: u8, number: u64| {
+        format!("INSERT INTO inbox (kind, source, agent, interface, payload, ship, ship_seq) VALUES ({kind}, 'tally', 'counter', 'counter', x'', '{ship}', {number});")
+    };
+    accepted("cmd-queued", &queued("nec", 1, 1));
+    refused("cmd-from", &queued("bus", 1, 1));
+    // Something queued from another ship that is neither a command nor a receipt: here a
+    // checkpoint request, which is in order when it is said to come from this ship.
+    let asking = |ship: &str| format!("INSERT INTO inbox (kind, source, agent, interface, payload, ship) VALUES (4, 'counter', 'counter', 'counter', x'', '{ship}')");
+    accepted("cmd-asking", &asking(""));
+    refused("cmd-kind", &asking("nec"));
+    refused("cmd-unnumbered", &queued("nec", 1, 0));
+    refused("cmd-not-taken", &queued("nec", 1, 3));
+    refused("cmd-same-number", &[queued("nec", 1, 1), queued("nec", 1, 1)].concat());
+    // Commands from one ship are queued in the order that ship numbered them.
+    accepted("cmd-in-order", &[queued("nec", 1, 1), queued("nec", 1, 2)].concat());
+    refused("cmd-out-of-order", &[queued("nec", 1, 2), queued("nec", 1, 1)].concat());
+    // With the receipts waiting to go, no more than the ship would have let itself owe.
+    let four = ["UPDATE peers SET received = 4 WHERE peer = 'nec';".to_string(), queued("nec", 1, 1), queued("nec", 1, 2), queued("nec", 1, 3), queued("nec", 1, 4)].concat();
+    accepted("cmd-owed", &four);
+    let result = tampered_for("cmd-owed-too-many", &four, Config { max_unanswered: 3, ..fast() });
+    assert!(matches!(result, Err(Error::BadShipFile(_))), "{result:?}");
+    refused("cmd-numbered-local", &queued("", 1, 1));
+
+    // A command recorded as awaiting its receipt is one this ship sent.
+    refused("wait-ahead", "UPDATE peer_wait SET seq = seq + 10");
+    refused("wait-nowhere", "UPDATE peer_wait SET peer = 'bus'");
+    refused("wait-tell", "UPDATE peer_wait SET tell = 2");
+    accepted("wait-none", "DELETE FROM peer_wait");
+    // And where the command is still waiting to go, the two records agree about it.
+    refused("wait-other-sender", "UPDATE peer_wait SET source = 'counter'");
+    refused("wait-other-target", "UPDATE peer_wait SET agent = 'tally', interface = 'tally'");
+
+    // A receipt waiting to go is about a command taken from that ship, says what became of
+    // it, and names no agent. There is one for a command, and none for one still queued.
+    let receipt_out = |seq: u64, payload: &str, source: &str, flag: u8| {
+        format!("INSERT INTO peer_out VALUES ('nec', {seq}, '{source}', '', '', x'{payload}', {flag}); UPDATE peers SET sent = {seq} WHERE peer = 'nec';")
+    };
+    accepted("receipt-out", &receipt_out(6, "08011001", "", 1));
+    refused("receipt-about", &receipt_out(6, "08091001", "", 1));
+    refused("receipt-verdict", &receipt_out(6, "0801", "", 1));
+    refused("receipt-garbage", &receipt_out(6, "ff", "", 1));
+    refused("receipt-source", &receipt_out(6, "08011001", "tally", 1));
+    refused("receipt-flag", &receipt_out(6, "08011001", "", 2));
+    refused("receipt-twice", &[receipt_out(6, "08011001", "", 1), receipt_out(7, "08011001", "", 1)].concat());
+    refused("receipt-queued", &[receipt_out(6, "08011001", "", 1), queued("nec", 1, 1)].concat());
+    refused("receipt-awaited", &[receipt_out(6, "08011001", "", 1), "INSERT INTO peer_wait VALUES ('nec', 6, 'tally', 'counter', 'counter', 1);".to_string()].concat());
+    // A verdict this runtime has no name for is not one it would have given.
+    refused("receipt-strange", &receipt_out(6, "0801104d", "", 1));
+    // A receipt has a size limit of its own, apart from the one on what agents send.
+    let wordy = format!("080110021a28{}", "78".repeat(40));
+    let result = tampered_for("receipt-small-events", &receipt_out(6, &wordy, "", 1), Config { max_event_bytes: 30, ..fast() });
+    assert!(result.is_ok(), "{result:?}");
+    // A command waiting to go is still held to the size of an event.
+    let result = tampered_for("cmd-large", "UPDATE peer_out SET payload = zeroblob(40) WHERE seq = 5", Config { max_event_bytes: 30, ..fast() });
+    assert!(matches!(result, Err(Error::BadShipFile(_))), "{result:?}");
+
+    // The numbers of messages have a ceiling, and a file is let in only with numbers no more
+    // than half way to it, so that a running ship never gets there.
+    let numbered = |column: &str, n: u64| format!("DELETE FROM peer_out; DELETE FROM peer_wait; UPDATE peers SET {column} = {n}");
+    accepted("cmd-far-along", &numbered("sent", 1 << 61));
+    refused("cmd-sent-ceiling", &numbered("sent", (1 << 61) + 1));
+    refused("cmd-taken-ceiling", &numbered("received", (1 << 61) + 1));
+
+    // A receipt queued for an agent says where the command went, in step with its own row.
+    let told = |ship: &str, payload: &str| {
+        format!("INSERT INTO inbox (kind, source, agent, interface, payload, ship) VALUES (5, 'counter', 'tally', 'counter', x'{payload}', '{ship}')")
+    };
+    let (of_nec, of_bus) = ("0801100122036e65632a07636f756e7465723207636f756e746572", "0801100122036275732a07636f756e7465723207636f756e746572");
+    accepted("receipt-told", &told("nec", of_nec));
+    refused("receipt-told-ship", &told("nec", of_bus));
+    refused("receipt-told-from", &told("bus", of_bus));
+    refused("receipt-told-bare", &told("nec", "08011001"));
+    // One receipt for a command, about a command this ship sent, and not one it still
+    // records as awaited.
+    refused("receipt-told-twice", &[told("nec", of_nec), ";".to_string(), told("nec", of_nec)].concat());
+    refused("receipt-told-unsent", &told("nec", "0809100122036e65632a07636f756e7465723207636f756e746572"));
+    refused("receipt-told-awaited", &told("nec", "0803100122036e65632a07636f756e7465723207636f756e746572"));
+    // The verdict is the other ship's word, kept as it came, even one this runtime cannot name.
+    accepted("receipt-told-strange", &told("nec", "0801104d22036e65632a07636f756e7465723207636f756e746572"));
+    // A receipt may be queued while the command it answers is still waiting to go (the other
+    // ship answered early). The two must then be about the same command: sent by the agent
+    // the receipt is for, and a command, not a receipt.
+    let early = "DELETE FROM peer_wait WHERE seq = 3;";
+    let about_3 = "0803100122036e65632a07636f756e7465723207636f756e746572";
+    accepted("receipt-early", &[early, &told("nec", about_3)].concat());
+    let for_another = format!("INSERT INTO inbox (kind, source, agent, interface, payload, ship) VALUES (5, 'counter', 'counter', 'counter', x'{about_3}', 'nec')");
+    refused("receipt-early-other", &[early, &for_another].concat());
+    let about_6 = "0806100122036e65632a07636f756e7465723207636f756e746572";
+    refused("receipt-about-receipt", &[receipt_out(6, "08011001", "", 1), told("nec", about_6)].concat());
+}
+
+// Receipts: what became of a command on the ship it was sent to.
+
+#[test]
+fn every_command_sent_to_another_ship_is_answered_once() {
+    let (a, b) = (TempDir::new("receipt-a"), TempDir::new("receipt-b"));
+    let directory = Directory::new();
+    // ~zod's tally agent may send to three agents on other ships. ~nec has the first open to
+    // other ships, the second closed, and no third.
+    let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
+    let sender = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: false }], uses: vec![to("counter"), to("tally"), to("ghost")] };
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), sender);
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), tally_manifest(true));
+
+    // One that runs, one whose handler fails, one to a closed interface, one to no agent.
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    assert_eq!(view(&zod, "~zod", "tally", "last-sent"), "1");
+    assert_eq!(send(&zod, "~zod", "tally", "far nec counter crash x"), "2");
+    assert_eq!(send(&zod, "~zod", "tally", "far nec tally note"), "3");
+    assert_eq!(send(&zod, "~zod", "tally", "far nec ghost boo"), "4");
+
+    // The agent is handed one receipt for each, in order, saying which command it is about,
+    // where that went, and what became of it. What a kernel said is passed on. How an agent
+    // failed is not. The receipt is filed as coming from the agent the command was sent to.
+    eventually("every command is answered", || zod.unanswered("~zod").unwrap() == 0 && view(&zod, "~zod", "tally", "receipts").lines().count() == 4);
+    let expected = "\
+1 ~nec/counter counter ran [] from ~nec/counter counter
+2 ~nec/counter counter failed [the agent failed] from ~nec/counter counter
+3 ~nec/tally tally denied [tally on tally is not open to other ships] from ~nec/tally tally
+4 ~nec/ghost ghost denied [no agent named ghost] from ~nec/ghost ghost
+";
+    assert_eq!(view(&zod, "~zod", "tally", "receipts"), expected);
+    assert_eq!(count(&nec, "~nec", "hits"), "1");
+    assert_eq!(count(&nec, "~nec", "x"), "0");
+    // Each one that did not run is in the sender's audit log, against the agent that sent it.
+    assert_eq!(
+        refusals(&zod, "~zod", "tally"),
+        [
+            "~nec did not run command 2 to counter counter: the agent failed: the agent failed",
+            "~nec did not run command 3 to tally tally: it was not allowed: tally on tally is not open to other ships",
+            "~nec did not run command 4 to ghost ghost: it was not allowed: no agent named ghost",
+        ]
+    );
+    // How the handler on ~nec failed stays on ~nec.
+    assert!(!view(&zod, "~zod", "tally", "receipts").contains("crash requested"));
+    // Nothing is left over at either end, and nothing comes twice.
+    eventually("nothing is left to go", || zod.outbound_pending("~zod").unwrap() == 0 && nec.outbound_pending("~nec").unwrap() == 0);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(view(&zod, "~zod", "tally", "receipts"), expected);
+
+    // A command that runs out of fuel there is answered too.
+    send(&zod, "~zod", "tally", "far nec counter spin");
+    eventually("the fifth is answered", || view(&zod, "~zod", "tally", "receipts").lines().count() == 5);
+    let answers = view(&zod, "~zod", "tally", "receipts");
+    let last = answers.lines().last().unwrap();
+    assert!(last.starts_with("5 ~nec/counter counter failed [it "), "{last}");
+}
+
+#[test]
+fn an_agent_with_no_receipt_handler_is_not_run_for_one() {
+    let (a, b) = (TempDir::new("receipt-none-a"), TempDir::new("receipt-none-b"));
+    let directory = Directory::new();
+    // The counter agent has no receipt handler. Here it may send to counters on other ships.
+    let passing = Manifest {
+        provides: vec![Provide { interface: "counter".into(), public: false, remote: true }],
+        uses: vec![Use { ship: "*".into(), agent: "counter".into(), interface: "counter".into(), read: false, send: true }],
+    };
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), passing, far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+
+    assert_eq!(send(&zod, "~zod", "counter", "pass nec inc hits"), "1");
+    eventually("it runs", || count(&nec, "~nec", "hits") == "1");
+    eventually("and is answered", || zod.unanswered("~zod").unwrap() == 0);
+    // The receipt closed the record of the command, and that is all: no event ran on ~zod.
+    assert_eq!(zod.pending("~zod").unwrap(), 0);
+    assert_eq!(zod.audit("~zod", 100).unwrap().len(), 1);
+
+    // A refusal is still written down, against the agent that sent the command.
+    let counter = nec.add_module(&counter_wasm()).unwrap();
+    nec.install("~nec", "counter", &counter, &counter_manifest(false)).unwrap();
+    assert_eq!(send(&zod, "~zod", "counter", "pass nec inc hits"), "2");
+    eventually("the refusal is on record", || {
+        refusals(&zod, "~zod", "counter") == ["~nec did not run command 2 to counter counter: it was not allowed: counter on counter is not open to other ships"]
+    });
+    assert_eq!(zod.unanswered("~zod").unwrap(), 0);
+    assert_eq!(zod.pending("~zod").unwrap(), 0);
+    assert_eq!(zod.audit("~zod", 100).unwrap().len(), 3);
+}
+
+#[test]
+fn a_receipt_waits_for_a_ship_that_is_away() {
+    let (a, b) = (TempDir::new("receipt-away-a"), TempDir::new("receipt-away-b"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    // ~nec takes commands but runs them only when told to.
+    let patient = Config { max_queued_per_deliver: 0, ..fast() };
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, patient.clone(), open_counter(), far_tally("*"));
+
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("~nec has the command", || nec.pending("~nec").unwrap() == 1);
+    eventually("~zod knows it does", || zod.outbound_pending("~zod").unwrap() == 0);
+    // Delivered, but not yet run: no receipt yet.
+    assert_eq!(zod.unanswered("~zod").unwrap(), 1);
+    assert_eq!(view(&zod, "~zod", "tally", "receipts"), "");
+
+    // ~zod goes away. ~nec runs the command and has a receipt it cannot deliver. Then ~nec
+    // stops too. The receipt is in its file.
+    drop(zod_net);
+    nec.run_pending("~nec", 10).unwrap();
+    assert_eq!(count(&nec, "~nec", "hits"), "1");
+    assert_eq!(nec.outbound_pending("~nec").unwrap(), 1);
+    stopped(nec_net, nec);
+
+    // Both come back, at new addresses. The receipt arrives, once.
+    let nec = Arc::new(Runtime::open(&b.0, patient).unwrap());
+    assert_eq!(nec.outbound_pending("~nec").unwrap(), 1);
+    let zod_net = Network::start(zod.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~zod", zod.public_key("~zod").unwrap(), zod_net.addr()).unwrap();
+    let nec_net = Network::start(nec.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    eventually("the receipt arrives", || view(&zod, "~zod", "tally", "receipts") == "1 ~nec/counter counter ran [] from ~nec/counter counter\n");
+    eventually("and ~nec lets go of it", || nec.outbound_pending("~nec").unwrap() == 0);
+    assert_eq!(zod.unanswered("~zod").unwrap(), 0);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(view(&zod, "~zod", "tally", "receipts").lines().count(), 1);
+    assert_eq!(count(&nec, "~nec", "hits"), "1");
+}
+
+#[test]
+fn a_receipt_is_believed_only_for_a_command_that_was_sent_to_that_ship() {
+    let dir = TempDir::new("receipt-false");
+    let directory = Directory::new();
+    let (nec, nec_net) = crewed(&dir, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    let (bus, doz) = ([5u8; 32], [6u8; 32]);
+    let public = |seed: &[u8; 32]| ed25519_dalek::SigningKey::from_bytes(seed).verifying_key().to_bytes();
+    directory.set("~bus", public(&bus), "127.0.0.1:9".parse().unwrap()).unwrap();
+    directory.set("~doz", public(&doz), "127.0.0.1:9".parse().unwrap()).unwrap();
+    use ship_proto::Verdict;
+    let receipts = || view(&nec, "~nec", "tally", "receipts");
+
+    // ~nec has sent one command to ~bus. It cannot be delivered, but it has been sent.
+    send(&nec, "~nec", "tally", "tell bus inc hits");
+    assert_eq!(nec.unanswered("~nec").unwrap(), 1);
+
+    // ~doz says command 1 ran. ~nec sent ~doz nothing, so that answers nothing. It is taken,
+    // so that it does not hold up what ~doz sends next, and dropped.
+    assert_eq!(hand_over(nec_net.addr(), "nec", doz, vec![receipt(1, 1, Verdict::Ran, "")]), 1);
+    // ~bus answers a command ~nec never sent it.
+    assert_eq!(hand_over(nec_net.addr(), "nec", bus, vec![receipt(1, 7, Verdict::Ran, "")]), 1);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(nec.unanswered("~nec").unwrap(), 1);
+    assert_eq!(receipts(), "");
+    assert_eq!(nec.pending("~nec").unwrap(), 0);
+
+    // ~bus answers the command it was sent. The reason is the other ship's words: it is cut
+    // to length and anything that is not plain text is taken out before it is kept.
+    let long = format!("no\u{7}\nway {}", "x".repeat(500));
+    assert_eq!(hand_over(nec_net.addr(), "nec", bus, vec![receipt(2, 1, Verdict::Denied, &long)]), 2);
+    eventually("the agent is told", || receipts().lines().count() == 1);
+    let told = receipts();
+    assert!(told.starts_with("1 ~bus/counter counter denied [no  way xxx"), "{told}");
+    assert_eq!(told.find(']').unwrap() - told.find('[').unwrap() - 1, 200, "{told}");
+    assert_eq!(nec.unanswered("~nec").unwrap(), 0);
+    let noted = refusals(&nec, "~nec", "tally");
+    assert_eq!(noted.len(), 1);
+    assert!(noted[0].starts_with("~bus did not run command 1 to counter counter: it was not allowed: no  way xxx"), "{noted:?}");
+
+    // A second answer to the same command, and the first one sent again, change nothing.
+    assert_eq!(hand_over(nec_net.addr(), "nec", bus, vec![receipt(2, 1, Verdict::Denied, "again"), receipt(3, 1, Verdict::Ran, "")]), 3);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(receipts(), told);
+    assert_eq!(refusals(&nec, "~nec", "tally").len(), 1);
+
+    // A verdict this runtime has no name for is passed on as it is, and counts as not run.
+    send(&nec, "~nec", "tally", "tell bus inc hits");
+    let mut strange = receipt(4, 2, Verdict::Ran, "");
+    strange.receipt.as_mut().unwrap().verdict = 77;
+    assert_eq!(hand_over(nec_net.addr(), "nec", bus, vec![strange]), 4);
+    eventually("the agent is told", || receipts().lines().count() == 2);
+    assert!(receipts().lines().last().unwrap().starts_with("2 ~bus/counter counter unknown []"), "{}", receipts());
+    assert_eq!(refusals(&nec, "~nec", "tally").len(), 2);
+}
+
+#[test]
+fn only_so_many_commands_may_be_unanswered() {
+    // The sender's side: a ship that does not answer is sent only so many.
+    let (a, b) = (TempDir::new("unanswered-a"), TempDir::new("unanswered-b"));
+    let directory = Directory::new();
+    let cfg = Config { max_unanswered: 3, ..fast() };
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, cfg, open_counter(), far_tally("*"));
+    for _ in 0..3 {
+        send(&zod, "~zod", "tally", "tell bus inc hits");
+    }
+    assert!(matches!(rejection(&zod, "tally", "tell bus inc hits"), Rejection::Limit(_)));
+    assert_eq!(zod.unanswered("~zod").unwrap(), 3);
+    // Another ship has its own count.
+    send(&zod, "~zod", "tally", "tell doz inc hits");
+
+    // The receiver's side: a ship that sends commands but will not take the receipts for
+    // them gets no more commands taken. ~bus hands over five. ~nec takes two.
+    let cfg = Config { max_unanswered: 2, max_queued_per_deliver: 0, ..fast() };
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, cfg, open_counter(), far_tally("*"));
+    let seed = [5u8; 32];
+    directory.set("~bus", ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(), "127.0.0.1:9".parse().unwrap()).unwrap();
+    let five: Vec<(u64, &str, &str)> = (1..=5).map(|n| (n, "counter", "inc hits")).collect();
+    let hand = || {
+        let request = ship_proto::PeerRequest::decode(&*delivery(&five)).unwrap();
+        let Some(ship_proto::peer_request::Body::Deliver(deliver)) = request.body else { unreachable!() };
+        hand_over(nec_net.addr(), "nec", seed, deliver.messages)
+    };
+    assert_eq!(hand(), 2);
+    // Sent again, the rest are still not taken: the two that are queued count as owed.
+    assert_eq!(hand(), 2);
+    // Running them does not change that: the two receipts are still owed, since ~bus is not
+    // there to take them.
+    nec.run_pending("~nec", 10).unwrap();
+    assert_eq!(count(&nec, "~nec", "hits"), "2");
+    assert_eq!(nec.outbound_pending("~nec").unwrap(), 2);
+    assert_eq!(hand(), 2);
+    assert_eq!(nec.pending("~nec").unwrap(), 0);
+}
+
+#[test]
+fn receipts_wait_for_room_and_none_is_lost() {
+    let (a, b) = (TempDir::new("receipt-room-a"), TempDir::new("receipt-room-b"));
+    let directory = Directory::new();
+    // ~zod has room in its queue for one receipt at a time, and runs none by itself.
+    let cramped = Config { max_inbox_bytes: 160, max_queued_per_deliver: 0, ..fast() };
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, cramped, open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    for _ in 0..8 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    eventually("all eight run", || count(&nec, "~nec", "hits") == "8");
+    // ~nec has eight receipts. ~zod takes what it has room for, and the rest stay with ~nec.
+    std::thread::sleep(Duration::from_millis(600));
+    let taken = zod.pending("~zod").unwrap();
+    assert!((1..=2).contains(&taken), "{taken} were taken");
+    assert_eq!(nec.outbound_pending("~nec").unwrap(), 8 - taken);
+    // As ~zod works through its queue the rest follow, in order, each once.
+    eventually("all eight receipts arrive", || {
+        zod.run_pending("~zod", 10).unwrap();
+        view(&zod, "~zod", "tally", "receipts").lines().count() == 8
+    });
+    let answers = view(&zod, "~zod", "tally", "receipts");
+    let about: Vec<&str> = answers.lines().map(|line| line.split(' ').next().unwrap()).collect();
+    assert_eq!(about, ["1", "2", "3", "4", "5", "6", "7", "8"]);
+    eventually("~nec lets go of them", || nec.outbound_pending("~nec").unwrap() == 0);
+    assert_eq!(zod.unanswered("~zod").unwrap(), 0);
+}
+
+#[test]
+fn a_receipt_for_an_agent_that_no_longer_takes_them_is_let_go() {
+    let (a, b) = (TempDir::new("receipt-gone-a"), TempDir::new("receipt-gone-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let patient = Config { max_queued_per_deliver: 0, ..fast() };
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, patient, open_counter(), far_tally("*"));
+
+    // The tally agent sends a command, and asks to be told what becomes of it. Before the
+    // answer comes, its module is replaced by one that has no receipt handler.
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("~nec has the command", || nec.pending("~nec").unwrap() == 1);
+    let other = zod.add_module(&counter_wasm()).unwrap();
+    zod.install("~zod", "tally", &other, &far_tally("*")).unwrap();
+    nec.run_pending("~nec", 10).unwrap();
+
+    // The receipt closes the record of the command. There is nobody to hand it to, and that
+    // is not a failure.
+    eventually("the receipt is dealt with", || zod.unanswered("~zod").unwrap() == 0 && zod.pending("~zod").unwrap() == 0);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(zod.audit("~zod", 100).unwrap().iter().all(|entry| entry.ok));
+}
+
+#[test]
+fn a_delivery_holds_only_so_many_messages() {
+    let dir = TempDir::new("cmd-many");
+    let directory = Directory::new();
+    let (nec, nec_net) = crewed(&dir, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    let seed = [5u8; 32];
+    directory.set("~bus", ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(), "127.0.0.1:9".parse().unwrap()).unwrap();
+    let deliver = |count: u64| {
+        let messages = (1..=count).map(|seq| ship_proto::PeerMessage { seq, ..Default::default() }).collect();
+        let request = ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Deliver(ship_proto::Deliver { messages })) }.encode_to_vec();
+        let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        tokio.block_on(async {
+            let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+            exchange(&connection, &request).await.unwrap()
+        })
+    };
+    // A megabyte holds a great many empty messages, each of which would cost far more to
+    // unpack than to send. One more than a delivery may hold, and the request is refused
+    // before any of it is unpacked.
+    for count in [257, 150_000] {
+        let reply = deliver(count);
+        assert!(reply.body.is_none() && reply.refused.contains("too many"), "{reply:?}");
+    }
+    assert_eq!(nec.pending("~nec").unwrap(), 0);
+    // As many as a delivery may hold are taken. These are not commands that could be run, so
+    // each is refused, up to as many receipts as ~nec will owe one ship.
+    let reply = deliver(256);
+    assert!(matches!(reply.body, Some(ship_proto::peer_reply::Body::Delivered(ship_proto::Delivered { last: 256 }))), "{reply:?}");
+    assert_eq!(nec.outbound_pending("~nec").unwrap(), 256);
+}
+
+#[test]
+fn what_an_agent_ran_into_is_not_told_to_the_ship_that_asked() {
+    let (a, b) = (TempDir::new("receipt-quiet-a"), TempDir::new("receipt-quiet-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    // ~nec's tally agent is open to other ships. It may send to other ships, but may not read
+    // the counter. ~nec lets any one ship have a single command unanswered.
+    let cfg = Config { max_unanswered: 1, ..fast() };
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, cfg, open_counter(), far_tally("*"));
+
+    // Asked to read the counter, it is refused by its own ship. Asked twice to send to a
+    // third ship, the second runs into ~nec's limit. Both refusals name things that are
+    // ~nec's own business: what its agent tried to read, and which ship it talks to.
+    send(&zod, "~zod", "tally", "far nec tally peek hits");
+    send(&zod, "~zod", "tally", "far nec tally tell doz inc hits");
+    send(&zod, "~zod", "tally", "far nec tally tell doz inc hits");
+    eventually("all three are answered", || view(&zod, "~zod", "tally", "receipts").lines().count() == 3);
+    let expected = "\
+1 ~nec/tally tally failed [the agent failed] from ~nec/tally tally
+2 ~nec/tally tally ran [] from ~nec/tally tally
+3 ~nec/tally tally limit [a limit on that ship was reached] from ~nec/tally tally
+";
+    assert_eq!(view(&zod, "~zod", "tally", "receipts"), expected);
+    // ~nec's own record has the particulars.
+    assert_eq!(nec.unanswered("~nec").unwrap(), 1);
+    assert_eq!(nec.audit("~nec", 100).unwrap().iter().filter(|entry| entry.agent == "tally" && !entry.ok).count(), 2);
+    // ~zod's has only what it was told.
+    let told = refusals(&zod, "~zod", "tally").join("\n");
+    assert!(!told.contains("doz") && !told.contains("may not") && !told.contains("counter"), "{told}");
+}
+
+#[test]
+fn a_message_too_large_to_ever_queue_does_not_block_what_follows() {
+    let (a, b) = (TempDir::new("cmd-large-a"), TempDir::new("cmd-large-b"));
+    let directory = Directory::new();
+    // ~zod's queue is too small for a receipt that carries a reason. ~nec's is too small for
+    // a command of two hundred bytes. Both hold shorter things.
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, Config { max_inbox_bytes: 100, ..fast() }, open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, Config { max_inbox_bytes: 200, ..fast() }, open_counter(), far_tally("*"));
+
+    // A command ~nec could never queue. Waiting for room would mean waiting for ever, with
+    // everything after it held up behind. It is refused, and the next one runs.
+    send(&zod, "~zod", "tally", &format!("tell nec inc {}", "k".repeat(200)));
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("the one after it runs", || count(&nec, "~nec", "hits") == "1");
+    // The refusal carries a reason, so its receipt is more than ~zod's queue could ever hold.
+    // The record of the command is closed all the same, and the audit log says the agent
+    // went untold. The receipt after it, which is short, reaches the agent.
+    eventually("both are answered", || zod.unanswered("~zod").unwrap() == 0);
+    eventually("the agent has the second", || view(&zod, "~zod", "tally", "receipts") == "2 ~nec/counter counter ran [] from ~nec/counter counter\n");
+    assert_eq!(
+        refusals(&zod, "~zod", "tally"),
+        ["~nec did not run command 1 to counter counter: a limit was reached: larger than that ship can hold (the receipt is too large for this ship's queue, so the agent was not told)"]
+    );
+}
+
+#[test]
+fn a_runtime_has_one_network_and_one_slow_ship_does_not_hold_up_the_rest() {
+    let (a, b) = (TempDir::new("net-one-a"), TempDir::new("net-one-b"));
+    let directory = Directory::new();
+    let rt = Arc::new(Runtime::open(&a.0, fast()).unwrap());
+    let (counter, tally) = (rt.add_module(&counter_wasm()).unwrap(), rt.add_module(&wasm("tally")).unwrap());
+    rt.create_ship("~zod", &kernel(&rt)).unwrap();
+    rt.install("~zod", "counter", &counter, &open_counter()).unwrap();
+    rt.install("~zod", "tally", &tally, &far_tally("*")).unwrap();
+    assert!(Network::start(rt.clone(), directory.clone(), NetConfig { max_carrying: 0, ..eager() }).is_err());
+    // Nor does a network start for ships whose files may be so small that, once what every
+    // ship file needs is taken off, the largest command they accept could never fit.
+    let tiny_dir = TempDir::new("net-one-tiny");
+    let tiny = Arc::new(Runtime::open(&tiny_dir.0, Config { max_ship_bytes: 96 << 10, ..fast() }).unwrap());
+    assert!(Network::start(tiny.clone(), directory.clone(), eager()).is_err());
+    let enough_dir = TempDir::new("net-one-enough");
+    let enough = Arc::new(Runtime::open(&enough_dir.0, Config { max_ship_bytes: 256 << 10, ..fast() }).unwrap());
+    assert!(Network::start(enough, directory.clone(), eager()).is_ok());
+
+    // One delivery at a time. Starting a second network while the first runs is refused, and
+    // that refusal does not disturb the first. Once the first has stopped, another may start.
+    let one = NetConfig { max_carrying: 1, ..eager() };
+    let first = Network::start(rt.clone(), directory.clone(), one.clone()).unwrap();
+    assert!(Network::start(rt.clone(), directory.clone(), one.clone()).is_err());
+    drop(first);
+    let net = Network::start(rt.clone(), directory.clone(), one).unwrap();
+    assert!(Network::start(rt.clone(), directory.clone(), eager()).is_err());
+    directory.set("~zod", rt.public_key("~zod").unwrap(), net.addr()).unwrap();
+
+    // ~bus is listed at an address where nothing answers, so every try at it runs out of
+    // time. ~nec is there. With one delivery at a time, ~nec still gets its command.
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    directory.set("~bus", [7u8; 32], "127.0.0.1:9".parse().unwrap()).unwrap();
+    for _ in 0..3 {
+        send(&rt, "~zod", "tally", "tell bus inc hits");
+    }
+    send(&rt, "~zod", "tally", "tell nec inc hits");
+    eventually("~nec has its command", || count(&nec, "~nec", "hits") == "1");
+    eventually("and ~zod its receipt", || view(&rt, "~zod", "tally", "receipts").lines().count() == 1);
+    assert_eq!(rt.outbound_pending("~zod").unwrap(), 3);
+}
+
+#[test]
+fn every_command_that_is_taken_is_run_however_many_arrive_at_once() {
+    let (a, b) = (TempDir::new("cmd-all-a"), TempDir::new("cmd-all-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+
+    // A hundred and fifty commands pile up while ~nec is away, and arrive together when it
+    // is back. ~nec runs a ship's queue sixty-four events at a time. It has said it holds
+    // them all, so nobody will send them again: it has to keep going until all have run.
+    drop(nec_net);
+    for _ in 0..150 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    let nec_net = Network::start(nec.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    eventually("all of them run", || count(&nec, "~nec", "hits") == "150");
+    eventually("and are answered", || zod.unanswered("~zod").unwrap() == 0 && view(&zod, "~zod", "tally", "receipts").lines().count() == 150);
+
+    // Commands that were taken and not yet run when a runtime stopped are run when its
+    // network next starts, with nothing new arriving to prompt it. Here ~nec first takes
+    // three without running them.
+    stopped(nec_net, nec);
+    let patient = Config { max_queued_per_deliver: 0, ..fast() };
+    let nec = Arc::new(Runtime::open(&b.0, patient).unwrap());
+    let nec_net = Network::start(nec.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    for _ in 0..3 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    eventually("~nec takes them", || nec.pending("~nec").unwrap() == 3 && zod.outbound_pending("~zod").unwrap() == 0);
+    assert_eq!(count(&nec, "~nec", "hits"), "150");
+    stopped(nec_net, nec);
+    let nec = Arc::new(Runtime::open(&b.0, fast()).unwrap());
+    let nec_net = Network::start(nec.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    eventually("they run", || count(&nec, "~nec", "hits") == "153");
+    eventually("and are answered", || zod.unanswered("~zod").unwrap() == 0);
+
+    // The same holds for a ship that moves with commands taken and not yet run: the runtime
+    // it arrives in runs them, though its network was already up and nothing new arrives.
+    stopped(nec_net, nec);
+    let nec = Arc::new(Runtime::open(&b.0, Config { max_queued_per_deliver: 0, ..fast() }).unwrap());
+    let nec_net = Network::start(nec.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    for _ in 0..2 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    eventually("~nec takes them", || nec.pending("~nec").unwrap() == 2 && zod.outbound_pending("~zod").unwrap() == 0);
+    let (c, out) = (TempDir::new("cmd-all-c"), TempDir::new("cmd-all-out"));
+    drop(nec_net);
+    nec.export_ship("~nec", &out.0).unwrap();
+    drop(nec);
+    let moved = Arc::new(Runtime::open(&c.0, fast()).unwrap());
+    let moved_net = Network::start(moved.clone(), directory.clone(), eager()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    moved.import_ship(&out.0, "~nec").unwrap();
+    directory.set("~nec", moved.public_key("~nec").unwrap(), moved_net.addr()).unwrap();
+    eventually("they run in the ship's new home", || count(&moved, "~nec", "hits") == "155");
+    eventually("and are answered", || zod.unanswered("~zod").unwrap() == 0);
+}
+
+#[test]
+fn a_ship_with_small_events_that_has_had_receipts_can_still_move() {
+    let (a, b, c, out) = (TempDir::new("receipt-small-a"), TempDir::new("receipt-small-b"), TempDir::new("receipt-small-c"), TempDir::new("receipt-small-out"));
+    let directory = Directory::new();
+    // ~zod takes no event of more than thirty bytes. A receipt is the runtime's own record
+    // and may be larger than that, and so may what the audit log says about it.
+    let small = Config { max_event_bytes: 30, ..fast() };
+    let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
+    let sender = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: false }], uses: vec![to("ghost")] };
+    let rt = Arc::new(Runtime::open(&a.0, small.clone()).unwrap());
+    let tally = rt.add_module(&wasm("tally")).unwrap();
+    rt.create_ship("~zod", &kernel(&rt)).unwrap();
+    rt.install("~zod", "tally", &tally, &sender).unwrap();
+    let relaxed = NetConfig { max_message_bytes: 8192, max_reading_bytes: 1 << 20, ..eager() };
+    let net = Network::start(rt.clone(), directory.clone(), relaxed).unwrap();
+    directory.set("~zod", rt.public_key("~zod").unwrap(), net.addr()).unwrap();
+    let (_nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+
+    send(&rt, "~zod", "tally", "far nec ghost boo");
+    eventually("the refusal comes back", || view(&rt, "~zod", "tally", "receipts").lines().count() == 1);
+    assert!(rt.audit("~zod", 100).unwrap().iter().any(|entry| entry.event.len() > 30));
+    drop(net);
+    rt.export_ship("~zod", &out.0).unwrap();
+    let other = Runtime::open(&c.0, small).unwrap();
+    other.import_ship(&out.0, "~zod").unwrap();
+    assert_eq!(view(&other, "~zod", "tally", "receipts"), view(&rt, "~zod", "tally", "receipts"));
+
+    // A network that could not carry the largest command its ships may send does not start.
+    let d = TempDir::new("receipt-small-d");
+    let spare = Arc::new(Runtime::open(&d.0, fast()).unwrap());
+    let cramped = NetConfig { max_message_bytes: 1 << 20, ..eager() };
+    assert!(Network::start(spare.clone(), directory.clone(), cramped).is_err());
+    // With room for the largest command and what goes round it, it does.
+    let roomy = NetConfig { max_message_bytes: (1 << 20) + 4096, ..eager() };
+    assert!(Network::start(spare, directory.clone(), roomy).is_ok());
+}
+
+#[test]
+fn one_command_from_outside_cannot_keep_a_ship_running_for_ever() {
+    let (a, b) = (TempDir::new("cmd-chain-a"), TempDir::new("cmd-chain-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+
+    // ~nec's tally agent answers a ping by sending itself the next one, without end. ~zod
+    // sets it off. The command from outside is run, and so is one round of what follows
+    // from it: sixty-four events. The rest wait in the queue like any others.
+    send(&zod, "~zod", "tally", "far nec tally ping 0");
+    eventually("the chain runs its round", || view(&nec, "~nec", "tally", "pings") == "64");
+    eventually("~zod has its receipt", || zod.unanswered("~zod").unwrap() == 0);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(view(&nec, "~nec", "tally", "pings"), "64");
+    assert_eq!(nec.pending("~nec").unwrap(), 1);
+}
+
+#[test]
+fn a_ship_whose_file_is_nearly_full_takes_no_commands_until_it_has_room() {
+    let (a, b) = (TempDir::new("cmd-full-a"), TempDir::new("cmd-full-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let provide = |interface: &str, remote: bool| Provide { interface: interface.into(), public: false, remote };
+    let counter = Manifest { provides: vec![provide("counter", true), provide("journal", false)], uses: vec![] };
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, Config { max_ship_bytes: 400 << 10, ..fast() }, counter, far_tally("*"));
+
+    // ~nec's file is filled to within a few pages of its limit. Part of that is one value
+    // that can be deleted later.
+    send(&nec, "~nec", "counter", "big 60000");
+    let entry = format!("journal {}", "x".repeat(6000));
+    while nec.deliver("~nec", "counter", entry.as_bytes()).is_ok() {}
+
+    // Taking a command means the sender lets go of it, so ~nec must be able to finish with
+    // it: run it, and keep the receipt. With no room to be sure of that, it takes nothing,
+    // and the command stays with ~zod.
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(nec.pending("~nec").unwrap(), 0);
+    assert_eq!(count(&nec, "~nec", "hits"), "0");
+    assert_eq!(zod.outbound_pending("~zod").unwrap(), 1);
+
+    // Room is made. The command is taken, runs, and is answered.
+    send(&nec, "~nec", "counter", "del big");
+    eventually("the command runs", || count(&nec, "~nec", "hits") == "1");
+    eventually("and is answered", || zod.unanswered("~zod").unwrap() == 0);
+
+    // A command larger than ~nec's whole file could ever hold is another matter. No amount
+    // of waiting would make room for it, so it is refused at once, and what follows it runs.
+    send(&zod, "~zod", "tally", &format!("tell nec inc {}", "k".repeat(500 << 10)));
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("the one after it runs", || count(&nec, "~nec", "hits") == "2");
+    eventually("both are answered", || zod.unanswered("~zod").unwrap() == 0 && view(&zod, "~zod", "tally", "receipts").lines().count() == 3);
+    let answers = view(&zod, "~zod", "tally", "receipts");
+    let last_two: Vec<&str> = answers.lines().skip(1).collect();
+    assert_eq!(
+        last_two,
+        ["2 ~nec/counter counter limit [larger than that ship can hold] from ~nec/counter counter", "3 ~nec/counter counter ran [] from ~nec/counter counter"]
+    );
+}
+
+#[test]
+fn a_batch_is_sized_by_what_is_sent_names_and_all() {
+    let (a, b) = (TempDir::new("cmd-names-a"), TempDir::new("cmd-names-b"));
+    let directory = Directory::new();
+    // Both runtimes carry small messages: room for the largest command and little more.
+    let small = Config { max_event_bytes: 200, ..fast() };
+    let net = NetConfig { max_message_bytes: 200 + 4096, ..eager() };
+    // ~zod's tally agent may send to an agent with as long a name as a name may be.
+    let long = "a".repeat(64);
+    let sender = Manifest {
+        provides: vec![Provide { interface: "tally".into(), public: false, remote: false }],
+        uses: vec![Use { ship: "*".into(), agent: long.clone(), interface: long.clone(), read: false, send: true }],
+    };
+    let (zod, _zod_net) = crewed_on(&a, "~zod", &directory, small.clone(), net.clone(), open_counter(), sender);
+
+    // Forty commands with nothing in them but names wait for ~nec, which is not there yet.
+    // Counted by their payloads they would all go in one batch, which would be far larger
+    // than either ship takes, and would be refused every time it was tried.
+    for _ in 0..40 {
+        send(&zod, "~zod", "tally", &format!("far nec {long} x"));
+    }
+    let (_nec, _nec_net) = crewed_on(&b, "~nec", &directory, small, net, open_counter(), far_tally("*"));
+    eventually("all forty are delivered and answered", || zod.unanswered("~zod").unwrap() == 0 && view(&zod, "~zod", "tally", "receipts").lines().count() == 40);
+    let answers = view(&zod, "~zod", "tally", "receipts");
+    assert_eq!(answers.lines().count(), 40);
+    assert!(answers.lines().all(|line| line.contains(" denied [no agent named aaaa")), "{answers}");
+}
+
+#[test]
+fn receipts_that_do_not_all_fit_are_taken_as_far_as_they_do() {
+    let (a, b) = (TempDir::new("receipt-part-a"), TempDir::new("receipt-part-b"));
+    let directory = Directory::new();
+    let provide = |interface: &str, remote: bool| Provide { interface: interface.into(), public: false, remote };
+    let counter = Manifest { provides: vec![provide("counter", true), provide("journal", false)], uses: vec![] };
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, Config { max_ship_bytes: 600 << 10, ..fast() }, counter, far_tally("*"));
+    let patient = Config { max_queued_per_deliver: 0, ..fast() };
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, patient, open_counter(), far_tally("*"));
+
+    // ~zod sends two hundred commands, which ~nec takes and holds without running. ~zod's
+    // tally agent keeps a large value that it lets go of when a receipt comes.
+    send(&zod, "~zod", "tally", "ballast 80000");
+    for _ in 0..200 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    eventually("~nec has them all", || nec.pending("~nec").unwrap() == 200 && zod.outbound_pending("~zod").unwrap() == 0);
+    // Then ~zod's file is filled until nothing more goes in.
+    for size in [6000, 500, 50] {
+        let entry = format!("journal {}", "x".repeat(size));
+        while zod.deliver("~zod", "counter", entry.as_bytes()).is_ok() {}
+    }
+
+    // ~nec runs the commands, and two hundred receipts come back together. There is no room
+    // for them all. Refused as a whole they would be sent again and again for ever, because
+    // what would make room is the first of them reaching the agent. Taken as far as they
+    // fit, the first few get through, the agent lets its large value go, and the rest follow.
+    nec.run_pending("~nec", 300).unwrap();
+    eventually("every receipt arrives", || zod.unanswered("~zod").unwrap() == 0 && view(&zod, "~zod", "tally", "receipts").lines().count() == 200);
+    let answers = view(&zod, "~zod", "tally", "receipts");
+    let about: Vec<u64> = answers.lines().map(|line| line.split(' ').next().unwrap().parse().unwrap()).collect();
+    assert_eq!(about, (1..=200).collect::<Vec<u64>>());
+}
+
+#[test]
+fn two_ships_that_have_filled_up_with_commands_for_each_other_still_get_through() {
+    let (a, b) = (TempDir::new("cmd-both-a"), TempDir::new("cmd-both-b"));
+    let directory = Directory::new();
+    // Two ships with small files. Each sends the other as much as it is let, while the
+    // other is not there to take any of it.
+    let small = Config { max_ship_bytes: 256 << 10, ..fast() };
+    let padding = "p".repeat(2000);
+    let fill = |rt: &Runtime, ship: &str, other: &str| {
+        let command = format!("tell {other} inc hits 1 {padding}");
+        let mut sent = 0;
+        let stopped_by = loop {
+            match rt.deliver(ship, "tally", command.as_bytes()) {
+                Ok(_) => sent += 1,
+                Err(e) => break e,
+            }
+        };
+        // What stops it is not the file running out. It is the rule that sending must leave
+        // room to take a command back: without that, neither ship could take the other's
+        // first command, neither would then let go of anything, and both would wait for ever.
+        assert!(matches!(&stopped_by, Error::Rejected(Rejection::Limit(why)) if why.contains("too full to send")), "{stopped_by:?}");
+        assert!(sent > 10, "only {sent} were sent");
+        // Trying again and again changes nothing. In particular the record of each refusal,
+        // which would otherwise be kept with the whole command in it, is not what fills
+        // the file in the end.
+        for _ in 0..150 {
+            assert!(rt.deliver(ship, "tally", command.as_bytes()).is_err());
+        }
+        sent
+    };
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, small.clone(), open_counter(), far_tally("*"));
+    drop(zod_net);
+    let from_zod = fill(&zod, "~zod", "nec");
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, small, open_counter(), far_tally("*"));
+    let from_nec = fill(&nec, "~nec", "zod");
+
+    // They meet. Everything gets through, both ways, and is answered.
+    let zod_net = Network::start(zod.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~zod", zod.public_key("~zod").unwrap(), zod_net.addr()).unwrap();
+    eventually("~nec has run all of ~zod's", || count(&nec, "~nec", "hits") == from_zod.to_string());
+    eventually("~zod has run all of ~nec's", || count(&zod, "~zod", "hits") == from_nec.to_string());
+    eventually("and every one is answered", || zod.unanswered("~zod").unwrap() == 0 && nec.unanswered("~nec").unwrap() == 0);
+}
+
+#[test]
+fn receipts_already_written_do_not_keep_a_small_ship_from_taking_more() {
+    let dir = TempDir::new("receipt-written");
+    let directory = Directory::new();
+    let (nec, nec_net) = crewed(&dir, "~nec", &directory, Config { max_ship_bytes: 256 << 10, ..fast() }, open_counter(), far_tally("*"));
+    let seed = [5u8; 32];
+    directory.set("~bus", ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(), "127.0.0.1:9".parse().unwrap()).unwrap();
+
+    // ~bus hands ~nec commands and is never there to take the receipts. ~nec keeps room for
+    // each receipt it has yet to write. A receipt it has written has its room already, and
+    // is not counted again: several hundred of them take a few pages of a small file, and
+    // counting them twice over would leave ~nec refusing commands it has plenty of room for.
+    for batch in 0..10u64 {
+        let messages: Vec<(u64, &str, &str)> = (1..=64).map(|n| (batch * 64 + n, "counter", "inc hits")).collect();
+        let request = ship_proto::PeerRequest::decode(&*delivery(&messages)).unwrap();
+        let Some(ship_proto::peer_request::Body::Deliver(deliver)) = request.body else { unreachable!() };
+        assert_eq!(hand_over(nec_net.addr(), "nec", seed, deliver.messages), (batch + 1) * 64);
+        eventually("the batch runs", || count(&nec, "~nec", "hits") == ((batch + 1) * 64).to_string());
+    }
+    assert_eq!(nec.outbound_pending("~nec").unwrap(), 640);
 }

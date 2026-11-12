@@ -14,11 +14,20 @@
 //! One runtime has one address for all the ships it holds, and answers as whichever of them
 //! the caller names. Two ships in the same runtime talk this way too.
 //!
+//! Over the link, ships carry commands to each other. A command an agent sends to another
+//! ship is kept by the sending ship, numbered, until the other ship says it has it; the other
+//! ship takes commands strictly in order and passes over any it has taken before. So each
+//! arrives exactly once, in the order sent, however many times the link drops or either side
+//! restarts in between. When the other ship has run a command, or refused it, it sends back a
+//! receipt the same way, so every command is answered exactly once too. This module only
+//! carries them, and sees that what a ship has taken gets run: the numbering and the queues
+//! are in each ship's file.
+//!
 //! The directory here is a fixed list handed in by whoever starts the network. In time it
 //! will be Urbit ID: names, keys, and sponsors from Azimuth. A ship's own key does not change
 //! while its runtime runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -36,7 +45,7 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
-use ship_proto::{peer_reply, peer_request, Message, PeerReply, PeerRequest, Ping, Pong};
+use ship_proto::{peer_reply, peer_request, Deliver, Delivered, Message, PeerReply, PeerRequest, Ping, Pong};
 use tokio::sync::Semaphore;
 
 use crate::{canonical_ship, lock, Error, Runtime};
@@ -47,6 +56,16 @@ const PROTOCOL: &[u8] = b"ship/1";
 
 /// The longest any time limit here may be set to.
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Room in a request for what goes round a command: names, numbers, and framing.
+const MESSAGE_ENVELOPE_BYTES: usize = 4096;
+
+/// The smallest a ship's file may be allowed to grow to, for a runtime that goes on the
+/// network. A ship refuses outright any command larger than a quarter of its file, and takes
+/// any other when it has room. For that to hold, an empty ship must have room for a quarter
+/// of its file on top of what every ship file needs just to exist, which is some tens of
+/// kilobytes. Below this size it would not, and a command could wait for ever.
+const MIN_SHIP_BYTES: u64 = 256 << 10;
 
 /// What the directory knows about a ship: its key and where to reach it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +147,18 @@ pub struct NetConfig {
     /// How many requests this runtime's ships may have out to other ships at once. Each may be
     /// holding a reply as large as `max_message_bytes`. Past this, a new request fails at once.
     pub max_requests: usize,
+    /// How many pieces of work on ships the network may have in hand at once: taking in
+    /// commands, running them, and reading out commands to send. Each holds a thread.
+    pub max_working: usize,
+    /// How many deliveries of commands and receipts to other ships may be in hand at once.
+    /// Each holds a batch as large as half of `max_message_bytes`. Past this, a delivery
+    /// waits its turn. Separate from `max_requests`, so that deliveries to ships that are
+    /// slow to answer cannot make this runtime's own requests fail.
+    pub max_carrying: usize,
+    /// After a failed try at carrying commands to a ship, how long before the next. It doubles
+    /// with each failure, up to `max_retry_delay`, and starts over after a success.
+    pub retry_delay: Duration,
+    pub max_retry_delay: Duration,
 }
 
 impl Default for NetConfig {
@@ -139,9 +170,14 @@ impl Default for NetConfig {
             max_connections: 1024,
             max_calls: 1024,
             max_streams: 8,
-            max_message_bytes: 1 << 20,
+            // Room for a command of the largest size a ship takes, with its wrapping.
+            max_message_bytes: (1 << 20) + (64 << 10),
             max_reading_bytes: 64 << 20,
             max_requests: 64,
+            max_working: 16,
+            max_carrying: 16,
+            retry_delay: Duration::from_millis(200),
+            max_retry_delay: Duration::from_secs(30),
         }
     }
 }
@@ -199,6 +235,25 @@ pub struct Answered {
 pub struct Network {
     shared: Arc<Shared>,
     threads: Threads,
+    /// Let go of last, when the rest has been stopped.
+    _claim: Claim,
+}
+
+/// A runtime's one place for a network, held for as long as that network runs. Two at once
+/// would each carry the same waiting messages, and the first to stop would leave the other
+/// never told of new ones.
+struct Claim(Arc<Runtime>);
+
+impl Claim {
+    fn take(runtime: &Arc<Runtime>) -> Option<Claim> {
+        runtime.claim_network().then(|| Claim(runtime.clone()))
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.release_network();
+    }
 }
 
 /// The threads the network runs on. Letting go of them never waits, so it is safe wherever it
@@ -249,6 +304,64 @@ struct Shared {
     reading: Arc<Semaphore>,
     /// Requests this runtime may still send. See `NetConfig::max_requests`.
     asking: Arc<Semaphore>,
+    /// Pieces of work on ships the network may still take on. See `NetConfig::max_working`.
+    working: Arc<Semaphore>,
+    /// Deliveries to other ships the network may still take on. See `NetConfig::max_carrying`.
+    carrying: Arc<Semaphore>,
+    carrier: Arc<Carrier>,
+}
+
+/// What the network knows about commands waiting to go to other ships.
+#[derive(Default)]
+struct Carrier {
+    /// Ships that may have commands waiting. A ship is put here when an event on it queues
+    /// some, and looked at once.
+    waiting: Mutex<HashSet<String>>,
+    /// Rung when there is something to look at.
+    news: tokio::sync::Notify,
+    /// For each (ship, other ship) with commands in hand, how carrying them is going.
+    lanes: Mutex<HashMap<Pair, Lane>>,
+    /// Ships that may have events queued which nothing else is about to run: ones that
+    /// another ship has just delivered, or that were there when the network started.
+    queued: Mutex<HashSet<String>>,
+    /// Ships whose queues are being run now. The flag says more arrived meanwhile.
+    tending: Mutex<HashMap<String, bool>>,
+}
+
+#[derive(Default)]
+struct Lane {
+    /// Some are being carried now. Only one carrier works a lane at a time, so that commands
+    /// go in order.
+    busy: bool,
+    /// The last try failed. Not before this moment, and after this long the time after.
+    retry_at: Option<tokio::time::Instant>,
+    delay: Duration,
+    /// The two ships disagree about what has passed between them. Nothing more is carried.
+    stalled: bool,
+}
+
+impl Carrier {
+    /// There may be commands waiting on this ship.
+    fn look_at(&self, ship: &str) {
+        lock(&self.waiting).insert(ship.to_string());
+        self.news.notify_one();
+    }
+
+    /// There may be events queued on this ship that nothing else will run.
+    fn run_at(&self, ship: &str) {
+        lock(&self.queued).insert(ship.to_string());
+        self.news.notify_one();
+    }
+}
+
+/// What came of trying to carry a lane's commands.
+enum Carried {
+    /// Everything that was waiting has gone.
+    All,
+    /// Some could not go. Try again after a while.
+    NotYet,
+    /// The two ships cannot agree on what has passed between them.
+    OutOfStep,
 }
 
 impl Network {
@@ -259,6 +372,24 @@ impl Network {
         }
         if cfg.max_reading_bytes > Semaphore::MAX_PERMITS || cfg.max_requests == 0 || cfg.max_requests > Semaphore::MAX_PERMITS {
             return Err(io::Error::other("max_reading_bytes or max_requests is out of range"));
+        }
+        if cfg.max_working == 0 || cfg.max_working > Semaphore::MAX_PERMITS {
+            return Err(io::Error::other("max_working is out of range"));
+        }
+        if cfg.max_carrying == 0 || cfg.max_carrying > Semaphore::MAX_PERMITS {
+            return Err(io::Error::other("max_carrying is out of range"));
+        }
+        // A command too large to send would wait for ever, with everything behind it. (Two
+        // runtimes with different limits can still disagree; settling one size for the wire
+        // is for the protocol to do.)
+        if runtime.inner.cfg.max_ship_bytes < MIN_SHIP_BYTES {
+            return Err(io::Error::other("max_ship_bytes is too small for ships that take commands from other ships"));
+        }
+        if cfg.max_message_bytes < runtime.inner.cfg.max_event_bytes.saturating_add(MESSAGE_ENVELOPE_BYTES) {
+            return Err(io::Error::other("max_message_bytes must have room for the largest command a ship here may send"));
+        }
+        if cfg.retry_delay.is_zero() || cfg.retry_delay > cfg.max_retry_delay || cfg.max_retry_delay > MAX_TIMEOUT {
+            return Err(io::Error::other("retry_delay must be more than nothing and at most max_retry_delay, itself at most a day"));
         }
         // A time limit has to be one a clock can keep. Far beyond a day it is no limit at all,
         // and near the largest a clock can hold, working out when it ends goes wrong.
@@ -297,6 +428,11 @@ impl Network {
         };
         let reading = Arc::new(Semaphore::new(cfg.max_reading_bytes));
         let asking = Arc::new(Semaphore::new(cfg.max_requests));
+        let working = Arc::new(Semaphore::new(cfg.max_working));
+        let carrying = Arc::new(Semaphore::new(cfg.max_carrying));
+        let carrier = Arc::new(Carrier::default());
+        // Taken last of the things that can fail, so that a start that fails gives it back.
+        let claim = Claim::take(&runtime).ok_or_else(|| io::Error::other("this runtime already has a network running"))?;
         let shared = Arc::new(Shared {
             runtime,
             directory,
@@ -308,9 +444,34 @@ impl Network {
             callers: Mutex::new(HashMap::new()),
             reading,
             asking,
+            working,
+            carrying,
+            carrier: carrier.clone(),
         });
         tokio.spawn(answer_calls(shared.clone()));
-        Ok(Network { shared, threads })
+        tokio.spawn(carry(shared.clone()));
+        // From now on the runtime says when a ship has queued commands for other ships.
+        let told = carrier.clone();
+        shared.runtime.set_outbound_hook(Some(Arc::new(move |ship: &str, queued: bool| {
+            told.look_at(ship);
+            if queued {
+                told.run_at(ship);
+            }
+        })));
+        // Ships may have had commands waiting since before this network started: to go to
+        // other ships, or taken from other ships and not yet run. A command that was taken
+        // just before a runtime stopped has been acknowledged, so nobody will send it again,
+        // and running it is up to this runtime.
+        let starting = shared.clone();
+        tokio.spawn(async move {
+            let runtime = starting.runtime.clone();
+            let found = work(&starting, move || runtime.ships_with_work()).await;
+            for ship in found.and_then(Result::ok).unwrap_or_default() {
+                starting.carrier.look_at(&ship);
+                starting.carrier.run_at(&ship);
+            }
+        });
+        Ok(Network { shared, threads, _claim: claim })
     }
 
     /// The address other ships reach this runtime at.
@@ -321,6 +482,17 @@ impl Network {
     /// How many connections are open, made or taken.
     pub fn open_connections(&self) -> usize {
         self.shared.endpoint.open_connections()
+    }
+
+    /// The (ship, other ship) pairs between which commands have stopped being carried,
+    /// because the two disagree about what has passed between them. That happens when one of
+    /// them has gone back to an earlier state, such as a restored backup. The commands are
+    /// kept. Nothing here sorts it out yet.
+    pub fn stalled(&self) -> Vec<(String, String)> {
+        let lanes = lock(&self.shared.carrier.lanes);
+        let mut stalled: Vec<Pair> = lanes.iter().filter(|(_, lane)| lane.stalled).map(|(pair, _)| pair.clone()).collect();
+        stalled.sort();
+        stalled
     }
 
     /// From one of this runtime's ships, ask another ship who it is. An answer means this end
@@ -362,6 +534,7 @@ impl Network {
 
 impl Drop for Network {
     fn drop(&mut self) {
+        self.shared.runtime.set_outbound_hook(None);
         self.shared.endpoint.close(VarInt::from_u32(0), b"stopping");
         // Give the goodbyes a moment to go out, so the ships at the other end know at once and
         // do not hold a dead connection until it times out. Only a moment: a ship that is not
@@ -751,7 +924,7 @@ async fn answer_request(shared: Arc<Shared>, connection: Connection, pair: Pair,
             connection.close(VarInt::from_u32(2), b"the directory changed");
             return;
         }
-        reply(&mut send, &answer(&pair.0, &pair.1, &bytes)).await;
+        reply(&mut send, &answer(&shared, &pair.0, &pair.1, &bytes).await).await;
     })
     .await;
     if served.is_err() {
@@ -801,14 +974,318 @@ fn refused(why: &str) -> PeerReply {
     PeerReply { body: None, refused: why.to_string() }
 }
 
+/// Do a piece of work on a ship, off the network's own threads. Work on a ship can wait on
+/// its file, and the network must keep answering meanwhile. Only so many are in hand at once.
+/// `None` if the network is stopping.
+async fn work<T: Send + 'static>(shared: &Shared, job: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let turn = shared.working.clone().acquire_owned().await.ok()?;
+    let done = tokio::task::spawn_blocking(move || {
+        let done = job();
+        drop(turn);
+        done
+    });
+    done.await.ok()
+}
+
 /// Answer one request from `caller` to `called`.
-fn answer(caller: &str, called: &str, request: &[u8]) -> PeerReply {
+async fn answer(shared: &Arc<Shared>, caller: &str, called: &str, request: &[u8]) -> PeerReply {
+    // Counted before it is decoded. A request of a megabyte can hold half a million empty
+    // messages, and decoding would give each one a few hundred bytes of memory.
+    if !messages_within(request, crate::store::MAX_BATCH_MESSAGES) {
+        return refused("not a request, or one with too many messages");
+    }
     let Ok(request) = PeerRequest::decode(request) else { return refused("not a request") };
     match request.body {
         Some(peer_request::Body::Ping(Ping { nonce })) if nonce.len() <= 64 => {
             let pong = Pong { nonce, ship: called.to_string(), caller: caller.to_string() };
             PeerReply { body: Some(peer_reply::Body::Pong(pong)), refused: String::new() }
         }
+        // Commands for a ship here, from the ship at the other end. Who that is was proved
+        // when the connection was made and checked again just now, so they are filed as
+        // coming from it and nobody else.
+        Some(peer_request::Body::Deliver(Deliver { messages })) => {
+            let (runtime, ship, peer) = (shared.runtime.clone(), called.to_string(), caller.to_string());
+            let taken = work(shared, move || runtime.accept_commands(&ship, &peer, &messages)).await;
+            let Some(Ok(last)) = taken else { return refused("the commands could not be taken; try again") };
+            // They are saved. Running them is the ship's own business and is not waited for:
+            // the sender is told only that they arrived.
+            shared.carrier.run_at(called);
+            PeerReply { body: Some(peer_reply::Body::Delivered(Delivered { last })), refused: String::new() }
+        }
         _ => refused("not a request this ship answers"),
+    }
+}
+
+/// Whether an encoded request is one that can be walked through field by field and holds at
+/// most `most` messages for delivery. This reads only the sizes written in the request and
+/// keeps nothing, so it costs nothing to run on a request that is all padding.
+fn messages_within(request: &[u8], most: usize) -> bool {
+    /// Walk the fields of one encoded message, handing each length-delimited one to `each`.
+    /// False if the bytes are not fields from end to end, or `each` says to stop.
+    fn walk<'a>(mut bytes: &'a [u8], mut each: impl FnMut(u64, &'a [u8]) -> bool) -> bool {
+        fn varint(bytes: &mut &[u8]) -> Option<u64> {
+            let mut value = 0u64;
+            for shift in (0..64).step_by(7) {
+                let (&byte, rest) = bytes.split_first()?;
+                *bytes = rest;
+                value |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return Some(value);
+                }
+            }
+            None
+        }
+        while !bytes.is_empty() {
+            let Some(key) = varint(&mut bytes) else { return false };
+            let skipped = match key & 7 {
+                0 => varint(&mut bytes).map(drop),
+                1 => bytes.get(8..).map(|rest| bytes = rest),
+                5 => bytes.get(4..).map(|rest| bytes = rest),
+                2 => varint(&mut bytes).and_then(|len| {
+                    let len = usize::try_from(len).ok()?;
+                    let body = bytes.get(..len)?;
+                    bytes = &bytes[len..];
+                    each(key >> 3, body).then_some(())
+                }),
+                // Groups are not used by anything a ship sends.
+                _ => None,
+            };
+            if skipped.is_none() {
+                return false;
+            }
+        }
+        true
+    }
+    let mut count = 0usize;
+    // Field 2 of a request is a delivery, and field 1 of a delivery is one message. A field
+    // may be given more than once, and all of them count.
+    walk(request, |field, body| {
+        field != 2
+            || walk(body, |field, _| {
+                count += usize::from(field == 1);
+                count <= most
+            })
+    })
+}
+
+/// Carry commands from this runtime's ships to other ships, for as long as the network runs.
+async fn carry(shared: Arc<Shared>) {
+    let carrier = &shared.carrier;
+    loop {
+        // Ships that may have events queued: see that they are run.
+        let ships: Vec<String> = lock(&carrier.queued).drain().collect();
+        for ship in ships {
+            tend(&shared, ship);
+        }
+        // Ships that may have commands waiting: see which other ships they are for.
+        let ships: Vec<String> = lock(&carrier.waiting).drain().collect();
+        for ship in ships {
+            let (runtime, name) = (shared.runtime.clone(), ship.clone());
+            let peers = work(&shared, move || runtime.outbound_peers(&name)).await;
+            for peer in peers.and_then(Result::ok).unwrap_or_default() {
+                start_lane(&shared, &ship, &peer);
+            }
+        }
+        // Then wait for news, or for the earliest moment a failed lane may be tried again.
+        let now = tokio::time::Instant::now();
+        let mut next = None;
+        for ((ship, _), lane) in lock(&carrier.lanes).iter_mut().filter(|(_, lane)| !lane.busy && !lane.stalled) {
+            match lane.retry_at {
+                Some(at) if at <= now => {
+                    lane.retry_at = None;
+                    lock(&carrier.waiting).insert(ship.clone());
+                }
+                Some(at) => next = Some(next.map_or(at, |soonest: tokio::time::Instant| soonest.min(at))),
+                None => {}
+            }
+        }
+        if !lock(&carrier.waiting).is_empty() || !lock(&carrier.queued).is_empty() {
+            continue;
+        }
+        match next {
+            Some(at) => drop(tokio::time::timeout_at(at, carrier.news.notified()).await),
+            None => carrier.news.notified().await,
+        }
+    }
+}
+
+/// See that what is queued on a ship is run.
+///
+/// Commands another ship delivers are acknowledged as soon as they are saved, so that ship
+/// will not send them again. From then on it is up to this runtime to run them, all of them,
+/// however many arrived at once. So everything that is queued when this starts is run, in
+/// rounds of `max_queued_per_deliver` events, giving up its turn between rounds so that one
+/// busy ship does not keep the others waiting.
+///
+/// What those events queue in their turn gets one more round and no further. Agents that
+/// keep sending each other commands would otherwise keep a ship running for ever on the
+/// strength of one command from outside. The rest wait, as they do after any event.
+///
+/// With `max_queued_per_deliver` set to nothing, the network runs nothing, and the queue is
+/// left to whoever embeds the runtime.
+///
+/// One of these runs for a ship at a time. If more arrives meanwhile, it goes round again.
+/// If the queue cannot be run, most likely because the ship's file is full, it is tried
+/// again a few times at growing intervals, and then left for the next arrival or the next
+/// start. Whatever could not be run is still queued.
+fn tend(shared: &Arc<Shared>, ship: String) {
+    /// How many times in a row a ship's queue is tried again after failing to run.
+    const TRIES: u32 = 8;
+    {
+        let mut tending = lock(&shared.carrier.tending);
+        if let Some(again) = tending.get_mut(&ship) {
+            *again = true;
+            return;
+        }
+        tending.insert(ship.clone(), false);
+    }
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let most = shared.runtime.inner.cfg.max_queued_per_deliver;
+        let (mut failures, mut delay) = (0, Duration::ZERO);
+        loop {
+            // `None` means the network is stopping.
+            let ran = if most == 0 { None } else { run_queue(&shared, &ship, most).await };
+            let failed = matches!(ran, Some(Err(_)));
+            failures = if failed { failures + 1 } else { 0 };
+            {
+                let mut tending = lock(&shared.carrier.tending);
+                let again = tending.get_mut(&ship).is_some_and(std::mem::take);
+                if ran.is_none() || !(again || (failed && failures < TRIES)) {
+                    tending.remove(&ship);
+                    return;
+                }
+            }
+            if failed {
+                delay = if delay.is_zero() { shared.cfg.retry_delay } else { (delay * 2).min(shared.cfg.max_retry_delay) };
+                tokio::time::sleep(delay).await;
+            } else {
+                delay = Duration::ZERO;
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+}
+
+/// Run everything queued on a ship as of now, then one round of what that queued.
+async fn run_queue(shared: &Arc<Shared>, ship: &str, most: usize) -> Option<Result<(), Error>> {
+    let (runtime, name) = (shared.runtime.clone(), ship.to_string());
+    let through = match work(shared, move || runtime.inbox_newest(&name)).await? {
+        Ok(newest) => newest,
+        Err(e) => return Some(Err(e)),
+    };
+    loop {
+        let (runtime, name) = (shared.runtime.clone(), ship.to_string());
+        match work(shared, move || runtime.run_pending_through(&name, most, through)).await? {
+            Ok((_, true)) => tokio::task::yield_now().await,
+            Ok((_, false)) => break,
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    let (runtime, name) = (shared.runtime.clone(), ship.to_string());
+    Some(work(shared, move || runtime.run_pending(&name, most)).await?.map(drop))
+}
+
+/// Start carrying one ship's commands to one other ship, unless that is already under way,
+/// has to wait after a failure, or has stalled.
+fn start_lane(shared: &Arc<Shared>, ship: &str, peer: &str) {
+    let pair = (ship.to_string(), peer.to_string());
+    {
+        let mut lanes = lock(&shared.carrier.lanes);
+        let lane = lanes.entry(pair.clone()).or_default();
+        if lane.busy || lane.stalled || lane.retry_at.is_some() {
+            return;
+        }
+        lane.busy = true;
+    }
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let carried = carry_lane(&shared, &pair.0, &pair.1).await;
+        {
+            let mut lanes = lock(&shared.carrier.lanes);
+            let lane = lanes.entry(pair.clone()).or_default();
+            lane.busy = false;
+            match carried {
+                Carried::All => (lane.retry_at, lane.delay) = (None, Duration::ZERO),
+                Carried::NotYet => {
+                    let delay = if lane.delay.is_zero() { shared.cfg.retry_delay } else { (lane.delay * 2).min(shared.cfg.max_retry_delay) };
+                    (lane.retry_at, lane.delay) = (Some(tokio::time::Instant::now() + delay), delay);
+                }
+                Carried::OutOfStep => lane.stalled = true,
+            }
+        }
+        // Something may have been queued while this was finishing, and the wait may need
+        // working out again.
+        shared.carrier.look_at(&pair.0);
+    });
+}
+
+/// Carry everything one ship has waiting for one other ship, a batch at a time, in order.
+async fn carry_lane(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried {
+    loop {
+        // One turn for each batch, taken before the batch is read out and given back when it
+        // has gone, so that a busy pair of ships does not keep the others waiting.
+        let Ok(_turn) = shared.carrying.acquire().await else { return Carried::NotYet };
+        let (runtime, from, to, most) = (shared.runtime.clone(), ship.to_string(), peer.to_string(), shared.cfg.max_message_bytes / 2);
+        let Some(Ok(batch)) = work(shared, move || runtime.outbound_batch(&from, &to, most)).await else { return Carried::NotYet };
+        let (Some(first), Some(newest)) = (batch.first().map(|message| message.seq), batch.last().map(|message| message.seq)) else {
+            return Carried::All;
+        };
+        let request = PeerRequest { body: Some(peer_request::Body::Deliver(Deliver { messages: batch })) };
+        let Ok(PeerReply { body: Some(peer_reply::Body::Delivered(Delivered { last })), .. }) = shared.ask(ship, peer, request).await else {
+            return Carried::NotYet;
+        };
+        // The other ship holds everything up to `last`. If that is short of where this batch
+        // began, it is missing commands this ship has already let go of.
+        if last.saturating_add(1) < first {
+            return Carried::OutOfStep;
+        }
+        let (runtime, from, to) = (shared.runtime.clone(), ship.to_string(), peer.to_string());
+        match work(shared, move || runtime.outbound_acked(&from, &to, last)).await {
+            Some(Ok(())) => {}
+            // It claims to hold a command this ship never sent.
+            Some(Err(Error::OutOfStep(_))) => return Carried::OutOfStep,
+            _ => return Carried::NotYet,
+        }
+        // It had no room for some of them. They wait, and go again later.
+        if last < newest {
+            return Carried::NotYet;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deliver(count: usize) -> Vec<u8> {
+        let messages = (0..count).map(|_| ship_proto::PeerMessage::default()).collect();
+        PeerRequest { body: Some(peer_request::Body::Deliver(Deliver { messages })) }.encode_to_vec()
+    }
+
+    #[test]
+    fn a_request_is_counted_before_it_is_decoded() {
+        assert!(messages_within(&deliver(0), 3));
+        assert!(messages_within(&deliver(3), 3));
+        assert!(!messages_within(&deliver(4), 3));
+        // Half a million empty messages fit in a megabyte.
+        let padded = deliver(500_000);
+        assert!(padded.len() < (1 << 20) + (1 << 16));
+        assert!(!messages_within(&padded, 256));
+        // The same field given twice adds up, as it does when decoded.
+        let twice = [deliver(2), deliver(2)].concat();
+        assert_eq!(PeerRequest::decode(&*twice).ok().and_then(|request| request.body), PeerRequest::decode(&*deliver(4)).unwrap().body);
+        assert!(!messages_within(&twice, 3));
+        // Other requests, and fields this runtime does not know, pass.
+        let ping = PeerRequest { body: Some(peer_request::Body::Ping(Ping { nonce: vec![1; 16] })) }.encode_to_vec();
+        assert!(messages_within(&ping, 0));
+        assert!(messages_within(&[ping.clone(), vec![0x78, 0x05]].concat(), 0));
+        // Anything that cannot be walked from end to end is refused: a length that runs off
+        // the end, a number that never ends, a group.
+        assert!(!messages_within(&[0x12, 0x05, 0x0a], 3));
+        assert!(!messages_within(&[0x80; 12], 3));
+        assert!(!messages_within(&[0x1b, 0x1c], 3));
+        // A count hidden behind a group is not reached, so the request is refused whole.
+        assert!(!messages_within(&[vec![0x1b, 0x1c], deliver(1)].concat(), 3));
     }
 }

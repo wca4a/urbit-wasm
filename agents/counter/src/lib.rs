@@ -56,6 +56,12 @@ fn handle(event: &[u8]) -> Vec<u8> {
             kv::put(b"checkpoints", mode.as_bytes());
             "ok".to_string()
         }
+        // Send the counter on another ship whatever follows the ship's name, as a command.
+        // This agent has no receipt handler, so it is never told what became of it.
+        (Some("pass"), Some(ship), _) => {
+            let rest = text.trim_start()["pass".len()..].trim_start()[ship.len()..].trim();
+            ship_sdk::send_to(ship, "counter", "counter", rest.as_bytes()).to_string()
+        }
         (Some("del"), Some(key), None) => {
             kv::delete(key.as_bytes());
             "ok".to_string()

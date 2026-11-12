@@ -34,8 +34,10 @@ fn uses(agent: &Registered) -> &[Use] {
     agent.manifest.as_ref().map_or(&[], |manifest| &manifest.uses)
 }
 
+/// Whether a manifest declares a use of an agent on this ship. A use that names another ship
+/// is about that ship's agent, and says nothing about a local agent of the same name.
 fn declares(uses: &[Use], agent: &str, interface: &str, wants: fn(&Use) -> bool) -> bool {
-    uses.iter().any(|u| u.agent == agent && u.interface == interface && wants(u))
+    uses.iter().any(|u| u.ship.is_empty() && u.agent == agent && u.interface == interface && wants(u))
 }
 
 /// Everything `agent` may use: its own interfaces, and each interface another agent provides
@@ -46,11 +48,19 @@ fn grants(registry: &Registry, agent: &Registered, wants: fn(&Use) -> bool) -> V
         let own = other.name == agent.name;
         for provide in provides(other) {
             if own || provide.public || declares(uses(agent), &other.name, &provide.interface, wants) {
-                out.push(Grant { agent: other.name.clone(), interface: provide.interface.clone() });
+                out.push(Grant { agent: other.name.clone(), interface: provide.interface.clone(), ship: String::new() });
             }
         }
     }
     out
+}
+
+/// What `agent` may send to agents on other ships: exactly what its manifest declares. Nothing
+/// on another ship is reachable without being named there, and the owner approved the
+/// manifest at install.
+fn remote_sends(agent: &Registered) -> Vec<Grant> {
+    let declared = uses(agent).iter().filter(|u| !u.ship.is_empty() && u.send);
+    declared.map(|u| Grant { agent: u.agent.clone(), interface: u.interface.clone(), ship: u.ship.clone() }).collect()
 }
 
 /// More than the encoded size of one grant, so sums of it are safe upper bounds.
@@ -72,7 +82,7 @@ fn largest_route(registry: &Registry) -> usize {
         .iter()
         .map(|agent| {
             let own: usize = provides(agent).iter().map(|p| grant_bytes(&agent.name, &p.interface)).sum();
-            let declared: usize = uses(agent).iter().map(|u| grant_bytes(&u.agent, &u.interface)).sum();
+            let declared: usize = uses(agent).iter().map(|u| grant_bytes(&u.agent, &u.interface) + u.ship.len() + 2).sum();
             own + declared
         })
         .max()
@@ -90,6 +100,25 @@ fn decide(request: &RouteRequest) -> RouteReply {
         return deny(format!("no agent named {}", request.agent));
     };
     let source = request.source.clone().unwrap_or_default();
+    // The runtime tells an agent what became of a command it sent to another ship. The
+    // runtime keeps a record of each such command and only passes on an answer to one of
+    // them, so there is nothing to decide here beyond the agent still being installed.
+    if request.kind() == Kind::Receipt {
+        return allow(&registry, target);
+    }
+    // A request from an agent on another ship. Only a command, and only to an interface that
+    // is open to other ships. Which ships may do what is then up to the agent, which is told
+    // who is asking. Nothing is known here about the other ship's agents, so nothing is
+    // looked up about the one that sent it.
+    if !source.ship.is_empty() {
+        let open = request.kind() == Kind::Command
+            && !source.owner
+            && provides(target).iter().any(|provide| provide.interface == request.interface && provide.remote);
+        if !open {
+            return deny(format!("{} on {} is not open to other ships", request.interface, target.name));
+        }
+        return allow(&registry, target);
+    }
     let wants: fn(&Use) -> bool = match request.kind() {
         Kind::Command => |u| u.send,
         Kind::Read => |u| u.read,
@@ -118,7 +147,8 @@ fn decide(request: &RouteRequest) -> RouteReply {
             return allow(&registry, target);
         }
         // An unrecognised kind must be refused, never treated as something harmless.
-        Kind::Unspecified => return deny("unknown kind of call"),
+        // (A receipt was answered above.)
+        Kind::Receipt | Kind::Unspecified => return deny("unknown kind of call"),
     };
     // The owner may call anything on their own ship. An agent needs the target to provide the
     // interface, and needs it to be public, its own, or a declared use.
@@ -144,7 +174,7 @@ fn allow(registry: &Registry, target: &Registered) -> RouteReply {
         reason: String::new(),
         module: target.module.clone(),
         reads: grants(registry, target, |u| u.read),
-        sends: grants(registry, target, |u| u.send),
+        sends: grants(registry, target, |u| u.send).into_iter().chain(remote_sends(target)).collect(),
     }
 }
 
@@ -159,6 +189,16 @@ fn valid_interface(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-._".contains(&b))
+}
+
+/// Where a use points: this ship (empty), any ship ("*"), or one ship by name.
+fn valid_ship(name: &str) -> bool {
+    let named = !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    name.is_empty() || name == "*" || named
 }
 
 fn valid_hash(hash: &str) -> bool {
@@ -186,13 +226,13 @@ fn install(install: Install) -> Result<(), String> {
         return Err("manifest has too many entries".into());
     }
     let names_ok = manifest.provides.iter().all(|p| valid_interface(&p.interface))
-        && manifest.uses.iter().all(|u| valid_name(&u.agent) && valid_interface(&u.interface));
+        && manifest.uses.iter().all(|u| valid_name(&u.agent) && valid_interface(&u.interface) && valid_ship(&u.ship));
     if !names_ok {
         return Err("manifest contains an invalid name".into());
     }
     // Two entries for the same thing could disagree, for example private and public.
     if repeats(manifest.provides.iter().map(|p| &p.interface).collect())
-        || repeats(manifest.uses.iter().map(|u| (&u.agent, &u.interface)).collect())
+        || repeats(manifest.uses.iter().map(|u| (&u.ship, &u.agent, &u.interface)).collect())
     {
         return Err("manifest lists the same interface twice".into());
     }

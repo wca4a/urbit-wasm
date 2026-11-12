@@ -11,11 +11,11 @@ use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 
-use ship_proto::{CheckpointBody, Device, Kind, Message};
+use ship_proto::{CheckpointBody, Device, Kind, Message, PeerMessage, Receipt, Verdict};
 
 use crate::{signed_bytes, AuditEntry, ChainCheck, Config, Durability, Effect, Error, CHECKPOINT_DOMAIN};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Each pending message counts as its payload plus this, so empty messages still use up quota.
 pub const MESSAGE_OVERHEAD: u64 = 64;
@@ -48,14 +48,32 @@ pub struct Queued {
     pub agent: String,
     pub interface: String,
     pub payload: Vec<u8>,
+    /// The ship the sending agent is on, if it is another ship. Empty for this one.
+    pub ship: String,
+    /// For a command from another ship: the number that ship gave it, which the receipt for
+    /// it will carry back.
+    pub ship_seq: u64,
 }
 
 impl Queued {
-    /// What this takes of the inbox quota. Only commands count; see `MAX_FOLLOWS`.
+    /// What this takes of the inbox quota. Commands and receipts count; see `MAX_FOLLOWS` for
+    /// why the rest need not.
     pub fn cost(&self) -> u64 {
-        if self.kind == Kind::Command as i32 { self.payload.len() as u64 + MESSAGE_OVERHEAD } else { 0 }
+        let counted = self.kind == Kind::Command as i32 || self.kind == Kind::Receipt as i32;
+        if counted { self.payload.len() as u64 + MESSAGE_OVERHEAD } else { 0 }
     }
 }
+
+/// The most a receipt says about why a command did not run.
+pub const MAX_REASON_BYTES: usize = 200;
+
+/// More than any receipt takes up, whatever names it carries. A receipt is the runtime's own
+/// record and not an agent's payload, so its size has a bound of its own, apart from
+/// `max_event_bytes`.
+pub const MAX_RECEIPT_BYTES: usize = 512;
+
+/// The most messages that go to another ship in one delivery.
+pub const MAX_BATCH_MESSAGES: usize = 256;
 
 /// Far below the point where SQLite refuses to hand out another AUTOINCREMENT value.
 const MAX_SEQ: i64 = 1 << 62;
@@ -79,8 +97,36 @@ CREATE TABLE inbox (
     source TEXT NOT NULL,
     agent TEXT NOT NULL,
     interface TEXT NOT NULL,
-    payload BLOB NOT NULL
+    payload BLOB NOT NULL,
+    ship TEXT NOT NULL DEFAULT '',
+    ship_seq INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX inbox_from ON inbox (ship) WHERE ship != '';
+CREATE TABLE peers (
+    peer TEXT PRIMARY KEY,
+    sent INTEGER NOT NULL,
+    received INTEGER NOT NULL,
+    out_bytes INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE peer_out (
+    peer TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    interface TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    receipt INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (peer, seq)
+) WITHOUT ROWID;
+CREATE TABLE peer_wait (
+    peer TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    interface TEXT NOT NULL,
+    tell INTEGER NOT NULL,
+    PRIMARY KEY (peer, seq)
+) WITHOUT ROWID;
 CREATE TABLE logs (
     agent TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -228,11 +274,210 @@ pub fn inbox_push(conn: &Connection, kind: Kind, source: &str, agent: &str, inte
         .map(drop)
 }
 
+/// Queue a command that came from an agent on another ship, which numbered it `ship_seq`.
+pub fn inbox_push_from(
+    conn: &Connection,
+    ship: &str,
+    ship_seq: u64,
+    source: &str,
+    agent: &str,
+    interface: &str,
+    payload: &[u8],
+) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT INTO inbox (kind, source, agent, interface, payload, ship, ship_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?
+        .execute(params![Kind::Command as i32, source, agent, interface, payload, ship, ship_seq as i64])
+        .map(drop)
+}
+
+/// Queue, for `agent`, the receipt for a command it sent to `target` on another ship.
+pub fn inbox_push_receipt(conn: &Connection, ship: &str, target: &str, agent: &str, interface: &str, receipt: &[u8]) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT INTO inbox (kind, source, agent, interface, payload, ship) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
+        .execute(params![Kind::Receipt as i32, target, agent, interface, receipt, ship])
+        .map(drop)
+}
+
+// Commands between ships, and the receipts for them. For each other ship this one talks to,
+// `peers` holds the number of the last message sent to it, the number of the last message
+// taken from it, and how much is waiting to go to it. `peer_out` holds the messages waiting,
+// each until the other ship says it has it: commands, and receipts for commands that ship
+// sent here. `peer_wait` holds, for each command sent, who sent it, until its receipt comes.
+
+/// How many other ships this ship has exchanged commands with.
+pub fn peer_count(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM peers")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+}
+
+fn peer_row(conn: &Connection, peer: &str) -> rusqlite::Result<Option<(u64, u64, u64)>> {
+    conn.prepare_cached("SELECT sent, received, out_bytes FROM peers WHERE peer = ?1")?
+        .query_row([peer], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64)))
+        .optional()
+}
+
+/// Whether this ship has a record for `peer`.
+pub fn peer_known(conn: &Connection, peer: &str) -> rusqlite::Result<bool> {
+    Ok(peer_row(conn, peer)?.is_some())
+}
+
+/// How much is waiting to go to `peer`, counted like any other queue.
+pub fn peer_out_bytes(conn: &Connection, peer: &str) -> rusqlite::Result<u64> {
+    Ok(peer_row(conn, peer)?.map_or(0, |(_, _, bytes)| bytes))
+}
+
+/// The number of the last command taken from `peer`.
+pub fn peer_received(conn: &Connection, peer: &str) -> rusqlite::Result<u64> {
+    Ok(peer_row(conn, peer)?.map_or(0, |(_, received, _)| received))
+}
+
+pub fn peer_set_received(conn: &Connection, peer: &str, received: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO peers VALUES (?1, 0, ?2, 0) ON CONFLICT (peer) DO UPDATE SET received = excluded.received",
+    )?
+    .execute(params![peer, received as i64])
+    .map(drop)
+}
+
+/// Queue a command for an agent on another ship, giving it the next number for that ship.
+/// Put a message at the end of what is waiting to go to `peer`, and return its number.
+fn peer_out_push(conn: &Connection, peer: &str, source: &str, agent: &str, interface: &str, payload: &[u8], receipt: bool) -> rusqlite::Result<u64> {
+    let cost = (payload.len() as u64 + MESSAGE_OVERHEAD) as i64;
+    conn.prepare_cached(
+        "INSERT INTO peers VALUES (?1, 1, 0, ?2) ON CONFLICT (peer) DO UPDATE SET sent = sent + 1, out_bytes = out_bytes + ?2",
+    )?
+    .execute(params![peer, cost])?;
+    let (seq, _, _) = peer_row(conn, peer)?.expect("written above");
+    conn.prepare_cached("INSERT INTO peer_out VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?
+        .execute(params![peer, seq as i64, source, agent, interface, payload, receipt])?;
+    Ok(seq)
+}
+
+/// Queue a command from `source` for an agent on `peer`, and return its number. `tell` says
+/// whether `source` is to be handed the receipt when it comes.
+pub fn peer_send(conn: &Connection, peer: &str, source: &str, agent: &str, interface: &str, payload: &[u8], tell: bool) -> rusqlite::Result<u64> {
+    let seq = peer_out_push(conn, peer, source, agent, interface, payload, false)?;
+    conn.prepare_cached("INSERT INTO peer_wait VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
+        .execute(params![peer, seq as i64, source, agent, interface, tell])?;
+    Ok(seq)
+}
+
+/// How many commands sent to `peer` have had no receipt yet.
+pub fn peer_unanswered(conn: &Connection, peer: &str) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM peer_wait WHERE peer = ?1")?.query_row([peer], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+}
+
+/// How many commands sent to other ships have had no receipt yet.
+pub fn peer_wait_len(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM peer_wait")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+}
+
+/// A command sent to `peer` that has had no receipt yet.
+pub struct Unanswered {
+    pub source: String,
+    pub agent: String,
+    pub interface: String,
+    pub tell: bool,
+}
+
+pub fn peer_wait_get(conn: &Connection, peer: &str, seq: u64) -> rusqlite::Result<Option<Unanswered>> {
+    conn.prepare_cached("SELECT source, agent, interface, tell FROM peer_wait WHERE peer = ?1 AND seq = ?2")?
+        .query_row(params![peer, seq as i64], |r| Ok(Unanswered { source: r.get(0)?, agent: r.get(1)?, interface: r.get(2)?, tell: r.get(3)? }))
+        .optional()
+}
+
+/// The receipt for a command has come, so it is no longer waited for.
+pub fn peer_wait_done(conn: &Connection, peer: &str, seq: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM peer_wait WHERE peer = ?1 AND seq = ?2")?.execute(params![peer, seq as i64]).map(drop)
+}
+
+/// `reason`, cut to what a receipt may carry.
+pub fn short_reason(reason: &str) -> &str {
+    let mut end = reason.len().min(MAX_REASON_BYTES);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
+}
+
+/// Queue, for `peer`, the receipt for the command it numbered `about`. A receipt takes no
+/// notice of how much is already waiting to go there: the command has run, or been refused,
+/// and saying so must not be what fails. `peer_owed` is what keeps their number down.
+pub fn receipt_push(conn: &Connection, peer: &str, about: u64, verdict: Verdict, reason: &str) -> rusqlite::Result<()> {
+    let receipt = Receipt { about, verdict: verdict as i32, reason: short_reason(reason).to_string(), ..Receipt::default() };
+    peer_out_push(conn, peer, "", "", "", &receipt.encode_to_vec(), true).map(drop)
+}
+
+/// How many receipts this ship owes `peer` or soon will, as two counts: those written and
+/// waiting to go to it, and the commands from it that are queued and have yet to run.
+pub fn peer_owed(conn: &Connection, peer: &str) -> rusqlite::Result<(usize, usize)> {
+    let waiting = conn
+        .prepare_cached("SELECT COUNT(*) FROM peer_out WHERE peer = ?1 AND receipt")?
+        .query_row([peer], |r| r.get::<_, i64>(0))?;
+    let queued = conn
+        .prepare_cached("SELECT COUNT(*) FROM inbox WHERE ship = ?1 AND ship != '' AND kind = ?2")?
+        .query_row(params![peer, Kind::Command as i32], |r| r.get::<_, i64>(0))?;
+    Ok((waiting as usize, queued as usize))
+}
+
+/// The other ships that have something waiting to go to them.
+pub fn peers_waiting(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    conn.prepare_cached("SELECT peer FROM peers WHERE out_bytes > 0 ORDER BY peer")?.query_map([], |r| r.get(0))?.collect()
+}
+
+/// How many messages are waiting to go to other ships.
+pub fn peer_out_len(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM peer_out")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+}
+
+/// The oldest messages waiting to go to `peer`: at most `max_bytes` as they will be sent,
+/// names and framing included, except that one is always returned if there is one, and at
+/// most a few hundred.
+pub fn peer_batch(conn: &Connection, peer: &str, max_bytes: usize) -> rusqlite::Result<Vec<PeerMessage>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT seq, LENGTH(payload), source, agent, interface, payload, receipt FROM peer_out WHERE peer = ?1 ORDER BY seq",
+    )?;
+    let mut rows = stmt.query([peer])?;
+    let (mut batch, mut bytes) = (Vec::new(), 0usize);
+    while let Some(row) = rows.next()? {
+        let (seq, payload) = (row.get::<_, i64>(0)? as u64, row.get::<_, Vec<u8>>(5)?);
+        let message = if row.get::<_, bool>(6)? {
+            // Written by this runtime, or checked when the ship was imported.
+            PeerMessage { seq, receipt: Some(Receipt::decode(&*payload).unwrap_or_default()), ..PeerMessage::default() }
+        } else {
+            PeerMessage { seq, from_agent: row.get(2)?, agent: row.get(3)?, interface: row.get(4)?, payload, receipt: None }
+        };
+        // Its size as it will be sent, with the few bytes that mark where it starts and ends.
+        // Counting payloads alone would let long names carry a batch past what can be sent,
+        // and the same batch would then be tried, and refused, for ever.
+        let len = message.encoded_len() + 8;
+        if batch.len() >= MAX_BATCH_MESSAGES || (!batch.is_empty() && bytes + len > max_bytes) {
+            break;
+        }
+        bytes += len;
+        batch.push(message);
+    }
+    Ok(batch)
+}
+
+/// The other ship says it holds every message up to `last`. Those are done with. `None` if
+/// that cannot be: it names a message this ship never sent.
+pub fn peer_acked(conn: &Connection, peer: &str, last: u64) -> rusqlite::Result<Option<()>> {
+    let Some((sent, _, _)) = peer_row(conn, peer)? else { return Ok((last == 0).then_some(())) };
+    if last > sent {
+        return Ok(None);
+    }
+    conn.prepare_cached("DELETE FROM peer_out WHERE peer = ?1 AND seq <= ?2")?.execute(params![peer, last as i64])?;
+    // Counted afresh from what is left, so it cannot drift.
+    conn.prepare_cached(
+        "UPDATE peers SET out_bytes = (SELECT COALESCE(SUM(LENGTH(payload) + ?2), 0) FROM peer_out WHERE peer = ?1) WHERE peer = ?1",
+    )?
+    .execute(params![peer, MESSAGE_OVERHEAD as i64])?;
+    Ok(Some(()))
+}
+
 /// Remove and return the oldest queued command. Call inside the transaction that will run it,
 /// so that taking it and its effects land together.
 pub fn inbox_pop(conn: &Connection) -> rusqlite::Result<Option<Queued>> {
     let oldest = conn
-        .prepare_cached("SELECT seq, kind, source, agent, interface, payload FROM inbox ORDER BY seq LIMIT 1")?
+        .prepare_cached("SELECT seq, kind, source, agent, interface, payload, ship, ship_seq FROM inbox ORDER BY seq LIMIT 1")?
         .query_row([], |r| {
             Ok(Queued {
                 seq: r.get(0)?,
@@ -241,6 +486,8 @@ pub fn inbox_pop(conn: &Connection) -> rusqlite::Result<Option<Queued>> {
                 agent: r.get(3)?,
                 interface: r.get(4)?,
                 payload: r.get(5)?,
+                ship: r.get(6)?,
+                ship_seq: r.get::<_, i64>(7)? as u64,
             })
         })
         .optional()?;
@@ -256,8 +503,8 @@ pub fn inbox_delete(conn: &Connection, seq: i64) -> rusqlite::Result<()> {
 
 pub fn inbox_bytes(conn: &Connection) -> Result<u64, Error> {
     let commands = conn.query_row(
-        "SELECT COALESCE(SUM(LENGTH(payload) + ?1), 0) FROM inbox WHERE kind = ?2",
-        params![MESSAGE_OVERHEAD as i64, Kind::Command as i32],
+        "SELECT COALESCE(SUM(LENGTH(payload) + ?1), 0) FROM inbox WHERE kind IN (?2, ?3)",
+        params![MESSAGE_OVERHEAD as i64, Kind::Command as i32, Kind::Receipt as i32],
         |r| r.get::<_, i64>(0),
     )?;
     Ok(commands as u64)
@@ -663,6 +910,23 @@ pub fn notify(conn: &Connection, follower: &str, agent: &str, name: &str) -> rus
     Ok(())
 }
 
+/// The number of the newest event waiting to run on this ship, or 0 if there is none.
+pub fn inbox_newest(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM inbox")?.query_row([], |r| r.get(0))
+}
+
+/// The number of the oldest event waiting to run on this ship: the next to run.
+pub fn inbox_oldest(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    conn.prepare_cached("SELECT MIN(seq) FROM inbox")?.query_row([], |r| r.get(0))
+}
+
+/// How much more the ship's file may hold before it reaches its limit.
+pub fn spare_bytes(conn: &Connection) -> rusqlite::Result<u64> {
+    let pragma = |name: &str| conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0));
+    let (size, most, used, unused) = (pragma("page_size")?, pragma("max_page_count")?, pragma("page_count")?, pragma("freelist_count")?);
+    Ok(((most - used).max(0) + unused).max(0) as u64 * size.max(0) as u64)
+}
+
 /// How many events are waiting to run on this ship.
 pub fn inbox_len(conn: &Connection) -> Result<usize, Error> {
     Ok(conn.query_row("SELECT COUNT(*) FROM inbox", [], |r| r.get::<_, i64>(0))? as usize)
@@ -822,11 +1086,16 @@ pub fn audit(conn: &Connection, agent: &str, event: &[u8], ok: bool, keep: u64) 
 /// names the log when it was a checkpoint request to `agent`, so that one can be asked for
 /// again; `full` names the log of `agent` that an append found full, so that a checkpoint of
 /// it is asked for; `storage_full` says the ship's file itself was full, so that entries its
-/// logs no longer need are let go. Leaves no transaction open, whatever happens.
+/// logs no longer need are let go; `owed` names the ship and number when the input was a
+/// command from another ship, with what to tell it. Leaves no transaction open, whatever
+/// happens. `recorded` says whether to write the audit row, the one part of this that can be
+/// done without.
 #[allow(clippy::too_many_arguments)]
 pub fn record_rejection(
     conn: &Connection,
+    recorded: bool,
     queued: Option<i64>,
+    owed: Option<(&str, u64, Verdict, &str)>,
     notice: Option<(&str, &str)>,
     checkpoint: Option<&str>,
     full: Option<&str>,
@@ -839,6 +1108,7 @@ pub fn record_rejection(
     // Making room comes first, since everything after it needs some.
     let saved = (if storage_full { reclaim(conn) } else { Ok(()) })
         .and_then(|()| queued.map_or(Ok(()), |seq| inbox_delete(conn, seq)))
+        .and_then(|()| owed.map_or(Ok(()), |(peer, about, verdict, reason)| receipt_push(conn, peer, about, verdict, reason)))
         .and_then(|()| checkpoint.map_or(Ok(()), |log| checkpoint_answered(conn, agent, log)))
         .and_then(|()| full.map_or(Ok(()), |log| ask_checkpoint_when_full(conn, agent, log)))
         .and_then(|()| {
@@ -847,7 +1117,7 @@ pub fn record_rejection(
                 notify_failed(conn, agent, publisher, name)
             })
         })
-        .and_then(|()| audit(conn, agent, event, false, keep))
+        .and_then(|()| if recorded { audit(conn, agent, event, false, keep) } else { Ok(()) })
         .and_then(|()| conn.execute_batch("COMMIT"));
     if saved.is_err() && !conn.is_autocommit() {
         let _ = conn.execute_batch("ROLLBACK");
@@ -858,7 +1128,7 @@ pub fn record_rejection(
 /// Record a rejected input that never reached a handler. Best effort: the caller's rejection
 /// is the result that matters, so a failure to log it is not reported.
 pub fn audit_failure(conn: &Connection, agent: &str, event: &[u8], keep: u64) {
-    let _ = record_rejection(conn, None, None, None, None, false, agent, event, keep);
+    let _ = record_rejection(conn, true, None, None, None, None, None, false, agent, event, keep);
 }
 
 /// The newest audit rows, newest first.
@@ -914,6 +1184,30 @@ fn integer(row: &Row, index: usize) -> Result<i64, Error> {
         ValueRef::Integer(n) if (0..=MAX_SEQ).contains(&n) => Ok(n),
         _ => Err(bad_row("expected a non-negative integer in range")),
     }
+}
+
+/// Whether this is how a ship's name is written here: lower-case letters and dashes.
+pub fn ship_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
+
+/// A stored receipt that another ship sent, if it is one this runtime could have kept: about
+/// a numbered command, with a reason no longer than a receipt may carry. Its verdict is the
+/// other ship's word and is kept as it came, so it may be one this runtime has no name for.
+fn taken_receipt(bytes: &[u8]) -> Option<Receipt> {
+    let receipt = Receipt::decode(bytes).ok()?;
+    (bytes.len() <= MAX_RECEIPT_BYTES && receipt.about >= 1 && receipt.reason.len() <= MAX_REASON_BYTES).then_some(receipt)
+}
+
+/// A stored receipt that this ship is to send, if it is one this runtime could have written:
+/// as above, and with a verdict it knows.
+fn own_receipt(bytes: &[u8]) -> Option<Receipt> {
+    let known = |receipt: &Receipt| Verdict::try_from(receipt.verdict).is_ok_and(|verdict| verdict != Verdict::Unspecified);
+    taken_receipt(bytes).filter(known)
 }
 
 fn bad_row(why: &str) -> Error {
@@ -1208,6 +1502,129 @@ pub fn import(
         follows.insert((follower, agent, log), false);
     }
 
+    // What this ship has sent to and taken from other ships: for each, the number of the last
+    // message sent, the number of the last taken, the messages still waiting to go, and the
+    // commands sent that have had no receipt. The numbers are what make a command arrive
+    // exactly once, so they go with the ship. What is recorded as waiting is counted afresh
+    // from the messages that are actually there.
+    let mut taken_from: HashMap<String, u64> = HashMap::new();
+    let mut sent_to: HashMap<String, u64> = HashMap::new();
+    let mut stmt = from.prepare("SELECT peer, sent, received FROM peers")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (peer, sent, received) = (text(row, 0)?, integer(row, 1)?, integer(row, 2)?);
+        if sent_to.len() >= cfg.max_peers || !ship_name_ok(&peer) || peer == name || sent_to.insert(peer.clone(), sent as u64).is_some() {
+            return Err(bad_row("another ship is recorded wrongly, or there are too many"));
+        }
+        // The numbers of messages have a ceiling. A ship that was let in close to it could
+        // run into it while running, where there is no good way out: a command already
+        // taken could not have its receipt numbered. So a file is only let in with numbers
+        // no more than half way there, which leaves more room than any ship will ever use.
+        if sent > MAX_SEQ / 2 || received > MAX_SEQ / 2 {
+            return Err(bad_row("another ship's message numbers are beyond what this runtime allows"));
+        }
+        taken_from.insert(peer.clone(), received as u64);
+        to.execute("INSERT INTO peers VALUES (?1, ?2, ?3, 0)", params![peer, sent, received])?;
+    }
+    /// What is waiting to go to one other ship.
+    #[derive(Default)]
+    struct Waiting {
+        last: u64,
+        bytes: u64,
+        command_bytes: u64,
+        receipts: usize,
+    }
+    let mut waiting: HashMap<String, Waiting> = HashMap::new();
+    // The commands from other ships that receipts waiting to go are about, as (ship, number
+    // that ship gave the command).
+    let mut answered: HashSet<(String, u64)> = HashSet::new();
+    let mut stmt = from.prepare("SELECT peer, seq, source, agent, interface, payload, receipt FROM peer_out ORDER BY peer, seq")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (peer, seq, receipt) = (text(row, 0)?, integer(row, 1)? as u64, integer(row, 6)?);
+        let (source, agent, interface) = (text(row, 2)?, text(row, 3)?, text(row, 4)?);
+        let payload = blob(row, 5, cfg.max_event_bytes.max(MAX_RECEIPT_BYTES))?;
+        let Some(received) = taken_from.get(&peer).copied() else {
+            return Err(bad_row("something is waiting to go to a ship this one has no record of"));
+        };
+        // Each is numbered after the one before it. They need not start at 1: the earlier ones
+        // have been delivered. The newest must be the last one sent, which is checked below.
+        let line = waiting.entry(peer.clone()).or_default();
+        let cost = payload.len() as u64 + MESSAGE_OVERHEAD;
+        if seq == 0 || (line.last != 0 && seq != line.last + 1) {
+            return Err(bad_row("what is waiting to go to another ship is numbered wrongly"));
+        }
+        (line.last, line.bytes) = (seq, line.bytes + cost);
+        match receipt {
+            0 => {
+                check_agent(&source)?;
+                check_agent(&agent)?;
+                line.command_bytes += cost;
+                if !interface_ok(&interface) || payload.len() > cfg.max_event_bytes || line.command_bytes > cfg.max_peer_out_bytes {
+                    return Err(bad_row("commands waiting to go to another ship are named wrongly or too large"));
+                }
+            }
+            // A receipt is for a command that ship sent here, and there is one for each. It
+            // names no agent: the other ship knows which command it numbered so.
+            1 => {
+                let sound = own_receipt(&payload).filter(|receipt| {
+                    let bare = receipt.ship.is_empty() && receipt.agent.is_empty() && receipt.interface.is_empty();
+                    bare && receipt.about <= received && answered.insert((peer.clone(), receipt.about))
+                });
+                line.receipts += 1;
+                if sound.is_none() || !(source.is_empty() && agent.is_empty() && interface.is_empty()) || line.receipts > cfg.max_unanswered {
+                    return Err(bad_row("a receipt waiting to go to another ship is not one this ship would have made"));
+                }
+            }
+            _ => return Err(bad_row("what is waiting to go to another ship is neither a command nor a receipt")),
+        }
+        to.execute(
+            "INSERT INTO peer_out VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![peer, seq as i64, source, agent, interface, payload, receipt],
+        )?;
+    }
+    for (peer, line) in &waiting {
+        // The newest waiting message is the last one sent, or some would have gone missing.
+        if line.last != sent_to[peer] {
+            return Err(bad_row("what is waiting to go to another ship does not reach the last one sent"));
+        }
+        to.execute("UPDATE peers SET out_bytes = ?2 WHERE peer = ?1", params![peer, line.bytes as i64])?;
+    }
+    // The commands sent that have had no receipt: each one a command this ship sent, and only
+    // so many to any one ship.
+    let mut unanswered: HashMap<String, usize> = HashMap::new();
+    let mut stmt = from.prepare("SELECT peer, seq, source, agent, interface, tell FROM peer_wait ORDER BY peer, seq")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (peer, seq, tell) = (text(row, 0)?, integer(row, 1)? as u64, integer(row, 5)?);
+        let (source, agent, interface) = (text(row, 2)?, text(row, 3)?, text(row, 4)?);
+        check_agent(&source)?;
+        check_agent(&agent)?;
+        let sent = sent_to.get(&peer).copied().unwrap_or(0);
+        let count = unanswered.entry(peer.clone()).or_default();
+        *count += 1;
+        if seq == 0 || seq > sent || !interface_ok(&interface) || !(0..=1).contains(&tell) || *count > cfg.max_unanswered {
+            return Err(bad_row("a command recorded as awaiting its receipt is not one this ship sent, or there are too many"));
+        }
+        to.execute("INSERT INTO peer_wait VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![peer, seq as i64, source, agent, interface, tell])?;
+    }
+    // Where a command awaiting its receipt is still waiting to go, the two records are of one
+    // command and must say the same of it. Otherwise its receipt would be handed to the wrong
+    // agent, or with the wrong account of where the command went.
+    in_time()?;
+    let at_odds: bool = to.query_row(
+        "SELECT EXISTS (SELECT 1 FROM peer_wait w JOIN peer_out o ON o.peer = w.peer AND o.seq = w.seq
+         WHERE o.receipt != 0 OR o.source != w.source OR o.agent != w.agent OR o.interface != w.interface)",
+        [],
+        |r| r.get(0),
+    )?;
+    if at_odds {
+        return Err(bad_row("a command recorded as awaiting its receipt does not match the command waiting to go"));
+    }
+
     // The queue, in its order and with its numbers, so that what runs after an import is what
     // would have run without one. That matters: a queued command that is refused is dropped
     // for good, and whether it is refused can depend on a checkpoint request ahead of it.
@@ -1219,15 +1636,40 @@ pub fn import(
     // per log or follower, as the runtime itself keeps it. Anything else is not a ship file.
     let mut pending = 0u64;
     let mut asked: HashSet<(String, String)> = HashSet::new();
-    let mut stmt = from.prepare("SELECT seq, kind, source, agent, interface, payload FROM inbox ORDER BY seq")?;
+    // For each other ship: the number of the last queued command from it and how many there
+    // are, and the commands sent to it whose receipts are queued.
+    let mut queued_from: HashMap<String, (u64, usize)> = HashMap::new();
+    let mut told_of: HashSet<(String, u64)> = HashSet::new();
+    let mut stmt = from.prepare("SELECT seq, kind, source, agent, interface, payload, ship, ship_seq FROM inbox ORDER BY seq")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         in_time()?;
-        let (seq, kind) = (integer(row, 0)?, integer(row, 1)?);
-        let (source, agent, interface) = (text(row, 2)?, text(row, 3)?, text(row, 4)?);
+        let (seq, kind, ship_seq) = (integer(row, 0)?, integer(row, 1)?, integer(row, 7)? as u64);
+        let (source, agent, interface, ship) = (text(row, 2)?, text(row, 3)?, text(row, 4)?, text(row, 6)?);
         check_agent(&source)?;
         check_agent(&agent)?;
-        if seq == 0 || !interface_ok(&interface) {
+        // Only a command or a receipt can have come from another ship, and only from one this
+        // ship has a record of. A command from another ship carries the number that ship gave
+        // it: one it has been taken under, higher than that of any command from that ship
+        // queued ahead of it, since they are taken and queued in order, and one no receipt
+        // has gone out for yet. With the receipts waiting to go, they are no more than this
+        // ship would have let itself owe. Nothing else carries such a number.
+        let from_elsewhere = !ship.is_empty();
+        let numbered = if from_elsewhere && kind == Kind::Command as i64 {
+            let (last, count) = queued_from.entry(ship.clone()).or_default();
+            let in_order = ship_seq > *last;
+            (*last, *count) = (ship_seq, *count + 1);
+            let owed = *count + waiting.get(&ship).map_or(0, |line| line.receipts);
+            in_order
+                && taken_from.get(&ship).is_some_and(|received| ship_seq <= *received)
+                && !answered.contains(&(ship.clone(), ship_seq))
+                && owed <= cfg.max_unanswered
+        } else {
+            // (That a receipt's ship is one this ship has a record of is checked with the
+            // receipt itself, below.)
+            ship_seq == 0 && (!from_elsewhere || kind == Kind::Receipt as i64)
+        };
+        if seq == 0 || !interface_ok(&interface) || !numbered {
             return Err(bad_row("a queued event is numbered or named wrongly"));
         }
         let payload = if kind == Kind::Command as i64 {
@@ -1235,6 +1677,32 @@ pub fn import(
             pending += payload.len() as u64 + MESSAGE_OVERHEAD;
             if pending > cfg.max_inbox_bytes {
                 return Err(bad_row("queued commands are larger than this runtime allows"));
+            }
+            payload
+        } else if kind == Kind::Receipt as i64 {
+            let payload = blob(row, 5, MAX_RECEIPT_BYTES)?;
+            pending += payload.len() as u64 + MESSAGE_OVERHEAD;
+            // A receipt is handed to the agent that sent the command, and says where it went.
+            // It is about a command this ship sent to that ship, there is one for a command,
+            // and once it is queued the command is no longer recorded as awaiting it.
+            let sound = taken_receipt(&payload).filter(|receipt| {
+                let told = receipt.ship == ship && receipt.agent == source && receipt.interface == interface;
+                told && sent_to.get(&ship).is_some_and(|sent| receipt.about <= *sent) && told_of.insert((ship.clone(), receipt.about))
+            });
+            // And if the command is still waiting to go, it is a command, sent by the agent
+            // this receipt is for, to where the receipt says.
+            let awaited = match &sound {
+                Some(receipt) => to.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM peer_wait WHERE peer = ?1 AND seq = ?2)
+                         OR EXISTS (SELECT 1 FROM peer_out WHERE peer = ?1 AND seq = ?2
+                                    AND (receipt != 0 OR source != ?3 OR agent != ?4 OR interface != ?5))",
+                    params![ship, receipt.about as i64, agent, source, interface],
+                    |r| r.get::<_, bool>(0),
+                )?,
+                None => false,
+            };
+            if sound.is_none() || awaited || pending > cfg.max_inbox_bytes {
+                return Err(bad_row("a queued receipt is not one this ship would have made"));
             }
             payload
         } else if kind == Kind::Checkpoint as i64 {
@@ -1259,7 +1727,10 @@ pub fn import(
         } else {
             return Err(bad_row("a queued event is of a kind this runtime does not know"));
         };
-        to.execute("INSERT INTO inbox VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![seq, kind, source, agent, interface, payload])?;
+        to.execute(
+            "INSERT INTO inbox VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![seq, kind, source, agent, interface, payload, ship, ship_seq as i64],
+        )?;
     }
     // A follower that is behind and has no notification waiting had been given up on after
     // repeated failures. An import starts it off afresh, behind everything already queued.
@@ -1274,7 +1745,8 @@ pub fn import(
         in_time()?;
         let (seq, at_ms, agent) = (integer(row, 0)?, integer(row, 1)?, text(row, 2)?);
         check_agent(&agent)?;
-        let event = blob(row, 3, cfg.max_event_bytes)?;
+        // An audit row is an event, or a line the runtime wrote about a receipt, or a receipt.
+        let event = blob(row, 3, cfg.max_event_bytes.max(MAX_RECEIPT_BYTES))?;
         to.execute("INSERT INTO audit VALUES (?1, ?2, ?3, ?4, ?5)", params![seq, at_ms, agent, event, integer(row, 4)? != 0])?;
     }
 
