@@ -9,7 +9,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
+use rusqlite::serialize::{Data, OwnedData};
+use rusqlite::{params, Connection, DatabaseName, OpenFlags, OptionalExtension, Row};
 
 use ship_proto::{CheckpointBody, Device, Kind, LogNews, Message, PeerMessage, Receipt, Verdict};
 
@@ -249,7 +250,7 @@ pub const MAX_LABEL_BYTES: usize = 64;
 
 /// Create a ship file at `path`, which must not exist. The caller creates it under a private
 /// name and publishes it afterwards, so a failure here never leaves a half-made ship behind.
-pub fn create(path: &Path, name: &str, kernel: &str, max_bytes: u64, incarnation: &[u8; 16]) -> Result<(), Error> {
+pub fn create(path: &Path, name: &str, kernel: &str, max_bytes: u64, incarnation: &[u8; 16], file_key: &[u8; 32]) -> Result<(), Error> {
     // create_new makes "does this ship already exist" atomic.
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(_) => {}
@@ -258,7 +259,7 @@ pub fn create(path: &Path, name: &str, kernel: &str, max_bytes: u64, incarnation
         }
         Err(e) => return Err(e.into()),
     }
-    let conn = open(path, Durability::Full, max_bytes)?;
+    let conn = open(path, Durability::Full, max_bytes, file_key)?;
     // Not WAL while the file is being built: a commit must put the data in the file itself,
     // because only that file is published.
     let mode: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
@@ -284,13 +285,46 @@ pub fn incarnation(conn: &Connection) -> rusqlite::Result<[u8; 16]> {
     Ok(stored.and_then(|mark| <[u8; 16]>::try_from(mark).ok()).unwrap_or_default())
 }
 
-pub fn open(path: &Path, durability: Durability, max_bytes: u64) -> Result<Connection, Error> {
+/// Give a connection the key its file is encrypted under. This comes before anything else is
+/// asked of the file: every page of it, and of the files SQLite keeps beside it while it is
+/// open, is encrypted, and nothing can be read until the key is there. A wrong key shows as
+/// the file not being a database at all.
+///
+/// The key is given as it is, with nothing derived from it: it is thirty-two random bytes,
+/// so there is no weak passphrase to stretch.
+fn unlock(conn: &Connection, file_key: &[u8; 32]) -> Result<(), Error> {
+    let hex: String = file_key.iter().map(|byte| format!("{byte:02x}")).collect();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))?;
+    // Whatever SQLite needs to set aside while working is kept in memory, not in a file of
+    // its own, which would not be encrypted.
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    // Read something, so that a file this key does not open is reported here, as that, and
+    // not later as whatever the first query happens to make of it.
+    match conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(())) {
+        Err(rusqlite::Error::SqliteFailure(failure, _)) if failure.code == rusqlite::ErrorCode::NotADatabase => {
+            Err(Error::BadShipFile("not a ship's file that this runtime's storage key opens".into()))
+        }
+        other => Ok(other?),
+    }
+}
+
+/// A setting that is a number. With the file encrypted, some of these come back as text.
+fn pragma_number(conn: &Connection, name: &str) -> rusqlite::Result<i64> {
+    conn.query_row(&format!("PRAGMA {name}"), [], |r| match r.get_ref(0)? {
+        ValueRef::Integer(number) => Ok(number),
+        ValueRef::Text(text) => Ok(std::str::from_utf8(text).ok().and_then(|text| text.parse().ok()).unwrap_or(0)),
+        _ => Ok(0),
+    })
+}
+
+pub fn open(path: &Path, durability: Durability, max_bytes: u64, file_key: &[u8; 32]) -> Result<Connection, Error> {
     // NO_MUTEX: the runtime guarantees one thread at a time per ship.
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
+    unlock(&conn, file_key)?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     // The ship's storage limit. A write that would grow the file past it fails as "full".
-    let page: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let page = pragma_number(&conn, "page_size")?;
     let pages = (max_bytes / page.max(1) as u64).clamp(1, u32::MAX as u64);
     conn.query_row(&format!("PRAGMA max_page_count = {pages}"), [], |r| r.get::<_, i64>(0))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -321,11 +355,23 @@ pub fn check_meta(conn: &Connection, name: &str) -> Result<(), Error> {
 }
 
 /// Open a ship file without changing anything about it, not even its journal mode.
-pub fn open_read_only(path: &Path) -> Result<Connection, Error> {
+pub fn open_read_only(path: &Path, file_key: &[u8; 32]) -> Result<Connection, Error> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
+    unlock(&conn, file_key)?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     Ok(conn)
+}
+
+/// The public half of the key pair made from the owner's recovery code, if the ship has
+/// been given one. An exported copy of the ship is sealed to it.
+pub fn recovery_public(conn: &Connection) -> rusqlite::Result<Option<[u8; 32]>> {
+    let stored: Option<Vec<u8>> = conn.query_row("SELECT value FROM meta WHERE key = 'recovery'", [], |r| r.get(0)).optional()?;
+    Ok(stored.and_then(|public| <[u8; 32]>::try_from(public).ok()))
+}
+
+pub fn recovery_set(conn: &Connection, public: &[u8; 32]) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO meta VALUES ('recovery', ?1)")?.execute([&public[..]]).map(drop)
 }
 
 /// The content hash of the ship's kernel module.
@@ -1264,7 +1310,7 @@ pub fn inbox_oldest(conn: &Connection) -> rusqlite::Result<Option<i64>> {
 
 /// How much more the ship's file may hold before it reaches its limit.
 pub fn spare_bytes(conn: &Connection) -> rusqlite::Result<u64> {
-    let pragma = |name: &str| conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0));
+    let pragma = |name: &str| pragma_number(conn, name);
     let (size, most, used, unused) = (pragma("page_size")?, pragma("max_page_count")?, pragma("page_count")?, pragma("freelist_count")?);
     Ok(((most - used).max(0) + unused).max(0) as u64 * size.max(0) as u64)
 }
@@ -1972,10 +2018,44 @@ pub fn audit_tail(conn: &Connection, limit: usize) -> Result<Vec<AuditEntry>, Er
 }
 
 /// Write a consistent single-file copy, safe while the ship is live.
-pub fn snapshot_into(conn: &Connection, dest: &Path) -> Result<(), Error> {
-    let dest = dest.to_str().ok_or_else(|| Error::BadShipFile("export path is not UTF-8".into()))?;
-    conn.execute("VACUUM INTO ?1", [dest])?;
-    Ok(())
+///
+/// The copy is the file's contents as they would be with nothing encrypted, and it is made
+/// in memory: it is never written anywhere as it stands. Whoever asked for it seals it
+/// before it goes to disk.
+pub fn snapshot(conn: &Connection) -> Result<Data<'_>, Error> {
+    // A database of its own, in memory and with no key, filled from this one in a single
+    // transaction and then read out whole. If an earlier copy could not be cleared away,
+    // it is cleared away now, so that one failure does not stop every copy after it.
+    let _ = conn.execute_batch("DETACH DATABASE plain");
+    conn.execute_batch("ATTACH DATABASE ':memory:' AS plain KEY ''")?;
+    let copied = conn
+        .execute_batch("BEGIN; SELECT sqlcipher_export('plain'); COMMIT;")
+        .and_then(|()| conn.serialize(DatabaseName::Attached("plain")));
+    if copied.is_err() && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    let detached = conn.execute_batch("DETACH DATABASE plain");
+    let contents = copied?;
+    detached?;
+    Ok(contents)
+}
+
+/// Open the contents of a ship's file, as `snapshot` gives them, as a database in memory
+/// that can be read and not changed. Nothing is read from it here: SQLite looks at none of
+/// it until the first statement is run.
+fn in_memory(contents: &[u8]) -> rusqlite::Result<Connection> {
+    let mut conn = Connection::open_in_memory()?;
+    // SQLite takes over a buffer that came from its own allocator.
+    let owned = unsafe {
+        let buffer = rusqlite::ffi::sqlite3_malloc64(contents.len().max(1) as u64) as *mut u8;
+        let Some(buffer) = std::ptr::NonNull::new(buffer) else {
+            return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOMEM), None));
+        };
+        std::ptr::copy_nonoverlapping(contents.as_ptr(), buffer.as_ptr(), contents.len());
+        OwnedData::from_raw_nonnull(buffer, contents.len())
+    };
+    conn.deserialize(DatabaseName::Main, owned, true)?;
+    Ok(conn)
 }
 
 fn schema_objects(conn: &Connection, limit: usize) -> Result<BTreeSet<(String, String, Option<String>)>, Error> {
@@ -1990,12 +2070,12 @@ fn schema_objects(conn: &Connection, limit: usize) -> Result<BTreeSet<(String, S
 /// either that page holds every row, or it points at a few pages that between them do. A
 /// file whose schema is laid out any other way is not one this runtime wrote. Nothing is
 /// taken on trust here: every number read is checked against what was actually read.
-fn schema_has(path: &Path, entries: usize) -> Result<bool, Error> {
+fn schema_has(contents: &[u8], entries: usize) -> Result<bool, Error> {
     const TABLE_LEAF: u8 = 0x0d;
     const TABLE_INTERIOR: u8 = 0x05;
     /// The most pages a schema of this runtime's size is ever spread over.
     const MAX_LEAVES: usize = 8;
-    let mut file = std::fs::File::open(path)?;
+    let mut file = io::Cursor::new(contents);
     let mut header = [0u8; 112];
     if file.read_exact(&mut header).is_err() || !header.starts_with(b"SQLite format 3\0") {
         return Ok(false);
@@ -2093,7 +2173,7 @@ fn bad_row(why: &str) -> Error {
 /// The source must have exactly this runtime's schema, so it cannot carry triggers or views, and
 /// every row is re-validated on the way across. Returns the hash of the ship's kernel module.
 pub fn import(
-    src: &Path,
+    contents: Vec<u8>,
     dest: &Path,
     name: &str,
     cfg: &Config,
@@ -2102,20 +2182,24 @@ pub fn import(
     check_agent: fn(&str) -> Result<(), Error>,
     check_hash: fn(&str) -> Result<(), Error>,
     incarnation: &[u8; 16],
+    file_key: &[u8; 32],
+    recovery: &[u8; 32],
 ) -> Result<String, Error> {
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA)?;
     let expected = schema_objects(&reference, usize::MAX)?;
     // SQLite parses a file's whole schema before any query can limit it, so count the schema
     // entries straight from the file first.
-    if !schema_has(src, expected.len())? {
+    if !schema_has(&contents, expected.len())? {
         return Err(bad_row("schema does not match this runtime's"));
     }
 
     // Limits go on before the first statement, because that is when SQLite reads and parses the
     // source's schema. They make it refuse oversized values and SQL instead of loading them.
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let from = Connection::open_with_flags(src, flags).map_err(|_| bad_row("not a ship file"))?;
+    // The source is read where it is, in memory, and cannot be written to.
+    let from = in_memory(&contents).map_err(|_| bad_row("not a ship file"))?;
+    // SQLite has its own copy now.
+    drop(contents);
     let largest =
         cfg.limits.max_value_bytes.max(cfg.limits.max_effect_bytes).max(cfg.max_event_bytes).max(cfg.max_checkpoint_bytes);
     let _ = from.set_limit(Limit::SQLITE_LIMIT_LENGTH, i32::try_from(largest + (64 << 10)).unwrap_or(i32::MAX));
@@ -2143,8 +2227,12 @@ pub fn import(
     // The copy is given a mark of its own, whatever mark the source had: it may be an old
     // copy of the ship, brought back, and other ships tell by the mark that it may have
     // forgotten what it once knew of them.
-    create(dest, name, &kernel_hash, cfg.max_ship_bytes, incarnation)?;
-    let to = open(dest, Durability::Full, cfg.max_ship_bytes)?;
+    create(dest, name, &kernel_hash, cfg.max_ship_bytes, incarnation, file_key)?;
+    let to = open(dest, Durability::Full, cfg.max_ship_bytes, file_key)?;
+    // The ship keeps the recovery key of the code that opened this copy, whatever the copy
+    // itself says its key is. So the code that brought a ship back is the code that opens
+    // the copies made of it from here on.
+    recovery_set(&to, recovery)?;
     // Leave WAL mode so that a commit means the data is in the main file, which is the only
     // file that gets published. The switch itself fails if earlier writes cannot be folded in.
     let mode: String = to.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;

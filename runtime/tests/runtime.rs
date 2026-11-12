@@ -6,8 +6,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use runtime::{
-    verify_checkpoint, verify_log, Config, Durability, Error, Limits, Manifest, Provide, Rejection, Runtime,
-    SignedCheckpoint, Use,
+    seal, verify_checkpoint, verify_log, Config, Durability, Error, Limits, Manifest, Provide, Rejection, Runtime,
+    SignedCheckpoint, StorageKey, Use,
 };
 
 const NO_LIMIT: usize = usize::MAX;
@@ -84,6 +84,65 @@ fn fast() -> Config {
 
 fn small_fuel() -> Config {
     Config { fuel_per_event: 2_000_000, ..fast() }
+}
+
+/// The recovery code the test ships are given.
+const CODE: &str = "test-test-test-test-test-test-test-test";
+
+/// Export a ship as one is set up to be: with its owner's recovery key in place.
+fn export(rt: &Runtime, ship: &str, dest: &Path) -> Result<(), Error> {
+    rt.set_recovery_key(ship, seal::recovery_public(CODE))?;
+    rt.export_ship(ship, dest)
+}
+
+/// The key a data directory's ships are encrypted under, where the runtime was left to make
+/// its own.
+fn storage_key(dir: &Path) -> StorageKey {
+    StorageKey::from_hex(&fs::read_to_string(dir.join("storage.key")).unwrap()).unwrap()
+}
+
+/// A ship's file in a data directory, opened with its key, beside whatever runtime has it.
+fn live(dir: &Path, ship: &str) -> rusqlite::Connection {
+    let file = rusqlite::Connection::open(dir.join("ships").join(format!("{ship}.ship"))).unwrap();
+    let key: String = seal::ship_file_key(&storage_key(dir), ship).iter().map(|byte| format!("{byte:02x}")).collect();
+    file.execute_batch(&format!("PRAGMA key = \"x'{key}'\";")).unwrap();
+    file
+}
+
+/// A ship's signing key, read from its key file in a data directory.
+fn seed_of(dir: &Path, ship: &str) -> [u8; 32] {
+    let file = fs::read(dir.join("keys").join(format!("{ship}.key"))).unwrap();
+    seal::open_signing_key(&storage_key(dir), ship, &file).unwrap()
+}
+
+/// What an exported copy of a ship in `dir` holds: its signing key and the contents of its file.
+fn unsealed(dir: &Path, ship: &str) -> ([u8; 32], Vec<u8>) {
+    seal::open_export(CODE, ship, fs::read(dir.join(format!("{ship}.ship"))).unwrap()).unwrap()
+}
+
+/// Open the exported copy of a ship in `dir`, as the holder of its recovery code can, let
+/// `change` alter its signing key and the contents of its file, and seal it again.
+fn reseal(dir: &Path, ship: &str, change: impl FnOnce(&mut [u8; 32], &mut Vec<u8>)) {
+    let (mut seed, mut contents) = unsealed(dir, ship);
+    change(&mut seed, &mut contents);
+    let sealed = seal::seal_export(&seal::recovery_public(CODE), ship, &seed, &contents, [5; 32]);
+    fs::write(dir.join(format!("{ship}.ship")), sealed).unwrap();
+}
+
+/// The same, with the contents of the file open as a database.
+fn rework(dir: &Path, ship: &str, change: impl FnOnce(&[u8; 32], &rusqlite::Connection)) {
+    reseal(dir, ship, |seed, contents| {
+        let plain = dir.join(format!("{ship}.plain"));
+        fs::write(&plain, &*contents).unwrap();
+        change(seed, &rusqlite::Connection::open(&plain).unwrap());
+        *contents = fs::read(&plain).unwrap();
+        fs::remove_file(&plain).unwrap();
+    });
+}
+
+/// The same, running one batch of statements against it.
+fn doctor(dir: &Path, ship: &str, statements: &str) {
+    rework(dir, ship, |_, file| file.execute_batch(statements).unwrap());
 }
 
 /// A runtime with one ship, `~zod`, running the counter agent as `counter`.
@@ -405,19 +464,19 @@ fn export_then_import_into_another_runtime() {
     send(&rt, "~zod", "counter", "say one");
     send(&rt, "~zod", "counter", "say two");
     let last = rt.drain_outbox("~zod", NO_LIMIT).unwrap().pop().unwrap();
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
     // Changes after the export must not leak into it.
     send(&rt, "~zod", "counter", "inc hits");
 
     let other = Runtime::open(&b.0, fast()).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(send(&other, "~zod", "counter", "get hits"), "9");
     send(&other, "~zod", "counter", "say after import");
     let seqs: Vec<i64> = other.drain_outbox("~zod", NO_LIMIT).unwrap().iter().map(|e| e.seq).collect();
     // The exported outbox was empty, so only the carried-over counter keeps numbers from being reused.
     assert_eq!(seqs, [last.seq + 1]);
-    assert!(matches!(other.import_ship(&out.0, "~zod"), Err(Error::ShipExists(_))));
-    assert!(matches!(other.import_ship(&out.0, "~bus"), Err(Error::UnknownShip(_))));
+    assert!(matches!(other.import_ship(&out.0, "~zod", CODE), Err(Error::ShipExists(_))));
+    assert!(matches!(other.import_ship(&out.0, "~bus", CODE), Err(Error::UnknownShip(_))));
 }
 
 #[test]
@@ -426,18 +485,18 @@ fn import_refuses_a_tampered_module_and_heals_a_damaged_local_copy() {
         (TempDir::new("tamper-a"), TempDir::new("tamper-b"), TempDir::new("tamper-c"), TempDir::new("tamper-out"));
     let rt = boot(&a, fast());
     send(&rt, "~zod", "counter", "inc hits 4");
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
     let blob = fs::read_dir(out.0.join("blobs")).unwrap().next().unwrap().unwrap().path();
 
     // The destination already holds a damaged blob under the right name: import must replace it.
     let healed = Runtime::open(&c.0, fast()).unwrap();
     fs::write(c.0.join("blobs").join(blob.file_name().unwrap()), b"damaged").unwrap();
-    healed.import_ship(&out.0, "~zod").unwrap();
+    healed.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(send(&healed, "~zod", "counter", "get hits"), "4");
 
     fs::write(&blob, b"tampered").unwrap();
     let other = Runtime::open(&b.0, fast()).unwrap();
-    assert!(matches!(other.import_ship(&out.0, "~zod"), Err(Error::BadModule(_))));
+    assert!(matches!(other.import_ship(&out.0, "~zod", CODE), Err(Error::BadModule(_))));
     assert!(matches!(other.deliver("~zod", "counter", b"get hits"), Err(Error::UnknownShip(_))));
 }
 
@@ -445,20 +504,19 @@ fn import_refuses_a_tampered_module_and_heals_a_damaged_local_copy() {
 fn import_refuses_a_ship_file_carrying_triggers() {
     let (a, b, out) = (TempDir::new("trigger-a"), TempDir::new("trigger-b"), TempDir::new("trigger-out"));
     let rt = boot(&a, fast());
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
 
     // A trigger like this would let one agent's ordinary write rewrite another agent's data.
-    let conn = rusqlite::Connection::open(out.0.join("zod.ship")).unwrap();
-    conn.execute_batch(
+    doctor(
+        &out.0,
+        "zod",
         "CREATE TRIGGER steal AFTER INSERT ON kv BEGIN
              UPDATE kv SET value = x'00' WHERE agent <> NEW.agent;
          END;",
-    )
-    .unwrap();
-    drop(conn);
+    );
 
     let other = Runtime::open(&b.0, fast()).unwrap();
-    assert!(matches!(other.import_ship(&out.0, "~zod"), Err(Error::BadShipFile(_))));
+    assert!(matches!(other.import_ship(&out.0, "~zod", CODE), Err(Error::BadShipFile(_))));
     assert!(matches!(other.deliver("~zod", "counter", b"get hits"), Err(Error::UnknownShip(_))));
 }
 
@@ -467,13 +525,13 @@ fn concurrent_imports_of_one_ship_admit_exactly_one() {
     let (a, b, out) = (TempDir::new("race-a"), TempDir::new("race-b"), TempDir::new("race-out"));
     let rt = boot(&a, fast());
     send(&rt, "~zod", "counter", "inc hits 6");
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
 
     let other = Runtime::open(&b.0, fast()).unwrap();
     let won = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..8 {
-            scope.spawn(|| match other.import_ship(&out.0, "~zod") {
+            scope.spawn(|| match other.import_ship(&out.0, "~zod", CODE) {
                 Ok(()) => drop(won.fetch_add(1, Ordering::SeqCst)),
                 Err(Error::ShipExists(_)) => {}
                 Err(e) => panic!("unexpected import error: {e}"),
@@ -624,7 +682,7 @@ fn export_into_the_runtimes_own_directory_keeps_modules_intact() {
     let dir = TempDir::new("self-export");
     let rt = boot(&dir, fast());
     send(&rt, "~zod", "counter", "inc hits 2");
-    rt.export_ship("~zod", &dir.0).unwrap();
+    export(&rt, "~zod", &dir.0).unwrap();
     drop(rt);
 
     // A restart reloads the module from disk, which would fail if the export had truncated it.
@@ -641,11 +699,11 @@ fn import_tampered(label: &str, tamper: &str) -> Result<(), Error> {
     );
     let rt = boot(&a, fast());
     send(&rt, "~zod", "counter", "inc hits");
-    rt.export_ship("~zod", &out.0).unwrap();
-    rusqlite::Connection::open(out.0.join("zod.ship")).unwrap().execute_batch(tamper).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
+    doctor(&out.0, "zod", tamper);
 
     let other = Runtime::open(&b.0, fast()).unwrap();
-    let result = other.import_ship(&out.0, "~zod");
+    let result = other.import_ship(&out.0, "~zod", CODE);
     if result.is_err() {
         assert!(matches!(other.deliver("~zod", "counter", b"get hits"), Err(Error::UnknownShip(_))));
         assert_eq!(fs::read_dir(b.0.join("tmp")).unwrap().count(), 0, "import left scratch files behind");
@@ -743,27 +801,27 @@ fn locked_for_another_process(dir: &Path) -> bool {
 fn import_cannot_be_pointed_at_devices_or_the_lock_file() {
     let (a, b, out) = (TempDir::new("alias-a"), TempDir::new("alias-b"), TempDir::new("alias-out"));
     let rt = boot(&a, fast());
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
     let blob = fs::read_dir(out.0.join("blobs")).unwrap().next().unwrap().unwrap().path();
     let other = Runtime::open(&b.0, fast()).unwrap();
 
     // A module "file" that is really an endless device must be refused, not read.
     fs::remove_file(&blob).unwrap();
     std::os::unix::fs::symlink("/dev/zero", &blob).unwrap();
-    assert!(other.import_ship(&out.0, "~zod").is_err());
+    assert!(other.import_ship(&out.0, "~zod", CODE).is_err());
 
     // A module file that is a second name for the runtime's lock file: reading and closing it
     // must not release the lock.
     fs::remove_file(&blob).unwrap();
     fs::hard_link(b.0.join("runtime.lock"), &blob).unwrap();
-    assert!(other.import_ship(&out.0, "~zod").is_err());
+    assert!(other.import_ship(&out.0, "~zod", CODE).is_err());
     assert!(matches!(Runtime::open(&b.0, fast()), Err(Error::DataDirInUse)));
     assert!(locked_for_another_process(&b.0));
 
     // The ship file itself as an endless device.
     fs::remove_file(out.0.join("zod.ship")).unwrap();
     std::os::unix::fs::symlink("/dev/zero", out.0.join("zod.ship")).unwrap();
-    assert!(other.import_ship(&out.0, "~zod").is_err());
+    assert!(other.import_ship(&out.0, "~zod", CODE).is_err());
     assert_eq!(fs::read_dir(b.0.join("tmp")).unwrap().count(), 0, "import left scratch files behind");
 }
 
@@ -798,18 +856,18 @@ fn import_refuses_a_damaged_file() {
     for key in 0..200 {
         send(&rt, "~zod", "counter", &format!("inc key{key}"));
     }
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
 
-    // Leave page one (the schema) alone and wreck every page after it.
-    let path = out.0.join("zod.ship");
-    let mut bytes = fs::read(&path).unwrap();
-    let page_size = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
-    assert!(bytes.len() > 2 * page_size, "expected the export to span several pages");
-    bytes[page_size..].fill(0xff);
-    fs::write(&path, bytes).unwrap();
+    // Leave page one (the schema) alone and wreck every page after it. The copy is sealed
+    // again afterwards, so this is damage the seal does not show: only reading the file does.
+    reseal(&out.0, "zod", |_, bytes| {
+        let page_size = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
+        assert!(bytes.len() > 2 * page_size, "expected the export to span several pages");
+        bytes[page_size..].fill(0xff);
+    });
 
     let other = Runtime::open(&b.0, fast()).unwrap();
-    assert!(other.import_ship(&out.0, "~zod").is_err());
+    assert!(other.import_ship(&out.0, "~zod", CODE).is_err());
     assert!(matches!(other.deliver("~zod", "counter", b"get key1"), Err(Error::UnknownShip(_))));
 }
 
@@ -898,10 +956,10 @@ fn queued_commands_survive_export_and_import() {
     let cfg = Config { max_queued_per_deliver: 0, ..fast() };
     let rt = boot_pair(&a, cfg.clone(), counter_manifest(false), tally_manifest(true));
     send(&rt, "~zod", "tally", "bump hits");
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
 
     let other = Runtime::open(&b.0, cfg).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(send(&other, "~zod", "counter", "get hits"), "0");
     assert_eq!(other.run_pending("~zod", 10).unwrap(), 1);
     assert_eq!(send(&other, "~zod", "counter", "get hits"), "1");
@@ -950,7 +1008,7 @@ fn a_hostile_kernel_cannot_point_the_runtime_at_other_files() {
         other => panic!("expected a rejection, got {other:?}"),
     }
     let out = TempDir::new("hostile-paths-out");
-    match rt.export_ship("~zod", &out.0) {
+    match export(&rt, "~zod", &out.0) {
         Err(Error::BadModule(why)) => assert!(why.contains("is not a module hash"), "{why}"),
         other => panic!("expected the export to be refused, got {other:?}"),
     }
@@ -1296,8 +1354,8 @@ fn small_limits_do_not_break_routing_or_the_ships_own_export() {
     let rt = boot(&a, cfg.clone());
     assert!(matches!(rt.deliver("~zod", "counter", b"far too long"), Err(Error::Rejected(Rejection::Limit(_)))));
     assert_eq!(rt.audit("~zod", 1).unwrap()[0].event, b"far ");
-    rt.export_ship("~zod", &out.0).unwrap();
-    Runtime::open(&b.0, cfg).unwrap().import_ship(&out.0, "~zod").unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
+    Runtime::open(&b.0, cfg).unwrap().import_ship(&out.0, "~zod", CODE).unwrap();
 }
 
 #[test]
@@ -1516,8 +1574,8 @@ fn verification_covers_the_link_to_the_previous_entry_and_the_exact_bytes() {
     let (_, end_hash) = check(&all).unwrap().unwrap();
 
     // Sign new entries with the ship's real key, as someone holding an export could.
-    rt.export_ship("~zod", &out.0).unwrap();
-    let seed: [u8; 32] = fs::read(out.0.join("zod.key")).unwrap().try_into().unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
+    let seed = unsealed(&out.0, "zod").0;
     let signer = SigningKey::from_bytes(&seed);
     let fourth = |prev: Vec<u8>| {
         let body = runtime::EntryBody {
@@ -1560,10 +1618,10 @@ fn logs_followers_and_the_key_survive_export_and_import() {
         send(&rt, "~zod", "counter", "log hits");
     }
     let key = rt.public_key("~zod").unwrap();
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
 
     let other = Runtime::open(&b.0, cfg).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(other.public_key("~zod").unwrap(), key);
     // The follower is prompted afresh and catches up.
     assert_eq!(read(&other, "tally", "tally", "seen"), "0");
@@ -1589,12 +1647,12 @@ fn import_refuses_logs_that_do_not_check_out() {
         for _ in 0..4 {
             send(&rt, "~zod", "counter", "log hits");
         }
-        rt.export_ship("~zod", &out.0).unwrap();
+        export(&rt, "~zod", &out.0).unwrap();
         damage(&out.0);
-        Runtime::open(&b.0, fast()).unwrap().import_ship(&out.0, "~zod")
+        Runtime::open(&b.0, fast()).unwrap().import_ship(&out.0, "~zod", CODE)
     };
     let sql = |statement: &'static str| {
-        move |out: &Path| rusqlite::Connection::open(out.join("zod.ship")).unwrap().execute_batch(statement).unwrap()
+        move |out: &Path| doctor(&out, "zod", statement)
     };
     assert!(import("log-intact", &|_| {}).is_ok());
     // An entry removed from the middle, an entry altered, and a log that claims the wrong owner.
@@ -1610,9 +1668,8 @@ fn import_refuses_logs_that_do_not_check_out() {
     assert!(matches!(import("log-cut", &sql("DELETE FROM log_entries WHERE seq = 4")), Err(Error::BadShipFile(_))));
     assert!(matches!(import("log-emptied", &sql("DELETE FROM log_entries")), Err(Error::BadShipFile(_))));
     assert!(matches!(import("log-renamed", &sql("UPDATE log_entries SET agent = 'other'")), Err(Error::BadShipFile(_))));
-    // The right log with the wrong key, and no key at all.
-    assert!(matches!(import("log-wrong-key", &|out| fs::write(out.join("zod.key"), [7u8; 32]).unwrap()), Err(Error::BadShipFile(_))));
-    assert!(matches!(import("log-no-key", &|out| fs::remove_file(out.join("zod.key")).unwrap()), Err(Error::BadShipFile(_))));
+    // The right log with the wrong key.
+    assert!(matches!(import("log-wrong-key", &|out| reseal(out, "zod", |seed, _| *seed = [7; 32])), Err(Error::BadShipFile(_))));
 }
 
 #[test]
@@ -1732,10 +1789,10 @@ fn a_follower_part_way_through_keeps_its_place() {
     // Its place survives the ship being closed and reopened, and a move to another runtime.
     rt.sleep_idle(Duration::ZERO);
     assert_eq!(read(&rt, "tally", "tally", "seen"), "3");
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
 
     let other = Runtime::open(&b.0, cfg).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(read(&other, "tally", "tally", "seen"), "3");
     while other.run_pending("~zod", 10).unwrap() > 0 {}
     assert_eq!(read(&other, "tally", "tally", "seen"), "5");
@@ -1798,7 +1855,7 @@ fn two_ships_with_the_same_name_cannot_be_mixed_up_on_import() {
         for _ in 0..entries {
             send(&rt, "~zod", "counter", "log hits");
         }
-        rt.export_ship("~zod", &out.0).unwrap();
+        export(&rt, "~zod", &out.0).unwrap();
     }
     let rt = Runtime::open(&dest.0, fast()).unwrap();
     let won = AtomicUsize::new(0);
@@ -1806,7 +1863,7 @@ fn two_ships_with_the_same_name_cannot_be_mixed_up_on_import() {
         for attempt in 0..8 {
             let (rt, won) = (&rt, &won);
             let out = if attempt % 2 == 0 { &out_a } else { &out_b };
-            scope.spawn(move || match rt.import_ship(&out.0, "~zod") {
+            scope.spawn(move || match rt.import_ship(&out.0, "~zod", CODE) {
                 Ok(()) => drop(won.fetch_add(1, Ordering::SeqCst)),
                 Err(Error::ShipExists(_)) => {}
                 Err(e) => panic!("unexpected import error: {e}"),
@@ -1823,18 +1880,19 @@ fn two_ships_with_the_same_name_cannot_be_mixed_up_on_import() {
 }
 
 #[test]
-fn an_exported_key_is_private_whatever_was_there_before() {
+fn an_exported_copy_is_private_whatever_was_there_before() {
     use std::os::unix::fs::PermissionsExt;
     let (dir, out) = (TempDir::new("key-perms"), TempDir::new("key-perms-out"));
     let rt = boot(&dir, fast());
-    // Something already sits where the key will go, readable by everyone.
-    let key_file = out.0.join("zod.key");
-    fs::write(&key_file, b"old").unwrap();
-    fs::set_permissions(&key_file, fs::Permissions::from_mode(0o644)).unwrap();
-    rt.export_ship("~zod", &out.0).unwrap();
-    assert_eq!(fs::metadata(&key_file).unwrap().permissions().mode() & 0o777, 0o600);
-    assert_eq!(fs::read(&key_file).unwrap().len(), 32);
-    assert_eq!(fs::read_dir(&out.0).unwrap().count(), 3, "export left scratch files behind");
+    // Something already sits where the copy will go, readable by everyone.
+    let copy = out.0.join("zod.ship");
+    fs::write(&copy, b"old").unwrap();
+    fs::set_permissions(&copy, fs::Permissions::from_mode(0o644)).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
+    assert_eq!(fs::metadata(&copy).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(fs::read(&copy).unwrap().starts_with(b"ship.v1.export\n"));
+    // The copy and the modules. The signing key is inside the copy, not in a file of its own.
+    assert_eq!(fs::read_dir(&out.0).unwrap().count(), 2, "export left other files behind");
 }
 
 #[test]
@@ -2054,11 +2112,11 @@ fn settle(rt: &Runtime) {
     panic!("the ship's queue never emptied");
 }
 
-/// Sign a checkpoint the way the runtime does, with a ship's key read from `key_file`.
-fn sign_checkpoint(key_file: &Path, body: &ship_proto::CheckpointBody) -> SignedCheckpoint {
+/// Sign a checkpoint the way the runtime does, with a ship's signing key.
+fn sign_checkpoint(seed: &[u8; 32], body: &ship_proto::CheckpointBody) -> SignedCheckpoint {
     use ed25519_dalek::Signer;
     use ship_proto::Message;
-    let key = ed25519_dalek::SigningKey::from_bytes(&fs::read(key_file).unwrap().try_into().unwrap());
+    let key = ed25519_dalek::SigningKey::from_bytes(seed);
     let body = body.encode_to_vec();
     let signature = key.sign(&[b"ship.v1.checkpoint\n".as_slice(), &body].concat()).to_bytes().to_vec();
     SignedCheckpoint { body, signature }
@@ -2127,7 +2185,7 @@ fn old_entries_are_dropped_once_a_checkpoint_can_stand_in_for_them() {
     drop(rt);
 
     // The dropped entries are really gone from the file, not merely hidden.
-    let file = rusqlite::Connection::open(dir.0.join("ships").join("zod.ship")).unwrap();
+    let file = live(&dir.0, "zod");
     let hidden: i64 = file
         .query_row(
             "SELECT COUNT(*) FROM log_entries e JOIN logs l ON l.agent = e.agent AND l.name = e.name WHERE e.seq <= l.base",
@@ -2168,9 +2226,9 @@ fn a_checkpoint_is_checked_like_an_entry() {
 
     // Signed with the ship's own key, but naming no entry, or giving no usable hash for it.
     use ship_proto::Message;
-    let key_file = dir.0.join("keys").join("zod.key");
+    let seed = seed_of(&dir.0, "zod");
     let genuine = ship_proto::CheckpointBody::decode(&*signed.body).unwrap();
-    let resign = |body: &ship_proto::CheckpointBody| sign_checkpoint(&key_file, body);
+    let resign = |body: &ship_proto::CheckpointBody| sign_checkpoint(&seed, body);
     assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &resign(&genuine)).is_ok());
     let nowhere = ship_proto::CheckpointBody { seq: 0, ..genuine.clone() };
     assert!(verify_checkpoint(&key, "~zod", "counter", "counter", &resign(&nowhere)).is_err());
@@ -2252,9 +2310,9 @@ fn a_history_log_is_kept_whole_and_asked_about_once() {
     assert_eq!(rt.log_entries("~zod", "counter", "journal", 0, NO_LIMIT).unwrap().len(), 20);
 
     // The agent's answer goes with the ship: an imported copy does not ask again either.
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
     let other = Runtime::open(&b.0, checkpointing()).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     for n in 21..=40 {
         assert_eq!(send(&other, "~zod", "counter", &format!("journal line {n}")), n.to_string());
     }
@@ -2333,7 +2391,7 @@ fn a_log_with_checkpoints_does_not_fill_up() {
 
     // What each log is recorded as holding is exactly the entries that are there, and within
     // the limit. Checkpoints are not counted as entries.
-    let file = rusqlite::Connection::open(dir.0.join("ships").join("zod.ship")).unwrap();
+    let file = live(&dir.0, "zod");
     let total = |sql: &str| file.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
     let wrong = total(
         "SELECT COUNT(*) FROM logs l WHERE l.bytes !=
@@ -2358,10 +2416,10 @@ fn a_trimmed_log_survives_export_and_import() {
     send(&rt, "~zod", "tally", "follow");
     let (key, base, taken) = (rt.public_key("~zod").unwrap(), dropped(&rt), checkpoint(&rt));
     let signed = rt.log_checkpoint("~zod", "counter", "counter").unwrap();
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
 
     let other = Runtime::open(&b.0, cfg).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(dropped(&other), base);
     assert_eq!(other.log_checkpoint("~zod", "counter", "counter").unwrap(), signed);
     assert_eq!(other.log_head("~zod", "counter", "counter").unwrap().unwrap().0, 20);
@@ -2417,21 +2475,22 @@ fn import_refuses_a_trimmed_log_that_does_not_check_out() {
             send(&rt, "~zod", "counter", "log hits");
         }
         // An earlier export of the same ship, kept beside the later one as `early.ship`.
-        rt.export_ship("~zod", &early.0).unwrap();
+        export(&rt, "~zod", &early.0).unwrap();
         for _ in 0..12 {
             send(&rt, "~zod", "counter", "log hits");
         }
-        rt.export_ship("~zod", &out.0).unwrap();
-        fs::copy(early.0.join("zod.ship"), out.0.join("early.ship")).unwrap();
+        export(&rt, "~zod", &out.0).unwrap();
+        fs::write(out.0.join("early.ship"), unsealed(&early.0, "zod").1).unwrap();
         damage(&out.0);
         fs::remove_file(out.0.join("early.ship")).unwrap();
-        Runtime::open(&b.0, checkpointing()).unwrap().import_ship(&out.0, "~zod")
+        Runtime::open(&b.0, checkpointing()).unwrap().import_ship(&out.0, "~zod", CODE)
     };
     let sql = |statement: &'static str| {
         move |out: &Path| {
-            let file = rusqlite::Connection::open(out.join("zod.ship")).unwrap();
-            file.execute("ATTACH ?1 AS early", [out.join("early.ship").to_str().unwrap()]).unwrap();
-            file.execute_batch(statement).unwrap();
+            rework(out, "zod", |_, file| {
+                file.execute("ATTACH ?1 AS early", [out.join("early.ship").to_str().unwrap()]).unwrap();
+                file.execute_batch(statement).unwrap();
+            })
         }
     };
     let refused = |label: &str, statement: &'static str| {
@@ -2468,18 +2527,22 @@ fn import_refuses_a_trimmed_log_that_does_not_check_out() {
     assert!(tight.is_ok(), "{tight:?}");
     // The same, with a checkpoint that is signed but gives its entry the wrong hash. The entry
     // itself is gone, so what shows it is the next entry's link back.
-    let unlinked = import("cp-all-forged", &|out| {
+    let forge = |seed: &[u8; 32], file: &rusqlite::Connection| {
         use ship_proto::Message;
-        let file = rusqlite::Connection::open(out.join("zod.ship")).unwrap();
         let body: Vec<u8> = file.query_row("SELECT body FROM checkpoints", [], |row| row.get(0)).unwrap();
         let wrong = ship_proto::CheckpointBody { hash: vec![9; 32], ..ship_proto::CheckpointBody::decode(&*body).unwrap() };
-        let signed = sign_checkpoint(&out.join("zod.key"), &wrong);
+        let signed = sign_checkpoint(seed, &wrong);
         file.execute("UPDATE checkpoints SET body = ?1, signature = ?2", rusqlite::params![signed.body, signed.signature]).unwrap();
-        file.execute_batch(
-            "UPDATE logs SET base = (SELECT seq FROM checkpoints);
-             DELETE FROM log_entries WHERE seq <= (SELECT seq FROM checkpoints)",
-        )
-        .unwrap();
+    };
+    let unlinked = import("cp-all-forged", &|out| {
+        rework(out, "zod", |seed, file| {
+            forge(seed, file);
+            file.execute_batch(
+                "UPDATE logs SET base = (SELECT seq FROM checkpoints);
+                 DELETE FROM log_entries WHERE seq <= (SELECT seq FROM checkpoints)",
+            )
+            .unwrap();
+        })
     });
     assert!(matches!(unlinked, Err(Error::BadShipFile(_))), "{unlinked:?}");
     // Every entry dropped. A log may hold none, but only when its checkpoint stands for its
@@ -2488,14 +2551,7 @@ fn import_refuses_a_trimmed_log_that_does_not_check_out() {
     refused("cp-emptied", "UPDATE logs SET base = head; DELETE FROM log_entries");
     // A checkpoint that really is signed by the ship, for the right entry, but giving that
     // entry a hash it does not have. Only comparing it with the entry itself shows this.
-    let forged = import("cp-forged", &|out| {
-        use ship_proto::Message;
-        let file = rusqlite::Connection::open(out.join("zod.ship")).unwrap();
-        let body: Vec<u8> = file.query_row("SELECT body FROM checkpoints", [], |row| row.get(0)).unwrap();
-        let wrong = ship_proto::CheckpointBody { hash: vec![9; 32], ..ship_proto::CheckpointBody::decode(&*body).unwrap() };
-        let signed = sign_checkpoint(&out.join("zod.key"), &wrong);
-        file.execute("UPDATE checkpoints SET body = ?1, signature = ?2", rusqlite::params![signed.body, signed.signature]).unwrap();
-    });
+    let forged = import("cp-forged", &|out| rework(out, "zod", forge));
     assert!(matches!(forged, Err(Error::BadShipFile(_))), "{forged:?}");
     // The newest entries removed.
     refused("cp-cut", "DELETE FROM log_entries WHERE seq > (SELECT seq FROM checkpoints)");
@@ -2671,11 +2727,11 @@ fn a_waiting_checkpoint_request_survives_export_and_import() {
         send(&rt, "~zod", "counter", "log hits");
     }
     assert_eq!(rt.pending("~zod").unwrap(), 1);
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
 
     // The request goes with the ship, like anything else that is waiting.
     let other = Runtime::open(&b.0, cfg).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert!(other.log_checkpoint("~zod", "counter", "counter").unwrap().is_none());
     assert_eq!(other.pending("~zod").unwrap(), 1);
     // And the copy knows it is waiting: another entry does not ask a second time.
@@ -2691,9 +2747,9 @@ fn a_waiting_checkpoint_request_survives_export_and_import() {
     let rt = boot(&a, cfg.clone());
     send(&rt, "~zod", "counter", "log-big 150");
     assert_eq!(rt.pending("~zod").unwrap(), 1);
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
     let other = Runtime::open(&b.0, cfg).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(other.pending("~zod").unwrap(), 1);
     settle(&other);
     assert_eq!(send(&other, "~zod", "counter", "log-big 150"), "2");
@@ -2713,9 +2769,9 @@ fn a_ship_has_a_bounded_number_of_logs() {
     let rt = boot_with_journal(&a, fast());
     send(&rt, "~zod", "counter", "log hits");
     send(&rt, "~zod", "counter", "journal a second log");
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
     let strict = Runtime::open(&b.0, Config { max_logs: 1, ..fast() }).unwrap();
-    assert!(matches!(strict.import_ship(&out.0, "~zod"), Err(Error::BadShipFile(_))));
+    assert!(matches!(strict.import_ship(&out.0, "~zod", CODE), Err(Error::BadShipFile(_))));
 }
 
 #[test]
@@ -2809,10 +2865,10 @@ fn import_keeps_the_queue_in_its_order() {
     // big to fit unless that checkpoint has been taken first.
     send(&rt, "~zod", "tally", "forward log-big 600");
     assert_eq!(rt.pending("~zod").unwrap(), 2);
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
 
     let other = Runtime::open(&b.0, cfg).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(other.pending("~zod").unwrap(), 2);
     // A queued command that is refused is dropped for good, so the order matters. The copy
     // ends up exactly where the original does.
@@ -2835,9 +2891,9 @@ fn import_keeps_the_queue_in_its_order() {
     }
     send(&rt, "~zod", "tally", "forward log-big 600");
     assert_eq!(rt.pending("~zod").unwrap(), 3);
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
     let other = Runtime::open(&b.0, cfg).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     for ship in [&rt, &other] {
         settle(ship);
         assert_eq!(ship.log_head("~zod", "counter", "counter").unwrap().unwrap().0, 6);
@@ -2854,9 +2910,9 @@ fn import_keeps_the_queue_in_its_order() {
     assert!(matches!(rejection(&rt, "counter", "log-big 150"), Rejection::Limit(_)));
     send(&rt, "~zod", "tally", "forward log-big 150");
     assert_eq!(rt.pending("~zod").unwrap(), 2);
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
     let other = Runtime::open(&b.0, cfg).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     for ship in [&rt, &other] {
         settle(ship);
         assert_eq!(ship.log_head("~zod", "counter", "counter").unwrap().unwrap().0, 3);
@@ -2908,10 +2964,10 @@ fn import_refuses_queued_events_the_ship_would_not_have_made() {
             send(&rt, "~zod", "counter", "log hits");
         }
         assert_eq!(rt.pending("~zod").unwrap(), 0);
-        rt.export_ship("~zod", &out.0).unwrap();
-        rusqlite::Connection::open(out.0.join("zod.ship")).unwrap().execute_batch(statement).unwrap();
+        export(&rt, "~zod", &out.0).unwrap();
+        doctor(&out.0, "zod", statement);
         let other = Runtime::open(&b.0, Config { max_queued_per_deliver: 0, ..fast() }).unwrap();
-        (other.import_ship(&out.0, "~zod"), other, b)
+        (other.import_ship(&out.0, "~zod", CODE), other, b)
     };
     let queue = |rows: &str| format!("INSERT INTO inbox (kind, source, agent, interface, payload) VALUES {rows}");
     let refused = |label: &str, rows: &str| {
@@ -2996,9 +3052,9 @@ fn a_full_ship_can_let_go_of_a_logs_only_entry() {
     assert_eq!(rt.log_head("~zod", "counter", "counter").unwrap(), Some((1, hash)));
 
     // A ship in that state can be exported and imported, and both carry on the same chain.
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
     let other = Runtime::open(&b.0, cfg.clone()).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     for ship in [&rt, &other] {
         assert_eq!(send(ship, "~zod", "counter", "log-big 30000"), "2");
         let rest = ship.log_entries("~zod", "counter", "counter", seq, NO_LIMIT).unwrap();
@@ -3007,8 +3063,8 @@ fn a_full_ship_can_let_go_of_a_logs_only_entry() {
 
     // An entry-less log whose recorded end is not the one its checkpoint signed for is refused.
     let c = TempDir::new("cp-last-c");
-    rusqlite::Connection::open(out.0.join("zod.ship")).unwrap().execute_batch("UPDATE logs SET head_hash = zeroblob(32)").unwrap();
-    assert!(matches!(Runtime::open(&c.0, cfg).unwrap().import_ship(&out.0, "~zod"), Err(Error::BadShipFile(_))));
+    doctor(&out.0, "zod", "UPDATE logs SET head_hash = zeroblob(32)");
+    assert!(matches!(Runtime::open(&c.0, cfg).unwrap().import_ship(&out.0, "~zod", CODE), Err(Error::BadShipFile(_))));
 }
 
 // Signing in, and reaching a ship over HTTP.
@@ -3177,10 +3233,10 @@ fn signed_in_devices_go_with_the_ship() {
     // Lock sign-in on the original. That is about guesses made against it, and stays behind.
     assert!(matches!(rt.sign_in("~zod", "guess", "x"), Err(Error::SignInRefused)));
     assert!(matches!(rt.sign_in("~zod", &code, "x"), Err(Error::SignInLocked(_))));
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
 
     let other = Runtime::open(&b.0, cfg.clone()).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(other.authenticate("~zod", &phone).unwrap().label, "phone");
     assert_eq!(other.authenticate("~zod", &laptop).unwrap().label, "laptop");
     let (_, third) = other.sign_in("~zod", &code, "tablet").unwrap();
@@ -3195,9 +3251,9 @@ fn signed_in_devices_go_with_the_ship() {
         let dir = TempDir::new(label);
         fs::remove_dir_all(&c.0).ok();
         fs::create_dir_all(&c.0).unwrap();
-        rt.export_ship("~zod", &c.0).unwrap();
-        rusqlite::Connection::open(c.0.join("zod.ship")).unwrap().execute_batch(statement).unwrap();
-        let result = Runtime::open(&dir.0, cfg).unwrap().import_ship(&c.0, "~zod");
+        export(&rt, "~zod", &c.0).unwrap();
+        doctor(&c.0, "zod", statement);
+        let result = Runtime::open(&dir.0, cfg).unwrap().import_ship(&c.0, "~zod", CODE);
         assert!(matches!(result, Err(Error::BadShipFile(_))), "{label}: {result:?}");
     };
     tampered("dev-short", "UPDATE devices SET token_hash = x'0102030405' WHERE seq = 1", cfg.clone());
@@ -5004,7 +5060,7 @@ fn ships_that_disagree_about_what_has_passed_between_them_stop_and_say_so() {
     let doz_key = doz.public_key("~doz").unwrap();
     drop(doz_net);
     drop(doz);
-    let seed: [u8; 32] = fs::read(c.0.join("keys").join("doz.key")).unwrap().try_into().unwrap();
+    let seed = seed_of(&c.0, "doz");
     let (addr, _stand_in, _) = stand_in(seed, seed, true, 0);
     directory.set("~doz", doz_key, addr).unwrap();
     send(&bus, "~bus", "tally", "tell doz inc hits");
@@ -5032,7 +5088,7 @@ fn commands_in_hand_and_what_has_been_taken_go_with_a_ship_that_moves() {
         send(&zod, "~zod", "tally", "tell nec inc hits");
     }
     drop(zod_net);
-    zod.export_ship("~zod", &out.0).unwrap();
+    export(&zod, "~zod", &out.0).unwrap();
     drop(zod);
 
     // The runtime it moves to has its network up and running already, with nothing to carry.
@@ -5040,7 +5096,7 @@ fn commands_in_hand_and_what_has_been_taken_go_with_a_ship_that_moves() {
     let moved = Arc::new(Runtime::open(&c.0, fast()).unwrap());
     let moved_net = Network::start(moved.clone(), directory.clone(), eager()).unwrap();
     std::thread::sleep(Duration::from_millis(300));
-    moved.import_ship(&out.0, "~zod").unwrap();
+    moved.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(moved.outbound_pending("~zod").unwrap(), 3);
     assert_eq!(moved.unanswered("~zod").unwrap(), 3);
     directory.set("~zod", moved.public_key("~zod").unwrap(), moved_net.addr()).unwrap();
@@ -5075,9 +5131,9 @@ fn commands_in_hand_and_what_has_been_taken_go_with_a_ship_that_moves() {
             let entry = entry.unwrap();
             fs::copy(entry.path(), copy.0.join("blobs").join(entry.file_name())).unwrap();
         }
-        rusqlite::Connection::open(copy.0.join("zod.ship")).unwrap().execute_batch(statement).unwrap();
+        doctor(&copy.0, "zod", statement);
         let rt = Runtime::open(&dir.0, cfg).unwrap();
-        let imported = rt.import_ship(&copy.0, "~zod");
+        let imported = rt.import_ship(&copy.0, "~zod", CODE);
         (rt, dir, imported)
     };
     let tampered_for = |label: &str, statement: &str, cfg: Config| tampered_in(label, statement, cfg).2;
@@ -5650,12 +5706,12 @@ fn every_command_that_is_taken_is_run_however_many_arrive_at_once() {
     eventually("~nec takes them", || nec.pending("~nec").unwrap() == 2 && zod.outbound_pending("~zod").unwrap() == 0);
     let (c, out) = (TempDir::new("cmd-all-c"), TempDir::new("cmd-all-out"));
     drop(nec_net);
-    nec.export_ship("~nec", &out.0).unwrap();
+    export(&nec, "~nec", &out.0).unwrap();
     drop(nec);
     let moved = Arc::new(Runtime::open(&c.0, fast()).unwrap());
     let moved_net = Network::start(moved.clone(), directory.clone(), eager()).unwrap();
     std::thread::sleep(Duration::from_millis(300));
-    moved.import_ship(&out.0, "~nec").unwrap();
+    moved.import_ship(&out.0, "~nec", CODE).unwrap();
     directory.set("~nec", moved.public_key("~nec").unwrap(), moved_net.addr()).unwrap();
     eventually("they run in the ship's new home", || count(&moved, "~nec", "hits") == "155");
     eventually("and are answered", || zod.unanswered("~zod").unwrap() == 0);
@@ -5683,14 +5739,15 @@ fn a_ship_with_small_events_that_has_had_receipts_can_still_move() {
     eventually("the refusal comes back", || view(&rt, "~zod", "tally", "receipts").lines().count() == 1);
     assert!(rt.audit("~zod", 100).unwrap().iter().any(|entry| entry.event.len() > 30));
     drop(net);
-    rt.export_ship("~zod", &out.0).unwrap();
+    export(&rt, "~zod", &out.0).unwrap();
     let other = Runtime::open(&c.0, small).unwrap();
-    other.import_ship(&out.0, "~zod").unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(view(&other, "~zod", "tally", "receipts"), view(&rt, "~zod", "tally", "receipts"));
 
     // A network that could not carry the largest command its ships may send does not start.
+    // (Its checkpoints are small, so that the size of a command is all that is in the way.)
     let d = TempDir::new("receipt-small-d");
-    let spare = Arc::new(Runtime::open(&d.0, fast()).unwrap());
+    let spare = Arc::new(Runtime::open(&d.0, Config { max_checkpoint_bytes: 1000, ..fast() }).unwrap());
     let cramped = NetConfig { max_message_bytes: 1 << 20, ..eager() };
     assert!(Network::start(spare.clone(), directory.clone(), cramped).is_err());
     // With room for the largest command and what goes round it, it does.
@@ -5827,7 +5884,7 @@ fn two_ships_that_have_filled_up_with_commands_for_each_other_still_get_through(
     let directory = Directory::new();
     // Two ships with small files. Each sends the other as much as it is let, while the
     // other is not there to take any of it.
-    let small = Config { max_ship_bytes: 288 << 10, ..fast() };
+    let small = Config { max_ship_bytes: 304 << 10, ..fast() };
     let padding = "p".repeat(2000);
     let fill = |rt: &Runtime, ship: &str, other: &str| {
         let command = format!("tell {other} inc hits 1 {padding}");
@@ -6460,8 +6517,8 @@ fn a_number_no_log_could_reach_is_not_believed() {
     assert_eq!(heard, Some(Answered::Heard(ship_proto::Heard { unknown: vec![false] })));
     assert_eq!(followed(&nec, "~nec").announced, 3);
     let (out, other) = (TempDir::new("flw-far-out"), TempDir::new("flw-far-other"));
-    nec.export_ship("~nec", &out.0).unwrap();
-    Runtime::open(&other.0, fast()).unwrap().import_ship(&out.0, "~nec").unwrap();
+    export(&nec, "~nec", &out.0).unwrap();
+    Runtime::open(&other.0, fast()).unwrap().import_ship(&out.0, "~nec", CODE).unwrap();
 }
 
 #[test]
@@ -6529,7 +6586,8 @@ fn a_network_that_could_not_carry_a_logs_checkpoint_does_not_start() {
     let directory = Directory::new();
     // A ship that follows a log may be sent its checkpoint whole. A network with no room
     // for the largest one a log here may have would leave such a follower stuck for good.
-    let cfg = Config { max_event_bytes: 1000, max_checkpoint_bytes: 100_000, ..fast() };
+    // (Few commands may go unanswered, so that the checkpoint is all that is in the way.)
+    let cfg = Config { max_event_bytes: 1000, max_checkpoint_bytes: 100_000, max_unanswered: 1000, ..fast() };
     let rt = Arc::new(Runtime::open(&dir.0, cfg).unwrap());
     let cramped = NetConfig { max_message_bytes: 50_000, ..eager() };
     assert!(Network::start(rt.clone(), directory.clone(), cramped).is_err());
@@ -6810,11 +6868,11 @@ fn followed_logs_go_with_a_ship_that_is_moved() {
     eventually("the agent has given up on them", || nec.pending("~nec").unwrap() == 0);
 
     // ~nec moves to another runtime with what it holds, and carries on from there.
-    nec.export_ship("~nec", &out.0).unwrap();
+    export(&nec, "~nec", &out.0).unwrap();
     stopped(nec_net, nec);
     let other = Arc::new(Runtime::open(&c.0, fast()).unwrap());
     let other_net = Network::start(other.clone(), directory.clone(), eager()).unwrap();
-    other.import_ship(&out.0, "~nec").unwrap();
+    other.import_ship(&out.0, "~nec", CODE).unwrap();
     directory.set("~nec", other.public_key("~nec").unwrap(), other_net.addr()).unwrap();
     let log = followed(&other, "~nec");
     assert_eq!((log.taken, log.fetched), (0, 6));
@@ -6829,11 +6887,11 @@ fn followed_logs_go_with_a_ship_that_is_moved() {
     send(&zod, "~zod", "counter", "log hits");
     std::thread::sleep(Duration::from_millis(300));
     let (d, zod_out) = (TempDir::new("flw-move-d"), TempDir::new("flw-move-zod-out"));
-    zod.export_ship("~zod", &zod_out.0).unwrap();
+    export(&zod, "~zod", &zod_out.0).unwrap();
     stopped(zod_net, zod);
     let moved = Arc::new(Runtime::open(&d.0, fast()).unwrap());
     let moved_net = Network::start(moved.clone(), directory.clone(), eager()).unwrap();
-    moved.import_ship(&zod_out.0, "~zod").unwrap();
+    moved.import_ship(&zod_out.0, "~zod", CODE).unwrap();
     directory.set("~zod", moved.public_key("~zod").unwrap(), moved_net.addr()).unwrap();
     let other_net = Network::start(other.clone(), directory.clone(), eager()).unwrap();
     directory.set("~nec", other.public_key("~nec").unwrap(), other_net.addr()).unwrap();
@@ -6891,10 +6949,10 @@ fn import_checks_what_a_ship_holds_of_other_ships_logs_and_who_follows_its_own()
         let dir = TempDir::new(label);
         fs::remove_dir_all(&out.0).ok();
         fs::create_dir_all(&out.0).unwrap();
-        rt.export_ship(ship, &out.0).unwrap();
-        rusqlite::Connection::open(out.0.join(format!("{}.ship", ship.trim_start_matches('~')))).unwrap().execute_batch(statement).unwrap();
+        export(&rt, ship, &out.0).unwrap();
+        doctor(&out.0, ship.trim_start_matches('~'), statement);
         let other = Runtime::open(&dir.0, cfg).unwrap();
-        let result = other.import_ship(&out.0, ship);
+        let result = other.import_ship(&out.0, ship, CODE);
         (result, other, dir)
     };
     let held = |label: &str, statement: &str| tampered(&nec, "~nec", label, statement, fast()).0;
@@ -6907,7 +6965,7 @@ fn import_checks_what_a_ship_holds_of_other_ships_logs_and_who_follows_its_own()
     let log = followed(&other, "~nec");
     assert_eq!((log.taken, log.fetched, log.announced), (0, 6, 6));
     drop(other);
-    let file = rusqlite::Connection::open(dir.0.join("ships").join("nec.ship")).unwrap();
+    let file = live(&dir.0, "nec");
     assert_eq!(file.query_row("SELECT joined FROM remote_logs", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     // How much is held is counted afresh, so a wrong figure there does no harm.
     held("held-recount", "UPDATE remote_logs SET bytes = 999999").unwrap();
@@ -6981,7 +7039,7 @@ fn import_checks_what_a_ship_holds_of_other_ships_logs_and_who_follows_its_own()
     result.unwrap();
     assert_eq!(other.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
     drop(other);
-    let file = rusqlite::Connection::open(dir.0.join("ships").join("zod.ship")).unwrap();
+    let file = live(&dir.0, "zod");
     assert_eq!(file.query_row("SELECT due FROM log_peers", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     shared("pub-everyone", "INSERT INTO log_shares VALUES ('counter', 'counter', '*')").unwrap();
     for (label, statement) in [
@@ -7088,8 +7146,8 @@ fn entries_asked_for_before_stopping_cannot_be_collected_after_starting_again() 
     assert_eq!(followed(&nec, "~nec").taken, 0);
     eventually("the log is fetched again from the start", || followed(&nec, "~nec").fetched == 3);
     let (out, other) = (TempDir::new("flw-sneak-out"), TempDir::new("flw-sneak-other"));
-    nec.export_ship("~nec", &out.0).unwrap();
-    Runtime::open(&other.0, fast()).unwrap().import_ship(&out.0, "~nec").unwrap();
+    export(&nec, "~nec", &out.0).unwrap();
+    Runtime::open(&other.0, fast()).unwrap().import_ship(&out.0, "~nec", CODE).unwrap();
 }
 
 #[test]
@@ -7125,7 +7183,7 @@ fn being_told_a_log_is_closed_is_a_reason_to_ask_and_no_more() {
     // News that the log is closed to ~nec reaches it late: sent while ~nec was shut out,
     // arriving after it was let back in. (Here it is sent by hand, as ~zod.) ~nec does not
     // stop on the strength of it. It asks ~zod, which shares the log, and carries on.
-    let seed: [u8; 32] = fs::read(a.0.join("keys").join("zod.key")).unwrap().try_into().unwrap();
+    let seed = seed_of(&a.0, "zod");
     let closed = ship_proto::LogNews { agent: "counter".into(), log: "counter".into(), head: 0, closed: true };
     let heard = ask_ship(nec_net.addr(), "nec", seed, Asked::News(ship_proto::News { logs: vec![closed] }));
     assert_eq!(heard, Some(Answered::Heard(ship_proto::Heard { unknown: vec![false] })));
@@ -7333,14 +7391,14 @@ fn watchful() -> NetConfig {
 fn brought_back(dir: &TempDir, saved: &TempDir, ship: &str, directory: &Arc<Directory>, net: NetConfig) -> (Arc<Runtime>, Network) {
     let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
     let network = Network::start(rt.clone(), directory.clone(), net).unwrap();
-    rt.import_ship(&saved.0, ship).unwrap();
+    rt.import_ship(&saved.0, ship, CODE).unwrap();
     directory.set(ship, rt.public_key(ship).unwrap(), network.addr()).unwrap();
     (rt, network)
 }
 
 /// One number read from a ship's file while its runtime is running.
 fn in_file(dir: &TempDir, ship: &str, query: &str) -> i64 {
-    let file = rusqlite::Connection::open(dir.0.join("ships").join(format!("{ship}.ship"))).unwrap();
+    let file = live(&dir.0, ship);
     file.query_row(query, [], |r| r.get(0)).unwrap()
 }
 
@@ -7360,7 +7418,7 @@ fn a_ship_brought_in_from_a_saved_copy_shows_a_new_mark() {
     };
     assert_eq!(shown(zod_net.addr()), mark);
     // The same ship in the same runtime, stopped and started, is the same copy of itself.
-    zod.export_ship("~zod", &out.0).unwrap();
+    export(&zod, "~zod", &out.0).unwrap();
     stopped(zod_net, zod);
     let (zod, zod_net) = back(&a, "~zod", &directory, fast());
     assert_eq!((zod.incarnation("~zod").unwrap(), shown(zod_net.addr())), (mark, mark.to_vec()));
@@ -7372,7 +7430,7 @@ fn a_ship_brought_in_from_a_saved_copy_shows_a_new_mark() {
     // And every time it is brought in, it is another copy again.
     let d = TempDir::new("mark-d");
     let again = Runtime::open(&d.0, fast()).unwrap();
-    again.import_ship(&out.0, "~zod").unwrap();
+    again.import_ship(&out.0, "~zod", CODE).unwrap();
     assert!(again.incarnation("~zod").unwrap() != fresh && again.incarnation("~zod").unwrap() != mark);
     // Two ships made alike have different marks.
     let c = TempDir::new("mark-c");
@@ -7391,7 +7449,7 @@ fn a_publisher_brought_back_from_before_a_ship_followed_it_is_asked_again() {
         send(&zod, "~zod", "counter", "log hits");
     }
     // ~zod is saved as it is now: nobody follows its log yet.
-    zod.export_ship("~zod", &saved.0).unwrap();
+    export(&zod, "~zod", &saved.0).unwrap();
     send(&nec, "~nec", "tally", "follow-on zod");
     eventually("~nec follows", || seen_on(&nec, "~nec", "zod") == 2);
     assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
@@ -7475,7 +7533,7 @@ fn a_ship_brought_back_from_a_saved_copy_gets_back_in_step_with_one_it_took_comm
     eventually("three run on ~nec and are answered", || count(&nec, "~nec", "hits") == "3" && zod.unanswered("~zod").unwrap() == 0);
     eventually("and ~nec has nothing left to send", || nec.outbound_pending("~nec").unwrap() == 0);
     // ~nec is saved as it is now, and then takes four more.
-    nec.export_ship("~nec", &saved.0).unwrap();
+    export(&nec, "~nec", &saved.0).unwrap();
     for _ in 0..4 {
         send(&zod, "~zod", "tally", "tell nec inc hits");
     }
@@ -7513,7 +7571,7 @@ fn a_ship_brought_back_from_a_saved_copy_does_not_reuse_numbers_the_other_ship_h
     eventually("three run and are answered", || count(&nec, "~nec", "hits") == "3" && zod.unanswered("~zod").unwrap() == 0);
     // ~zod is saved, sends four more, and is then brought back from the saved copy. It
     // remembers sending three. ~nec has had seven.
-    zod.export_ship("~zod", &saved.0).unwrap();
+    export(&zod, "~zod", &saved.0).unwrap();
     for _ in 0..4 {
         send(&zod, "~zod", "tally", "tell nec inc hits");
     }
@@ -7635,8 +7693,8 @@ fn a_ship_is_believed_about_where_it_stands_only_within_bounds() {
     assert_eq!(stood(ask(stands(8, 5, 9, &[]))), stands(5, 8, 6, &[]));
     assert_eq!(stood(ask(stands(8, 2, 3, &[]))), stands(5, 8, 6, &[]));
     // What was done leaves a file the ship can still be moved with.
-    zod.export_ship("~zod", &out.0).unwrap();
-    Runtime::open(&other.0, fast()).unwrap().import_ship(&out.0, "~zod").unwrap();
+    export(&zod, "~zod", &out.0).unwrap();
+    Runtime::open(&other.0, fast()).unwrap().import_ship(&out.0, "~zod", CODE).unwrap();
 }
 
 #[test]
@@ -7651,7 +7709,7 @@ fn a_ship_that_is_moved_says_where_it_stands_and_nothing_is_lost() {
     eventually("three run and are answered", || count(&nec, "~nec", "hits") == "3" && zod.unanswered("~zod").unwrap() == 0);
     // ~zod is moved, as it is, to another runtime. It did not go back to anything, but it
     // cannot know that, so it says where it stands. The two agree, and that is the end of it.
-    zod.export_ship("~zod", &out.0).unwrap();
+    export(&zod, "~zod", &out.0).unwrap();
     stopped(zod_net, zod);
     let (zod, zod_net) = brought_back(&c, &out, "~zod", &directory, eager());
     eventually("the two have compared notes", || in_file(&c, "zod", "SELECT resync FROM peers WHERE peer = 'nec'") == 0);
@@ -7707,7 +7765,7 @@ fn a_command_taken_by_a_ship_that_then_went_back_to_before_it_knew_the_sender_is
     let idle = Config { max_queued_per_deliver: 0, ..fast() };
     let (nec, nec_net) = crewed(&b, "~nec", &directory, idle, open_counter(), far_tally("*"));
     // ~nec is saved before it has had any dealings with ~zod.
-    nec.export_ship("~nec", &saved.0).unwrap();
+    export(&nec, "~nec", &saved.0).unwrap();
     send(&zod, "~zod", "tally", "tell nec inc hits");
     eventually("~nec has the command", || zod.outbound_pending("~zod").unwrap() == 0);
     assert_eq!((nec.pending("~nec").unwrap(), zod.unanswered("~zod").unwrap()), (1, 1));
@@ -7742,8 +7800,8 @@ fn two_ships_that_both_have_to_compare_notes_get_it_done() {
     eventually("nothing is left to send", || zod.outbound_pending("~zod").unwrap() + nec.outbound_pending("~nec").unwrap() == 0);
     // Both are moved at once, so each has to tell the other where it stands, and each
     // has a command waiting to go as soon as it has.
-    zod.export_ship("~zod", &out_a.0).unwrap();
-    nec.export_ship("~nec", &out_b.0).unwrap();
+    export(&zod, "~zod", &out_a.0).unwrap();
+    export(&nec, "~nec", &out_b.0).unwrap();
     stopped(zod_net, zod);
     stopped(nec_net, nec);
     let (zod, _zod_net) = brought_back(&c, &out_a, "~zod", &directory, eager());
@@ -7802,4 +7860,350 @@ fn what_arrives_on_a_connection_that_has_been_replaced_is_not_acted_on() {
     // The same command on a connection that is still the newest is taken.
     assert_eq!(hand_over(addr, "zod", BUS, vec![command]), 1);
     eventually("it runs", || count(&zod, "~zod", "hits") == "1");
+}
+
+/// Whether `needle` appears anywhere in `haystack`.
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+#[test]
+fn nothing_a_ship_keeps_on_disk_can_be_read_without_the_storage_key() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, out) = (TempDir::new("rest"), TempDir::new("rest-out"));
+    let rt = boot(&dir, fast());
+    send(&rt, "~zod", "counter", "inc plainsightmarker 7");
+    let (ship_file, key_file) = (dir.0.join("ships").join("zod.ship"), dir.0.join("keys").join("zod.key"));
+    let seed = seed_of(&dir.0, "zod");
+    assert_eq!(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(), rt.public_key("~zod").unwrap());
+
+    // The ship's file and the files SQLite keeps beside it while the ship is open: none of
+    // them shows what the ship holds, what kind of file it is, or the ship's signing key.
+    let beside = |suffix: &str| {
+        let mut path = ship_file.clone().into_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    let unreadable = |when: &str| {
+        for suffix in ["", "-wal", "-journal"] {
+            let Ok(bytes) = fs::read(beside(suffix)) else { continue };
+            for shown in [&b"plainsightmarker"[..], b"SQLite format 3", b"CREATE TABLE", b"counter", &seed[..8]] {
+                assert!(!holds(&bytes, shown), "{when}: zod.ship{suffix} shows {:?}", String::from_utf8_lossy(shown));
+            }
+        }
+    };
+    // While the ship is running, what it last wrote is in the file beside its own.
+    assert!(fs::metadata(beside("-wal")).is_ok_and(|wal| wal.len() > 0), "expected the ship to be writing to a file beside its own");
+    unreadable("running");
+    // The same contents, with nothing encrypted, do show all of that: the check can fail.
+    export(&rt, "~zod", &out.0).unwrap();
+    let contents = unsealed(&out.0, "zod").1;
+    assert!(holds(&contents, b"plainsightmarker") && contents.starts_with(b"SQLite format 3") && holds(&contents, b"CREATE TABLE"));
+    drop(rt);
+    unreadable("shut");
+
+    // The file that holds the signing key is private, and the key in it is not there to read.
+    let kept = fs::read(&key_file).unwrap();
+    assert_eq!(kept.len(), 60);
+    assert_eq!(fs::metadata(&key_file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!holds(&kept, &seed[..8]) && !holds(&kept, &seed[24..]));
+
+    // Opened as an ordinary database, or with the key for another ship's file, it is not one.
+    let rows = |file: &rusqlite::Connection| file.query_row("SELECT count(*) FROM kv", [], |row| row.get::<_, i64>(0));
+    assert!(rows(&rusqlite::Connection::open(&ship_file).unwrap()).is_err());
+    let wrong = rusqlite::Connection::open(&ship_file).unwrap();
+    let key: String = seal::ship_file_key(&storage_key(&dir.0), "nec").iter().map(|byte| format!("{byte:02x}")).collect();
+    wrong.execute_batch(&format!("PRAGMA key = \"x'{key}'\";")).unwrap();
+    assert!(rows(&wrong).is_err());
+    // With its own key it is.
+    assert!(rows(&live(&dir.0, "zod")).unwrap() > 0);
+}
+
+#[test]
+fn a_ship_opens_only_under_the_storage_key_it_was_made_with() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("storage-key");
+    let rt = boot(&dir, fast());
+    send(&rt, "~zod", "counter", "inc hits 3");
+    drop(rt);
+
+    // Left to itself, the runtime made a key and kept it in the data directory, private.
+    let kept = dir.0.join("storage.key");
+    assert_eq!(fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o600);
+    let written = fs::read_to_string(&kept).unwrap();
+    assert_eq!(written.trim().len(), 64);
+    let key = StorageKey::from_hex(&written).unwrap();
+    let handed = |key: &StorageKey| Config { storage_key: Some(key.clone()), ..fast() };
+    let hits = |rt: &Runtime| rt.deliver("~zod", "counter", b"get hits").map(|outcome| String::from_utf8(outcome.reply).unwrap());
+
+    // Handed the same key, a runtime needs no kept one, and does not write the key down.
+    fs::remove_file(&kept).unwrap();
+    let rt = Runtime::open(&dir.0, handed(&key)).unwrap();
+    assert_eq!(hits(&rt).unwrap(), "3");
+    drop(rt);
+    assert!(!kept.exists(), "a key that was handed over was written to disk");
+
+    // Handed another key, it does not start: the directory knows its key when it sees it.
+    // Started, it could open none of the ships there, and would make new ones under a
+    // second key beside them.
+    assert!(matches!(Runtime::open(&dir.0, handed(&StorageKey::new([9; 32]))), Err(Error::BadStorageKey(_))));
+    // Handed none, with none kept, it does not make a new one, for the same reason.
+    assert!(matches!(Runtime::open(&dir.0, fast()), Err(Error::BadStorageKey(_))));
+    assert!(!kept.exists());
+    // What the directory tells its key by is not the key, and does not open anything.
+    let told_by = fs::read_to_string(dir.0.join("storage.check")).unwrap();
+    assert!(told_by.trim() != written.trim() && StorageKey::from_hex(&told_by).is_some());
+    assert!(matches!(Runtime::open(&dir.0, handed(&StorageKey::from_hex(&told_by).unwrap())), Err(Error::BadStorageKey(_))));
+    // With that gone or changed there is nothing to go by, and no key is taken on trust.
+    fs::rename(dir.0.join("storage.check"), dir.0.join("set-aside")).unwrap();
+    assert!(matches!(Runtime::open(&dir.0, handed(&key)), Err(Error::BadStorageKey(_))));
+    assert!(matches!(Runtime::open(&dir.0, handed(&StorageKey::new([9; 32]))), Err(Error::BadStorageKey(_))));
+    assert!(!dir.0.join("storage.check").exists());
+    fs::write(dir.0.join("storage.check"), format!("{}\n", "0".repeat(64))).unwrap();
+    assert!(matches!(Runtime::open(&dir.0, handed(&key)), Err(Error::BadStorageKey(_))));
+    fs::write(dir.0.join("storage.check"), format!("{}{}junk", told_by.trim(), " ".repeat(192))).unwrap();
+    assert!(matches!(Runtime::open(&dir.0, handed(&key)), Err(Error::BadStorageKey(_))));
+    fs::rename(dir.0.join("set-aside"), dir.0.join("storage.check")).unwrap();
+
+    // A kept key that is not a key stops the runtime, rather than being replaced: replacing
+    // it would put every ship in the directory out of reach for good.
+    let padded = format!("{}{}junk", written.trim(), " ".repeat(192));
+    for junk in ["", "not a key", &written[..63], &format!("{}0", written.trim()), &padded] {
+        fs::write(&kept, junk).unwrap();
+        assert!(matches!(Runtime::open(&dir.0, fast()), Err(Error::BadStorageKey(_))), "{junk:?}");
+        assert_eq!(fs::read_to_string(&kept).unwrap(), junk);
+    }
+    fs::remove_file(&kept).unwrap();
+    // The same in a directory that has never been used, where there is nothing yet to tell
+    // a key by: what is kept there is not a key, and nothing is started on the strength of it.
+    let unused = TempDir::new("storage-key-unused");
+    fs::write(unused.0.join("storage.key"), "not a key").unwrap();
+    assert!(matches!(Runtime::open(&unused.0, fast()), Err(Error::BadStorageKey(_))));
+    assert!(!unused.0.join("storage.check").exists());
+    assert_eq!(fs::read_to_string(unused.0.join("storage.key")).unwrap(), "not a key");
+    // The right key, handed over, still opens the ship.
+    let rt = Runtime::open(&dir.0, handed(&key)).unwrap();
+    assert_eq!(hits(&rt).unwrap(), "3");
+    drop(rt);
+
+    // One ship's file and key do not open under another ship's name, even with the right
+    // storage key: each ship has keys of its own.
+    fs::copy(dir.0.join("ships").join("zod.ship"), dir.0.join("ships").join("nec.ship")).unwrap();
+    fs::copy(dir.0.join("keys").join("zod.key"), dir.0.join("keys").join("nec.key")).unwrap();
+    let rt = Runtime::open(&dir.0, handed(&key)).unwrap();
+    assert!(matches!(rt.deliver("~nec", "counter", b"get hits"), Err(Error::BadShipFile(why)) if why.contains("storage key")));
+    assert!(matches!(rt.public_key("~nec"), Err(Error::BadShipFile(why)) if why.contains("storage key")));
+    assert_eq!(hits(&rt).unwrap(), "3");
+
+    // A ship's file and key lifted out of the directory and put into another runtime's,
+    // which has a storage key of its own, are of no use there.
+    let elsewhere = TempDir::new("storage-key-elsewhere");
+    drop(Runtime::open(&elsewhere.0, fast()).unwrap());
+    fs::copy(dir.0.join("ships").join("zod.ship"), elsewhere.0.join("ships").join("zod.ship")).unwrap();
+    fs::copy(dir.0.join("keys").join("zod.key"), elsewhere.0.join("keys").join("zod.key")).unwrap();
+    let thief = Runtime::open(&elsewhere.0, fast()).unwrap();
+    assert!(matches!(thief.deliver("~zod", "counter", b"get hits"), Err(Error::BadShipFile(why)) if why.contains("storage key")));
+    assert!(matches!(thief.public_key("~zod"), Err(Error::BadShipFile(why)) if why.contains("storage key")));
+}
+
+#[test]
+fn a_ship_is_exported_only_once_it_has_a_recovery_key_and_only_the_code_opens_the_copy() {
+    let (a, b, c, out, again, later) =
+        (TempDir::new("code-a"), TempDir::new("code-b"), TempDir::new("code-c"), TempDir::new("code-out"), TempDir::new("code-again"), TempDir::new("code-later"));
+    let rt = boot(&a, fast());
+    send(&rt, "~zod", "counter", "inc hits 4");
+
+    // With no recovery key there is nothing to seal a copy to, and no copy is made.
+    assert!(!rt.has_recovery_key("~zod").unwrap());
+    assert!(matches!(rt.export_ship("~zod", &out.0), Err(Error::NoRecoveryKey(_))));
+    assert!(!out.0.join("zod.ship").exists());
+    // A key that anyone could open a copy sealed to is not taken.
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    // Nor is a good key written in a way the code would not write it.
+    let mut top_bit = seal::recovery_public(CODE);
+    top_bit[31] |= 0x80;
+    for weak in [[0u8; 32], one, top_bit] {
+        assert!(rt.set_recovery_key("~zod", weak).is_err());
+    }
+    assert!(!rt.has_recovery_key("~zod").unwrap());
+
+    let code = rt.new_recovery_code("~zod").unwrap();
+    assert_eq!(code.split('-').map(str::len).collect::<Vec<_>>(), vec![4; 8]);
+    assert!(rt.has_recovery_key("~zod").unwrap());
+    rt.export_ship("~zod", &out.0).unwrap();
+
+    // Another code, no code, and the code short of its last letter do not open the copy.
+    let other = Runtime::open(&b.0, fast()).unwrap();
+    for wrong in [CODE, "", &code[..code.len() - 1]] {
+        let refused = other.import_ship(&out.0, "~zod", wrong);
+        assert!(matches!(&refused, Err(Error::BadShipFile(why)) if why.contains("recovery code")), "{wrong:?}: {refused:?}");
+        assert!(matches!(other.deliver("~zod", "counter", b"get hits"), Err(Error::UnknownShip(_))));
+        assert_eq!(fs::read_dir(b.0.join("tmp")).unwrap().count(), 0, "import left scratch files behind");
+    }
+    // The code does, typed the way people type.
+    other.import_ship(&out.0, "~zod", &format!("  {} ", code.to_uppercase().replace('-', " "))).unwrap();
+    assert_eq!(send(&other, "~zod", "counter", "get hits"), "4");
+
+    // The ship that came back goes on with the same recovery key, with nobody setting
+    // anything: a copy made of it where it now is opens with the same code.
+    assert!(other.has_recovery_key("~zod").unwrap());
+    send(&other, "~zod", "counter", "inc hits");
+    other.export_ship("~zod", &again.0).unwrap();
+    let third = Runtime::open(&c.0, fast()).unwrap();
+    third.import_ship(&again.0, "~zod", &code).unwrap();
+    assert_eq!(send(&third, "~zod", "counter", "get hits"), "5");
+
+    // Given a new code, the ship seals to that from then on. Copies made before still open
+    // with the code they were sealed to, and only with that.
+    let newer = rt.new_recovery_code("~zod").unwrap();
+    assert_ne!(newer, code);
+    rt.export_ship("~zod", &later.0).unwrap();
+    let sealed = |dir: &TempDir| fs::read(dir.0.join("zod.ship")).unwrap();
+    assert!(seal::open_export(&newer, "zod", sealed(&later)).is_some() && seal::open_export(&code, "zod", sealed(&later)).is_none());
+    assert!(seal::open_export(&code, "zod", sealed(&out)).is_some() && seal::open_export(&newer, "zod", sealed(&out)).is_none());
+}
+
+#[test]
+fn an_exported_copy_shows_nothing_and_is_refused_if_it_has_been_changed_at_all() {
+    let (a, b, out, second) = (TempDir::new("sealed-a"), TempDir::new("sealed-b"), TempDir::new("sealed-out"), TempDir::new("sealed-second"));
+    let rt = boot(&a, fast());
+    send(&rt, "~zod", "counter", "inc plainsightmarker 7");
+    export(&rt, "~zod", &out.0).unwrap();
+    let path = out.0.join("zod.ship");
+    let sealed = fs::read(&path).unwrap();
+
+    // What is inside is the ship's file and its signing key. None of it shows from outside.
+    let (seed, contents) = unsealed(&out.0, "zod");
+    assert_eq!(seed, seed_of(&a.0, "zod"));
+    assert!(holds(&contents, b"plainsightmarker") && contents.starts_with(b"SQLite format 3"));
+    for shown in [&b"plainsightmarker"[..], b"SQLite format 3", b"CREATE TABLE", &seed[..8], &seed[24..]] {
+        assert!(!holds(&sealed, shown), "the copy shows {:?}", String::from_utf8_lossy(shown));
+    }
+    // The copy, the modules, and nothing else: no key in a file of its own, nothing left
+    // over from making it, here or in the runtime's own directory.
+    let mut made: Vec<String> = fs::read_dir(&out.0).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+    made.sort();
+    assert_eq!(made, ["blobs", "zod.ship"]);
+    assert_eq!(fs::read_dir(a.0.join("tmp")).unwrap().count(), 0, "export left scratch files behind");
+    // The ship can still be used, and exported again. Two copies of it do not look alike.
+    assert_eq!(send(&rt, "~zod", "counter", "get plainsightmarker"), "7");
+    export(&rt, "~zod", &second.0).unwrap();
+    let another = fs::read(second.0.join("zod.ship")).unwrap();
+    assert_eq!(another.len(), sealed.len());
+    assert_ne!(another[15..47], sealed[15..47]);
+    assert!(!(0..sealed.len() - 16).step_by(16).any(|at| another[at..at + 16] == sealed[at..at + 16] && at >= 47));
+
+    // Changed anywhere, cut short, added to, or not sealed at all, it is not taken.
+    let other = Runtime::open(&b.0, fast()).unwrap();
+    let refused = |bytes: Vec<u8>, what: &str| {
+        fs::write(&path, bytes).unwrap();
+        let result = other.import_ship(&out.0, "~zod", CODE);
+        assert!(matches!(&result, Err(Error::BadShipFile(_))), "{what}: {result:?}");
+        assert!(matches!(other.deliver("~zod", "counter", b"get hits"), Err(Error::UnknownShip(_))));
+        assert_eq!(fs::read_dir(b.0.join("tmp")).unwrap().count(), 0, "import left scratch files behind");
+    };
+    for index in [0, 14, 15, 46, 47, 78, 79, 80, sealed.len() / 2, sealed.len() - 17, sealed.len() - 16, sealed.len() - 1] {
+        let mut changed = sealed.clone();
+        changed[index] ^= 1;
+        refused(changed, &format!("byte {index} changed"));
+    }
+    refused(sealed[..sealed.len() - 1].to_vec(), "cut short by a byte");
+    refused(sealed[..47].to_vec(), "cut down to its head");
+    refused(Vec::new(), "empty");
+    refused([&sealed[..], &[0]].concat(), "a byte added");
+    refused(contents.clone(), "not sealed");
+    // Nor is it another ship's copy under a new name.
+    fs::write(out.0.join("nec.ship"), &sealed).unwrap();
+    assert!(matches!(other.import_ship(&out.0, "~nec", CODE), Err(Error::BadShipFile(_))));
+    assert!(matches!(other.deliver("~nec", "counter", b"get hits"), Err(Error::UnknownShip(_))));
+
+    // As it was made, it is.
+    fs::write(&path, &sealed).unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
+    assert_eq!(send(&other, "~zod", "counter", "get plainsightmarker"), "7");
+    assert_eq!(fs::read_dir(b.0.join("tmp")).unwrap().count(), 0, "import left scratch files behind");
+    // Where it has gone, it is kept under that runtime's storage key and no other.
+    assert_ne!(fs::read_to_string(a.0.join("storage.key")).unwrap(), fs::read_to_string(b.0.join("storage.key")).unwrap());
+    assert!(live(&b.0, "zod").query_row("SELECT count(*) FROM kv", [], |row| row.get::<_, i64>(0)).unwrap() > 0);
+    assert_eq!(seed_of(&b.0, "zod"), seed);
+}
+
+#[test]
+fn a_ship_brought_back_keeps_the_recovery_key_of_the_code_that_opened_it() {
+    let (a, out) = (TempDir::new("kept-code-a"), TempDir::new("kept-code-out"));
+    let rt = boot(&a, fast());
+    send(&rt, "~zod", "counter", "inc hits 2");
+    export(&rt, "~zod", &out.0).unwrap();
+
+    // Whoever has the recovery code can open a copy and seal it again, so what the file
+    // inside says its recovery key is cannot be relied on. It is made to name somebody
+    // else's key, something that is not a key, and no key at all.
+    let theirs: String = seal::recovery_public("somebody-elses-code").iter().map(|byte| format!("{byte:02x}")).collect();
+    let cases = [
+        ("theirs", format!("UPDATE meta SET value = x'{theirs}' WHERE key = 'recovery'")),
+        ("junk", "UPDATE meta SET value = 'junk' WHERE key = 'recovery'".to_string()),
+        ("short", "UPDATE meta SET value = x'0102' WHERE key = 'recovery'".to_string()),
+        ("none", "DELETE FROM meta WHERE key = 'recovery'".to_string()),
+    ];
+    for (label, statement) in cases {
+        let (b, again) = (TempDir::new(&format!("kept-code-{label}")), TempDir::new(&format!("kept-code-{label}-again")));
+        doctor(&out.0, "zod", &statement);
+        let other = Runtime::open(&b.0, fast()).unwrap();
+        other.import_ship(&out.0, "~zod", CODE).unwrap();
+        assert_eq!(send(&other, "~zod", "counter", "get hits"), "2", "{label}");
+        // The ship seals its next copy to the code that brought it back.
+        assert!(other.has_recovery_key("~zod").unwrap(), "{label}");
+        other.export_ship("~zod", &again.0).unwrap();
+        let sealed = fs::read(again.0.join("zod.ship")).unwrap();
+        assert!(seal::open_export(CODE, "zod", sealed.clone()).is_some(), "{label}");
+        assert!(seal::open_export("somebody-elses-code", "zod", sealed).is_none(), "{label}");
+    }
+}
+
+#[test]
+fn an_export_cannot_replace_the_ship_it_is_a_copy_of() {
+    let (dir, aside) = (TempDir::new("export-onto"), TempDir::new("export-onto-aside"));
+    let rt = boot(&dir, fast());
+    send(&rt, "~zod", "counter", "inc hits 6");
+    rt.set_recovery_key("~zod", seal::recovery_public(CODE)).unwrap();
+    // The copy has the name the ship's own file has. Sent to where the runtime keeps its
+    // ships, straight or by another name for the same place, it is refused.
+    let ships = dir.0.join("ships");
+    std::os::unix::fs::symlink(&ships, aside.0.join("alias")).unwrap();
+    for dest in [ships.clone(), ships.join("..").join("ships"), aside.0.join("alias")] {
+        assert!(matches!(rt.export_ship("~zod", &dest), Err(Error::Io(_))), "{}", dest.display());
+    }
+    // The ship is as it was, now and after a restart, and nothing was left beside it.
+    assert_eq!(send(&rt, "~zod", "counter", "get hits"), "6");
+    assert!(!ships.join("blobs").exists());
+    drop(rt);
+    let rt = Runtime::open(&dir.0, fast()).unwrap();
+    assert_eq!(send(&rt, "~zod", "counter", "get hits"), "6");
+    // Anywhere else in the runtime's own directory is fine.
+    rt.export_ship("~zod", &dir.0).unwrap();
+    assert!(seal::open_export(CODE, "zod", fs::read(dir.0.join("zod.ship")).unwrap()).is_some());
+}
+
+#[test]
+fn an_export_that_fails_leaves_the_copy_that_was_there() {
+    use std::os::unix::fs::PermissionsExt;
+    let (a, b, out) = (TempDir::new("export-fails-a"), TempDir::new("export-fails-b"), TempDir::new("export-fails-out"));
+    let rt = boot(&a, fast());
+    send(&rt, "~zod", "counter", "inc hits 2");
+    export(&rt, "~zod", &out.0).unwrap();
+    let before = fs::read(out.0.join("zod.ship")).unwrap();
+
+    // The next export cannot write its modules.
+    send(&rt, "~zod", "counter", "inc hits");
+    let blobs = out.0.join("blobs");
+    fs::set_permissions(&blobs, fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = rt.export_ship("~zod", &out.0);
+    fs::set_permissions(&blobs, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed.is_err());
+    // The copy made before is untouched, and still comes back whole.
+    assert_eq!(fs::read(out.0.join("zod.ship")).unwrap(), before);
+    let other = Runtime::open(&b.0, fast()).unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
+    assert_eq!(send(&other, "~zod", "counter", "get hits"), "2");
 }

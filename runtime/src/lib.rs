@@ -4,6 +4,7 @@
 
 mod host;
 pub mod net;
+pub mod seal;
 pub mod server;
 mod ship;
 mod store;
@@ -27,6 +28,7 @@ use ship_proto::{AdminRequest, CheckpointBody, Install, Message, Source};
 use wasmtime::{Engine, InstancePre, Linker, Module};
 
 pub use ship_proto::{Device, EntryBody, Manifest, Provide, SignedCheckpoint, SignedEntry, Use};
+pub use seal::StorageKey;
 pub use store::RemoteFollow;
 
 use host::Ctx;
@@ -132,6 +134,15 @@ pub struct Config {
     pub signin_lock_millis: u64,
     pub durability: Durability,
     pub limits: Limits,
+    /// The key everything this runtime keeps on disk for its ships is encrypted under: each
+    /// ship's file, and the file that holds its signing key. Whoever runs the runtime holds
+    /// it, and should keep it somewhere other than the disk the ships are on.
+    ///
+    /// Left out, the runtime makes one the first time it opens a data directory and keeps it
+    /// there, in `storage.key`. That is enough to try things out, and it means a ship's file
+    /// copied off on its own cannot be read. It does nothing for a disk that is stolen whole,
+    /// since the key is on it.
+    pub storage_key: Option<StorageKey>,
 }
 
 impl Default for Config {
@@ -174,6 +185,7 @@ impl Default for Config {
                 max_effect_bytes: 1 << 20,
                 max_effects_per_event: 1024,
             },
+            storage_key: None,
         }
     }
 }
@@ -222,6 +234,11 @@ pub enum Error {
     UnknownModule(String),
     BadModule(String),
     BadShipFile(String),
+    /// The storage key the runtime was given, or the one kept in its data directory, is not
+    /// a key.
+    BadStorageKey(String),
+    /// The ship has not been given a recovery key, so there is nothing to seal a copy of it to.
+    NoRecoveryKey(String),
     /// The kernel would not install the agent.
     InstallRefused(String),
     /// Another runtime already has this data directory open.
@@ -259,6 +276,8 @@ impl fmt::Display for Error {
             Error::UnknownModule(hash) => write!(f, "no such module: {hash}"),
             Error::BadModule(why) => write!(f, "bad module: {why}"),
             Error::BadShipFile(why) => write!(f, "bad ship file: {why}"),
+            Error::BadStorageKey(why) => write!(f, "bad storage key: {why}"),
+            Error::NoRecoveryKey(name) => write!(f, "{name} has no recovery key to seal a copy to"),
             Error::InstallRefused(why) => write!(f, "install refused: {why}"),
             Error::DataDirInUse => write!(f, "another runtime is using this data directory"),
             Error::LogTrimmed(base) => write!(f, "the log no longer holds entries up to {base}; fetch its checkpoint"),
@@ -310,6 +329,9 @@ type SlotRef = Arc<Mutex<Slot>>;
 pub(crate) struct Inner {
     pub engine: Engine,
     pub cfg: Config,
+    /// The operator's key. Never written anywhere by the runtime, except to `storage.key`
+    /// when the operator supplied none.
+    storage: StorageKey,
     linker: Linker<Ctx>,
     ships_dir: PathBuf,
     blobs_dir: PathBuf,
@@ -694,26 +716,89 @@ fn clean_label(label: &str) -> String {
     if clean.is_empty() { "device".to_string() } else { clean }
 }
 
-/// Read a ship's signing key: 32 bytes in a regular file.
-fn load_key(path: &Path) -> Result<SigningKey, Error> {
-    let bad = || Error::BadShipFile(format!("{}: not a ship key", path.display()));
-    let mut seed = Vec::new();
-    open_regular(path).map_err(|_| bad())?.take(33).read_to_end(&mut seed)?;
-    Ok(SigningKey::from_bytes(&<[u8; 32]>::try_from(seed).map_err(|_| bad())?))
+/// Read a ship's signing key from its key file: a regular file, holding the key encrypted
+/// under the storage key and bound to the ship's name.
+fn load_key(path: &Path, storage: &StorageKey, ship: &str) -> Result<SigningKey, Error> {
+    let bad = || Error::BadShipFile(format!("{}: not this ship's key under this runtime's storage key", path.display()));
+    let mut file = Vec::new();
+    open_regular(path).map_err(|_| bad())?.take(seal::SIGNING_KEY_FILE_BYTES as u64 + 1).read_to_end(&mut file)?;
+    seal::open_signing_key(storage, ship, &file).map(|seed| SigningKey::from_bytes(&seed)).ok_or_else(bad)
 }
 
-/// Put a key at `path`, replacing whatever is there. It is written to a new file that only its
-/// owner can read and then renamed into place, so the key is never in a file with looser
-/// permissions, is never half written under its real name, and an existing symlink at `path`
-/// is replaced rather than followed.
-fn write_key(path: &Path, key: &SigningKey) -> io::Result<()> {
+/// Put a ship's signing key at `path`, encrypted, replacing whatever is there.
+fn write_key(path: &Path, storage: &StorageKey, ship: &str, key: &SigningKey) -> io::Result<()> {
+    write_private(path, &seal::wrap_signing_key(storage, ship, &key.to_bytes(), random_bytes::<12>()?))
+}
+
+/// Put a file that only its owner may read at `path`, replacing whatever is there. It is
+/// written to a new file and then renamed into place, so what it holds is never in a file with
+/// looser permissions, is never half written under its real name, and an existing symlink at
+/// `path` is replaced rather than followed.
+fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let scratch = Scratch::new(dir);
     let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&scratch.0)?;
-    file.write_all(&key.to_bytes())?;
+    file.write_all(contents)?;
     file.sync_all()?;
     fs::rename(&scratch.0, path)?;
     sync_dir(dir)
+}
+
+/// The storage key kept in a data directory for a runtime that was given none. Sixty-four
+/// hexadecimal digits, so it can be moved to wherever the operator keeps secrets and handed
+/// back through `Config::storage_key`.
+///
+/// One is made only for a directory that is new. A directory that has been used was used
+/// under some key, and a new one would open none of its ships.
+fn kept_storage_key(path: &Path, used: bool) -> Result<StorageKey, Error> {
+    let bad = || Error::BadStorageKey(format!("{} does not hold a storage key", path.display()));
+    match open_regular(path) {
+        Ok(file) => {
+            StorageKey::from_hex(&short_text(file).ok_or_else(bad)?).ok_or_else(bad)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !used => {
+            let key = random_bytes::<32>()?;
+            write_private(path, format!("{}\n", hex(&key)).as_bytes())?;
+            Ok(StorageKey::new(key))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(Error::BadStorageKey(format!("{} is missing, and this data directory was made with a storage key", path.display())))
+        }
+        Err(_) => Err(bad()),
+    }
+}
+
+/// All of a small text file, or nothing if there is more of it than a key takes.
+fn short_text(file: fs::File) -> Option<String> {
+    const MOST: usize = 256;
+    let mut written = String::new();
+    file.take(MOST as u64 + 1).read_to_string(&mut written).ok()?;
+    (written.len() <= MOST).then_some(written)
+}
+
+/// Whether anything is in a directory.
+fn holds_files(dir: &Path) -> io::Result<bool> {
+    Ok(fs::read_dir(dir)?.next().is_some())
+}
+
+/// Make sure a storage key is the one a data directory was made with, by what the directory
+/// keeps to tell it by. A new directory is given that now.
+///
+/// Without this a runtime started with the wrong key would start, find that it could open
+/// none of its ships, and make new ones under a second key beside them.
+fn check_storage_key(path: &Path, storage: &StorageKey, used: bool) -> Result<(), Error> {
+    let expected = hex(&seal::storage_check(storage));
+    let wrong = || Error::BadStorageKey("not the storage key this data directory was made with".into());
+    match open_regular(path) {
+        Ok(file) => {
+            if short_text(file).ok_or_else(wrong)?.trim_end() == expected { Ok(()) } else { Err(wrong()) }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !used => Ok(write_private(path, format!("{expected}\n").as_bytes())?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(Error::BadStorageKey(format!("{} is missing, so there is nothing to tell this data directory's storage key by", path.display())))
+        }
+        Err(_) => Err(wrong()),
+    }
 }
 
 /// A scratch file that no other call can share, removed (with any SQLite side files) on drop.
@@ -746,6 +831,16 @@ impl Runtime {
         }
         cfg.max_awake = cfg.max_awake.max(1);
         let dir_lock = lock_data_dir(data_dir)?;
+        // Taken out of the configuration, which is kept and can be read back and printed.
+        let check = data_dir.join("storage.check");
+        // A directory has been used once it holds a ship, or a ship's key, or the means to
+        // tell its storage key by.
+        let used = check.symlink_metadata().is_ok() || holds_files(&ships_dir)? || holds_files(&keys_dir)?;
+        let storage = match cfg.storage_key.take() {
+            Some(key) => key,
+            None => kept_storage_key(&data_dir.join("storage.key"), used)?,
+        };
+        check_storage_key(&check, &storage, used)?;
 
         let mut wasm_cfg = wasmtime::Config::new();
         wasm_cfg.consume_fuel(true);
@@ -772,6 +867,7 @@ impl Runtime {
             inner: Arc::new(Inner {
                 engine,
                 cfg,
+                storage,
                 linker,
                 ships_dir,
                 blobs_dir,
@@ -820,7 +916,7 @@ impl Runtime {
         // Built under a private name and then published, so a failure part way through cannot
         // leave a broken file sitting on the ship's name for ever.
         let fresh = Scratch::new(&self.inner.tmp_dir);
-        store::create(&fresh.0, &name, kernel_hash, self.inner.cfg.max_ship_bytes, &random_bytes::<16>()?)?;
+        store::create(&fresh.0, &name, kernel_hash, self.inner.cfg.max_ship_bytes, &random_bytes::<16>()?, &self.inner.file_key(&name))?;
         self.inner.publish(&name, &fresh.0, &SigningKey::from_bytes(&seed))
     }
 
@@ -987,7 +1083,7 @@ impl Runtime {
         if !self.inner.ship_path(&name).exists() {
             return Err(Error::UnknownShip(name));
         }
-        Ok(load_key(&self.inner.key_path(&name))?.verifying_key().to_bytes())
+        Ok(self.inner.load_key(&name)?.verifying_key().to_bytes())
     }
 
     /// A ship's signing key, for proving to other ships that this runtime speaks for it. It
@@ -1017,7 +1113,7 @@ impl Runtime {
             let Some(ship) = file.to_str().and_then(|file| file.strip_suffix(".ship")).and_then(|ship| canonical_ship(ship).ok()) else {
                 continue;
             };
-            if let Ok(key) = load_key(&self.inner.key_path(&ship)) {
+            if let Ok(key) = self.inner.load_key(&ship) {
                 held.insert(ship, Arc::new(key));
             }
         }
@@ -1462,12 +1558,47 @@ impl Runtime {
         self.inner.with_ship(ship, |ship| store::audit_tail(&lock(&ship.conn), limit))
     }
 
-    /// Write `<dest>/<ship>.ship` plus the module blobs it needs under `<dest>/blobs`.
+    /// Give a ship the public half of its owner's recovery key pair. Copies of the ship made
+    /// by `export_ship` are sealed to it from then on, and only the recovery code opens them.
     ///
-    /// The export includes the ship's private signing key, because a ship is its file plus its
-    /// key. It is a way to move or back up a ship, not something to hand to anyone else: whoever
-    /// holds it can sign as the ship. Running both the original and an imported copy would give
-    /// two writers of the same logs, which nothing here yet prevents.
+    /// The owner's own device can make the code, keep it, and send only this public half
+    /// (`seal::recovery_public`), so the code is never seen by the machine the ship runs on.
+    /// Giving a ship a new key does nothing to copies already made: the old code still
+    /// opens those.
+    pub fn set_recovery_key(&self, ship: &str, public: [u8; 32]) -> Result<(), Error> {
+        if !seal::recovery_key_usable(&public) {
+            return Err(Error::InvalidName("not a recovery key a copy can be sealed to".into()));
+        }
+        self.inner.with_ship(ship, |ship| Ok(store::recovery_set(&lock(&ship.conn), &public)?))
+    }
+
+    /// Make a new recovery code for a ship, give the ship its public half, and return the
+    /// code. The runtime keeps no copy of it. This is the simple way; it does show the code
+    /// to the machine the ship runs on, once.
+    pub fn new_recovery_code(&self, ship: &str) -> Result<String, Error> {
+        let code = seal::recovery_code(&random_bytes::<20>()?);
+        self.set_recovery_key(ship, seal::recovery_public(&code))?;
+        Ok(code)
+    }
+
+    /// Whether a ship has been given a recovery key, and so can be exported.
+    pub fn has_recovery_key(&self, ship: &str) -> Result<bool, Error> {
+        self.inner.with_ship(ship, |ship| Ok(store::recovery_public(&lock(&ship.conn))?.is_some()))
+    }
+
+    /// Write `<dest>/<ship>.ship`, a sealed copy of the ship, plus the module blobs it needs
+    /// under `<dest>/blobs`.
+    ///
+    /// The copy holds everything in the ship's file and its private signing key, because a
+    /// ship is its file plus its key. It is sealed to the ship's recovery key, so it can be
+    /// made with nobody present and left anywhere: only the owner's recovery code opens it.
+    /// A ship that has no recovery key cannot be exported. The copy is put together in
+    /// memory, about twice the size of the ship's file while it is made, and nothing
+    /// unsealed is written to disk. The module blobs are code, not the ship's data, and are
+    /// written as they are.
+    ///
+    /// Running both the original and an imported copy would give two writers of the same
+    /// logs, which nothing here yet prevents.
     ///
     /// Which agent modules a ship needs is known only to its kernel, so the export contains the
     /// modules the kernel lists. A kernel that leaves one out produces a ship that imports
@@ -1475,14 +1606,24 @@ impl Runtime {
     pub fn export_ship(&self, ship: &str, dest: impl AsRef<Path>) -> Result<(), Error> {
         let name = canonical_ship(ship)?;
         let dest = dest.as_ref();
+        fs::create_dir_all(dest)?;
+        // The copy is called what the ship's own file is called. Written where the runtime
+        // keeps its ships, by whatever path that directory was reached, it would replace
+        // the ship with a copy of itself that the runtime cannot open.
+        if fs::canonicalize(dest)? == fs::canonicalize(&self.inner.ships_dir)? {
+            return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "a ship cannot be exported into the directory its runtime keeps ships in")));
+        }
         fs::create_dir_all(dest.join("blobs"))?;
         self.inner.with_ship(&name, |ship| {
             let mut hashes = ship.modules(&self.inner)?;
             let conn = lock(&ship.conn);
+            let Some(recovery) = store::recovery_public(&conn)? else { return Err(Error::NoRecoveryKey(name.clone())) };
             hashes.push(store::kernel(&conn)?);
-            store::snapshot_into(&conn, &dest.join(format!("{name}.ship")))?;
-            // A ship is its file plus its key, so the key travels with it.
-            write_key(&dest.join(format!("{name}.key")), &ship.key)?;
+            // A ship is its file plus its key, so the key travels with it, inside the seal.
+            let sealed = {
+                let contents = store::snapshot(&conn)?;
+                seal::seal_export(&recovery, &name, &ship.key.to_bytes(), &contents, random_bytes::<32>()?)
+            };
             for hash in hashes {
                 // Read, verify, then rename into place: copying a file onto itself (an export into
                 // this runtime's own directory) would truncate it.
@@ -1491,17 +1632,26 @@ impl Runtime {
                 fs::write(&scratch.0, &bytes)?;
                 fs::rename(&scratch.0, dest.join("blobs").join(format!("{hash}.wasm")))?;
             }
-            Ok(())
+            // The copy goes in last, and all at once. If anything before this failed, a copy
+            // that was already there is still there, whole, with the modules it needs: modules
+            // are only ever added.
+            Ok(write_private(&dest.join(format!("{name}.ship")), &sealed)?)
         })
     }
 
-    /// Bring in a ship exported by `export_ship`, from this or another runtime.
+    /// Bring in a ship exported by `export_ship`, from this or another runtime, with the
+    /// recovery code its copy was sealed to.
     ///
-    /// The source is treated as untrusted: its rows are copied into a freshly created file, and
-    /// every module it names is verified against its hash. The ship brings its own kernel, which
-    /// decides policy for that ship only; the runtime's limits and the separation between ships
-    /// do not depend on it.
-    pub fn import_ship(&self, src: impl AsRef<Path>, ship: &str) -> Result<(), Error> {
+    /// The source is treated as untrusted even once it has opened: its rows are copied into a
+    /// freshly created file, and every module it names is verified against its hash. The ship
+    /// brings its own kernel, which decides policy for that ship only; the runtime's limits and
+    /// the separation between ships do not depend on it.
+    ///
+    /// The copy is opened and read in memory, up to about twice `max_import_bytes` for a
+    /// moment, and what it holds is written to disk only into the new ship's own encrypted
+    /// file. The code is used here and not kept. The ship goes on with the recovery key of
+    /// that code.
+    pub fn import_ship(&self, src: impl AsRef<Path>, ship: &str, code: &str) -> Result<(), Error> {
         let name = canonical_ship(ship)?;
         let src = src.as_ref();
         let dest_file = self.inner.ship_path(&name);
@@ -1516,16 +1666,32 @@ impl Runtime {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::UnknownShip(name)),
             Err(e) => return Err(e.into()),
         };
-        let key = load_key(&src.join(format!("{name}.key")))?;
-        let (copy, fresh) = (Scratch::new(&self.inner.tmp_dir), Scratch::new(&self.inner.tmp_dir));
-        // Copy by bytes read, not by reported size, which a special file can misstate.
+        let fresh = Scratch::new(&self.inner.tmp_dir);
+        // Counted by bytes read, not by reported size, which a special file can misstate.
         let limit = self.inner.cfg.max_import_bytes;
-        if io::copy(&mut source.take(limit + 1), &mut fs::File::create(&copy.0)?)? > limit {
+        let mut sealed = Vec::new();
+        if source.take(limit + 1).read_to_end(&mut sealed)? as u64 > limit {
             return Err(Error::BadShipFile(format!("{name}: larger than this runtime will import")));
         }
+        let Some((seed, contents)) = seal::open_export(code, &name, sealed) else {
+            return Err(Error::BadShipFile(format!("{name}: not a copy of this ship that this recovery code opens")));
+        };
+        let key = SigningKey::from_bytes(&seed);
         let public = key.verifying_key();
-        let kernel_hash =
-            store::import(&copy.0, &fresh.0, &name, &self.inner.cfg, deadline, &public, check_agent_name, check_hash, &random_bytes::<16>()?)?;
+        let file_key = self.inner.file_key(&name);
+        let kernel_hash = store::import(
+            contents,
+            &fresh.0,
+            &name,
+            &self.inner.cfg,
+            deadline,
+            &public,
+            check_agent_name,
+            check_hash,
+            &random_bytes::<16>()?,
+            &file_key,
+            &seal::recovery_public(code),
+        )?;
         let fetch = |hash: &str| -> Result<(), Error> {
             // Check the bytes on disk, not the compiled cache, which could hide a damaged blob.
             if self.inner.read_blob(hash).is_err() {
@@ -1539,7 +1705,7 @@ impl Runtime {
         // Only the ship's kernel knows which agent modules it needs, so ask it, reading the new
         // file without changing it.
         let hashes = {
-            let conn = store::open_read_only(&fresh.0)?;
+            let conn = store::open_read_only(&fresh.0, &file_key)?;
             let kernel = self.inner.kernel(&kernel_hash)?;
             let mut staged = Ship {
                 name: name.as_str().into(),
@@ -1632,7 +1798,7 @@ impl Inner {
         if dest_file.exists() {
             return Err(Error::ShipExists(name.to_string()));
         }
-        write_key(&self.key_path(name), key)?;
+        write_key(&self.key_path(name), &self.storage, name, key)?;
         match fs::hard_link(staged, &dest_file) {
             Ok(()) => {
                 // The network learns of a new ship here, the one place a ship comes to be. The
@@ -1650,6 +1816,15 @@ impl Inner {
 
     fn key_path(&self, name: &str) -> PathBuf {
         self.keys_dir.join(format!("{name}.key"))
+    }
+
+    /// The key a ship's file is encrypted under.
+    fn file_key(&self, name: &str) -> [u8; 32] {
+        seal::ship_file_key(&self.storage, name)
+    }
+
+    fn load_key(&self, name: &str) -> Result<SigningKey, Error> {
+        load_key(&self.key_path(name), &self.storage, name)
     }
 
     fn blob_path(&self, hash: &str) -> PathBuf {
@@ -1747,12 +1922,12 @@ impl Inner {
     }
 
     fn wake(&self, name: &str) -> Result<Ship, Error> {
-        let conn = store::open(&self.ship_path(name), self.cfg.durability, self.cfg.max_ship_bytes)?;
+        let conn = store::open(&self.ship_path(name), self.cfg.durability, self.cfg.max_ship_bytes, &self.file_key(name))?;
         store::check_meta(&conn, name)?;
         let kernel = self.kernel(&store::kernel(&conn)?)?;
         let key = {
             let _together = lock(&self.lifecycle);
-            Arc::new(load_key(&self.key_path(name))?)
+            Arc::new(self.load_key(name)?)
         };
         let (outbox_bytes, inbox_bytes) = (store::outbox_bytes(&conn)?, store::inbox_bytes(&conn)?);
         let incarnation = store::incarnation(&conn)?;

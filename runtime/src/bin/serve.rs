@@ -8,12 +8,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use runtime::server::{Server, ServerConfig};
-use runtime::{Config, Error, Manifest, Provide, Runtime};
+use runtime::{Config, Error, Manifest, Provide, Runtime, StorageKey};
 
 const USAGE: &str = "usage: serve --dir <data directory> [--addr 127.0.0.1:8080] [--host-suffix .example.net]
-             [--secure-cookies] [--access-code <ship>] [--signin-link <ship>]
+             [--storage-key-file <file>] [--secure-cookies] [--access-code <ship>] [--signin-link <ship>]
              [--demo [--kernel <kernel.wasm>] [--counter <counter.wasm>]]
 
+  --storage-key-file <file>
+                         the key the ships' files are encrypted under, as 64 hexadecimal digits,
+                         kept somewhere other than the data directory. Without it the key is
+                         made and kept in the data directory, as storage.key
   --access-code <ship>   give the ship a new reusable access code and print it
   --signin-link <ship>   print a one-time sign-in link for the ship, good for ten minutes
   --demo                 make a ship ~zod with the counter agent, if there is none, and print
@@ -27,6 +31,7 @@ fn fail(why: &str) -> ! {
 fn main() {
     let (mut dir, mut addr, mut host_suffix) = (None, "127.0.0.1:8080".to_string(), None);
     let (mut secure_cookies, mut demo) = (false, false);
+    let mut storage_key_file = None;
     let (mut access_codes, mut signin_links) = (Vec::new(), Vec::new());
     let mut kernel = PathBuf::from("target/wasm/wasm32-unknown-unknown/release/kernel.wasm");
     let mut counter = PathBuf::from("target/wasm/wasm32-unknown-unknown/release/counter.wasm");
@@ -38,6 +43,7 @@ fn main() {
             "--dir" => dir = Some(PathBuf::from(value())),
             "--addr" => addr = value(),
             "--host-suffix" => host_suffix = Some(value()),
+            "--storage-key-file" => storage_key_file = Some(PathBuf::from(value())),
             "--secure-cookies" => secure_cookies = true,
             "--demo" => demo = true,
             "--access-code" => access_codes.push(value()),
@@ -49,7 +55,11 @@ fn main() {
     }
     let dir = dir.unwrap_or_else(|| fail("--dir is required"));
 
-    let runtime = Arc::new(Runtime::open(&dir, Config::default()).unwrap_or_else(|e| fail(&format!("cannot open {}: {e}", dir.display()))));
+    let storage_key = storage_key_file.map(|file| {
+        let written = std::fs::read_to_string(&file).unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", file.display())));
+        StorageKey::from_hex(&written).unwrap_or_else(|| fail(&format!("{} does not hold 64 hexadecimal digits", file.display())))
+    });
+    let runtime = Arc::new(Runtime::open(&dir, Config { storage_key, ..Config::default() }).unwrap_or_else(|e| fail(&format!("cannot open {}: {e}", dir.display()))));
     if demo {
         let read = |path: &PathBuf| {
             std::fs::read(path).unwrap_or_else(|e| fail(&format!("cannot read {}: {e}\nbuild it first; see the README", path.display())))
