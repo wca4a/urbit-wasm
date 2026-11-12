@@ -1304,7 +1304,7 @@ fn small_limits_do_not_break_routing_or_the_ships_own_export() {
 fn a_full_ship_rejects_growth_and_stays_consistent() {
     // A small storage limit, so that a big write makes the database itself report "full" in the
     // middle of an event. This is the same path any storage error takes.
-    let cfg = Config { max_ship_bytes: 96 << 10, ..fast() };
+    let cfg = Config { max_ship_bytes: 128 << 10, ..fast() };
     let dir = TempDir::new("full");
     let rt = boot_pair(&dir, cfg.clone(), counter_manifest(false), tally_manifest(true));
     send(&rt, "~zod", "counter", "inc hits 3");
@@ -1747,7 +1747,7 @@ fn the_kernel_decides_who_is_told_about_new_entries() {
     use ship_proto::{FollowRequest, Message};
     // This follower's notify handler only records that it was called. It never asks for the
     // entries, so the only thing that can stop it being called is the kernel's own check.
-    let request = FollowRequest { agent: "counter".into(), log: "counter".into() }.encode_to_vec();
+    let request = FollowRequest { agent: "counter".into(), log: "counter".into(), ship: String::new() }.encode_to_vec();
     let source = format!(
         r#"(module
             (import "host" "log_follow" (func $follow (param i32 i32)))
@@ -1896,8 +1896,8 @@ fn a_followers_place_moves_only_when_it_has_the_entries() {
     use ship_proto::{FollowRequest, Message, NextRequest};
     // This follower asks for entries with a buffer of no size at all, so they can never fit.
     // One version stops there; the other goes on to collect what it asked for.
-    let follow = FollowRequest { agent: "counter".into(), log: "counter".into() }.encode_to_vec();
-    let next = NextRequest { agent: "counter".into(), log: "counter".into(), max: 10, checkpoints: false }.encode_to_vec();
+    let follow = FollowRequest { agent: "counter".into(), log: "counter".into(), ship: String::new() }.encode_to_vec();
+    let next = NextRequest { agent: "counter".into(), log: "counter".into(), max: 10, checkpoints: false, ship: String::new() }.encode_to_vec();
     let escaped = |bytes: &[u8]| bytes.iter().map(|b| format!("\\{b:02x}")).collect::<String>();
     let follower = |then: &str| {
         format!(
@@ -1950,7 +1950,7 @@ fn a_followers_own_handler_cannot_pile_up_notifications() {
     // This agent follows its own log. When prompted it takes no entries; instead it either asks
     // to follow again or appends another entry. Both would queue a second prompt on top of the
     // one the runtime queues for a round that made no progress.
-    let follow = FollowRequest { agent: "echo".into(), log: "e".into() }.encode_to_vec();
+    let follow = FollowRequest { agent: "echo".into(), log: "e".into(), ship: String::new() }.encode_to_vec();
     let append = AppendRequest { log: "e".into(), payload: b"x".to_vec() }.encode_to_vec();
     let escaped = |bytes: &[u8]| bytes.iter().map(|b| format!("\\{b:02x}")).collect::<String>();
     let echo = |when_prompted: &str| {
@@ -2978,7 +2978,7 @@ fn a_full_ship_can_let_go_of_a_logs_only_entry() {
     // One big entry, covered by a checkpoint taken straight after it. A second entry would fit
     // in the log many times over, but not in what is left of this ship's file.
     let (dir, b, out) = (TempDir::new("cp-last"), TempDir::new("cp-last-b"), TempDir::new("cp-last-out"));
-    let cfg = Config { max_ship_bytes: 136 << 10, checkpoint_min_bytes: 0, ..fast() };
+    let cfg = Config { max_ship_bytes: 168 << 10, checkpoint_min_bytes: 0, ..fast() };
     let rt = boot(&dir, cfg.clone());
     assert_eq!(send(&rt, "~zod", "counter", "log-big 60000"), "1");
     let key = rt.public_key("~zod").unwrap();
@@ -3849,7 +3849,9 @@ fn networked(dir: &TempDir, ship: &str, directory: &Arc<Directory>) -> (Arc<Runt
 fn networked_with(dir: &TempDir, ship: &str, directory: &Arc<Directory>, cfg: NetConfig) -> (Arc<Runtime>, Network) {
     // A network has to be able to carry the largest command its ships may send, so a test
     // that makes messages small makes events small to match.
-    let events = Config { max_event_bytes: cfg.max_message_bytes.saturating_sub(4096).min(1 << 20), ..fast() };
+    // (And likewise the largest checkpoint a log there may have.)
+    let most = cfg.max_message_bytes.saturating_sub(4096).min(1 << 20);
+    let events = Config { max_event_bytes: most, max_checkpoint_bytes: most, ..fast() };
     let rt = Arc::new(Runtime::open(&dir.0, events).unwrap());
     rt.create_ship(ship, &kernel(&rt)).unwrap();
     let net = Network::start(rt.clone(), directory.clone(), cfg).unwrap();
@@ -4162,6 +4164,14 @@ fn stand_in_ship_that(shown: [u8; 32], held: [u8; 32], answers: bool) -> (std::n
 
 /// The same, saying when commands are delivered to it that it holds every one up to `claims`.
 fn stand_in(shown: [u8; 32], held: [u8; 32], answers: bool, claims: u64) -> (std::net::SocketAddr, tokio::runtime::Runtime, Arc<AtomicBool>) {
+    stand_in_with(shown, held, answers, claims, None)
+}
+
+/// How a stand-in answers the requests about logs: what it is asked, and what it says back.
+type LogAnswers = Arc<dyn Fn(ship_proto::peer_request::Body) -> Option<ship_proto::peer_reply::Body> + Send + Sync>;
+
+/// The same, answering requests about logs as `logs` says.
+fn stand_in_with(shown: [u8; 32], held: [u8; 32], answers: bool, claims: u64, logs: Option<LogAnswers>) -> (std::net::SocketAddr, tokio::runtime::Runtime, Arc<AtomicBool>) {
     use rustls::pki_types::{CertificateDer, SubjectPublicKeyInfoDer, UnixTime};
     use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 
@@ -4208,7 +4218,7 @@ fn stand_in(shown: [u8; 32], held: [u8; 32], answers: bool, claims: u64) -> (std
     let started = started_one.clone();
     tokio.spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            let started = started.clone();
+            let (started, logs) = (started.clone(), logs.clone());
             tokio::spawn(async move {
                 let Ok(connection) = incoming.await else { return };
                 let back = connection.clone();
@@ -4234,6 +4244,10 @@ fn stand_in(shown: [u8; 32], held: [u8; 32], answers: bool, claims: u64) -> (std
                             ship_proto::peer_reply::Body::Pong(ship_proto::Pong { nonce: ping.nonce, ship, caller: "zod".into() })
                         }
                         Some(ship_proto::peer_request::Body::Deliver(_)) => ship_proto::peer_reply::Body::Delivered(ship_proto::Delivered { last: claims }),
+                        Some(about_logs) => match logs.as_ref().and_then(|logs| logs(about_logs)) {
+                            Some(body) => body,
+                            None => return,
+                        },
                         None => return,
                     };
                     let reply = ship_proto::PeerReply { body: Some(body), refused: String::new() };
@@ -5644,7 +5658,7 @@ fn a_ship_with_small_events_that_has_had_receipts_can_still_move() {
     let directory = Directory::new();
     // ~zod takes no event of more than thirty bytes. A receipt is the runtime's own record
     // and may be larger than that, and so may what the audit log says about it.
-    let small = Config { max_event_bytes: 30, ..fast() };
+    let small = Config { max_event_bytes: 30, max_checkpoint_bytes: 30, ..fast() };
     let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
     let sender = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: false }], uses: vec![to("ghost")] };
     let rt = Arc::new(Runtime::open(&a.0, small.clone()).unwrap());
@@ -5741,7 +5755,7 @@ fn a_batch_is_sized_by_what_is_sent_names_and_all() {
     let (a, b) = (TempDir::new("cmd-names-a"), TempDir::new("cmd-names-b"));
     let directory = Directory::new();
     // Both runtimes carry small messages: room for the largest command and little more.
-    let small = Config { max_event_bytes: 200, ..fast() };
+    let small = Config { max_event_bytes: 200, max_checkpoint_bytes: 200, ..fast() };
     let net = NetConfig { max_message_bytes: 200 + 4096, ..eager() };
     // ~zod's tally agent may send to an agent with as long a name as a name may be.
     let long = "a".repeat(64);
@@ -5804,7 +5818,7 @@ fn two_ships_that_have_filled_up_with_commands_for_each_other_still_get_through(
     let directory = Directory::new();
     // Two ships with small files. Each sends the other as much as it is let, while the
     // other is not there to take any of it.
-    let small = Config { max_ship_bytes: 256 << 10, ..fast() };
+    let small = Config { max_ship_bytes: 288 << 10, ..fast() };
     let padding = "p".repeat(2000);
     let fill = |rt: &Runtime, ship: &str, other: &str| {
         let command = format!("tell {other} inc hits 1 {padding}");
@@ -5862,4 +5876,1425 @@ fn receipts_already_written_do_not_keep_a_small_ship_from_taking_more() {
         eventually("the batch runs", || count(&nec, "~nec", "hits") == ((batch + 1) * 64).to_string());
     }
     assert_eq!(nec.outbound_pending("~nec").unwrap(), 640);
+}
+
+// Following a log on another ship.
+
+use ship_proto::peer_reply::Body as Answered;
+use ship_proto::peer_request::Body as Asked;
+
+/// The tally agent, open to other ships, allowed to follow the counter's log on `ship` and to
+/// send to the counter and tally agents there: one ship by name, or "*" for any.
+fn following_tally(ship: &str) -> Manifest {
+    let counter = Use { ship: ship.into(), agent: "counter".into(), interface: "counter".into(), read: true, send: true };
+    let tally = Use { ship: ship.into(), agent: "tally".into(), interface: "tally".into(), read: false, send: true };
+    Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true }], uses: vec![counter, tally] }
+}
+
+/// How many entries of the counter's log on `publisher` the tally agent on `ship` has taken.
+fn seen_on(rt: &Runtime, ship: &str, publisher: &str) -> u64 {
+    view(rt, ship, "tally", &format!("seen-on {publisher}")).parse().unwrap()
+}
+
+/// What the tally agent on `ship` was last told about that log having stopped, if anything.
+fn stopped_on(rt: &Runtime, ship: &str, publisher: &str) -> String {
+    view(rt, ship, "tally", &format!("stopped-on {publisher}"))
+}
+
+/// The one log on another ship that a ship's agents follow.
+fn followed(rt: &Runtime, ship: &str) -> runtime::RemoteFollow {
+    let mut all = rt.remote_follows(ship).unwrap();
+    assert_eq!(all.len(), 1, "{all:?}");
+    all.remove(0)
+}
+
+/// Give a ship's tally agent a different manifest, as its owner might.
+fn reinstall_tally(rt: &Runtime, ship: &str, manifest: &Manifest) {
+    rt.install(ship, "tally", &rt.add_module(&wasm("tally")).unwrap(), manifest).unwrap();
+}
+
+/// Put a ship that was stopped back on the network, in a runtime opened on its directory.
+fn back(dir: &TempDir, ship: &str, directory: &Arc<Directory>, cfg: Config) -> (Arc<Runtime>, Network) {
+    let rt = Arc::new(Runtime::open(&dir.0, cfg).unwrap());
+    let net = Network::start(rt.clone(), directory.clone(), eager()).unwrap();
+    directory.set(ship, rt.public_key(ship).unwrap(), net.addr()).unwrap();
+    (rt, net)
+}
+
+/// Send one request to the ship `called` at `addr` as whoever holds `seed`, and return its answer.
+fn ask_ship(addr: std::net::SocketAddr, called: &str, seed: [u8; 32], request: Asked) -> Option<Answered> {
+    let request = ship_proto::PeerRequest { body: Some(request) }.encode_to_vec();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), addr, called).unwrap().await.unwrap();
+        exchange(&connection, &request).await.and_then(|reply| reply.body)
+    })
+}
+
+/// A request for the entries of a log after `after`.
+fn fetch(agent: &str, log: &str, after: u64, joining: bool) -> Asked {
+    Asked::Fetch(ship_proto::Fetch { agent: agent.into(), log: log.into(), after, max_bytes: 1 << 20, joining })
+}
+
+fn public_of(seed: [u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes()
+}
+
+/// A log as a ship holding `seed` would publish it: each entry signed and linked to the one
+/// before. Returns the entries and where the log ends.
+fn signed_log(seed: [u8; 32], ship: &str, agent: &str, log: &str, payloads: &[&str]) -> (Vec<runtime::SignedEntry>, ship_proto::LogHead) {
+    use ed25519_dalek::Signer;
+    use sha2::Digest;
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let (mut entries, mut prev) = (Vec::new(), Vec::new());
+    for (index, payload) in payloads.iter().enumerate() {
+        let body = runtime::EntryBody {
+            ship: ship.into(),
+            agent: agent.into(),
+            log: log.into(),
+            seq: index as u64 + 1,
+            prev: prev.clone(),
+            payload: payload.as_bytes().to_vec(),
+        }
+        .encode_to_vec();
+        let signature = key.sign(&[b"ship.v1.entry\n".as_slice(), &body].concat()).to_bytes().to_vec();
+        prev = sha2::Sha256::digest(&body).to_vec();
+        entries.push(runtime::SignedEntry { body, signature });
+    }
+    (entries, ship_proto::LogHead { seq: payloads.len() as u64, hash: prev })
+}
+
+/// Where a run of entries ends.
+fn end_of(entries: &[runtime::SignedEntry]) -> ship_proto::LogHead {
+    use sha2::Digest;
+    let hash = entries.last().map_or(Vec::new(), |entry| sha2::Sha256::digest(&entry.body).to_vec());
+    ship_proto::LogHead { seq: entries.len() as u64, hash }
+}
+
+/// An answer to a request for entries.
+fn fetched(entries: Vec<runtime::SignedEntry>, head: ship_proto::LogHead) -> Option<Answered> {
+    Some(Answered::Fetched(ship_proto::Fetched { entries, head: Some(head), ..Default::default() }))
+}
+
+/// A stand-in that publishes a log honestly: whatever is asked for, it sends what comes after.
+fn serving(entries: Vec<runtime::SignedEntry>) -> LogAnswers {
+    Arc::new(move |asked| match asked {
+        Asked::Fetch(fetch) => fetched(entries.iter().skip(fetch.after as usize).cloned().collect(), end_of(&entries)),
+        _ => None,
+    })
+}
+
+const BUS: [u8; 32] = [7u8; 32];
+
+/// A ship ~nec whose tally agent follows the counter's log on ~bus, where ~bus is a stand-in
+/// that answers as `answers` says. Whatever is returned must be kept for as long as it is used.
+fn fed_by(label: &str, answers: LogAnswers) -> (Arc<Runtime>, (TempDir, Network, tokio::runtime::Runtime)) {
+    let dir = TempDir::new(label);
+    let directory = Directory::new();
+    let (addr, running, _) = stand_in_with(BUS, BUS, true, 0, Some(answers));
+    directory.set("~bus", public_of(BUS), addr).unwrap();
+    let (nec, net) = crewed(&dir, "~nec", &directory, fast(), open_counter(), following_tally("*"));
+    assert_eq!(send(&nec, "~nec", "tally", "follow-on bus"), "following");
+    (nec, (dir, net, running))
+}
+
+#[test]
+fn a_log_on_another_ship_is_followed_entry_by_entry() {
+    let (a, b) = (TempDir::new("flw-a"), TempDir::new("flw-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("zod"));
+
+    // ~zod's counter publishes a log and lets ~nec follow it. ~nec's tally agent follows it
+    // and is handed every entry, once and in order: the agent itself fails on any other.
+    for _ in 0..12 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    assert_eq!(send(&zod, "~zod", "counter", "share nec"), "ok");
+    assert_eq!(send(&nec, "~nec", "tally", "follow-on zod"), "following");
+    eventually("~nec's agent has every entry", || seen_on(&nec, "~nec", "zod") == 12);
+    assert_eq!(view(&nec, "~nec", "tally", "last-on zod"), "hits=12");
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+
+    // New entries reach it without its asking again: ~zod says the log has grown, and ~nec
+    // fetches what is new.
+    for _ in 0..5 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    eventually("the new entries arrive", || seen_on(&nec, "~nec", "zod") == 17);
+    eventually("and ~nec knows it has them all", || {
+        let log = followed(&nec, "~nec");
+        (log.taken, log.fetched, log.announced, log.stopped.clone()) == (17, 17, 17, None)
+    });
+    let log = followed(&nec, "~nec");
+    assert_eq!((log.follower.as_str(), log.ship.as_str(), log.agent.as_str(), log.log.as_str()), ("tally", "zod", "counter", "counter"));
+
+    // With nothing new, nothing happens: the agent is prompted when there are entries, and
+    // not otherwise.
+    let rounds = view(&nec, "~nec", "tally", "rounds-on zod");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(view(&nec, "~nec", "tally", "rounds-on zod"), rounds);
+    // The log on ~nec's own ship, of the same name, is another log altogether.
+    assert_eq!(nec.log_head("~nec", "counter", "counter").unwrap(), None);
+    assert_eq!(view(&nec, "~nec", "tally", "seen"), "0");
+}
+
+#[test]
+fn following_a_log_elsewhere_needs_the_followers_owner_to_have_agreed() {
+    let (a, b) = (TempDir::new("flw-own-a"), TempDir::new("flw-own-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    // ~nec's tally agent may send to other ships, and may not follow their logs.
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    for _ in 0..3 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&zod, "~zod", "counter", "share *");
+
+    let denied = |command: &str| match nec.deliver("~nec", "tally", command.as_bytes()) {
+        Err(Error::Rejected(Rejection::Denied(why))) => assert!(why.contains("may not follow"), "{why}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    denied("follow-on zod");
+    assert!(nec.remote_follows("~nec").unwrap().is_empty());
+    // Being allowed to follow the log on one ship says nothing about another.
+    reinstall_tally(&nec, "~nec", &following_tally("bus"));
+    denied("follow-on zod");
+    // Nor does being allowed to follow the log of that name on its own ship.
+    reinstall_tally(&nec, "~nec", &tally_manifest(true));
+    denied("follow-on zod");
+    assert!(nec.remote_follows("~nec").unwrap().is_empty());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(zod.log_followers("~zod", "counter", "counter").unwrap().is_empty());
+
+    reinstall_tally(&nec, "~nec", &following_tally("*"));
+    assert_eq!(send(&nec, "~nec", "tally", "follow-on zod"), "following");
+    eventually("the entries arrive", || seen_on(&nec, "~nec", "zod") == 3);
+
+    // The owner takes the permission away again. What ~zod publishes next is still fetched,
+    // since the ship was following, but the agent is not handed it and cannot ask for it.
+    reinstall_tally(&nec, "~nec", &far_tally("*"));
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("the new entry is fetched", || followed(&nec, "~nec").fetched == 4);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(seen_on(&nec, "~nec", "zod"), 3);
+    denied("take-on zod");
+    // Given it back, the agent asks again and is handed what was waiting.
+    reinstall_tally(&nec, "~nec", &following_tally("zod"));
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("the waiting entry is handed over", || seen_on(&nec, "~nec", "zod") == 4);
+
+    // While it has no leave to follow, the agent is not so much as prompted about the log.
+    // (This agent now notes each prompt and takes nothing, so a prompt would show.)
+    send(&nec, "~nec", "tally", "lazy");
+    reinstall_tally(&nec, "~nec", &far_tally("*"));
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("the new entry is fetched", || followed(&nec, "~nec").fetched == 5);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(view(&nec, "~nec", "tally", "poked"), "0");
+    // With leave, it is.
+    reinstall_tally(&nec, "~nec", &following_tally("zod"));
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("the agent is prompted", || view(&nec, "~nec", "tally", "poked") != "0");
+}
+
+#[test]
+fn only_the_ships_its_publisher_lets_in_may_follow_a_log() {
+    let (a, b, c) = (TempDir::new("flw-share-a"), TempDir::new("flw-share-b"), TempDir::new("flw-share-c"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("*"));
+    let (bus, _bus_net) = crewed(&c, "~bus", &directory, fast(), open_counter(), following_tally("*"));
+    for _ in 0..4 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+
+    // Nobody has been let in. ~nec asks, is refused, and its agent is told why.
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("~nec is told", || stopped_on(&nec, "~nec", "zod").contains("does not share"));
+    assert_eq!(seen_on(&nec, "~nec", "zod"), 0);
+    assert!(zod.log_followers("~zod", "counter", "counter").unwrap().is_empty());
+    // A ship that is not let in is told the same whether or not there is such a log.
+    let dev = [9u8; 32];
+    directory.set("~dev", public_of(dev), "127.0.0.1:9".parse().unwrap()).unwrap();
+    let ask = |agent: &str, log: &str| match ask_ship(zod_net.addr(), "zod", dev, fetch(agent, log, 0, true)) {
+        Some(Answered::Fetched(answer)) => answer,
+        other => panic!("not an answer about a log: {other:?}"),
+    };
+    let (real, none) = (ask("counter", "counter"), ask("ghost", "nothing"));
+    assert!(!real.denied.is_empty() && real.entries.is_empty() && real.head.is_none() && real.checkpoint.is_none(), "{real:?}");
+    assert_eq!(real, none);
+    assert!(zod.log_followers("~zod", "counter", "counter").unwrap().is_empty());
+
+    // The counter lets ~nec in by name. ~nec's agent asks again and gets the log. ~bus does not.
+    send(&zod, "~zod", "counter", "share nec");
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("~nec has the log", || seen_on(&nec, "~nec", "zod") == 4);
+    assert_eq!(stopped_on(&nec, "~nec", "zod"), "");
+    send(&bus, "~bus", "tally", "follow-on zod");
+    eventually("~bus is told", || stopped_on(&bus, "~bus", "zod").contains("does not share"));
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+
+    // Every ship is let in, and ~bus gets it on asking again.
+    send(&zod, "~zod", "counter", "share *");
+    assert_eq!(zod.log_shares("~zod", "counter", "counter").unwrap(), ["*", "nec"]);
+    send(&bus, "~bus", "tally", "follow-on zod");
+    eventually("~bus has the log", || seen_on(&bus, "~bus", "zod") == 4);
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["bus", "nec"]);
+
+    // That is taken back. ~bus, no longer covered, is told the log is closed to it, asks,
+    // is refused, and gets no more. ~nec was let in by name and carries on.
+    send(&zod, "~zod", "counter", "unshare *");
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+    eventually("~bus is told", || stopped_on(&bus, "~bus", "zod").contains("does not share"));
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("~nec has the new entry", || seen_on(&nec, "~nec", "zod") == 5);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(seen_on(&bus, "~bus", "zod"), 4);
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+    // Asking again gets ~bus the same answer.
+    let rounds = view(&bus, "~bus", "tally", "rounds-on zod");
+    send(&bus, "~bus", "tally", "follow-on zod");
+    eventually("~bus is refused again", || view(&bus, "~bus", "tally", "rounds-on zod") != rounds);
+    assert!(stopped_on(&bus, "~bus", "zod").contains("does not share"));
+    assert_eq!(followed(&bus, "~bus").fetched, 4);
+
+    // Let back in, it picks up where it was, with nothing handed over twice.
+    send(&zod, "~zod", "counter", "share bus");
+    send(&bus, "~bus", "tally", "follow-on zod");
+    eventually("~bus catches up", || seen_on(&bus, "~bus", "zod") == 5);
+    assert_eq!(stopped_on(&bus, "~bus", "zod"), "");
+}
+
+#[test]
+fn a_follower_or_a_publisher_that_was_away_picks_up_where_it_left_off() {
+    let (a, b) = (TempDir::new("flw-away-a"), TempDir::new("flw-away-b"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("zod"));
+    for _ in 0..3 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&zod, "~zod", "counter", "share nec");
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("the first entries arrive", || seen_on(&nec, "~nec", "zod") == 3);
+
+    // ~nec goes away, and ~zod's log grows. ~zod cannot tell it. That it has yet to be told
+    // is kept in ~zod's file: ~zod is stopped and started again, and still knows.
+    drop(nec_net);
+    for _ in 0..4 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    stopped(zod_net, zod);
+    let (zod, zod_net) = back(&a, "~zod", &directory, fast());
+    let nec_net = Network::start(nec.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    eventually("~nec is told and catches up", || seen_on(&nec, "~nec", "zod") == 7);
+
+    // ~zod is off the network while its log grows, and says so when it is back.
+    drop(zod_net);
+    for _ in 0..2 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    let zod_net = Network::start(zod.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~zod", zod.public_key("~zod").unwrap(), zod_net.addr()).unwrap();
+    eventually("~nec catches up again", || seen_on(&nec, "~nec", "zod") == 9);
+
+    // ~nec is stopped part way through a long run of entries and started again.
+    for _ in 0..40 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    eventually("~nec is under way", || seen_on(&nec, "~nec", "zod") > 12);
+    stopped(nec_net, nec);
+    let (nec, _nec_net) = back(&b, "~nec", &directory, fast());
+    eventually("~nec has them all, each once", || seen_on(&nec, "~nec", "zod") == 49);
+    assert_eq!(view(&nec, "~nec", "tally", "last-on zod"), "hits=49");
+}
+
+#[test]
+fn what_another_ship_sends_is_checked_before_any_of_it_is_kept() {
+    let good = || signed_log(BUS, "bus", "counter", "counter", &["a=1", "a=2", "a=3"]).0;
+    let refused = |label: &str, entries: Vec<runtime::SignedEntry>, taken: u64| {
+        let (nec, _kept) = fed_by(label, serving(entries));
+        eventually(label, || stopped_on(&nec, "~nec", "bus").contains("does not carry on"));
+        assert_eq!(seen_on(&nec, "~nec", "bus"), taken, "{label}");
+        let log = followed(&nec, "~nec");
+        assert_eq!((log.fetched, log.stopped.is_some()), (taken, true), "{label}");
+    };
+
+    // Entries signed with ~bus's key, each linked to the one before, are taken.
+    let (nec, _kept) = fed_by("flw-check-good", serving(good()));
+    eventually("the entries are taken", || seen_on(&nec, "~nec", "bus") == 3);
+    assert_eq!(view(&nec, "~nec", "tally", "last-on bus"), "a=3");
+    assert_eq!(followed(&nec, "~nec").stopped, None);
+
+    // Signed with another key. Anyone can write entries that say they are ~bus's.
+    refused("flw-check-key", signed_log([8u8; 32], "bus", "counter", "counter", &["a=1"]).0, 0);
+    // Genuinely ~bus's, but entries of another log, another agent's log, or a log of that
+    // name on another ship.
+    refused("flw-check-log", signed_log(BUS, "bus", "counter", "journal", &["a=1"]).0, 0);
+    refused("flw-check-agent", signed_log(BUS, "bus", "tally", "counter", &["a=1"]).0, 0);
+    refused("flw-check-ship", signed_log(BUS, "zod", "counter", "counter", &["a=1"]).0, 0);
+    // Changed after it was signed.
+    let mut altered = good();
+    let last = altered[0].body.len() - 1;
+    altered[0].body[last] ^= 1;
+    refused("flw-check-altered", altered, 0);
+    // The first entry left out, so that what comes does not start where it should.
+    let (nec, _kept) = fed_by("flw-check-gap", Arc::new(move |asked| match asked {
+        Asked::Fetch(_) => fetched(good()[1..].to_vec(), end_of(&good())),
+        _ => None,
+    }));
+    eventually("a gap", || stopped_on(&nec, "~nec", "bus").contains("does not carry on"));
+    assert_eq!(seen_on(&nec, "~nec", "bus"), 0);
+    // Two good entries and then one from a different history: genuine, numbered three, but
+    // not linked to the second. The two are kept and handed over. The third is not.
+    let other = signed_log(BUS, "bus", "counter", "counter", &["b=1", "b=2", "b=3"]).0;
+    refused("flw-check-fork", vec![good()[0].clone(), good()[1].clone(), other[2].clone()], 2);
+}
+
+#[test]
+fn a_publisher_whose_log_is_no_longer_the_one_followed_is_noticed() {
+    let (entries, head) = signed_log(BUS, "bus", "counter", "counter", &["a=1", "a=2", "a=3"]);
+    // Each of these stand-ins gives the log honestly the first time it is asked, and
+    // something else from then on: what a ship would say that had gone back to an earlier
+    // state, or had written something different since.
+    let later = |label: &str, then: ship_proto::Fetched, why: &str| {
+        let (asked, first) = (Arc::new(AtomicUsize::new(0)), entries.clone());
+        let (count, head) = (asked.clone(), head.clone());
+        let (nec, _kept) = fed_by(label, Arc::new(move |request| match request {
+            Asked::Fetch(_) if count.fetch_add(1, Ordering::SeqCst) == 0 => fetched(first.clone(), head.clone()),
+            Asked::Fetch(_) => Some(Answered::Fetched(then.clone())),
+            _ => None,
+        }));
+        eventually("the log is taken", || seen_on(&nec, "~nec", "bus") == 3);
+        assert_eq!(stopped_on(&nec, "~nec", "bus"), "");
+        // The agent asks afresh, which is when ~nec next hears from ~bus.
+        send(&nec, "~nec", "tally", "follow-on bus");
+        eventually(label, || stopped_on(&nec, "~nec", "bus").contains(why));
+        assert_eq!(seen_on(&nec, "~nec", "bus"), 3, "{label}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "{label}: it went on asking");
+    };
+    let says = |head: ship_proto::LogHead| ship_proto::Fetched { head: Some(head), ..Default::default() };
+    // Its log is shorter than the copy ~nec holds.
+    later("flw-back-short", says(end_of(&entries[..2])), "does not carry on");
+    // As long, and ending in a different entry.
+    let other = signed_log(BUS, "bus", "counter", "counter", &["b=1", "b=2", "b=3"]);
+    later("flw-back-fork", says(other.1), "does not carry on");
+    // It says there is more and sends none.
+    later("flw-back-none", says(ship_proto::LogHead { seq: 9, hash: vec![1; 32] }), "sent none");
+    // Asked again when nothing has changed, an honest publisher says the same as before,
+    // and nothing stops.
+    let (nec, _kept) = fed_by("flw-back-same", serving(entries.clone()));
+    eventually("the log is taken", || seen_on(&nec, "~nec", "bus") == 3);
+    send(&nec, "~nec", "tally", "follow-on bus");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!((stopped_on(&nec, "~nec", "bus"), followed(&nec, "~nec").stopped), (String::new(), None));
+}
+
+#[test]
+fn a_publisher_that_says_there_is_more_than_it_has_is_asked_afresh_and_no_more() {
+    let (entries, head) = signed_log(BUS, "bus", "counter", "counter", &["a=1", "a=2", "a=3", "a=4", "a=5"]);
+    // The first answer has two entries and says the log has five. After that the log ends
+    // at the second: this ship went back to an earlier state between the two answers. ~nec
+    // asks for the rest, is given none, and so asks afresh where the log stands. That is
+    // three questions. It does not stop, and it does not go on asking.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let (count, short) = (asked.clone(), entries[..2].to_vec());
+    let (nec, _kept) = fed_by("flw-less", Arc::new(move |request| match request {
+        Asked::Fetch(_) if count.fetch_add(1, Ordering::SeqCst) == 0 => fetched(short.clone(), head.clone()),
+        Asked::Fetch(asked) => fetched(Vec::new(), end_of(&short)).filter(|_| asked.after == 2),
+        _ => None,
+    }));
+    eventually("the two entries are taken", || seen_on(&nec, "~nec", "bus") == 2);
+    eventually("~nec has asked afresh", || asked.load(Ordering::SeqCst) == 3);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(asked.load(Ordering::SeqCst), 3, "it went on asking");
+    let log = followed(&nec, "~nec");
+    assert_eq!((log.taken, log.fetched, log.announced, log.stopped), (2, 2, 2, None));
+}
+
+#[test]
+fn a_follower_too_far_behind_another_ships_log_is_handed_its_checkpoint() {
+    let (a, b, c) = (TempDir::new("flw-cp-a"), TempDir::new("flw-cp-b"), TempDir::new("flw-cp-c"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, checkpointing(), open_counter(), far_tally("*"));
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share *");
+    for _ in 0..4 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("~nec has the first entries", || seen_on(&nec, "~nec", "zod") == 4);
+    assert_eq!(view(&nec, "~nec", "tally", "jumps-on zod"), "0");
+
+    // ~nec is away while ~zod's log grows far enough that its early entries are dropped.
+    drop(nec_net);
+    for _ in 0..30 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    let base = match zod.log_entries("~zod", "counter", "counter", 0, NO_LIMIT) {
+        Err(Error::LogTrimmed(base)) => base,
+        other => panic!("nothing was dropped: {other:?}"),
+    };
+    assert!(base > 4, "only {base} were dropped");
+    // Back, it cannot be given entry 5. It is given ~zod's state as of a later entry, which
+    // it checks like an entry, and the entries after that.
+    let nec_net = Network::start(nec.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    eventually("~nec is level with ~zod", || seen_on(&nec, "~nec", "zod") == 34);
+    assert_eq!(view(&nec, "~nec", "tally", "jumps-on zod"), "1");
+    assert_eq!(view(&nec, "~nec", "tally", "last-on zod"), "hits=34");
+
+    // A ship that starts following now begins from the checkpoint too.
+    let (bus, _bus_net) = crewed(&c, "~bus", &directory, fast(), open_counter(), following_tally("*"));
+    send(&bus, "~bus", "tally", "follow-on zod");
+    eventually("~bus is level with ~zod", || seen_on(&bus, "~bus", "zod") == 34);
+    assert_eq!(view(&bus, "~bus", "tally", "jumps-on zod"), "1");
+}
+
+#[test]
+fn a_checkpoint_from_another_ship_is_checked_like_an_entry() {
+    use ed25519_dalek::Signer;
+    let (entries, _) = signed_log(BUS, "bus", "counter", "counter", &["a=1", "a=2", "a=3", "a=4"]);
+    let checkpoint = |seed: [u8; 32], log: &str, seq: u64, state: &[u8]| {
+        let hash = if seq as usize <= entries.len() { end_of(&entries[..seq as usize]).hash } else { vec![3; 32] };
+        let body = ship_proto::CheckpointBody { ship: "bus".into(), agent: "counter".into(), log: log.into(), seq, hash, state: state.to_vec() };
+        let body = body.encode_to_vec();
+        let signature = ed25519_dalek::SigningKey::from_bytes(&seed).sign(&[b"ship.v1.checkpoint\n".as_slice(), &body].concat()).to_bytes().to_vec();
+        SignedCheckpoint { body, signature }
+    };
+    // A stand-in whose log starts at entry 3: asked for anything earlier it sends `given`.
+    let from_three = |label: &str, given: SignedCheckpoint| {
+        let entries = entries.clone();
+        fed_by(label, Arc::new(move |asked| match asked {
+            Asked::Fetch(fetch) if fetch.after < 2 => {
+                Some(Answered::Fetched(ship_proto::Fetched { head: Some(end_of(&entries)), checkpoint: Some(given.clone()), ..Default::default() }))
+            }
+            Asked::Fetch(fetch) => fetched(entries.iter().skip(fetch.after as usize).cloned().collect(), end_of(&entries)),
+            _ => None,
+        }))
+    };
+    // Signed by ~bus, for this log: the state is handed over, then the entries after it,
+    // which must link back to the entry the checkpoint names.
+    let (nec, _kept) = from_three("flw-cpx-good", checkpoint(BUS, "counter", 2, b"a=2"));
+    eventually("the checkpoint and what follows are taken", || seen_on(&nec, "~nec", "bus") == 4);
+    assert_eq!(view(&nec, "~nec", "tally", "jumps-on bus"), "1");
+    assert_eq!(followed(&nec, "~nec").stopped, None);
+
+    let refused = |label: &str, given: SignedCheckpoint, why: &str| {
+        let (nec, _kept) = from_three(label, given);
+        eventually(label, || stopped_on(&nec, "~nec", "bus").contains(why));
+        assert_eq!((seen_on(&nec, "~nec", "bus"), view(&nec, "~nec", "tally", "jumps-on bus")), (0, "0".to_string()), "{label}");
+    };
+    // Signed with another key, or for another log.
+    refused("flw-cpx-key", checkpoint([8u8; 32], "counter", 2, b"a=2"), "does not carry on");
+    refused("flw-cpx-log", checkpoint(BUS, "journal", 2, b"a=2"), "does not carry on");
+    // Larger than this ship takes.
+    refused("flw-cpx-big", checkpoint(BUS, "counter", 2, &vec![b's'; (1 << 20) + 1]), "larger than this ship takes");
+    // An entry signed by ~bus passed off as a checkpoint: the two are signed differently.
+    let passed_off = SignedCheckpoint { body: entries[1].body.clone(), signature: entries[1].signature.clone() };
+    refused("flw-cpx-entry", passed_off, "does not carry on");
+    // Genuine, but for an entry numbered beyond anything a log could reach.
+    refused("flw-cpx-far", checkpoint(BUS, "counter", (1 << 62) + 1, b"a=2"), "does not carry on");
+
+    // A checkpoint for the highest entry number there can be, and then a genuine entry
+    // that follows it. The checkpoint is taken. The entry is one too far.
+    let limit = 1u64 << 61;
+    let (edge, link) = (checkpoint(BUS, "counter", limit, b"a=2"), vec![3u8; 32]);
+    let body = runtime::EntryBody { ship: "bus".into(), agent: "counter".into(), log: "counter".into(), seq: limit + 1, prev: link, payload: b"a=3".to_vec() };
+    let body = body.encode_to_vec();
+    let signature = ed25519_dalek::SigningKey::from_bytes(&BUS).sign(&[b"ship.v1.entry\n".as_slice(), &body].concat()).to_bytes().to_vec();
+    let beyond = runtime::SignedEntry { body, signature };
+    let (nec, _kept) = fed_by("flw-cpx-edge", Arc::new(move |asked| match asked {
+        Asked::Fetch(fetch) if fetch.after < limit => {
+            let head = Some(ship_proto::LogHead { seq: limit, hash: vec![3; 32] });
+            Some(Answered::Fetched(ship_proto::Fetched { head, checkpoint: Some(edge.clone()), ..Default::default() }))
+        }
+        Asked::Fetch(_) => fetched(vec![beyond.clone()], end_of(std::slice::from_ref(&beyond))),
+        _ => None,
+    }));
+    eventually("the checkpoint is taken", || view(&nec, "~nec", "tally", "jumps-on bus") == "1");
+    // (Nothing is believed to lie beyond the limit, so ~nec asks for more only when its
+    // agent asks afresh.)
+    send(&nec, "~nec", "tally", "follow-on bus");
+    eventually("the entry beyond the limit is refused", || stopped_on(&nec, "~nec", "bus").contains("does not carry on"));
+    assert_eq!((followed(&nec, "~nec").fetched, view(&nec, "~nec", "tally", "jumps-on bus")), (limit, "1".to_string()));
+
+    // A checkpoint moves a follower forward. A stand-in that answers every question with
+    // the same one is believed the first time and not the second, when it stands for an
+    // entry ~nec already holds.
+    let again = checkpoint(BUS, "counter", 2, b"a=2");
+    let end = end_of(&entries);
+    let (nec, _kept) = fed_by("flw-cpx-again", Arc::new(move |asked| match asked {
+        Asked::Fetch(_) => Some(Answered::Fetched(ship_proto::Fetched { head: Some(end.clone()), checkpoint: Some(again.clone()), ..Default::default() })),
+        _ => None,
+    }));
+    eventually("the second is refused", || stopped_on(&nec, "~nec", "bus").contains("does not carry on"));
+    assert_eq!((seen_on(&nec, "~nec", "bus"), view(&nec, "~nec", "tally", "jumps-on bus")), (2, "1".to_string()));
+}
+
+#[test]
+fn a_number_no_log_could_reach_is_not_believed() {
+    let (entries, _) = signed_log(BUS, "bus", "counter", "counter", &["a=1", "a=2", "a=3"]);
+    let (nec, kept) = fed_by("flw-far", serving(entries));
+    eventually("the log is taken", || seen_on(&nec, "~nec", "bus") == 3);
+
+    // ~bus says its log has reached an entry numbered in the quintillions. A number like
+    // that is only a prompt to ask, and this one is not even that: kept, it would be a
+    // number ~nec's own file could not be read back with.
+    let far = ship_proto::LogNews { agent: "counter".into(), log: "counter".into(), head: (1 << 62) + 5, closed: false };
+    let heard = ask_ship(kept.1.addr(), "nec", BUS, Asked::News(ship_proto::News { logs: vec![far] }));
+    assert_eq!(heard, Some(Answered::Heard(ship_proto::Heard { unknown: vec![false] })));
+    assert_eq!(followed(&nec, "~nec").announced, 3);
+    let (out, other) = (TempDir::new("flw-far-out"), TempDir::new("flw-far-other"));
+    nec.export_ship("~nec", &out.0).unwrap();
+    Runtime::open(&other.0, fast()).unwrap().import_ship(&out.0, "~nec").unwrap();
+}
+
+#[test]
+fn a_follower_is_told_again_when_the_log_grew_while_it_was_being_told() {
+    let dir = TempDir::new("flw-told");
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&dir, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    send(&zod, "~zod", "counter", "share *");
+    // ~bus is a stand-in that takes its time over each piece of news, and notes where it
+    // was told the log ends.
+    let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let heads = told.clone();
+    let (addr, _running, _) = stand_in_with(BUS, BUS, true, 0, Some(Arc::new(move |asked| match asked {
+        Asked::News(news) => {
+            heads.lock().unwrap().extend(news.logs.iter().map(|log| log.head));
+            std::thread::sleep(Duration::from_millis(500));
+            Some(Answered::Heard(ship_proto::Heard { unknown: vec![false; news.logs.len()] }))
+        }
+        _ => None,
+    })));
+    directory.set("~bus", public_of(BUS), addr).unwrap();
+    assert!(matches!(ask_ship(zod_net.addr(), "zod", BUS, fetch("counter", "counter", 0, true)), Some(Answered::Fetched(_))));
+
+    // The log gets its first entry, and ~bus is told. While ~bus is still taking that in,
+    // the log gets a second. ~bus's answer is to news of the first, so it is told again.
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("~bus is told of the first", || told.lock().unwrap().len() == 1);
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("and of the second", || *told.lock().unwrap() == [1, 2]);
+    // And then no more, since nothing has changed.
+    std::thread::sleep(Duration::from_millis(900));
+    assert_eq!(*told.lock().unwrap(), [1, 2]);
+}
+
+#[test]
+fn a_ship_shut_out_and_let_back_in_before_it_was_told_carries_on() {
+    let (a, b) = (TempDir::new("flw-back-in-a"), TempDir::new("flw-back-in-b"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    for _ in 0..2 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("the entries arrive", || seen_on(&nec, "~nec", "zod") == 2);
+
+    // While ~zod is off the network, its counter shuts ~nec out and then thinks better of
+    // it. ~nec was never told, and need not be: it goes on following as if nothing happened.
+    drop(zod_net);
+    send(&zod, "~zod", "counter", "unshare nec");
+    assert!(zod.log_followers("~zod", "counter", "counter").unwrap().is_empty());
+    send(&zod, "~zod", "counter", "share nec");
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+    send(&zod, "~zod", "counter", "log hits");
+    let zod_net = Network::start(zod.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~zod", zod.public_key("~zod").unwrap(), zod_net.addr()).unwrap();
+    eventually("the new entry arrives", || seen_on(&nec, "~nec", "zod") == 3);
+    assert_eq!((stopped_on(&nec, "~nec", "zod"), followed(&nec, "~nec").stopped), (String::new(), None));
+}
+
+#[test]
+fn a_network_that_could_not_carry_a_logs_checkpoint_does_not_start() {
+    let dir = TempDir::new("flw-cp-size");
+    let directory = Directory::new();
+    // A ship that follows a log may be sent its checkpoint whole. A network with no room
+    // for the largest one a log here may have would leave such a follower stuck for good.
+    let cfg = Config { max_event_bytes: 1000, max_checkpoint_bytes: 100_000, ..fast() };
+    let rt = Arc::new(Runtime::open(&dir.0, cfg).unwrap());
+    let cramped = NetConfig { max_message_bytes: 50_000, ..eager() };
+    assert!(Network::start(rt.clone(), directory.clone(), cramped).is_err());
+    let roomy = NetConfig { max_message_bytes: 100_000 + 4096, ..eager() };
+    assert!(Network::start(rt, directory, roomy).is_ok());
+}
+
+#[test]
+fn a_follower_that_falls_behind_is_not_sent_the_whole_log_to_keep() {
+    let (a, b) = (TempDir::new("flw-slow-a"), TempDir::new("flw-slow-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    // ~nec holds at most about a thousand bytes of another ship's log for an agent.
+    let cfg = Config { max_follow_bytes: 1000, ..fast() };
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, cfg.clone(), open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    // The first entry is one ~nec's agent refuses to handle, so it takes nothing.
+    send(&zod, "~zod", "counter", "log poison");
+    for _ in 0..60 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("~nec has fetched what it will hold", || followed(&nec, "~nec").fetched >= 14);
+    std::thread::sleep(Duration::from_millis(600));
+    // Each entry counts as its payload plus 64 bytes: fourteen or fifteen of them. Not 61.
+    let log = followed(&nec, "~nec");
+    assert!((log.taken, log.announced) == (0, 61) && log.fetched <= 15, "{log:?}");
+    assert_eq!(seen_on(&nec, "~nec", "zod"), 0);
+
+    // The same holds through a restart: nothing more is fetched, and nothing is lost.
+    stopped(nec_net, nec);
+    let (nec, _nec_net) = back(&b, "~nec", &directory, cfg);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(followed(&nec, "~nec").fetched, log.fetched);
+
+    // The agent comes round to handling that entry. As it takes entries, room is made, and
+    // more are fetched, until it has them all.
+    send(&nec, "~nec", "tally", "tolerate");
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("~nec's agent has every entry", || seen_on(&nec, "~nec", "zod") == 61);
+    assert_eq!(view(&nec, "~nec", "tally", "last-on zod"), "hits=60");
+}
+
+#[test]
+fn what_is_fetched_from_other_ships_logs_leaves_room_to_take_their_commands() {
+    let (a, b) = (TempDir::new("flw-room-a"), TempDir::new("flw-room-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    // A small file, and no limit to speak of on what is held of another ship's log.
+    let cfg = Config { max_ship_bytes: 420 << 10, max_follow_bytes: 64 << 20, ..fast() };
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, cfg, open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    // (~zod's counter never manages a checkpoint, so its log keeps every entry, and the
+    // first is one ~nec's agent refuses to handle.)
+    send(&zod, "~zod", "counter", "checkpoints broken");
+    send(&zod, "~zod", "counter", "log poison");
+    for _ in 0..12 {
+        send(&zod, "~zod", "counter", "log-big 30000");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("~nec has fetched some", || followed(&nec, "~nec").fetched >= 3);
+    std::thread::sleep(Duration::from_millis(900));
+    let held = followed(&nec, "~nec").fetched;
+    assert!(held < 13, "everything was fetched, into a file with no room for it: {:?} seen {}", followed(&nec, "~nec"), seen_on(&nec, "~nec", "zod"));
+
+    // What it stopped short for: a command from ~zod is still taken, run, and answered.
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("the command runs on ~nec", || count(&nec, "~nec", "hits") == "1");
+    eventually("and is answered", || zod.unanswered("~zod").unwrap() == 0);
+
+    // Once the agent takes what is held, the rest is fetched.
+    send(&nec, "~nec", "tally", "tolerate");
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("~nec's agent has every entry", || seen_on(&nec, "~nec", "zod") == 13);
+}
+
+#[test]
+fn an_agent_can_stop_following_and_start_again_from_the_beginning() {
+    let (a, b) = (TempDir::new("flw-stop-a"), TempDir::new("flw-stop-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    for _ in 0..6 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("the entries arrive", || seen_on(&nec, "~nec", "zod") == 6);
+
+    // It stops. Nothing of the log is held any more, and ~zod, on next telling ~nec that
+    // the log has grown, learns that nobody there follows it and stops telling it.
+    assert_eq!(send(&nec, "~nec", "tally", "unfollow-on zod"), "stopped");
+    assert!(nec.remote_follows("~nec").unwrap().is_empty());
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("~zod stops telling ~nec", || zod.log_followers("~zod", "counter", "counter").unwrap().is_empty());
+    assert_eq!(seen_on(&nec, "~nec", "zod"), 0);
+    // An agent that does not follow a log cannot take from it.
+    assert!(matches!(nec.deliver("~nec", "tally", b"take-on zod"), Err(Error::Rejected(Rejection::Denied(_)))));
+
+    // Following again starts from the first entry, and ~zod notes it as a follower again.
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("all seven arrive", || seen_on(&nec, "~nec", "zod") == 7);
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("and it is told of the eighth", || seen_on(&nec, "~nec", "zod") == 8);
+}
+
+#[test]
+fn stopping_while_entries_wait_lets_go_of_them_and_of_the_notice() {
+    let (a, b) = (TempDir::new("flw-drop-a"), TempDir::new("flw-drop-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    // Nothing queued on ~nec runs by itself, so its agent's notice waits in the queue.
+    let cfg = Config { max_queued_per_deliver: 0, ..fast() };
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, cfg, open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    for _ in 0..3 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("the entries are fetched", || followed(&nec, "~nec").fetched == 3);
+    eventually("and the agent's notice is queued", || nec.pending("~nec").unwrap() == 1);
+
+    send(&nec, "~nec", "tally", "unfollow-on zod");
+    assert_eq!(nec.pending("~nec").unwrap(), 0);
+    assert!(nec.remote_follows("~nec").unwrap().is_empty());
+    // The same for a log on its own ship.
+    reinstall_tally(&nec, "~nec", &tally_manifest(true));
+    send(&nec, "~nec", "tally", "follow");
+    send(&nec, "~nec", "counter", "log hits");
+    assert_eq!(nec.pending("~nec").unwrap(), 1);
+    send(&nec, "~nec", "tally", "unfollow");
+    assert_eq!((nec.pending("~nec").unwrap(), nec.log_position("~nec", "tally", "counter", "counter").unwrap()), (0, None));
+}
+
+#[test]
+fn a_log_is_shared_by_its_own_publisher_with_other_ships_and_only_so_many() {
+    let dir = TempDir::new("flw-limits");
+    let directory = Directory::new();
+    let cfg = Config { max_log_shares: 3, ..fast() };
+    let (zod, _zod_net) = crewed(&dir, "~zod", &directory, cfg, open_counter(), far_tally("*"));
+    let refused = |command: &str| match zod.deliver("~zod", "counter", command.as_bytes()) {
+        Err(Error::Rejected(rejection)) => rejection,
+        other => panic!("{command}: expected a refusal, got {other:?}"),
+    };
+    // An agent shares its own logs, not another agent's.
+    assert!(matches!(refused("share-other nec"), Rejection::Denied(why) if why.contains("offers no interface")));
+    // With other ships, by name. Its own ship's agents follow its logs another way.
+    assert!(matches!(refused("share zod"), Rejection::Denied(why) if why.contains("other ships")));
+    assert!(matches!(refused("share Not-A-Ship"), Rejection::Denied(why) if why.contains("not a ship's name")));
+    assert!(zod.log_shares("~zod", "counter", "counter").unwrap().is_empty());
+
+    // Three names, of which "*" is one, and no more. Saying one again is not one more.
+    for ship in ["nec", "bus", "*", "nec", "~bus"] {
+        assert_eq!(send(&zod, "~zod", "counter", &format!("share {ship}")), "ok");
+    }
+    assert!(matches!(refused("share doz"), Rejection::Limit(why) if why.contains("at most 3")));
+    assert_eq!(zod.log_shares("~zod", "counter", "counter").unwrap(), ["*", "bus", "nec"]);
+    send(&zod, "~zod", "counter", "unshare bus");
+    assert_eq!(send(&zod, "~zod", "counter", "share doz"), "ok");
+    assert_eq!(zod.log_shares("~zod", "counter", "counter").unwrap(), ["*", "doz", "nec"]);
+}
+
+#[test]
+fn a_log_has_only_so_many_followers_and_one_more_waits() {
+    let (a, b, c) = (TempDir::new("flw-many-a"), TempDir::new("flw-many-b"), TempDir::new("flw-many-c"));
+    let directory = Directory::new();
+    let cfg = Config { max_log_followers: 1, ..fast() };
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, cfg, open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("*"));
+    let (bus, _bus_net) = crewed(&c, "~bus", &directory, fast(), open_counter(), following_tally("*"));
+    send(&zod, "~zod", "counter", "share *");
+    send(&zod, "~zod", "counter", "log hits");
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("~nec follows", || seen_on(&nec, "~nec", "zod") == 1);
+
+    // ~bus is let in, but the log has the one follower it may. ~bus is not refused for
+    // good: it goes on asking, and its agent is told nothing.
+    send(&bus, "~bus", "tally", "follow-on zod");
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!((followed(&bus, "~bus").fetched, followed(&bus, "~bus").stopped, stopped_on(&bus, "~bus", "zod")), (0, None, String::new()));
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+
+    // ~nec stops following, ~zod finds out on next telling it, and ~bus gets in.
+    send(&nec, "~nec", "tally", "unfollow-on zod");
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("~bus follows", || seen_on(&bus, "~bus", "zod") == 2);
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["bus"]);
+}
+
+#[test]
+fn an_answer_to_old_news_does_not_strike_off_a_ship_that_has_asked_afresh() {
+    let dir = TempDir::new("flw-gen");
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&dir, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    send(&zod, "~zod", "counter", "share *");
+    send(&zod, "~zod", "counter", "log hits");
+
+    // ~bus is a stand-in. Told that the log has grown, it answers that it does not follow
+    // it. But the first time, before answering, it asks to follow afresh: the answer is
+    // then to news from before that, and ~zod must not take it as ~bus leaving.
+    let (addr_of_zod, told) = (zod_net.addr(), Arc::new(AtomicUsize::new(0)));
+    let count = told.clone();
+    let (addr, _running, _) = stand_in_with(BUS, BUS, true, 0, Some(Arc::new(move |asked| match asked {
+        Asked::News(news) => {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::thread::spawn(move || ask_ship(addr_of_zod, "zod", BUS, fetch("counter", "counter", 0, true))).join().unwrap();
+            }
+            Some(Answered::Heard(ship_proto::Heard { unknown: vec![true; news.logs.len()] }))
+        }
+        _ => None,
+    })));
+    directory.set("~bus", public_of(BUS), addr).unwrap();
+    assert!(matches!(ask_ship(zod_net.addr(), "zod", BUS, fetch("counter", "counter", 0, true)), Some(Answered::Fetched(_))));
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["bus"]);
+
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("~bus is told once, and again", || told.load(Ordering::SeqCst) >= 2);
+    // The second answer is to news that nothing has overtaken, and ~bus is struck off.
+    eventually("~bus is struck off", || zod.log_followers("~zod", "counter", "counter").unwrap().is_empty());
+    assert_eq!(told.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn ships_that_disagree_about_commands_still_follow_each_others_logs() {
+    let dir = TempDir::new("flw-stalled");
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&dir, "~zod", &directory, fast(), open_counter(), following_tally("*"));
+    // ~bus says it holds ninety-nine commands from ~zod, which has sent one. Commands
+    // between the two stop there. ~bus's log is another matter.
+    let (entries, _) = signed_log(BUS, "bus", "counter", "counter", &["a=1", "a=2"]);
+    let (addr, _running, _) = stand_in_with(BUS, BUS, true, 99, Some(serving(entries)));
+    directory.set("~bus", public_of(BUS), addr).unwrap();
+    send(&zod, "~zod", "tally", "tell bus inc hits");
+    eventually("~zod notices", || zod_net.stalled() == [("zod".to_string(), "bus".to_string())]);
+
+    send(&zod, "~zod", "tally", "follow-on bus");
+    eventually("~zod's agent has ~bus's log", || seen_on(&zod, "~zod", "bus") == 2);
+    assert_eq!(zod_net.stalled(), [("zod".to_string(), "bus".to_string())]);
+    assert_eq!(zod.outbound_pending("~zod").unwrap(), 1);
+}
+
+#[test]
+fn naming_ones_own_ship_follows_the_log_there_as_any_agent_would() {
+    let dir = TempDir::new("flw-self");
+    let rt = boot_pair(&dir, fast(), counter_manifest(false), tally_manifest(true));
+    send(&rt, "~zod", "counter", "log hits");
+    assert_eq!(send(&rt, "~zod", "tally", "follow-on zod"), "following");
+    assert_eq!(rt.log_position("~zod", "tally", "counter", "counter").unwrap(), Some(1));
+    assert_eq!(read(&rt, "tally", "tally", "seen"), "1");
+    assert!(rt.remote_follows("~zod").unwrap().is_empty());
+}
+
+#[test]
+fn followed_logs_go_with_a_ship_that_is_moved() {
+    let (a, b, c, out) = (TempDir::new("flw-move-a"), TempDir::new("flw-move-b"), TempDir::new("flw-move-c"), TempDir::new("flw-move-out"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    send(&zod, "~zod", "counter", "log poison");
+    for _ in 0..5 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    // ~nec has fetched six entries and its agent has taken none of them.
+    eventually("the entries are fetched", || followed(&nec, "~nec").fetched == 6);
+    eventually("the agent has given up on them", || nec.pending("~nec").unwrap() == 0);
+
+    // ~nec moves to another runtime with what it holds, and carries on from there.
+    nec.export_ship("~nec", &out.0).unwrap();
+    stopped(nec_net, nec);
+    let other = Arc::new(Runtime::open(&c.0, fast()).unwrap());
+    let other_net = Network::start(other.clone(), directory.clone(), eager()).unwrap();
+    other.import_ship(&out.0, "~nec").unwrap();
+    directory.set("~nec", other.public_key("~nec").unwrap(), other_net.addr()).unwrap();
+    let log = followed(&other, "~nec");
+    assert_eq!((log.taken, log.fetched), (0, 6));
+    send(&zod, "~zod", "counter", "log hits");
+    send(&other, "~nec", "tally", "tolerate");
+    send(&other, "~nec", "tally", "follow-on zod");
+    eventually("the agent has every entry, each once", || seen_on(&other, "~nec", "zod") == 7);
+
+    // ~zod moves too. Whoever follows its logs is told afresh where they stand, so ~nec
+    // hears of an entry written just before the move that it had not been told of.
+    drop(other_net);
+    send(&zod, "~zod", "counter", "log hits");
+    std::thread::sleep(Duration::from_millis(300));
+    let (d, zod_out) = (TempDir::new("flw-move-d"), TempDir::new("flw-move-zod-out"));
+    zod.export_ship("~zod", &zod_out.0).unwrap();
+    stopped(zod_net, zod);
+    let moved = Arc::new(Runtime::open(&d.0, fast()).unwrap());
+    let moved_net = Network::start(moved.clone(), directory.clone(), eager()).unwrap();
+    moved.import_ship(&zod_out.0, "~zod").unwrap();
+    directory.set("~zod", moved.public_key("~zod").unwrap(), moved_net.addr()).unwrap();
+    let other_net = Network::start(other.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~nec", other.public_key("~nec").unwrap(), other_net.addr()).unwrap();
+    eventually("~nec hears of the eighth entry", || seen_on(&other, "~nec", "zod") == 8);
+    assert_eq!(moved.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+    assert_eq!(moved.log_shares("~zod", "counter", "counter").unwrap(), ["nec"]);
+}
+
+#[test]
+fn news_and_answers_with_too_many_parts_are_not_taken_in() {
+    let dir = TempDir::new("flw-count");
+    let directory = Directory::new();
+    let (_zod, zod_net) = crewed(&dir, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let dev = [9u8; 32];
+    directory.set("~dev", public_of(dev), "127.0.0.1:9".parse().unwrap()).unwrap();
+    // A piece of news may name a few hundred logs. One that names more is refused whole,
+    // before any of it is unpacked.
+    let news = |logs: usize| Asked::News(ship_proto::News { logs: vec![ship_proto::LogNews::default(); logs] });
+    match ask_ship(zod_net.addr(), "zod", dev, news(256)) {
+        Some(Answered::Heard(heard)) => assert_eq!(heard.unknown, vec![true; 256]),
+        other => panic!("not an answer to news: {other:?}"),
+    }
+    assert_eq!(ask_ship(zod_net.addr(), "zod", dev, news(257)), None);
+
+    // Likewise an answer with more entries than are ever sent at once. It is not looked at,
+    // so nothing in it can stop the log or be kept: the ship asks again later.
+    let (nec, _kept) = fed_by("flw-count-b", Arc::new(|asked| match asked {
+        Asked::Fetch(_) => fetched(vec![runtime::SignedEntry::default(); 257], ship_proto::LogHead::default()),
+        _ => None,
+    }));
+    std::thread::sleep(Duration::from_millis(700));
+    let log = followed(&nec, "~nec");
+    assert_eq!((log.fetched, log.stopped, stopped_on(&nec, "~nec", "bus")), (0, None, String::new()));
+}
+
+#[test]
+fn import_checks_what_a_ship_holds_of_other_ships_logs_and_who_follows_its_own() {
+    let (a, b, out) = (TempDir::new("flw-imp-a"), TempDir::new("flw-imp-b"), TempDir::new("flw-imp-out"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("*"));
+    send(&zod, "~zod", "counter", "share nec");
+    send(&zod, "~zod", "counter", "checkpoints broken");
+    send(&zod, "~zod", "counter", "log poison");
+    for _ in 0..5 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    // ~nec holds six entries of ~zod's log, and its agent has taken none of them.
+    eventually("the entries are fetched", || followed(&nec, "~nec").fetched == 6);
+    eventually("the agent has given up on them", || nec.pending("~nec").unwrap() == 0);
+
+    // Export a ship, change its file, and import it under the given limits.
+    let tampered = |rt: &Runtime, ship: &str, label: &str, statement: &str, cfg: Config| {
+        let dir = TempDir::new(label);
+        fs::remove_dir_all(&out.0).ok();
+        fs::create_dir_all(&out.0).unwrap();
+        rt.export_ship(ship, &out.0).unwrap();
+        rusqlite::Connection::open(out.0.join(format!("{}.ship", ship.trim_start_matches('~')))).unwrap().execute_batch(statement).unwrap();
+        let other = Runtime::open(&dir.0, cfg).unwrap();
+        let result = other.import_ship(&out.0, ship);
+        (result, other, dir)
+    };
+    let held = |label: &str, statement: &str| tampered(&nec, "~nec", label, statement, fast()).0;
+    let refused = |label: &str, result: Result<(), Error>| assert!(result.is_err(), "{label} was let in");
+
+    // As it stands, the file is let in, with what it held. The ship it follows is asked
+    // afresh where its log stands, since an import may be a return to an earlier state.
+    let (result, other, dir) = tampered(&nec, "~nec", "held-intact", "SELECT 1", fast());
+    result.unwrap();
+    let log = followed(&other, "~nec");
+    assert_eq!((log.taken, log.fetched, log.announced), (0, 6, 6));
+    drop(other);
+    let file = rusqlite::Connection::open(dir.0.join("ships").join("nec.ship")).unwrap();
+    assert_eq!(file.query_row("SELECT joined FROM remote_logs", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    // How much is held is counted afresh, so a wrong figure there does no harm.
+    held("held-recount", "UPDATE remote_logs SET bytes = 999999").unwrap();
+
+    // What is held must be exactly the entries between the agent's place and the newest
+    // one fetched: none missing in the middle, at the end, or at the start, and none beyond.
+    for (label, statement) in [
+        ("held-gap", "DELETE FROM remote_entries WHERE seq = 3"),
+        ("held-short", "DELETE FROM remote_entries WHERE seq = 6"),
+        ("held-early", "DELETE FROM remote_entries WHERE seq = 1"),
+        ("held-none", "DELETE FROM remote_entries"),
+        ("held-beyond", "INSERT INTO remote_entries VALUES ('zod', 'counter', 'counter', 'tally', 7, x'00')"),
+        ("held-ahead", "UPDATE follows SET cursor = 7 WHERE ship = 'zod'"),
+        ("held-passed", "UPDATE follows SET cursor = 2 WHERE ship = 'zod'"),
+        // Entries of a log nobody follows, a copy with no follower, and a follower with no copy.
+        ("held-orphan", "INSERT INTO remote_entries VALUES ('bus', 'counter', 'counter', 'tally', 1, x'00')"),
+        ("held-unfollowed", "DELETE FROM follows WHERE ship = 'zod'"),
+        ("held-nothing", "DELETE FROM remote_logs; DELETE FROM remote_entries"),
+        // The hash the next entry must link to is 32 bytes, and a reason is a few words.
+        ("held-hash", "UPDATE remote_logs SET head_hash = x'0102'"),
+        ("held-nohash", "UPDATE remote_logs SET head_hash = x''"),
+        ("held-reason", "UPDATE remote_logs SET stopped = hex(zeroblob(101))"),
+        // No entry is numbered beyond what any log could reach, held or only heard of.
+        ("held-far", "UPDATE follows SET cursor = 2305843009213693953 WHERE ship = 'zod'; UPDATE remote_logs SET head = 2305843009213693953; DELETE FROM remote_entries"),
+        ("held-far-heard", "UPDATE remote_logs SET announced = 2305843009213693953"),
+    ] {
+        refused(label, held(label, statement));
+    }
+    held("held-taken", "UPDATE follows SET cursor = 2 WHERE ship = 'zod'; DELETE FROM remote_entries WHERE seq <= 2").unwrap();
+    held("held-stopped", "UPDATE remote_logs SET stopped = 'for a reason'").unwrap();
+    // The other ship is a ship, and not this one.
+    let renamed = |name: &str| {
+        format!("UPDATE follows SET ship = '{name}' WHERE ship = 'zod'; UPDATE remote_logs SET peer = '{name}'; UPDATE remote_entries SET peer = '{name}'")
+    };
+    held("held-renamed", &renamed("bus")).unwrap();
+    refused("held-name", held("held-name", &renamed("Not A Ship")));
+    refused("held-self", held("held-self", &renamed("nec")));
+
+    // A checkpoint held in place of dropped entries comes after the agent's place and no
+    // later than the newest entry fetched, and the entries held start straight after it.
+    let checkpoint = |seq: u64, also: &str| format!("INSERT INTO remote_checkpoints VALUES ('zod', 'counter', 'counter', 'tally', {seq}, x'aa'); {also}");
+    held("held-cp", &checkpoint(3, "DELETE FROM remote_entries WHERE seq <= 3")).unwrap();
+    refused("held-cp-over", held("held-cp-over", &checkpoint(3, "")));
+    refused("held-cp-passed", held("held-cp-passed", &checkpoint(3, "DELETE FROM remote_entries WHERE seq <= 3; UPDATE follows SET cursor = 3 WHERE ship = 'zod'")));
+    refused("held-cp-beyond", held("held-cp-beyond", &checkpoint(7, "DELETE FROM remote_entries")));
+    refused("held-cp-orphan", held("held-cp-orphan", "INSERT INTO remote_checkpoints VALUES ('bus', 'counter', 'counter', 'tally', 1, x'aa')"));
+
+    // No more is held than this runtime would have let it grow to, in all or in one entry.
+    refused("held-much", tampered(&nec, "~nec", "held-much", "SELECT 1", Config { max_follow_bytes: 100, ..fast() }).0);
+    tampered(&nec, "~nec", "held-enough", "SELECT 1", Config { max_follow_bytes: 400, ..fast() }).0.unwrap();
+    refused("held-large", tampered(&nec, "~nec", "held-large", "SELECT 1", Config { max_event_bytes: 4, max_checkpoint_bytes: 4, ..fast() }).0);
+
+    // A notice queued for the agent is about a log it follows on that ship, there is one
+    // at most, and it carries no number.
+    let notice = |ship: &str, number: u64| {
+        format!("INSERT INTO inbox (kind, source, agent, interface, payload, ship, ship_seq) VALUES (3, 'counter', 'tally', 'counter', x'', '{ship}', {number});")
+    };
+    let (result, other, _dir) = tampered(&nec, "~nec", "held-notice", &notice("zod", 0), fast());
+    result.unwrap();
+    assert_eq!(other.pending("~nec").unwrap(), 1);
+    refused("held-notice-twice", held("held-notice-twice", &[notice("zod", 0), notice("zod", 0)].concat()));
+    refused("held-notice-stray", held("held-notice-stray", &notice("bus", 0)));
+    refused("held-notice-numbered", held("held-notice-numbered", &notice("zod", 1)));
+
+    // The publisher's side. ~zod's file says who may follow its log and who does. Let in
+    // as it stands, every follower is marked to be told afresh where the log ends.
+    let shared = |label: &str, statement: &str| tampered(&zod, "~zod", label, statement, fast()).0;
+    let (result, other, dir) = tampered(&zod, "~zod", "pub-intact", "SELECT 1", fast());
+    result.unwrap();
+    assert_eq!(other.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+    drop(other);
+    let file = rusqlite::Connection::open(dir.0.join("ships").join("zod.ship")).unwrap();
+    assert_eq!(file.query_row("SELECT due FROM log_peers", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    shared("pub-everyone", "INSERT INTO log_shares VALUES ('counter', 'counter', '*')").unwrap();
+    for (label, statement) in [
+        // A log is shared with other ships, by name or with "*".
+        ("pub-share-name", "INSERT INTO log_shares VALUES ('counter', 'counter', 'Not A Ship')"),
+        ("pub-share-self", "INSERT INTO log_shares VALUES ('counter', 'counter', 'zod')"),
+        ("pub-share-agent", "INSERT INTO log_shares VALUES ('Not An Agent', 'counter', 'bus')"),
+        // A ship that follows a log is another ship, and one the log is shared with,
+        // unless it has been shut out and is waiting to be told.
+        ("pub-follower-uncovered", "DELETE FROM log_shares"),
+        ("pub-follower-flag", "UPDATE log_peers SET kicked = 2"),
+        ("pub-follower-self", "INSERT INTO log_shares VALUES ('counter', 'counter', '*'); INSERT INTO log_peers VALUES ('counter', 'counter', 'zod', 0, 0, 0)"),
+        ("pub-follower-name", "INSERT INTO log_shares VALUES ('counter', 'counter', '*'); INSERT INTO log_peers VALUES ('counter', 'counter', 'Not A Ship', 0, 0, 0)"),
+    ] {
+        refused(label, shared(label, statement));
+    }
+    shared("pub-follower-kicked", "DELETE FROM log_shares; UPDATE log_peers SET kicked = 1").unwrap();
+    // And only so many of each.
+    refused("pub-share-many", tampered(&zod, "~zod", "pub-share-many", "SELECT 1", Config { max_log_shares: 0, ..fast() }).0);
+    refused("pub-follower-many", tampered(&zod, "~zod", "pub-follower-many", "SELECT 1", Config { max_log_followers: 0, ..fast() }).0);
+}
+
+#[test]
+fn an_answer_to_an_earlier_asking_is_not_taken_for_a_later_one() {
+    let (entries, head) = signed_log(BUS, "bus", "counter", "counter", &["a=1", "a=2", "a=3"]);
+    // ~bus is slow to answer the first time it is asked, and says then that its log is
+    // empty. By the time that answer arrives, ~nec's agent has stopped following and
+    // started again. The answer is to the first asking. Taken for the second, it would
+    // leave ~nec sure that it had asked, been answered, and had nothing to wait for.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let count = asked.clone();
+    let (nec, _kept) = fed_by("flw-stale", Arc::new(move |request| match request {
+        Asked::Fetch(_) if count.fetch_add(1, Ordering::SeqCst) == 0 => {
+            std::thread::sleep(Duration::from_millis(700));
+            fetched(Vec::new(), ship_proto::LogHead::default())
+        }
+        Asked::Fetch(fetch) => fetched(entries.iter().skip(fetch.after as usize).cloned().collect(), head.clone()),
+        _ => None,
+    }));
+    eventually("the first question is put", || asked.load(Ordering::SeqCst) == 1);
+    send(&nec, "~nec", "tally", "unfollow-on bus");
+    send(&nec, "~nec", "tally", "follow-on bus");
+    eventually("the second asking gets its own answer", || seen_on(&nec, "~nec", "bus") == 3);
+
+    // The same when the agent asks again without having stopped: asking again is asking
+    // afresh, and the answer to the asking before is not the answer to this one.
+    let (entries, head) = signed_log(BUS, "bus", "counter", "counter", &["a=1", "a=2", "a=3"]);
+    let asked = Arc::new(AtomicUsize::new(0));
+    let count = asked.clone();
+    let (nec, _kept) = fed_by("flw-stale-again", Arc::new(move |request| match request {
+        Asked::Fetch(_) if count.fetch_add(1, Ordering::SeqCst) == 0 => {
+            std::thread::sleep(Duration::from_millis(700));
+            fetched(Vec::new(), ship_proto::LogHead::default())
+        }
+        Asked::Fetch(fetch) => fetched(entries.iter().skip(fetch.after as usize).cloned().collect(), head.clone()),
+        _ => None,
+    }));
+    eventually("the first question is put", || asked.load(Ordering::SeqCst) == 1);
+    send(&nec, "~nec", "tally", "follow-on bus");
+    eventually("the second asking gets its own answer", || seen_on(&nec, "~nec", "bus") == 3);
+}
+
+#[test]
+fn an_answer_is_sized_by_what_is_sent_signatures_and_all() {
+    let (a, b) = (TempDir::new("flw-size-a"), TempDir::new("flw-size-b"));
+    let directory = Directory::new();
+    // Two runtimes set up alike, with small messages. Many small entries are waiting. An
+    // answer is filled by the size it will have on the wire, so it is one the other ship
+    // will read. Counted by the entries alone it would be too large, be refused, and be
+    // sent again just the same.
+    let small = Config { max_event_bytes: 200, max_checkpoint_bytes: 200, ..fast() };
+    let net = NetConfig { max_message_bytes: 200 + 4096, ..eager() };
+    let (zod, _zod_net) = crewed_on(&a, "~zod", &directory, small.clone(), net.clone(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed_on(&b, "~nec", &directory, small, net, open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    send(&zod, "~zod", "counter", "checkpoints broken");
+    for _ in 0..64 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("every entry arrives", || seen_on(&nec, "~nec", "zod") == 64);
+}
+
+#[test]
+fn entries_asked_for_before_stopping_cannot_be_collected_after_starting_again() {
+    let (a, b) = (TempDir::new("flw-sneak-a"), TempDir::new("flw-sneak-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    // Nothing queued on ~nec runs by itself, so what is fetched stays held.
+    let cfg = Config { max_queued_per_deliver: 0, ..fast() };
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, cfg, open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    for _ in 0..3 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("the entries are fetched", || followed(&nec, "~nec").fetched == 3);
+
+    // In one event the agent asks for entries without room to be handed them, stops
+    // following, follows again, and tries to collect what it asked for before. There is
+    // nothing to collect. Were there, its place in the new following would move past
+    // entries it has never been given.
+    assert_eq!(send(&nec, "~nec", "tally", "sneak-on zod"), "true -1");
+    assert_eq!(followed(&nec, "~nec").taken, 0);
+    eventually("the log is fetched again from the start", || followed(&nec, "~nec").fetched == 3);
+    let (out, other) = (TempDir::new("flw-sneak-out"), TempDir::new("flw-sneak-other"));
+    nec.export_ship("~nec", &out.0).unwrap();
+    Runtime::open(&other.0, fast()).unwrap().import_ship(&out.0, "~nec").unwrap();
+}
+
+#[test]
+fn an_agent_far_behind_works_through_the_whole_log_without_further_prompting() {
+    let (a, b) = (TempDir::new("flw-long-a"), TempDir::new("flw-long-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    send(&zod, "~zod", "counter", "checkpoints broken");
+    for _ in 0..1000 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    // ~nec fetches all thousand in four goes. Its agent takes three each time it is
+    // prompted, which is over three hundred rounds: more than are run on the strength of
+    // four things arriving from outside. Nothing else happens on either ship, and it
+    // finishes.
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("the agent has every entry", || seen_on(&nec, "~nec", "zod") == 1000);
+}
+
+#[test]
+fn being_told_a_log_is_closed_is_a_reason_to_ask_and_no_more() {
+    let (a, b) = (TempDir::new("flw-closed-a"), TempDir::new("flw-closed-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    send(&zod, "~zod", "counter", "log hits");
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("the entry arrives", || seen_on(&nec, "~nec", "zod") == 1);
+
+    // News that the log is closed to ~nec reaches it late: sent while ~nec was shut out,
+    // arriving after it was let back in. (Here it is sent by hand, as ~zod.) ~nec does not
+    // stop on the strength of it. It asks ~zod, which shares the log, and carries on.
+    let seed: [u8; 32] = fs::read(a.0.join("keys").join("zod.key")).unwrap().try_into().unwrap();
+    let closed = ship_proto::LogNews { agent: "counter".into(), log: "counter".into(), head: 0, closed: true };
+    let heard = ask_ship(nec_net.addr(), "nec", seed, Asked::News(ship_proto::News { logs: vec![closed] }));
+    assert_eq!(heard, Some(Answered::Heard(ship_proto::Heard { unknown: vec![false] })));
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("~nec carries on", || seen_on(&nec, "~nec", "zod") == 2);
+    assert_eq!((stopped_on(&nec, "~nec", "zod"), followed(&nec, "~nec").stopped), (String::new(), None));
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+}
+
+#[test]
+fn an_agent_that_asks_again_whenever_it_is_refused_is_held_to_a_slow_pace() {
+    // ~bus refuses every time. ~nec's agent answers each refusal by asking again, at once.
+    // Each refusal counts as a try that failed, and tries that fail are spaced out, so the
+    // two ships are not kept busy for as long as the agent cares to go on.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let count = asked.clone();
+    let dir = TempDir::new("flw-stubborn");
+    let directory = Directory::new();
+    let (addr, _running, _) = stand_in_with(BUS, BUS, true, 0, Some(Arc::new(move |request| match request {
+        Asked::Fetch(_) => {
+            count.fetch_add(1, Ordering::SeqCst);
+            Some(Answered::Fetched(ship_proto::Fetched { denied: "no".into(), ..Default::default() }))
+        }
+        _ => None,
+    })));
+    directory.set("~bus", public_of(BUS), addr).unwrap();
+    let (nec, _nec_net) = crewed(&dir, "~nec", &directory, fast(), open_counter(), following_tally("*"));
+    send(&nec, "~nec", "tally", "stubborn");
+    send(&nec, "~nec", "tally", "follow-on bus");
+    std::thread::sleep(Duration::from_millis(2500));
+    // Tries are at most 300ms apart here, so there have been a handful. Not hundreds.
+    let tries = asked.load(Ordering::SeqCst);
+    assert!((3..=40).contains(&tries), "asked {tries} times in two and a half seconds");
+}
+
+#[test]
+fn an_answer_given_before_a_log_was_closed_does_not_call_off_the_asking() {
+    // ~bus answers the first question slowly: its log is shared, and empty. Before that
+    // answer arrives, ~nec is told the log is closed to it, which makes it ask afresh. The
+    // slow answer is to the question from before. Taken as the answer to the new one, it
+    // would leave ~nec following a log it has been shut out of, and never told so.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let count = asked.clone();
+    let (nec, kept) = fed_by("flw-closed-late", Arc::new(move |request| match request {
+        Asked::Fetch(_) if count.fetch_add(1, Ordering::SeqCst) == 0 => {
+            std::thread::sleep(Duration::from_millis(700));
+            fetched(Vec::new(), ship_proto::LogHead::default())
+        }
+        Asked::Fetch(_) => Some(Answered::Fetched(ship_proto::Fetched { denied: "no".into(), ..Default::default() })),
+        _ => None,
+    }));
+    eventually("the first question is put", || asked.load(Ordering::SeqCst) == 1);
+    let closed = ship_proto::LogNews { agent: "counter".into(), log: "counter".into(), head: 0, closed: true };
+    let heard = ask_ship(kept.1.addr(), "nec", BUS, Asked::News(ship_proto::News { logs: vec![closed] }));
+    assert_eq!(heard, Some(Answered::Heard(ship_proto::Heard { unknown: vec![false] })));
+    eventually("~nec asks again and is told the log has stopped", || stopped_on(&nec, "~nec", "bus").contains("does not share"));
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn looking_at_a_followed_log_without_taking_anything_keeps_nothing_running() {
+    let (a, b) = (TempDir::new("flw-idle-a"), TempDir::new("flw-idle-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    send(&zod, "~zod", "counter", "log hits");
+    // ~nec's agent is prompted about the entry and never takes it.
+    send(&nec, "~nec", "tally", "lazy");
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("the entry is fetched", || followed(&nec, "~nec").fetched == 1);
+    eventually("the agent has given up on it", || nec.pending("~nec").unwrap() == 0);
+
+    // Now it sends itself a command that looks at the log, takes nothing, and sends itself
+    // the same again. Taking entries from another ship's log is a reason to keep a ship's
+    // queue running. Looking is not: the chain is run as far as any chain of commands is,
+    // and then waits.
+    send(&nec, "~nec", "tally", "idle-on zod");
+    std::thread::sleep(Duration::from_millis(1500));
+    let idles: usize = view(&nec, "~nec", "tally", "idles").parse().unwrap();
+    assert!(idles <= 200, "the chain ran {idles} times");
+    let pending = nec.pending("~nec").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!((nec.pending("~nec").unwrap(), followed(&nec, "~nec").taken), (pending, 0));
+}
+
+#[test]
+fn a_ship_short_of_room_takes_on_no_new_followers_until_it_has_some() {
+    let (a, b) = (TempDir::new("flw-tight-a"), TempDir::new("flw-tight-b"));
+    let directory = Directory::new();
+    // ~zod's file is small and its counter has nearly filled it: less is free than ~zod
+    // keeps for taking a command from another ship.
+    let cfg = Config { max_ship_bytes: 420 << 10, ..fast() };
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, cfg, open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    send(&zod, "~zod", "counter", "log hits");
+    assert_eq!(send(&zod, "~zod", "counter", "big 200000"), "ok");
+
+    // Noting ~nec as a follower would be one more record written because another ship
+    // asked. ~zod does not write it. ~nec is not refused for good: it goes on asking.
+    send(&nec, "~nec", "tally", "follow-on zod");
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(zod.log_followers("~zod", "counter", "counter").unwrap().is_empty());
+    assert_eq!((followed(&nec, "~nec").fetched, followed(&nec, "~nec").stopped), (0, None));
+    // ~zod can still take a command, which is what the room is kept for.
+    send(&nec, "~nec", "tally", "tell zod inc hits");
+    eventually("the command runs on ~zod", || count(&zod, "~zod", "hits") == "1");
+
+    // Its counter lets go of what it was holding, and ~nec gets in.
+    send(&zod, "~zod", "counter", "del big");
+    eventually("~nec follows", || seen_on(&nec, "~nec", "zod") == 1);
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+}
+
+#[test]
+fn a_ship_shut_out_of_a_log_is_not_told_how_far_it_has_got_since() {
+    let dir = TempDir::new("flw-closed-head");
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&dir, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    send(&zod, "~zod", "counter", "share *");
+    // ~bus is a stand-in that notes whatever it is told about ~zod's logs.
+    let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let noted = told.clone();
+    let (addr, _running, _) = stand_in_with(BUS, BUS, true, 0, Some(Arc::new(move |asked| match asked {
+        Asked::News(news) => {
+            noted.lock().unwrap().extend(news.logs.iter().map(|log| (log.closed, log.head)));
+            Some(Answered::Heard(ship_proto::Heard { unknown: vec![false; news.logs.len()] }))
+        }
+        _ => None,
+    })));
+    directory.set("~bus", public_of(BUS), addr).unwrap();
+    assert!(matches!(ask_ship(zod_net.addr(), "zod", BUS, fetch("counter", "counter", 0, true)), Some(Answered::Fetched(_))));
+
+    // While ~zod is off the network, its counter shuts ~bus out, and then the log grows.
+    // Back on, ~zod tells ~bus the log is closed to it. It does not say where the log has
+    // got to: that happened after ~bus was shut out.
+    drop(zod_net);
+    send(&zod, "~zod", "counter", "unshare *");
+    for _ in 0..3 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    let zod_net = Network::start(zod.clone(), directory.clone(), eager()).unwrap();
+    directory.set("~zod", zod.public_key("~zod").unwrap(), zod_net.addr()).unwrap();
+    eventually("~bus is told the log is closed", || !told.lock().unwrap().is_empty());
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(*told.lock().unwrap(), [(true, 0)]);
+}
+
+#[test]
+fn a_ship_holds_only_so_much_of_a_log_however_much_it_is_sent() {
+    // ~bus sends all forty entries of its log at once, whatever it is asked for. ~nec keeps
+    // what it has room to hold for its agent, which has yet to take any, and lets the rest
+    // go by: it will ask for them when there is room.
+    let payloads: Vec<String> = (1..=40).map(|n| format!("a={n}")).collect();
+    let (entries, _) = signed_log(BUS, "bus", "counter", "counter", &payloads.iter().map(String::as_str).collect::<Vec<_>>());
+    let dir = TempDir::new("flw-hold");
+    let directory = Directory::new();
+    let (addr, _running, _) = stand_in_with(BUS, BUS, true, 0, Some(serving(entries)));
+    directory.set("~bus", public_of(BUS), addr).unwrap();
+    let cfg = Config { max_follow_bytes: 400, max_queued_per_deliver: 0, ..fast() };
+    let (nec, _nec_net) = crewed(&dir, "~nec", &directory, cfg, open_counter(), following_tally("*"));
+    send(&nec, "~nec", "tally", "follow-on bus");
+    eventually("~nec has fetched what it will hold", || followed(&nec, "~nec").fetched >= 6);
+    std::thread::sleep(Duration::from_millis(500));
+    let log = followed(&nec, "~nec");
+    assert!((log.taken, log.announced) == (0, 40) && log.fetched <= 7, "{log:?}");
+}
+
+#[test]
+fn an_agent_taking_entries_makes_room_and_more_are_fetched() {
+    let (a, b) = (TempDir::new("flw-refill-a"), TempDir::new("flw-refill-b"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    // Nothing queued on ~nec runs by itself, and it holds about a thousand bytes of a log.
+    let cfg = Config { max_follow_bytes: 1000, max_queued_per_deliver: 0, ..fast() };
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, cfg, open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share nec");
+    for _ in 0..60 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("~nec has fetched what it will hold", || followed(&nec, "~nec").fetched >= 14);
+    std::thread::sleep(Duration::from_millis(500));
+    let held = followed(&nec, "~nec").fetched;
+    assert!(held <= 15, "{held}");
+
+    // The agent is given its turn once, and takes three entries. That alone is what makes
+    // ~nec ask for more: nothing else is happening on either ship.
+    assert_eq!(nec.run_pending("~nec", 1).unwrap(), 1);
+    assert_eq!(followed(&nec, "~nec").taken, 3);
+    eventually("more is fetched", || followed(&nec, "~nec").fetched > held);
 }

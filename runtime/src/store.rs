@@ -1,8 +1,8 @@
 //! One SQLite file per ship. The file is the ship's source of truth.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,11 +11,14 @@ use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 
-use ship_proto::{CheckpointBody, Device, Kind, Message, PeerMessage, Receipt, Verdict};
+use ship_proto::{CheckpointBody, Device, Kind, LogNews, Message, PeerMessage, Receipt, Verdict};
 
 use crate::{signed_bytes, AuditEntry, ChainCheck, Config, Durability, Effect, Error, CHECKPOINT_DOMAIN};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
+
+// The schema and one query name a command by its number, where SQLite needs to see it written out.
+const _: () = assert!(Kind::Command as i32 == 1);
 
 /// Each pending message counts as its payload plus this, so empty messages still use up quota.
 pub const MESSAGE_OVERHEAD: u64 = 64;
@@ -78,6 +81,10 @@ pub const MAX_BATCH_MESSAGES: usize = 256;
 /// Far below the point where SQLite refuses to hand out another AUTOINCREMENT value.
 const MAX_SEQ: i64 = 1 << 62;
 
+/// The highest entry number this ship will believe of a log on another ship. No log gets
+/// there by being written to, and a number beyond it could not be kept in the ship's file.
+pub const MAX_LOG_SEQ: u64 = (MAX_SEQ / 2) as u64;
+
 const SCHEMA: &str = "
 CREATE TABLE meta (key TEXT PRIMARY KEY, value) WITHOUT ROWID;
 CREATE TABLE kv (
@@ -101,7 +108,7 @@ CREATE TABLE inbox (
     ship TEXT NOT NULL DEFAULT '',
     ship_seq INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX inbox_from ON inbox (ship) WHERE ship != '';
+CREATE INDEX inbox_from ON inbox (ship) WHERE ship != '' AND kind = 1;
 CREATE TABLE peers (
     peer TEXT PRIMARY KEY,
     sent INTEGER NOT NULL,
@@ -137,6 +144,7 @@ CREATE TABLE logs (
     tail_bytes INTEGER NOT NULL,
     asked INTEGER NOT NULL,
     history INTEGER NOT NULL,
+    marked INTEGER NOT NULL,
     PRIMARY KEY (agent, name)
 ) WITHOUT ROWID;
 CREATE TABLE checkpoints (
@@ -157,13 +165,62 @@ CREATE TABLE log_entries (
 ) WITHOUT ROWID;
 CREATE TABLE follows (
     follower TEXT NOT NULL,
+    ship TEXT NOT NULL,
     agent TEXT NOT NULL,
     name TEXT NOT NULL,
     cursor INTEGER NOT NULL,
     notified INTEGER NOT NULL,
     failures INTEGER NOT NULL,
-    PRIMARY KEY (follower, agent, name)
+    PRIMARY KEY (follower, ship, agent, name)
 ) WITHOUT ROWID;
+CREATE TABLE remote_logs (
+    peer TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    name TEXT NOT NULL,
+    follower TEXT NOT NULL,
+    head INTEGER NOT NULL,
+    head_hash BLOB NOT NULL,
+    announced INTEGER NOT NULL,
+    bytes INTEGER NOT NULL,
+    joined INTEGER NOT NULL,
+    stopped TEXT NOT NULL,
+    gen INTEGER NOT NULL,
+    PRIMARY KEY (peer, agent, name, follower)
+) WITHOUT ROWID;
+CREATE TABLE remote_entries (
+    peer TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    name TEXT NOT NULL,
+    follower TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY (peer, agent, name, follower, seq)
+) WITHOUT ROWID;
+CREATE TABLE remote_checkpoints (
+    peer TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    name TEXT NOT NULL,
+    follower TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    state BLOB NOT NULL,
+    PRIMARY KEY (peer, agent, name, follower)
+) WITHOUT ROWID;
+CREATE TABLE log_shares (
+    agent TEXT NOT NULL,
+    name TEXT NOT NULL,
+    peer TEXT NOT NULL,
+    PRIMARY KEY (agent, name, peer)
+) WITHOUT ROWID;
+CREATE TABLE log_peers (
+    agent TEXT NOT NULL,
+    name TEXT NOT NULL,
+    peer TEXT NOT NULL,
+    due INTEGER NOT NULL,
+    kicked INTEGER NOT NULL,
+    gen INTEGER NOT NULL,
+    PRIMARY KEY (agent, name, peer)
+) WITHOUT ROWID;
+CREATE INDEX log_peers_due ON log_peers (due, peer);
 CREATE TABLE audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     at_ms INTEGER NOT NULL,
@@ -412,14 +469,40 @@ pub fn peer_owed(conn: &Connection, peer: &str) -> rusqlite::Result<(usize, usiz
         .prepare_cached("SELECT COUNT(*) FROM peer_out WHERE peer = ?1 AND receipt")?
         .query_row([peer], |r| r.get::<_, i64>(0))?;
     let queued = conn
-        .prepare_cached("SELECT COUNT(*) FROM inbox WHERE ship = ?1 AND ship != '' AND kind = ?2")?
-        .query_row(params![peer, Kind::Command as i32], |r| r.get::<_, i64>(0))?;
+        // (Written out as the index on commands from other ships has it, so that it is used.)
+        .prepare_cached("SELECT COUNT(*) FROM inbox WHERE ship = ?1 AND ship != '' AND kind = 1")?
+        .query_row(params![peer], |r| r.get::<_, i64>(0))?;
     Ok((waiting as usize, queued as usize))
 }
 
-/// The other ships that have something waiting to go to them.
-pub fn peers_waiting(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    conn.prepare_cached("SELECT peer FROM peers WHERE out_bytes > 0 ORDER BY peer")?.query_map([], |r| r.get(0))?.collect()
+/// What a ship has to take up with another ship.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerWork {
+    /// Commands or receipts waiting to go to it.
+    pub messages: bool,
+    /// News of this ship's logs for it, or entries of its logs to ask it for.
+    pub logs: bool,
+}
+
+/// The other ships this ship has something to take up with, and what. `max_follow_bytes` is
+/// how much of another ship's log is held for an agent before no more is asked for.
+pub fn peers_waiting(conn: &Connection, max_follow_bytes: u64) -> rusqlite::Result<BTreeMap<String, PeerWork>> {
+    let mut found: BTreeMap<String, PeerWork> = BTreeMap::new();
+    let mut stmt = conn.prepare_cached("SELECT peer FROM peers WHERE out_bytes > 0")?;
+    for peer in stmt.query_map([], |r| r.get::<_, String>(0))? {
+        found.entry(peer?).or_default().messages = true;
+    }
+    let mut stmt = conn.prepare_cached("SELECT DISTINCT peer FROM log_peers WHERE due = 1")?;
+    for peer in stmt.query_map([], |r| r.get::<_, String>(0))? {
+        found.entry(peer?).or_default().logs = true;
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT peer FROM remote_logs WHERE stopped = '' AND (joined = 0 OR head < announced) AND bytes < ?1",
+    )?;
+    for peer in stmt.query_map([max_follow_bytes.min(i64::MAX as u64) as i64], |r| r.get::<_, String>(0))? {
+        found.entry(peer?).or_default().logs = true;
+    }
+    Ok(found)
 }
 
 /// How many messages are waiting to go to other ships.
@@ -475,7 +558,10 @@ pub fn peer_acked(conn: &Connection, peer: &str, last: u64) -> rusqlite::Result<
 
 /// Remove and return the oldest queued command. Call inside the transaction that will run it,
 /// so that taking it and its effects land together.
-pub fn inbox_pop(conn: &Connection) -> rusqlite::Result<Option<Queued>> {
+///
+/// For a notification about a log on another ship, also returns how much room the file had
+/// before it was taken off the queue. See `Ship::execute`.
+pub fn inbox_pop(conn: &Connection) -> rusqlite::Result<Option<(Queued, Option<u64>)>> {
     let oldest = conn
         .prepare_cached("SELECT seq, kind, source, agent, interface, payload, ship, ship_seq FROM inbox ORDER BY seq LIMIT 1")?
         .query_row([], |r| {
@@ -491,10 +577,11 @@ pub fn inbox_pop(conn: &Connection) -> rusqlite::Result<Option<Queued>> {
             })
         })
         .optional()?;
-    if let Some(queued) = &oldest {
-        inbox_delete(conn, queued.seq)?;
-    }
-    Ok(oldest)
+    let Some(queued) = oldest else { return Ok(None) };
+    let from_elsewhere = queued.kind == Kind::Notify as i32 && !queued.ship.is_empty();
+    let spare_before = if from_elsewhere { Some(spare_bytes(conn)?) } else { None };
+    inbox_delete(conn, queued.seq)?;
+    Ok(Some((queued, spare_before)))
 }
 
 pub fn inbox_delete(conn: &Connection, seq: i64) -> rusqlite::Result<()> {
@@ -536,9 +623,10 @@ pub fn log_append(conn: &Connection, agent: &str, name: &str, seq: u64, body: &[
         .execute(params![agent, name, seq as i64, body, signature])?;
     // Columns: head, head_hash, bytes held, base (entries up to here are dropped), tail_bytes
     // (entries since the last checkpoint), asked (a checkpoint request is queued), history
-    // (the publisher has said this log must never be trimmed).
+    // (the publisher has said this log must never be trimmed), marked (every ship that
+    // follows this log is already down as needing to be told it has grown).
     conn.prepare_cached(
-        "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, ?5, 0, ?5, 0, 0) ON CONFLICT (agent, name) DO UPDATE
+        "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, ?5, 0, ?5, 0, 0, 0) ON CONFLICT (agent, name) DO UPDATE
          SET head = excluded.head, head_hash = excluded.head_hash, bytes = bytes + excluded.bytes,
              tail_bytes = tail_bytes + excluded.tail_bytes",
     )?
@@ -849,6 +937,21 @@ fn meta_set(conn: &Connection, key: &str, value: u64) -> rusqlite::Result<()> {
         .map(drop)
 }
 
+/// A number this ship has not used before for the purpose `key` names, and will not use
+/// again: one more than the last. It marks one state of a record apart from every other
+/// state that record, or a later record in its place, will ever be in, so that something
+/// decided about one cannot be carried out on another.
+fn fresh_mark(conn: &Connection, key: &str) -> rusqlite::Result<u64> {
+    let mark = meta_number(conn, key)? + 1;
+    // No ship gets through these. But one that somehow had must stop here: carrying on
+    // would hand the same number out again and again.
+    if mark > MAX_SEQ as u64 {
+        return Err(rusqlite::Error::IntegralValueOutOfRange(0, MAX_SEQ));
+    }
+    meta_set(conn, key, mark)?;
+    Ok(mark)
+}
+
 /// Until when signing in to this ship is locked after too many wrong codes, or 0.
 pub fn signin_locked_until(conn: &Connection) -> rusqlite::Result<u64> {
     meta_number(conn, "signin_locked_until")
@@ -869,11 +972,26 @@ pub fn signin_succeeded(conn: &Connection) -> rusqlite::Result<()> {
     meta_set(conn, "signin_failures", 0)
 }
 
+/// A log that an agent follows: one on this ship when `ship` is empty, and otherwise one on
+/// that ship, which this ship keeps a copy of the part its agent has yet to take.
+#[derive(Clone, Copy, Debug)]
+pub struct Followed<'a> {
+    pub ship: &'a str,
+    pub agent: &'a str,
+    pub name: &'a str,
+}
+
+impl<'a> Followed<'a> {
+    pub fn here(agent: &'a str, name: &'a str) -> Self {
+        Followed { ship: "", agent, name }
+    }
+}
+
 /// Record that `follower` follows a log, starting before its first entry. Returns false if it
 /// already did.
-pub fn follow(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<bool> {
-    conn.prepare_cached("INSERT OR IGNORE INTO follows VALUES (?1, ?2, ?3, 0, 0, 0)")?
-        .execute(params![follower, agent, name])
+pub fn follow(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<bool> {
+    conn.prepare_cached("INSERT OR IGNORE INTO follows VALUES (?1, ?2, ?3, ?4, 0, 0, 0)")?
+        .execute(params![follower, log.ship, log.agent, log.name])
         .map(|added| added == 1)
 }
 
@@ -884,28 +1002,40 @@ pub fn follow_count(conn: &Connection, follower: &str) -> rusqlite::Result<usize
 }
 
 /// The number of the last entry `follower` has taken from a log, if it follows that log.
-pub fn cursor(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<Option<u64>> {
-    conn.prepare_cached("SELECT cursor FROM follows WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
-        .query_row(params![follower, agent, name], |r| r.get::<_, i64>(0))
+pub fn cursor(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<Option<u64>> {
+    conn.prepare_cached("SELECT cursor FROM follows WHERE follower = ?1 AND ship = ?2 AND agent = ?3 AND name = ?4")?
+        .query_row(params![follower, log.ship, log.agent, log.name], |r| r.get::<_, i64>(0))
         .optional()
         .map(|cursor| cursor.map(|seq| seq as u64))
 }
 
-pub fn set_cursor(conn: &Connection, follower: &str, agent: &str, name: &str, cursor: u64) -> rusqlite::Result<()> {
-    conn.prepare_cached("UPDATE follows SET cursor = ?4 WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
-        .execute(params![follower, agent, name, cursor as i64])
+pub fn set_cursor(conn: &Connection, follower: &str, log: Followed, cursor: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE follows SET cursor = ?5 WHERE follower = ?1 AND ship = ?2 AND agent = ?3 AND name = ?4")?
+        .execute(params![follower, log.ship, log.agent, log.name, cursor as i64])
         .map(drop)
+}
+
+/// Where the log ends, as far as this ship holds it: for a log on another ship, the newest
+/// entry fetched.
+fn followed_head(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<u64> {
+    if log.ship.is_empty() {
+        return Ok(log_head(conn, log.agent, log.name)?.0);
+    }
+    Ok(replica(conn, follower, log)?.map_or(0, |held| held.head))
 }
 
 /// Queue a notification for one follower, unless one is already waiting. At most one is ever
 /// queued per follower and log, however many entries arrive and whatever the follower's own
 /// handler does; that bound is why notifications need no room in the command queue.
-pub fn notify(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<()> {
+pub fn notify(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<()> {
     let marked = conn
-        .prepare_cached("UPDATE follows SET notified = 1 WHERE follower = ?1 AND agent = ?2 AND name = ?3 AND notified = 0")?
-        .execute(params![follower, agent, name])?;
+        .prepare_cached(
+            "UPDATE follows SET notified = 1 WHERE follower = ?1 AND ship = ?2 AND agent = ?3 AND name = ?4 AND notified = 0",
+        )?
+        .execute(params![follower, log.ship, log.agent, log.name])?;
     if marked == 1 {
-        inbox_push(conn, Kind::Notify, agent, follower, name, &[])?;
+        conn.prepare_cached("INSERT INTO inbox (kind, source, agent, interface, payload, ship) VALUES (?1, ?2, ?3, ?4, x'', ?5)")?
+            .execute(params![Kind::Notify as i32, log.agent, follower, log.name, log.ship])?;
     }
     Ok(())
 }
@@ -932,40 +1062,41 @@ pub fn inbox_len(conn: &Connection) -> Result<usize, Error> {
     Ok(conn.query_row("SELECT COUNT(*) FROM inbox", [], |r| r.get::<_, i64>(0))? as usize)
 }
 
-/// Notify every follower of a log that has no notification waiting. Returns how many.
+/// Notify every follower on this ship of one of its logs that has no notification waiting.
+/// Returns how many.
 pub fn notify_followers(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<u32> {
     let followers: Vec<String> = conn
-        .prepare_cached("SELECT follower FROM follows WHERE agent = ?1 AND name = ?2 AND notified = 0")?
+        .prepare_cached("SELECT follower FROM follows WHERE ship = '' AND agent = ?1 AND name = ?2 AND notified = 0")?
         .query_map(params![agent, name], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     // A new entry starts a follower off afresh, including one that had been given up on.
-    conn.prepare_cached("UPDATE follows SET failures = 0 WHERE agent = ?1 AND name = ?2 AND notified = 0")?
+    conn.prepare_cached("UPDATE follows SET failures = 0 WHERE ship = '' AND agent = ?1 AND name = ?2 AND notified = 0")?
         .execute(params![agent, name])?;
     for follower in &followers {
-        notify(conn, follower, agent, name)?;
+        notify(conn, follower, Followed::here(agent, name))?;
     }
     Ok(followers.len() as u32)
 }
 
 /// A follower's notification has been taken off the queue, so the next new entry may queue another.
-pub fn clear_notified(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<()> {
-    conn.prepare_cached("UPDATE follows SET notified = 0 WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
-        .execute(params![follower, agent, name])
+pub fn clear_notified(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE follows SET notified = 0 WHERE follower = ?1 AND ship = ?2 AND agent = ?3 AND name = ?4")?
+        .execute(params![follower, log.ship, log.agent, log.name])
         .map(drop)
 }
 
 /// A follower's notify handler failed. Its position has not moved, so it is still behind. Try it
 /// again a few times, in case the cause was passing, and then stop: an entry it can never
 /// handle must not be retried for ever.
-pub fn notify_failed(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<()> {
-    conn.prepare_cached("UPDATE follows SET failures = failures + 1 WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
-        .execute(params![follower, agent, name])?;
+pub fn notify_failed(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE follows SET failures = failures + 1 WHERE follower = ?1 AND ship = ?2 AND agent = ?3 AND name = ?4")?
+        .execute(params![follower, log.ship, log.agent, log.name])?;
     let failures = conn
-        .prepare_cached("SELECT failures FROM follows WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
-        .query_row(params![follower, agent, name], |r| r.get::<_, i64>(0))
+        .prepare_cached("SELECT failures FROM follows WHERE follower = ?1 AND ship = ?2 AND agent = ?3 AND name = ?4")?
+        .query_row(params![follower, log.ship, log.agent, log.name], |r| r.get::<_, i64>(0))
         .optional()?;
     if failures.is_some_and(|failures| failures < MAX_NOTIFY_FAILURES) {
-        notify(conn, follower, agent, name)?;
+        notify(conn, follower, log)?;
     }
     Ok(())
 }
@@ -973,36 +1104,519 @@ pub fn notify_failed(conn: &Connection, follower: &str, agent: &str, name: &str)
 /// A follower's notify handler has finished without error. `before` is where it had got to
 /// when the handler started. If it is still behind and took nothing, prompting it again would
 /// go round for ever, so that counts as a failed round. Otherwise it is started off afresh.
-pub fn notify_handled(conn: &Connection, follower: &str, agent: &str, name: &str, before: Option<u64>) -> rusqlite::Result<()> {
-    let (head, _) = log_head(conn, agent, name)?;
-    match cursor(conn, follower, agent, name)? {
-        Some(now) if now < head && Some(now) == before => notify_failed(conn, follower, agent, name),
-        _ => resume(conn, follower, agent, name),
+pub fn notify_handled(conn: &Connection, follower: &str, log: Followed, before: Option<u64>) -> rusqlite::Result<()> {
+    let head = followed_head(conn, follower, log)?;
+    match cursor(conn, follower, log)? {
+        Some(now) if now < head && Some(now) == before => notify_failed(conn, follower, log),
+        _ => resume(conn, follower, log),
     }
 }
 
 /// Start a follower off afresh: forget its past failures and prompt it if it is behind.
-pub fn resume(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<()> {
-    conn.prepare_cached("UPDATE follows SET failures = 0 WHERE follower = ?1 AND agent = ?2 AND name = ?3")?
-        .execute(params![follower, agent, name])?;
-    renotify_if_behind(conn, follower, agent, name).map(drop)
+pub fn resume(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE follows SET failures = 0 WHERE follower = ?1 AND ship = ?2 AND agent = ?3 AND name = ?4")?
+        .execute(params![follower, log.ship, log.agent, log.name])?;
+    renotify_if_behind(conn, follower, log)
 }
 
 /// After a follower has handled a notification: if entries remain that it has not taken and
-/// nothing is queued, queue another. Returns whether it did.
-pub fn renotify_if_behind(conn: &Connection, follower: &str, agent: &str, name: &str) -> rusqlite::Result<bool> {
-    let behind = conn
-        .prepare_cached(
-            "SELECT 1 FROM follows f JOIN logs l ON l.agent = f.agent AND l.name = f.name
-             WHERE f.follower = ?1 AND f.agent = ?2 AND f.name = ?3 AND f.notified = 0 AND f.cursor < l.head",
-        )?
-        .query_row(params![follower, agent, name], |_| Ok(()))
-        .optional()?
-        .is_some();
-    if behind {
-        notify(conn, follower, agent, name)?;
+/// nothing is queued, queue another.
+pub fn renotify_if_behind(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<()> {
+    let head = followed_head(conn, follower, log)?;
+    if cursor(conn, follower, log)?.is_some_and(|cursor| cursor < head) {
+        notify(conn, follower, log)?;
     }
-    Ok(behind)
+    Ok(())
+}
+
+/// Stop following a log. A notification already queued for it goes too: there would be
+/// nothing for it to hand over.
+pub fn unfollow(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM follows WHERE follower = ?1 AND ship = ?2 AND agent = ?3 AND name = ?4")?
+        .execute(params![follower, log.ship, log.agent, log.name])?;
+    conn.prepare_cached("DELETE FROM inbox WHERE kind = ?1 AND agent = ?2 AND ship = ?3 AND source = ?4 AND interface = ?5")?
+        .execute(params![Kind::Notify as i32, follower, log.ship, log.agent, log.name])?;
+    if !log.ship.is_empty() {
+        for table in ["remote_logs", "remote_entries", "remote_checkpoints"] {
+            conn.prepare_cached(&format!("DELETE FROM {table} WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4"))?
+                .execute(params![log.ship, log.agent, log.name, follower])?;
+        }
+    }
+    Ok(())
+}
+
+// Following a log on another ship. For each agent that follows one, `remote_logs` says how
+// far this ship has fetched it, how far the publishing ship has said it reaches, and whether
+// it has stopped. `remote_entries` holds the entries fetched and not yet taken by the agent,
+// and `remote_checkpoints` a checkpoint fetched in place of entries that ship had dropped.
+// Only payloads are kept: each entry was checked against that ship's key as it arrived.
+
+/// What this ship holds of a log on another ship, for one of its agents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Replica {
+    /// The newest entry fetched, and its hash, which the next entry must link back to.
+    pub head: u64,
+    pub head_hash: Vec<u8>,
+    /// The newest entry the publishing ship has said the log has.
+    pub announced: u64,
+    /// What is held and not yet taken, counted like any other queue.
+    pub bytes: u64,
+    /// Whether the publishing ship has answered since this agent last asked to follow.
+    pub joined: bool,
+    /// Empty, or why no more of the log will come.
+    pub stopped: String,
+    /// A number given to this copy each time the agent asks to follow: no two askings on
+    /// one ship share one. An answer from the other ship is for the asking it was put under,
+    /// and is not taken for a later one.
+    pub gen: u64,
+}
+
+pub fn replica(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<Option<Replica>> {
+    conn.prepare_cached(
+        "SELECT head, head_hash, announced, bytes, joined, stopped, gen FROM remote_logs
+         WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4",
+    )?
+    .query_row(params![log.ship, log.agent, log.name, follower], |r| {
+        Ok(Replica {
+            head: r.get::<_, i64>(0)? as u64,
+            head_hash: r.get(1)?,
+            announced: r.get::<_, i64>(2)? as u64,
+            bytes: r.get::<_, i64>(3)? as u64,
+            joined: r.get(4)?,
+            stopped: r.get(5)?,
+            gen: r.get::<_, i64>(6)? as u64,
+        })
+    })
+    .optional()
+}
+
+/// Begin following a log on another ship, or ask afresh for one already followed: it is no
+/// longer stopped, and the publishing ship is asked again where it stands.
+pub fn replica_start(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<()> {
+    // A number no earlier asking on this ship has had, whether or not that one is still
+    // followed. An answer still on its way to an earlier asking then fits no copy.
+    let gen = fresh_mark(conn, "follow_gen")?;
+    conn.prepare_cached(
+        "INSERT INTO remote_logs VALUES (?1, ?2, ?3, ?4, 0, x'', 0, 0, 0, '', ?5)
+         ON CONFLICT (peer, agent, name, follower) DO UPDATE SET joined = 0, stopped = '', gen = ?5",
+    )?
+    .execute(params![log.ship, log.agent, log.name, follower, gen as i64])
+    .map(drop)
+}
+
+pub fn replica_save(conn: &Connection, follower: &str, log: Followed, held: &Replica) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "UPDATE remote_logs SET head = ?5, head_hash = ?6, announced = ?7, bytes = ?8, joined = ?9, stopped = ?10
+         WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4",
+    )?
+    .execute(params![
+        log.ship,
+        log.agent,
+        log.name,
+        follower,
+        held.head as i64,
+        held.head_hash,
+        held.announced as i64,
+        held.bytes as i64,
+        held.joined,
+        held.stopped
+    ])
+    .map(drop)
+}
+
+/// Keep an entry fetched from another ship until the agent takes it.
+pub fn replica_push(conn: &Connection, follower: &str, log: Followed, seq: u64, payload: &[u8]) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT INTO remote_entries VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
+        .execute(params![log.ship, log.agent, log.name, follower, seq as i64, payload])
+        .map(drop)
+}
+
+/// Keep a checkpoint fetched from another ship in place of entries it had dropped. Whatever
+/// entries were being held come before it, so they go: the checkpoint stands for them.
+pub fn replica_checkpoint_set(conn: &Connection, follower: &str, log: Followed, seq: u64, state: &[u8]) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM remote_entries WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4")?
+        .execute(params![log.ship, log.agent, log.name, follower])?;
+    conn.prepare_cached("INSERT OR REPLACE INTO remote_checkpoints VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
+        .execute(params![log.ship, log.agent, log.name, follower, seq as i64, state])
+        .map(drop)
+}
+
+/// The checkpoint waiting for the agent, if there is one, as (entry number, state).
+pub fn replica_checkpoint(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<Option<(u64, Vec<u8>)>> {
+    conn.prepare_cached("SELECT seq, state FROM remote_checkpoints WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4")?
+        .query_row(params![log.ship, log.agent, log.name, follower], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)))
+        .optional()
+}
+
+/// Held entries after `after`, oldest first, as (number, payload): at most `max_entries`, and
+/// at most `max_bytes` in total, except that one is always returned if there is one.
+pub fn replica_range(
+    conn: &Connection,
+    follower: &str,
+    log: Followed,
+    after: u64,
+    max_entries: usize,
+    max_bytes: usize,
+) -> rusqlite::Result<Vec<(u64, Vec<u8>)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT seq, payload FROM remote_entries WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4 AND seq > ?5 ORDER BY seq",
+    )?;
+    let mut rows = stmt.query(params![log.ship, log.agent, log.name, follower, i64::try_from(after).unwrap_or(i64::MAX)])?;
+    let (mut entries, mut bytes) = (Vec::new(), 0usize);
+    while let Some(row) = rows.next()? {
+        let payload: Vec<u8> = row.get(1)?;
+        if entries.len() >= max_entries || (!entries.is_empty() && bytes + payload.len() > max_bytes) {
+            break;
+        }
+        bytes += payload.len();
+        entries.push((row.get::<_, i64>(0)? as u64, payload));
+    }
+    Ok(entries)
+}
+
+/// The agent has taken everything up to entry `last`, so its position moves there and what
+/// was held up to it is let go.
+pub fn replica_taken(conn: &Connection, follower: &str, log: Followed, last: u64) -> rusqlite::Result<()> {
+    set_cursor(conn, follower, log, last)?;
+    for table in ["remote_entries", "remote_checkpoints"] {
+        conn.prepare_cached(&format!("DELETE FROM {table} WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4 AND seq <= ?5"))?
+            .execute(params![log.ship, log.agent, log.name, follower, last as i64])?;
+    }
+    // Counted afresh from what is left, so it cannot drift.
+    conn.prepare_cached(
+        "UPDATE remote_logs SET bytes =
+             (SELECT COALESCE(SUM(LENGTH(payload) + ?5), 0) FROM remote_entries WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4)
+           + (SELECT COALESCE(SUM(LENGTH(state) + ?5), 0) FROM remote_checkpoints WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4)
+         WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4",
+    )?
+    .execute(params![log.ship, log.agent, log.name, follower, MESSAGE_OVERHEAD as i64])
+    .map(drop)
+}
+
+/// The agents on this ship that follow a log on another ship.
+pub fn replica_followers(conn: &Connection, peer: &str, agent: &str, name: &str) -> rusqlite::Result<Vec<String>> {
+    conn.prepare_cached("SELECT follower FROM remote_logs WHERE peer = ?1 AND agent = ?2 AND name = ?3")?
+        .query_map(params![peer, agent, name], |r| r.get(0))?
+        .collect()
+}
+
+/// The publishing ship says a log is closed to this ship. That is taken as a prompt to ask
+/// and no more: every agent here that follows it asks afresh, and it is the answer to that
+/// asking which says whether the log has stopped. News can be overtaken on its way, by the
+/// log being shared again and followed again, and must not stop a copy on its own.
+///
+/// An answer that ship gave before it closed the log may still be on its way. Taken now, it
+/// would count as the answer to this asking and call it off. So the copies are numbered
+/// anew, as they are when an agent asks to follow, and that answer fits none of them.
+pub fn replica_recheck(conn: &Connection, peer: &str, agent: &str, name: &str) -> rusqlite::Result<()> {
+    let gen = fresh_mark(conn, "follow_gen")?;
+    conn.prepare_cached("UPDATE remote_logs SET joined = 0, gen = ?4 WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND stopped = ''")?
+        .execute(params![peer, agent, name, gen as i64])
+        .map(drop)
+}
+
+/// The publishing ship says its log reaches entry `head`. Remembered for every agent here
+/// that follows it and has not stopped, never lowered.
+pub fn replica_heard(conn: &Connection, peer: &str, agent: &str, name: &str, head: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "UPDATE remote_logs SET announced = MAX(announced, ?4) WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND stopped = ''",
+    )?
+    .execute(params![peer, agent, name, head as i64])
+    .map(drop)
+}
+
+/// One thing to ask another ship for: the entries of a log after `after`, for `follower`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchJob {
+    pub follower: String,
+    pub agent: String,
+    pub name: String,
+    pub after: u64,
+    /// How much more this ship will hold for the follower.
+    pub room: u64,
+    /// The publishing ship has not answered since the follower last asked to follow.
+    pub joining: bool,
+    /// Which asking to follow this is for. See `Replica::gen`.
+    pub gen: u64,
+}
+
+/// What to ask `peer` for: every log on it that an agent here follows, that has not stopped,
+/// that this ship has yet to join or knows to have grown, and that it has room to hold more
+/// of. An entry is taken whenever less than `max_bytes` is held, so each of these is sure to
+/// get somewhere.
+pub fn replica_work(conn: &Connection, peer: &str, max_bytes: u64) -> rusqlite::Result<Vec<FetchJob>> {
+    conn.prepare_cached(
+        "SELECT follower, agent, name, head, bytes, joined, gen FROM remote_logs
+         WHERE peer = ?1 AND stopped = '' AND (joined = 0 OR head < announced) AND bytes < ?2",
+    )?
+    .query_map(params![peer, max_bytes.min(i64::MAX as u64) as i64], |r| {
+        Ok(FetchJob {
+            follower: r.get(0)?,
+            agent: r.get(1)?,
+            name: r.get(2)?,
+            after: r.get::<_, i64>(3)? as u64,
+            room: max_bytes.saturating_sub(r.get::<_, i64>(4)? as u64),
+            joining: !r.get::<_, bool>(5)?,
+            gen: r.get::<_, i64>(6)? as u64,
+        })
+    })?
+    .collect()
+}
+
+/// A log on another ship as one of this ship's agents follows it, for the owner to look at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteFollow {
+    pub follower: String,
+    pub ship: String,
+    pub agent: String,
+    pub log: String,
+    /// The last entry the agent has taken, the last this ship has fetched, and the last the
+    /// publishing ship has said there is.
+    pub taken: u64,
+    pub fetched: u64,
+    pub announced: u64,
+    /// Why no more will come, if that is so.
+    pub stopped: Option<String>,
+}
+
+pub fn remote_follows(conn: &Connection) -> rusqlite::Result<Vec<RemoteFollow>> {
+    conn.prepare_cached(
+        "SELECT r.follower, r.peer, r.agent, r.name, f.cursor, r.head, r.announced, r.stopped
+         FROM remote_logs r JOIN follows f ON f.follower = r.follower AND f.ship = r.peer AND f.agent = r.agent AND f.name = r.name
+         ORDER BY r.follower, r.peer, r.agent, r.name",
+    )?
+    .query_map([], |r| {
+        let stopped: String = r.get(7)?;
+        Ok(RemoteFollow {
+            follower: r.get(0)?,
+            ship: r.get(1)?,
+            agent: r.get(2)?,
+            log: r.get(3)?,
+            taken: r.get::<_, i64>(4)? as u64,
+            fetched: r.get::<_, i64>(5)? as u64,
+            announced: r.get::<_, i64>(6)? as u64,
+            stopped: (!stopped.is_empty()).then_some(stopped),
+        })
+    })?
+    .collect()
+}
+
+// Letting other ships follow this ship's logs. `log_shares` is who each log's publisher has
+// said may follow it: ships by name, or "*" for all. `log_peers` is who does: a ship is put
+// there when it first asks, and is told from then on when the log grows. `due` marks a ship
+// that has yet to be told of the log's newest entries, `kicked` one that may no longer
+// follow and has yet to be told so, and `gen` is given a number never used before whenever
+// something changes what the row means, or a row is written in the place of one that was
+// struck off, so that an answer to old news cannot undo something newer. The index on `due`
+// covers every row, told or not: a row then takes the same room in the file whichever it is,
+// and marking rows as untold, as an import does, cannot make the file grow.
+
+/// How many ships, counting "*" as one, a log is shared with.
+pub fn share_count(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM log_shares WHERE agent = ?1 AND name = ?2")?
+        .query_row(params![agent, name], |r| r.get::<_, i64>(0))
+        .map(|count| count as usize)
+}
+
+/// Whether `peer` may follow a log: it is named, or every ship is let in.
+pub fn shared_with(conn: &Connection, agent: &str, name: &str, peer: &str) -> rusqlite::Result<bool> {
+    conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM log_shares WHERE agent = ?1 AND name = ?2 AND peer IN (?3, '*'))")?
+        .query_row(params![agent, name, peer], |r| r.get(0))
+}
+
+/// Whether a log is shared with exactly `peer`: that ship by name, or "*" itself.
+pub fn shared_exactly(conn: &Connection, agent: &str, name: &str, peer: &str) -> rusqlite::Result<bool> {
+    conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM log_shares WHERE agent = ?1 AND name = ?2 AND peer = ?3)")?
+        .query_row(params![agent, name, peer], |r| r.get(0))
+}
+
+/// The ships a log is shared with, "*" among them if every ship is.
+pub fn shares(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<Vec<String>> {
+    conn.prepare_cached("SELECT peer FROM log_shares WHERE agent = ?1 AND name = ?2 ORDER BY peer")?
+        .query_map(params![agent, name], |r| r.get(0))?
+        .collect()
+}
+
+/// The ships that follow a log, leaving out any that have been shut out and not yet told.
+pub fn log_followers(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<Vec<String>> {
+    conn.prepare_cached("SELECT peer FROM log_peers WHERE agent = ?1 AND name = ?2 AND kicked = 0 ORDER BY peer")?
+        .query_map(params![agent, name], |r| r.get(0))?
+        .collect()
+}
+
+/// Let `peer` (a ship, or "*") follow a log. A ship that was shut out and has not been told
+/// yet is simply let back in. Returns whether anything changed.
+pub fn share_add(conn: &Connection, agent: &str, name: &str, peer: &str) -> rusqlite::Result<bool> {
+    let added = conn.prepare_cached("INSERT OR IGNORE INTO log_shares VALUES (?1, ?2, ?3)")?.execute(params![agent, name, peer])?;
+    let back = conn
+        .prepare_cached("UPDATE log_peers SET kicked = 0, gen = ?4 WHERE agent = ?1 AND name = ?2 AND kicked = 1 AND (peer = ?3 OR ?3 = '*')")?
+        .execute(params![agent, name, peer, fresh_mark(conn, "peer_gen")? as i64])?;
+    Ok(added + back > 0)
+}
+
+/// Stop letting `peer` (a ship, or "*") follow a log. Every ship that follows it and is no
+/// longer let in is marked to be told so. Returns how many were.
+pub fn share_remove(conn: &Connection, agent: &str, name: &str, peer: &str) -> rusqlite::Result<usize> {
+    conn.prepare_cached("DELETE FROM log_shares WHERE agent = ?1 AND name = ?2 AND peer = ?3")?.execute(params![agent, name, peer])?;
+    conn.prepare_cached(
+        "UPDATE log_peers SET kicked = 1, due = 1, gen = ?3
+         WHERE agent = ?1 AND name = ?2 AND kicked = 0
+           AND NOT EXISTS (SELECT 1 FROM log_shares s WHERE s.agent = ?1 AND s.name = ?2 AND s.peer IN (log_peers.peer, '*'))",
+    )?
+    .execute(params![agent, name, fresh_mark(conn, "peer_gen")? as i64])
+}
+
+/// How many ships follow a log, counting those shut out and not yet told.
+pub fn log_peer_count(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM log_peers WHERE agent = ?1 AND name = ?2")?
+        .query_row(params![agent, name], |r| r.get::<_, i64>(0))
+        .map(|count| count as usize)
+}
+
+/// Some followers of this log are no longer all marked as needing to be told.
+fn unmark(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE logs SET marked = 0 WHERE agent = ?1 AND name = ?2 AND marked = 1")?.execute(params![agent, name]).map(drop)
+}
+
+/// `peer`, which may follow this log, has asked for some of it. Note it as a follower if it
+/// is not one, so that it is told when the log grows. It is being given where the log ends
+/// along with whatever it asked for, so it has nothing yet to be told. `joining` says it is
+/// starting afresh. Says whether it was noted just now, was a follower already, or could
+/// not be noted because the log already has `max` followers.
+pub fn log_peer_join(conn: &Connection, agent: &str, name: &str, peer: &str, joining: bool, max: usize) -> rusqlite::Result<Joined> {
+    let known = conn
+        .prepare_cached("SELECT kicked FROM log_peers WHERE agent = ?1 AND name = ?2 AND peer = ?3")?
+        .query_row(params![agent, name, peer], |r| r.get::<_, bool>(0))
+        .optional()?;
+    match known {
+        None if log_peer_count(conn, agent, name)? >= max => return Ok(Joined::Full),
+        None => {
+            conn.prepare_cached("INSERT INTO log_peers VALUES (?1, ?2, ?3, 0, 0, ?4)")?
+                .execute(params![agent, name, peer, fresh_mark(conn, "peer_gen")? as i64])?;
+            unmark(conn, agent, name)?;
+            return Ok(Joined::New);
+        }
+        // Let back in before it was told it had been shut out: it need not be told now.
+        Some(true) => {
+            conn.prepare_cached("UPDATE log_peers SET kicked = 0, due = 0, gen = ?4 WHERE agent = ?1 AND name = ?2 AND peer = ?3")?
+                .execute(params![agent, name, peer, fresh_mark(conn, "peer_gen")? as i64])?;
+        }
+        Some(false) if joining => {
+            conn.prepare_cached("UPDATE log_peers SET gen = ?4 WHERE agent = ?1 AND name = ?2 AND peer = ?3")?
+                .execute(params![agent, name, peer, fresh_mark(conn, "peer_gen")? as i64])?;
+            return Ok(Joined::Known);
+        }
+        Some(false) => return Ok(Joined::Known),
+    }
+    unmark(conn, agent, name)?;
+    Ok(Joined::Known)
+}
+
+/// What came of noting a ship as a follower of a log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Joined {
+    /// It was one already.
+    Known,
+    /// It is one now: a new record was written.
+    New,
+    /// The log has as many followers as it may.
+    Full,
+}
+
+/// A log has grown. Mark every ship that follows it as needing to be told, and return how
+/// many were not marked already. Once all are marked, further entries cost one look at the
+/// log's own row until some ship has been told.
+pub fn log_peers_mark(conn: &Connection, agent: &str, name: &str) -> rusqlite::Result<usize> {
+    let marked: bool = conn
+        .prepare_cached("SELECT marked FROM logs WHERE agent = ?1 AND name = ?2")?
+        .query_row(params![agent, name], |r| r.get(0))
+        .optional()?
+        .unwrap_or(false);
+    if marked {
+        return Ok(0);
+    }
+    let changed = conn.prepare_cached("UPDATE log_peers SET due = 1 WHERE agent = ?1 AND name = ?2 AND due = 0")?.execute(params![agent, name])?;
+    conn.prepare_cached("UPDATE logs SET marked = 1 WHERE agent = ?1 AND name = ?2")?.execute(params![agent, name])?;
+    Ok(changed)
+}
+
+/// Something to tell a ship that follows one of this ship's logs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewsItem {
+    pub agent: String,
+    pub name: String,
+    pub head: u64,
+    pub closed: bool,
+    /// What the row said when this was read. See `news_heard`.
+    pub gen: i64,
+}
+
+impl NewsItem {
+    pub fn as_sent(&self) -> LogNews {
+        LogNews { agent: self.agent.clone(), log: self.name.clone(), head: self.head, closed: self.closed }
+    }
+}
+
+/// The most logs one ship is told about at once.
+pub const MAX_NEWS_LOGS: usize = 256;
+
+/// The most entries of a log that go to another ship in one answer.
+pub const MAX_FETCH_ENTRIES: usize = 256;
+
+/// What `peer` has yet to be told about the logs it follows here. A ship that has been shut
+/// out of a log is told so and nothing else: where the log ends now is no longer its business.
+///
+/// They are taken in the order of their names, starting after `after`, the last log this
+/// ship was told about, and going round to the beginning. A ship that follows more logs than
+/// one piece of news holds, many of them busy, would otherwise hear of the same ones every
+/// time, and never of the rest.
+pub fn news_for(conn: &Connection, peer: &str, after: Option<(&str, &str)>) -> rusqlite::Result<Vec<NewsItem>> {
+    let (agent, name) = after.unwrap_or(("", ""));
+    let read = |round: &str, limit: usize| -> rusqlite::Result<Vec<NewsItem>> {
+        conn.prepare_cached(&format!(
+            "SELECT p.agent, p.name, CASE WHEN p.kicked THEN 0 ELSE COALESCE(l.head, 0) END, p.kicked, p.gen
+             FROM log_peers p LEFT JOIN logs l ON l.agent = p.agent AND l.name = p.name
+             WHERE p.due = 1 AND p.peer = ?1 AND (p.agent, p.name) {round} (?2, ?3)
+             ORDER BY p.agent, p.name LIMIT ?4"
+        ))?
+        .query_map(params![peer, agent, name, limit as i64], |r| {
+            Ok(NewsItem { agent: r.get(0)?, name: r.get(1)?, head: r.get::<_, i64>(2)? as u64, closed: r.get(3)?, gen: r.get(4)? })
+        })?
+        .collect()
+    };
+    let mut news = read(">", MAX_NEWS_LOGS)?;
+    if after.is_some() && news.len() < MAX_NEWS_LOGS {
+        news.extend(read("<=", MAX_NEWS_LOGS - news.len())?);
+    }
+    Ok(news)
+}
+
+/// `peer` has taken in what it was told. `unknown` says, for each item, whether it answered
+/// that it does not follow that log.
+///
+/// A ship told a log is closed to it, or that says it does not follow one, is no longer a
+/// follower. One told where a log ends needs no more telling, unless the log has grown since.
+/// Each of these holds only if the row still says what it said when the news was read: a
+/// ship that has since asked to follow afresh, or been let back in, is not struck off on the
+/// strength of an answer to old news.
+pub fn news_heard(conn: &Connection, peer: &str, told: &[NewsItem], unknown: &[bool]) -> rusqlite::Result<()> {
+    for (index, item) in told.iter().enumerate() {
+        if item.closed || unknown.get(index).copied().unwrap_or(false) {
+            conn.prepare_cached("DELETE FROM log_peers WHERE agent = ?1 AND name = ?2 AND peer = ?3 AND gen = ?4")?
+                .execute(params![item.agent, item.name, peer, item.gen])?;
+            continue;
+        }
+        let settled = conn
+            .prepare_cached(
+                "UPDATE log_peers SET due = 0 WHERE agent = ?1 AND name = ?2 AND peer = ?3 AND gen = ?4 AND kicked = 0
+                   AND ?5 >= COALESCE((SELECT head FROM logs WHERE agent = ?1 AND name = ?2), 0)",
+            )?
+            .execute(params![item.agent, item.name, peer, item.gen, item.head as i64])?;
+        if settled > 0 {
+            unmark(conn, &item.agent, &item.name)?;
+        }
+    }
+    Ok(())
 }
 
 /// Returns the value's length, and the value itself only when it fits in `cap` bytes.
@@ -1081,8 +1695,9 @@ pub fn audit(conn: &Connection, agent: &str, event: &[u8], ok: bool, keep: u64) 
 }
 
 /// Record a rejected input in a transaction of its own and, when it was queued, take it off the
-/// queue in that same transaction. `notice` names the log (publisher, name) when the input was
-/// a notification to `agent`, so that the next new entry can notify it again; `checkpoint`
+/// queue in that same transaction. `notice` names the log when the input was a notification
+/// to `agent`, so that the next new entry can notify it again, and says whether the failure
+/// is to be counted and the agent prompted once more; `checkpoint`
 /// names the log when it was a checkpoint request to `agent`, so that one can be asked for
 /// again; `full` names the log of `agent` that an append found full, so that a checkpoint of
 /// it is asked for; `storage_full` says the ship's file itself was full, so that entries its
@@ -1096,7 +1711,7 @@ pub fn record_rejection(
     recorded: bool,
     queued: Option<i64>,
     owed: Option<(&str, u64, Verdict, &str)>,
-    notice: Option<(&str, &str)>,
+    notice: Option<(Followed, bool)>,
     checkpoint: Option<&str>,
     full: Option<&str>,
     storage_full: bool,
@@ -1112,9 +1727,9 @@ pub fn record_rejection(
         .and_then(|()| checkpoint.map_or(Ok(()), |log| checkpoint_answered(conn, agent, log)))
         .and_then(|()| full.map_or(Ok(()), |log| ask_checkpoint_when_full(conn, agent, log)))
         .and_then(|()| {
-            notice.map_or(Ok(()), |(publisher, name)| {
-                clear_notified(conn, agent, publisher, name)?;
-                notify_failed(conn, agent, publisher, name)
+            notice.map_or(Ok(()), |(log, again)| {
+                clear_notified(conn, agent, log)?;
+                if again { notify_failed(conn, agent, log) } else { Ok(()) }
             })
         })
         .and_then(|()| if recorded { audit(conn, agent, event, false, keep) } else { Ok(()) })
@@ -1153,15 +1768,58 @@ fn schema_objects(conn: &Connection, limit: usize) -> Result<BTreeSet<(String, S
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// True if the file's first page is a single b-tree leaf holding exactly `entries` schema rows.
-fn schema_page_has(path: &Path, entries: usize) -> Result<bool, Error> {
-    let mut header = [0u8; 108];
-    if std::fs::File::open(path)?.read_exact(&mut header).is_err() {
+/// True if the file's schema holds exactly `entries` rows, read straight from its pages.
+///
+/// The schema is a table whose top is the file's first page. This runtime's schema is small:
+/// either that page holds every row, or it points at a few pages that between them do. A
+/// file whose schema is laid out any other way is not one this runtime wrote. Nothing is
+/// taken on trust here: every number read is checked against what was actually read.
+fn schema_has(path: &Path, entries: usize) -> Result<bool, Error> {
+    const TABLE_LEAF: u8 = 0x0d;
+    const TABLE_INTERIOR: u8 = 0x05;
+    /// The most pages a schema of this runtime's size is ever spread over.
+    const MAX_LEAVES: usize = 8;
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0u8; 112];
+    if file.read_exact(&mut header).is_err() || !header.starts_with(b"SQLite format 3\0") {
         return Ok(false);
     }
-    const TABLE_LEAF: u8 = 0x0d;
     let cells = u16::from_be_bytes([header[103], header[104]]) as usize;
-    Ok(header.starts_with(b"SQLite format 3\0") && header[100] == TABLE_LEAF && cells == entries)
+    match header[100] {
+        TABLE_LEAF => Ok(cells == entries),
+        TABLE_INTERIOR if cells < MAX_LEAVES => {
+            let page_size = match u16::from_be_bytes([header[16], header[17]]) {
+                1 => 65536u64,
+                size if size >= 512 && size.is_power_of_two() => u64::from(size),
+                _ => return Ok(false),
+            };
+            let mut top = vec![0u8; page_size as usize];
+            if file.seek(SeekFrom::Start(0)).is_err() || file.read_exact(&mut top).is_err() {
+                return Ok(false);
+            }
+            // Each cell starts with the number of the page below it, and the header holds
+            // the number of the last.
+            let mut below = Vec::with_capacity(cells + 1);
+            for cell in 0..cells {
+                let at = u16::from_be_bytes([top[112 + 2 * cell], top[113 + 2 * cell]]) as usize;
+                let Some(number) = top.get(at..at + 4) else { return Ok(false) };
+                below.push(u32::from_be_bytes(number.try_into().expect("four bytes")));
+            }
+            below.push(u32::from_be_bytes(header[108..112].try_into().expect("four bytes")));
+            let mut found = 0usize;
+            for page in below {
+                let mut start = [0u8; 8];
+                let at = u64::from(page).checked_sub(1).filter(|before| *before >= 1).map(|before| before * page_size);
+                let Some(at) = at else { return Ok(false) };
+                if file.seek(SeekFrom::Start(at)).is_err() || file.read_exact(&mut start).is_err() || start[0] != TABLE_LEAF {
+                    return Ok(false);
+                }
+                found += u16::from_be_bytes([start[3], start[4]]) as usize;
+            }
+            Ok(found == entries)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn text(row: &Row, index: usize) -> Result<String, Error> {
@@ -1232,8 +1890,8 @@ pub fn import(
     reference.execute_batch(SCHEMA)?;
     let expected = schema_objects(&reference, usize::MAX)?;
     // SQLite parses a file's whole schema before any query can limit it, so count the schema
-    // entries straight from the file first. A schema as small as ours always fits on page one.
-    if !schema_page_has(src, expected.len())? {
+    // entries straight from the file first.
+    if !schema_has(src, expected.len())? {
         return Err(bad_row("schema does not match this runtime's"));
     }
 
@@ -1382,7 +2040,7 @@ pub fn import(
             return Err(bad_row("a log with no entries left has no checkpoint for its end"));
         }
         to.execute(
-            "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, 0, ?5, 0, 0, ?6)",
+            "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, 0, ?5, 0, 0, ?6, 0)",
             params![agent, log, claim.head as i64, claim.head_hash, claim.base as i64, claim.history],
         )?;
         claim.rebuilt = true;
@@ -1406,7 +2064,7 @@ pub fn import(
         }
         claim.rebuilt = true;
         to.execute(
-            "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+            "INSERT INTO logs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, 0)",
             params![
                 log.chain.agent,
                 log.chain.log,
@@ -1479,27 +2137,170 @@ pub fn import(
     let heads: HashMap<(String, String), (u64, bool)> =
         claims.into_iter().map(|(log, claim)| (log, (claim.head, claim.history))).collect();
 
-    let mut behind = Vec::new();
-    let mut following: HashMap<String, usize> = HashMap::new();
-    let mut follows: HashMap<(String, String, String), bool> = HashMap::new();
-    let mut stmt = from.prepare("SELECT follower, agent, name, cursor FROM follows")?;
+    // What this ship holds of logs on other ships, for the agents that follow them. Only
+    // payloads are kept, and they were checked against the other ship's key as they came,
+    // which cannot be done again here: this is the ship's own account of what it was sent,
+    // as its agents' stored values are. What is checked is that the account hangs together:
+    // each copy belongs to an agent that follows that log, holds exactly the entries between
+    // what the agent has taken and what was fetched, and is no larger than it could have
+    // grown. A file that lied about a hash would only stop its own ship from following on.
+    struct Held {
+        head: u64,
+        checkpoint: Option<u64>,
+        first: Option<u64>,
+        last: u64,
+        bytes: u64,
+        newest_cost: u64,
+        followed: bool,
+    }
+    type Copy = (String, String, String, String);
+    let mut held: HashMap<Copy, Held> = HashMap::new();
+    let mut stmt = from.prepare("SELECT peer, agent, name, follower, head, head_hash, announced, stopped FROM remote_logs")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         in_time()?;
-        let (follower, agent, log, cursor) = (text(row, 0)?, text(row, 1)?, text(row, 2)?, integer(row, 3)? as u64);
+        let (peer, agent, log, follower) = (text(row, 0)?, text(row, 1)?, text(row, 2)?, text(row, 3)?);
+        let (head, head_hash, announced, stopped) = (integer(row, 4)? as u64, blob(row, 5, 32)?, integer(row, 6)?, text(row, 7)?);
+        check_agent(&agent)?;
+        check_agent(&follower)?;
+        let linked = if head == 0 { head_hash.is_empty() } else { head_hash.len() == 32 };
+        if !ship_name_ok(&peer) || peer == name || !interface_ok(&log) || !linked || stopped.len() > MAX_REASON_BYTES {
+            return Err(bad_row("a log followed on another ship is recorded wrongly"));
+        }
+        // No entry numbered beyond this is ever kept or believed in, so that whatever
+        // another ship sends, the numbers in this ship's file stay ones it can be read
+        // back with.
+        if head > MAX_LOG_SEQ || announced as u64 > MAX_LOG_SEQ {
+            return Err(bad_row("a log followed on another ship is numbered beyond what this runtime allows"));
+        }
+        // It starts afresh with the other ship: an import may be a return to an earlier
+        // state, and asking again is how the two find out where they stand. (The number that
+        // tells one asking from the next starts again too.)
+        to.execute(
+            "INSERT INTO remote_logs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, 0)",
+            params![peer, agent, log, follower, head as i64, head_hash, announced, stopped],
+        )?;
+        let fresh = Held { head, checkpoint: None, first: None, last: 0, bytes: 0, newest_cost: 0, followed: false };
+        held.insert((peer, agent, log, follower), fresh);
+    }
+    let mut stmt = from.prepare("SELECT peer, agent, name, follower, seq, state FROM remote_checkpoints")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let copy: Copy = (text(row, 0)?, text(row, 1)?, text(row, 2)?, text(row, 3)?);
+        let (seq, state) = (integer(row, 4)? as u64, blob(row, 5, cfg.max_checkpoint_bytes)?);
+        let Some(copy_held) = held.get_mut(&copy).filter(|held| seq >= 1 && seq <= held.head) else {
+            return Err(bad_row("a checkpoint held from another ship belongs to no log followed there"));
+        };
+        (copy_held.checkpoint, copy_held.bytes) = (Some(seq), state.len() as u64 + MESSAGE_OVERHEAD);
+        to.execute("INSERT INTO remote_checkpoints VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![copy.0, copy.1, copy.2, copy.3, seq as i64, state])?;
+    }
+    let mut stmt = from.prepare("SELECT peer, agent, name, follower, seq, payload FROM remote_entries ORDER BY peer, agent, name, follower, seq")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let copy: Copy = (text(row, 0)?, text(row, 1)?, text(row, 2)?, text(row, 3)?);
+        let (seq, payload) = (integer(row, 4)? as u64, blob(row, 5, cfg.max_event_bytes)?);
+        // Each follows the one before, with no gaps. Where they start and end is checked
+        // below, once it is known how far the agent has got.
+        let Some(copy_held) = held.get_mut(&copy).filter(|held| seq >= 1 && (held.first.is_none() || seq == held.last + 1)) else {
+            return Err(bad_row("entries held from another ship are numbered wrongly, or belong to no log followed there"));
+        };
+        let cost = payload.len() as u64 + MESSAGE_OVERHEAD;
+        copy_held.first.get_or_insert(seq);
+        (copy_held.last, copy_held.bytes, copy_held.newest_cost) = (seq, copy_held.bytes + cost, cost);
+        to.execute("INSERT INTO remote_entries VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![copy.0, copy.1, copy.2, copy.3, seq as i64, payload])?;
+    }
+
+    let mut behind = Vec::new();
+    let mut following: HashMap<String, usize> = HashMap::new();
+    let mut follows: HashMap<(String, String, String, String), bool> = HashMap::new();
+    let mut stmt = from.prepare("SELECT follower, ship, agent, name, cursor FROM follows")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (follower, ship, agent, log, cursor) = (text(row, 0)?, text(row, 1)?, text(row, 2)?, text(row, 3)?, integer(row, 4)? as u64);
         check_agent(&follower)?;
         check_agent(&agent)?;
-        let head = heads.get(&(agent.clone(), log.clone())).map_or(0, |(head, _)| *head);
+        let head = if ship.is_empty() {
+            heads.get(&(agent.clone(), log.clone())).map_or(0, |(head, _)| *head)
+        } else {
+            // A log on another ship. What is held of it is exactly what lies between the
+            // agent's position and the newest entry fetched: a checkpoint first, if one is
+            // waiting, and then entries up to that newest one. An entry is only taken while
+            // less than the limit is held, so all but the newest come to less than it.
+            let Some(copy) = held.get_mut(&(ship.clone(), agent.clone(), log.clone(), follower.clone())).filter(|copy| !copy.followed) else {
+                return Err(bad_row("an agent follows a log on another ship that the file holds nothing of"));
+            };
+            copy.followed = true;
+            let from_here = match copy.checkpoint {
+                Some(at) if at > cursor => at,
+                Some(_) => return Err(bad_row("a checkpoint held from another ship is one the agent has already passed")),
+                None => cursor,
+            };
+            let whole = match copy.first {
+                Some(first) => first == from_here + 1 && copy.last == copy.head && copy.bytes - copy.newest_cost < cfg.max_follow_bytes,
+                None => copy.head == from_here,
+            };
+            if !whole {
+                return Err(bad_row("what is held of a log on another ship is not what lies between its follower and its end"));
+            }
+            to.execute(
+                "UPDATE remote_logs SET bytes = ?5 WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4",
+                params![ship, agent, log, follower, copy.bytes as i64],
+            )?;
+            copy.head
+        };
         let count = following.entry(follower.clone()).or_default();
         *count += 1;
         if !interface_ok(&log) || cursor > head || *count > MAX_FOLLOWS {
             return Err(bad_row("a follower is ahead of the log it follows, or follows too many"));
         }
-        to.execute("INSERT INTO follows VALUES (?1, ?2, ?3, ?4, 0, 0)", params![follower, agent, log, cursor as i64])?;
+        to.execute("INSERT INTO follows VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)", params![follower, ship, agent, log, cursor as i64])?;
         if cursor < head {
-            behind.push((follower.clone(), agent.clone(), log.clone()));
+            behind.push((follower.clone(), ship.clone(), agent.clone(), log.clone()));
         }
-        follows.insert((follower, agent, log), false);
+        follows.insert((follower, ship, agent, log), false);
+    }
+    if held.values().any(|copy| !copy.followed) {
+        return Err(bad_row("the file holds part of a log on another ship that no agent follows"));
+    }
+
+    // Who may follow this ship's logs, and who does. A ship that follows a log and has not
+    // been shut out must be one the log is shared with. Every one of them is told afresh
+    // where the log stands: this ship may have come back from an earlier state.
+    let mut shared: HashSet<(String, String, String)> = HashSet::new();
+    let mut shared_count: HashMap<(String, String), usize> = HashMap::new();
+    let mut stmt = from.prepare("SELECT agent, name, peer FROM log_shares")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (agent, log, peer) = (text(row, 0)?, text(row, 1)?, text(row, 2)?);
+        check_agent(&agent)?;
+        let count = shared_count.entry((agent.clone(), log.clone())).or_default();
+        *count += 1;
+        if !interface_ok(&log) || !(peer == "*" || (ship_name_ok(&peer) && peer != name)) || *count > cfg.max_log_shares {
+            return Err(bad_row("a log is shared with something that is not a ship, or with too many"));
+        }
+        to.execute("INSERT INTO log_shares VALUES (?1, ?2, ?3)", params![agent, log, peer])?;
+        shared.insert((agent, log, peer));
+    }
+    let mut follower_count: HashMap<(String, String), usize> = HashMap::new();
+    let mut stmt = from.prepare("SELECT agent, name, peer, kicked FROM log_peers")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        in_time()?;
+        let (agent, log, peer, kicked) = (text(row, 0)?, text(row, 1)?, text(row, 2)?, integer(row, 3)?);
+        check_agent(&agent)?;
+        let count = follower_count.entry((agent.clone(), log.clone())).or_default();
+        *count += 1;
+        let let_in = shared.contains(&(agent.clone(), log.clone(), peer.clone())) || shared.contains(&(agent.clone(), log.clone(), "*".to_string()));
+        if !interface_ok(&log) || !ship_name_ok(&peer) || peer == name || kicked > 1 || (kicked == 0 && !let_in) || *count > cfg.max_log_followers {
+            return Err(bad_row("a ship is recorded as following a log it may not, or too many are"));
+        }
+        // The marks that tell one asking from another start again with the import: nothing
+        // asked of the ship before it can still be on its way to this copy of it.
+        to.execute("INSERT INTO log_peers VALUES (?1, ?2, ?3, 1, ?4, 0)", params![agent, log, peer, kicked])?;
     }
 
     // What this ship has sent to and taken from other ships: for each, the number of the last
@@ -1666,8 +2467,9 @@ pub fn import(
                 && owed <= cfg.max_unanswered
         } else {
             // (That a receipt's ship is one this ship has a record of is checked with the
-            // receipt itself, below.)
-            ship_seq == 0 && (!from_elsewhere || kind == Kind::Receipt as i64)
+            // receipt itself, below, and that a notification is about a log some agent
+            // follows, on this ship or another, with the notification.)
+            ship_seq == 0 && (!from_elsewhere || kind == Kind::Receipt as i64 || kind == Kind::Notify as i64)
         };
         if seq == 0 || !interface_ok(&interface) || !numbered {
             return Err(bad_row("a queued event is numbered or named wrongly"));
@@ -1715,13 +2517,13 @@ pub fn import(
             interface.clone().into_bytes()
         } else if kind == Kind::Notify as i64 {
             // `source` is the publisher and `agent` the follower being told.
-            match follows.get_mut(&(agent.clone(), source.clone(), interface.clone())) {
+            match follows.get_mut(&(agent.clone(), ship.clone(), source.clone(), interface.clone())) {
                 Some(told @ false) => *told = true,
                 _ => return Err(bad_row("a queued notification is not one this ship would have made")),
             }
             to.execute(
-                "UPDATE follows SET notified = 1 WHERE follower = ?1 AND agent = ?2 AND name = ?3",
-                params![agent, source, interface],
+                "UPDATE follows SET notified = 1 WHERE follower = ?1 AND ship = ?2 AND agent = ?3 AND name = ?4",
+                params![agent, ship, source, interface],
             )?;
             Vec::new()
         } else {
@@ -1734,9 +2536,9 @@ pub fn import(
     }
     // A follower that is behind and has no notification waiting had been given up on after
     // repeated failures. An import starts it off afresh, behind everything already queued.
-    for (follower, agent, log) in &behind {
+    for (follower, ship, agent, log) in &behind {
         in_time()?;
-        notify(&to, follower, agent, log)?;
+        notify(&to, follower, Followed { ship, agent, name: log })?;
     }
 
     let mut stmt = from.prepare("SELECT seq, at_ms, agent, event, ok FROM audit ORDER BY seq DESC LIMIT ?1")?;
@@ -1803,4 +2605,38 @@ pub fn import(
 
     to.execute_batch("COMMIT")?;
     Ok(kernel_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn news_goes_round_every_log_a_ship_follows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        // ~nec follows 300 logs here, all with something to be told. ~bus follows one.
+        for n in 0..300 {
+            conn.execute("INSERT INTO log_peers VALUES ('agent', ?1, 'nec', 1, 0, 0)", [format!("log-{n:03}")]).unwrap();
+        }
+        conn.execute("INSERT INTO log_peers VALUES ('agent', 'log-000', 'bus', 1, 0, 0)", []).unwrap();
+        let names = |news: &[NewsItem]| news.iter().map(|item| item.name.clone()).collect::<Vec<_>>();
+        let expect = |range: std::ops::Range<usize>| range.map(|n| format!("log-{n:03}")).collect::<Vec<_>>();
+
+        // The first piece of news is the first 256, in order.
+        let first = news_for(&conn, "nec", None).unwrap();
+        assert_eq!(names(&first), expect(0..256));
+        // Nothing is settled: those logs are busy, and stay marked. The next piece of news
+        // starts after the last one told, takes the rest, and goes round to the beginning.
+        let last = first.last().unwrap();
+        let second = news_for(&conn, "nec", Some((&last.agent, &last.name))).unwrap();
+        assert_eq!(names(&second), [expect(256..300), expect(0..212)].concat());
+        // Starting after the very last log is starting from the beginning.
+        assert_eq!(names(&news_for(&conn, "nec", Some(("agent", "log-299"))).unwrap()), expect(0..256));
+        // Another ship's news is its own.
+        assert_eq!(names(&news_for(&conn, "bus", Some(("agent", "log-100"))).unwrap()), expect(0..1));
+        // And only what has yet to be told.
+        conn.execute("UPDATE log_peers SET due = 0 WHERE peer = 'nec' AND name < 'log-298'", []).unwrap();
+        assert_eq!(names(&news_for(&conn, "nec", Some(("agent", "log-298"))).unwrap()), [expect(299..300), expect(298..299)].concat());
+    }
 }

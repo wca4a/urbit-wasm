@@ -66,7 +66,8 @@ message Use {
   bool read = 3;
   bool send = 4;
   // Empty for an agent on this ship. Otherwise the ship that agent is on, or "*" for any
-  // ship. Only sending is meant for other ships so far.
+  // ship. For another ship, `send` lets this agent send that agent commands, and `read` lets
+  // it follow that agent's log of this name. The owner agrees to both at install.
   string ship = 5;
 }
 
@@ -164,10 +165,22 @@ message AppendRequest {
   bytes payload = 2;
 }
 
-// Agent to runtime: start following another agent's log.
+// Agent to runtime: start following another agent's log, or stop.
 message FollowRequest {
   string agent = 1;
   string log = 2;
+  // The ship that agent is on. Empty for this ship.
+  string ship = 3;
+}
+
+// Agent to runtime: let another ship follow one of this agent's own logs, or stop letting it.
+// It is the agent that decides who may follow its logs, and nobody else.
+message ShareRequest {
+  string log = 1;
+  // The ship, or "*" for every ship.
+  string ship = 2;
+  // Set to stop sharing. A ship that was following is told the log is closed to it.
+  bool stop = 3;
 }
 
 // Agent to runtime: give me the entries after my position in a log I follow, and move my
@@ -180,6 +193,8 @@ message NextRequest {
   // it is never moved past entries it has not seen: if they have been dropped, its request
   // fails instead.
   bool checkpoints = 4;
+  // The ship that agent is on. Empty for this ship.
+  string ship = 5;
 }
 
 message Entry {
@@ -194,6 +209,10 @@ message NextReply {
   // Set when the follower was so far behind that the entries it needed have been dropped. It
   // must replace what it holds with this state; its position is then the checkpoint's.
   Checkpoint checkpoint = 3;
+  // For a log on another ship: set when no more of it will come, with a few words on why.
+  // That ship has stopped sharing it, or what it sends no longer carries on from what this
+  // ship holds. Following the log again asks afresh.
+  string stopped = 4;
 }
 
 // A checkpoint says: as of entry `seq`, the state behind this log is `state`. It lets entries
@@ -295,6 +314,8 @@ message PeerRequest {
   oneof body {
     Ping ping = 1;
     Deliver deliver = 2;
+    Fetch fetch = 3;
+    News news = 4;
   }
 }
 
@@ -302,6 +323,8 @@ message PeerReply {
   oneof body {
     Pong pong = 1;
     Delivered delivered = 2;
+    Fetched fetched = 3;
+    Heard heard = 4;
   }
   // Set, with no body, when the request was not one the other ship would answer.
   string refused = 15;
@@ -385,4 +408,55 @@ message Deliver {
 // those again later.
 message Delivered {
   uint64 last = 1;
+}
+
+// Following a log on another ship. The ship that follows asks for the entries after the last
+// one it holds, checks each against the publishing ship's key and against the entry before
+// it, and keeps them for its agent. The publishing ship keeps a note of each ship that
+// follows a log, and tells it when the log has grown. Being told is only a prompt to ask:
+// the entries always come by asking, so the ship that follows takes them when it has room.
+
+// A ship that follows to the ship that publishes: the entries of a log after number `after`.
+message Fetch {
+  string agent = 1;
+  string log = 2;
+  uint64 after = 3;
+  // About how many bytes of entries to send. One entry is always sent if there is one.
+  uint32 max_bytes = 4;
+  // Set when the asker is starting to follow, or starting again. The publisher then takes
+  // nothing it noted about this follower before for granted.
+  bool joining = 5;
+}
+
+message Fetched {
+  // In order, starting at `after` + 1. Empty when there are none, or a checkpoint is sent.
+  repeated SignedEntry entries = 1;
+  // Where the log ends now.
+  LogHead head = 2;
+  // Set, with no entries, when the entry after `after` has been dropped. The asker takes
+  // this state and asks again from the entry it stands for.
+  SignedCheckpoint checkpoint = 3;
+  // Set, with nothing else, when the asker may not follow this log. The same is said
+  // whether or not there is such a log.
+  string denied = 4;
+}
+
+// The ship that publishes to a ship that follows: these logs have grown, or are closed to it.
+message News {
+  repeated LogNews logs = 1;
+}
+
+message LogNews {
+  string agent = 1;
+  string log = 2;
+  // The number of the log's newest entry.
+  uint64 head = 3;
+  // The publisher no longer shares this log with the ship being told.
+  bool closed = 4;
+}
+
+// For each log in the News, in order: whether the ship that was told does not follow it. The
+// publisher then stops telling it.
+message Heard {
+  repeated bool unknown = 1;
 }

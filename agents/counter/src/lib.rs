@@ -62,6 +62,20 @@ fn handle(event: &[u8]) -> Vec<u8> {
             let rest = text.trim_start()["pass".len()..].trim_start()[ship.len()..].trim();
             ship_sdk::send_to(ship, "counter", "counter", rest.as_bytes()).to_string()
         }
+        // Let another ship follow this agent's log, or every ship with "*", or stop.
+        (Some("share"), Some(ship), None) => {
+            log::share("counter", ship);
+            "ok".to_string()
+        }
+        (Some("unshare"), Some(ship), None) => {
+            log::unshare("counter", ship);
+            "ok".to_string()
+        }
+        // Try to share a log this agent does not have.
+        (Some("share-other"), Some(ship), None) => {
+            log::share("tally", ship);
+            "ok".to_string()
+        }
         (Some("del"), Some(key), None) => {
             kv::delete(key.as_bytes());
             "ok".to_string()

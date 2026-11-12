@@ -63,6 +63,13 @@ fn remote_sends(agent: &Registered) -> Vec<Grant> {
     declared.map(|u| Grant { agent: u.agent.clone(), interface: u.interface.clone(), ship: u.ship.clone() }).collect()
 }
 
+/// The logs on other ships that `agent` may follow: exactly what its manifest declares, in the
+/// same way.
+fn remote_reads(agent: &Registered) -> Vec<Grant> {
+    let declared = uses(agent).iter().filter(|u| !u.ship.is_empty() && u.read);
+    declared.map(|u| Grant { agent: u.agent.clone(), interface: u.interface.clone(), ship: u.ship.clone() }).collect()
+}
+
 /// More than the encoded size of one grant, so sums of it are safe upper bounds.
 fn grant_bytes(agent: &str, interface: &str) -> usize {
     agent.len() + interface.len() + 16
@@ -104,6 +111,18 @@ fn decide(request: &RouteRequest) -> RouteReply {
     // runtime keeps a record of each such command and only passes on an answer to one of
     // them, so there is nothing to decide here beyond the agent still being installed.
     if request.kind() == Kind::Receipt {
+        return allow(&registry, target);
+    }
+    // The runtime tells an agent that a log it follows on another ship has entries for it.
+    // The agent must still be allowed to follow that log: its manifest names that ship, or
+    // any ship, with that agent and log.
+    if !source.ship.is_empty() && request.kind() == Kind::Notify {
+        let declared = uses(target).iter().any(|u| {
+            (u.ship == source.ship || u.ship == "*") && u.agent == source.agent && u.interface == request.interface && u.read
+        });
+        if source.owner || !declared {
+            return deny(format!("{} does not follow {} on {} on another ship", target.name, request.interface, source.agent));
+        }
         return allow(&registry, target);
     }
     // A request from an agent on another ship. Only a command, and only to an interface that
@@ -173,7 +192,7 @@ fn allow(registry: &Registry, target: &Registered) -> RouteReply {
         allowed: true,
         reason: String::new(),
         module: target.module.clone(),
-        reads: grants(registry, target, |u| u.read),
+        reads: grants(registry, target, |u| u.read).into_iter().chain(remote_reads(target)).collect(),
         sends: grants(registry, target, |u| u.send).into_iter().chain(remote_sends(target)).collect(),
     }
 }

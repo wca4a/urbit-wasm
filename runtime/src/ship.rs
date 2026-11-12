@@ -9,14 +9,15 @@ use ed25519_dalek::{Signer, SigningKey};
 use rusqlite::Connection;
 use ship_proto::admin_request::Op;
 use ship_proto::{
-    AdminReply, AdminRequest, CheckpointBody, CheckpointReply, Grant, Invocation, Kind, Message, RouteReply, RouteRequest,
-    Source, Verdict,
+    AdminReply, AdminRequest, CheckpointBody, CheckpointReply, EntryBody, Fetch, Fetched, Grant, Invocation, Kind, LogHead,
+    LogNews, Message, RouteReply, RouteRequest, SignedCheckpoint, SignedEntry, Source, Verdict,
 };
 use wasmtime::{Store, StoreLimitsBuilder, Trap};
 
 use crate::host::{Ctx, Denied, LimitExceeded, LogsFull};
+use crate::store::{FetchJob, Followed, Replica};
 use crate::{
-    check_target, lock, signed_bytes, store, AgentModule, Error, Inner, Outcome, Rejection, CHECKPOINT_DOMAIN,
+    check_target, lock, signed_bytes, store, AgentModule, ChainCheck, Error, Inner, Outcome, Rejection, CHECKPOINT_DOMAIN,
     EPOCH_TICK_MILLIS, WASM_STACK_BYTES,
 };
 
@@ -55,6 +56,9 @@ struct Event<'a> {
     /// For a command from another ship: that ship, and the number it gave the command. It is
     /// owed a receipt saying what became of it.
     owed: Option<(&'a str, u64)>,
+    /// For a notification about a log on another ship: how much room the file had before
+    /// the notification was taken off the queue.
+    spare_before: Option<u64>,
 }
 
 struct Invoke<'a> {
@@ -83,6 +87,10 @@ struct Returned {
     appended: u32,
     /// How many commands the event queued for other ships.
     sent: u32,
+    /// How many other things the event did that the network has to act on.
+    net: u32,
+    /// How many times the event took entries held from a log on another ship.
+    took: u32,
     reply: Vec<u8>,
     fuel_left: u64,
     effects: u32,
@@ -137,6 +145,8 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
         inbox_room: call.inbox_room,
         appended: 0,
         sent: 0,
+        net: 0,
+        took: 0,
         can_checkpoint: call.module.pre.module().get_export("checkpoint").is_some(),
         takes_receipts: call.module.pre.module().get_export("receipt").is_some(),
     };
@@ -182,6 +192,8 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
     Ok(Returned {
         appended: ctx.appended,
         sent: ctx.sent,
+        net: ctx.net,
+        took: ctx.took,
         reply,
         fuel_left,
         effects: ctx.effects,
@@ -318,6 +330,27 @@ impl Ship {
             self.rollback();
         }
         done
+    }
+
+    /// Run `work` as a transaction of its own, on behalf of another ship: answering what it
+    /// asks, or taking in what it sends about logs. Whatever is written for another ship
+    /// must leave room in the file to take a command from a ship and finish with it. If the
+    /// work has used up room and too little is left, none of it is kept, and the other
+    /// ship is told to try again later. Work that uses no room is kept however little
+    /// room there is: a ship short of room still answers, it only takes nothing on.
+    ///
+    /// This is measured over everything the work wrote, down to the smallest record: a
+    /// number that grows by a digit can be what tips a full page into a new one.
+    pub(crate) fn transact_for_peer<R>(&mut self, cfg: &crate::Config, work: impl FnOnce(&Connection) -> Result<R, Error>) -> Result<R, Error> {
+        self.transact(|conn| {
+            let before = store::spare_bytes(conn)?;
+            let done = work(conn)?;
+            let after = store::spare_bytes(conn)?;
+            if after < before && after < room_to_take_one(cfg) {
+                return Err(Error::TooMany("records kept for other ships for the room it has"));
+            }
+            Ok(done)
+        })
     }
 
     /// Take messages another ship has sent to this one, each once and in order. Returns the
@@ -485,6 +518,246 @@ impl Ship {
         Ok(received)
     }
 
+    /// Answer another ship that asks for entries of one of this ship's logs.
+    ///
+    /// Whether it may have them is up to the agent that publishes the log, which says so
+    /// with `share`. A ship that may not is told so in the same words whether or not there
+    /// is such a log. One that may is noted as a follower, so that it is told when the log
+    /// grows, and given the entries after the one it names: as they were signed, so that it
+    /// can check them for itself. If those have been dropped it is given the log's
+    /// checkpoint, and asks again from there.
+    pub fn serve_log(&mut self, rt: &Arc<Inner>, peer: &str, fetch: &Fetch, most: usize) -> Result<Fetched, Error> {
+        let (cfg, name) = (&rt.cfg, self.name.clone());
+        self.transact_for_peer(cfg, |conn| {
+            let (agent, log) = (fetch.agent.as_str(), fetch.log.as_str());
+            if check_target(agent, log).is_err() || !store::shared_with(conn, agent, log, peer)? {
+                return Ok(Fetched { denied: format!("~{name} does not share that log with ~{peer}"), ..Fetched::default() });
+            }
+            match store::log_peer_join(conn, agent, log, peer, fetch.joining, cfg.max_log_followers)? {
+                store::Joined::Full => return Err(Error::TooMany("ships following that log")),
+                // A new follower is a new record in this ship's file, written because
+                // another ship asked. A ship that is already short of the room it keeps
+                // for taking a command takes on no new followers, whether or not this one
+                // record would use any: the ship that asked is told to try again later.
+                store::Joined::New if store::spare_bytes(conn)? < room_to_take_one(cfg) => {
+                    return Err(Error::TooMany("ships following its logs for the room it has"));
+                }
+                store::Joined::New | store::Joined::Known => {}
+            }
+            let (seq, hash) = store::log_head(conn, agent, log)?;
+            let head = Some(LogHead { seq, hash });
+            if fetch.after < store::log_base(conn, agent, log)? {
+                let stored = store::checkpoint(conn, agent, log)?
+                    .ok_or_else(|| Error::BadShipFile("a log has lost its early entries but has no checkpoint".into()))?;
+                let checkpoint = Some(SignedCheckpoint { body: stored.body, signature: stored.signature });
+                return Ok(Fetched { head, checkpoint, ..Fetched::default() });
+            }
+            // As many as fit in `budget` bytes as they will be sent, signatures and framing
+            // included, and always one. Counting the entries' bodies alone would let many
+            // small ones carry the answer past what the other ship will read, and it would
+            // ask for the same ones, and be sent the same answer, for ever.
+            let budget = (fetch.max_bytes as usize).min(most);
+            let (mut entries, mut bytes) = (Vec::new(), 0usize);
+            for stored in store::log_range(conn, agent, log, fetch.after, store::MAX_FETCH_ENTRIES, budget)? {
+                let entry = SignedEntry { body: stored.body, signature: stored.signature };
+                let len = entry.encoded_len() + 8;
+                if !entries.is_empty() && bytes + len > budget {
+                    break;
+                }
+                bytes += len;
+                entries.push(entry);
+            }
+            Ok(Fetched { entries, head, ..Fetched::default() })
+        })
+    }
+
+    /// Take in what another ship answered when asked for entries of a log one of this
+    /// ship's agents follows. Returns what is left to do, and whether the agent was queued a
+    /// notification.
+    ///
+    /// Nothing is taken on that ship's word. Each entry must be signed by its key, belong to
+    /// that log, and follow directly on from the last one this ship holds, by number and by
+    /// hash; a checkpoint must be signed the same way. What passes is kept for the agent,
+    /// which is prompted to take it. An entry is taken whenever less than
+    /// `max_follow_bytes` is held, so a fetch always gets somewhere, and what is held never
+    /// passes that limit by more than one entry.
+    ///
+    /// If what came is not a continuation of what this ship holds, the log is stopped, and
+    /// the agent is told when it next asks for entries. That happens when the other ship
+    /// has gone back to an earlier state and written something different since. Nothing
+    /// here sorts that out: the agent can stop following and start again from the beginning.
+    pub fn take_entries(
+        &mut self,
+        rt: &Arc<Inner>,
+        peer: &str,
+        key: &[u8; 32],
+        job: &FetchJob,
+        fetched: &Fetched,
+    ) -> Result<(Taken, bool), Error> {
+        let cfg = &rt.cfg;
+        // What is fetched must leave room in the ship's file to take a command from another
+        // ship and finish with it, as sending must. The room is measured, after each entry
+        // is written: how much a row takes in the file depends on more than its payload.
+        //
+        // Beyond that room, what is taken here leads to a notification for the agent, and
+        // a notification has to be seen through, whether or not the agent ever handles it:
+        // taken off the queue, and if it is refused, recorded. A command taken from another
+        // ship is allowed some room for that, and so is this: `STORAGE_SLACK_BYTES` must be
+        // left over when the notification is queued. Entries are held to the same again on
+        // top, so that what is written after them here cannot be what crosses that line.
+        let after_notice = room_to_take_one(cfg) + STORAGE_SLACK_BYTES;
+        let floor = after_notice + STORAGE_SLACK_BYTES;
+        self.transact_for_peer(cfg, |conn| {
+            let (follower, log) = (job.follower.as_str(), Followed { ship: peer, agent: &job.agent, name: &job.name });
+            // The agent may have stopped following since this was asked for.
+            let Some(mut held) = store::replica(conn, follower, log)? else { return Ok((Taken::Done, false)) };
+            // Or the log has stopped, or the agent has asked to follow afresh since, or this
+            // ship's copy is no longer where it was when it asked. In each case the answer is
+            // to a question no longer being put. Taking it would be wrong: an answer to an
+            // earlier asking says nothing about whether that ship knows of this one.
+            if !held.stopped.is_empty() || held.gen != job.gen || held.head != job.after {
+                return Ok((left(&held, job, cfg), false));
+            }
+            let (mut took, mut no_room) = (false, false);
+            let mut spare = store::spare_bytes(conn)?;
+            let nothing = fetched.entries.is_empty() && fetched.checkpoint.is_none();
+            let their = fetched.head.clone().unwrap_or_default();
+            let anchor = <[u8; 32]>::try_from(&held.head_hash[..]).ok();
+            let verifier = ed25519_dalek::VerifyingKey::from_bytes(key).ok();
+            if !fetched.denied.is_empty() {
+                held.stopped = format!("~{peer} does not share this log with this ship");
+            } else if let Some(checkpoint) = &fetched.checkpoint {
+                // The entries after this ship's copy have been dropped over there. The
+                // checkpoint stands in for them, and for everything held here before it.
+                match crate::verify_checkpoint(key, peer, &job.agent, &job.name, checkpoint) {
+                    Ok(((seq, hash), state)) if seq > held.head && seq <= store::MAX_LOG_SEQ && fetched.entries.is_empty() => {
+                        let cost = state.len() as u64 + store::MESSAGE_OVERHEAD;
+                        if state.len() > cfg.max_checkpoint_bytes {
+                            held.stopped = "the log's checkpoint is larger than this ship takes".into();
+                        } else if spare < cost + floor {
+                            no_room = true;
+                        } else {
+                            conn.execute_batch("SAVEPOINT fetched")?;
+                            store::replica_checkpoint_set(conn, follower, log, seq, &state)?;
+                            if store::spare_bytes(conn)? < floor {
+                                conn.execute_batch("ROLLBACK TO fetched; RELEASE fetched")?;
+                                no_room = true;
+                            } else {
+                                conn.execute_batch("RELEASE fetched")?;
+                                (held.head, held.head_hash, held.bytes, took) = (seq, hash.to_vec(), cost, true);
+                            }
+                        }
+                    }
+                    _ => held.stopped = NOT_A_CONTINUATION.into(),
+                }
+            } else if let (Some(verifier), true) = (verifier, held.head == 0 || anchor.is_some()) {
+                let mut chain = ChainCheck::new(&verifier, peer, &job.agent, &job.name, anchor.filter(|_| held.head > 0).map(|hash| (held.head, hash)));
+                for entry in fetched.entries.iter().take(store::MAX_FETCH_ENTRIES) {
+                    if held.bytes >= cfg.max_follow_bytes {
+                        break;
+                    }
+                    let Ok((seq, hash, payload_len)) = chain.accept(&entry.body, &entry.signature) else {
+                        held.stopped = NOT_A_CONTINUATION.into();
+                        break;
+                    };
+                    // Signed and in its place, but numbered beyond any log this ship will
+                    // keep track of. It can only follow a checkpoint at the very limit.
+                    if seq > store::MAX_LOG_SEQ {
+                        held.stopped = NOT_A_CONTINUATION.into();
+                        break;
+                    }
+                    if payload_len > cfg.max_event_bytes {
+                        held.stopped = "an entry of the log is larger than this ship takes".into();
+                        break;
+                    }
+                    let cost = payload_len as u64 + store::MESSAGE_OVERHEAD;
+                    if spare < cost + floor {
+                        no_room = true;
+                        break;
+                    }
+                    // It decoded a moment ago, when it was checked.
+                    let payload = EntryBody::decode(&*entry.body).map(|body| body.payload).unwrap_or_default();
+                    conn.execute_batch("SAVEPOINT fetched")?;
+                    store::replica_push(conn, follower, log, seq, &payload)?;
+                    spare = store::spare_bytes(conn)?;
+                    if spare < floor {
+                        // Writing it took more room than there was to give. It is not kept.
+                        conn.execute_batch("ROLLBACK TO fetched; RELEASE fetched")?;
+                        no_room = true;
+                        break;
+                    }
+                    conn.execute_batch("RELEASE fetched")?;
+                    (held.head, held.head_hash, held.bytes, took) = (seq, hash.to_vec(), held.bytes + cost, true);
+                }
+            } else {
+                held.stopped = NOT_A_CONTINUATION.into();
+            }
+            if held.stopped.is_empty() {
+                // Where that ship says its log ends, against what this ship now holds.
+                let same_end = their.seq == held.head && (held.head == 0 || their.hash == held.head_hash);
+                if their.seq < held.head || (their.seq == held.head && !same_end) {
+                    // Its log is shorter than this ship's copy, or ends differently.
+                    held.stopped = NOT_A_CONTINUATION.into();
+                } else if nothing && their.seq > held.head {
+                    held.stopped = format!("~{peer} says the log has more entries but sent none");
+                } else if nothing && held.joined && held.head < held.announced {
+                    // This ship asked because it had been told of more, and there is no
+                    // more: that ship is not where it said it was. Forget what was said
+                    // and ask afresh, so that anything written since is not missed.
+                    (held.announced, held.joined) = (held.head, false);
+                } else {
+                    (held.announced, held.joined) = (held.announced.max(their.seq.min(store::MAX_LOG_SEQ)).max(held.head), true);
+                }
+            }
+            let stopped = !held.stopped.is_empty();
+            store::replica_save(conn, follower, log, &held)?;
+            if took {
+                // Something new to take starts the follower off afresh, as a new entry
+                // does for a follower of a log on this ship.
+                store::resume(conn, follower, log)?;
+            }
+            if stopped {
+                // Told even with nothing to take: its next look says why no more will come.
+                store::notify(conn, follower, log)?;
+            }
+            // See `after_notice` above. If the room is not there, none of this is kept, and
+            // it is tried again later.
+            if (took || stopped) && store::spare_bytes(conn)? < after_notice {
+                return Err(Error::TooMany("notices waiting for the room it has"));
+            }
+            let taken = match (stopped, no_room && !took) {
+                (true, _) => Taken::Stopped,
+                (false, true) => Taken::NoRoom,
+                (false, false) => left(&held, job, cfg),
+            };
+            Ok((taken, took || stopped))
+        })
+    }
+
+    /// Take in what another ship says about logs of its own that agents here follow: that
+    /// they have grown, or are closed to this ship. Returns, for each, whether no agent here
+    /// follows it.
+    ///
+    /// All of it is only a prompt to ask. A number is not believed: entries are taken as
+    /// they are fetched and checked. Nor is being told a log is closed, which may have been
+    /// overtaken on its way by the log being shared and followed again: the ship asks, and
+    /// the answer to that is what says the log has stopped.
+    pub fn hear_news(&mut self, cfg: &crate::Config, peer: &str, news: &[LogNews]) -> Result<Vec<bool>, Error> {
+        self.transact_for_peer(cfg, |conn| {
+            let mut unknown = Vec::with_capacity(news.len().min(store::MAX_NEWS_LOGS));
+            for item in news.iter().take(store::MAX_NEWS_LOGS) {
+                let named = check_target(&item.agent, &item.log).is_ok();
+                unknown.push(!named || store::replica_followers(conn, peer, &item.agent, &item.log)?.is_empty());
+                if item.closed {
+                    store::replica_recheck(conn, peer, &item.agent, &item.log)?;
+                } else if item.head <= store::MAX_LOG_SEQ {
+                    store::replica_heard(conn, peer, &item.agent, &item.log, item.head)?;
+                }
+            }
+            Ok(unknown)
+        })
+    }
+
     /// The setting for one operation, with its time limit starting now.
     fn env<'a>(&'a self, rt: &'a Arc<Inner>) -> Env<'a> {
         let deadline = Instant::now() + Duration::from_millis(rt.cfg.max_event_millis);
@@ -498,7 +771,7 @@ impl Ship {
     /// as a separate, best-effort write, so that failures can be investigated.
     pub fn command(&mut self, rt: &Arc<Inner>, source: &Source, agent: &str, interface: &str, payload: &[u8]) -> Result<Outcome, Error> {
         self.begin("BEGIN IMMEDIATE")?;
-        self.execute(rt, Event { kind: Kind::Command, source, agent, interface, payload, queued: None, owed: None })
+        self.execute(rt, Event { kind: Kind::Command, source, agent, interface, payload, queued: None, owed: None, spare_before: None })
     }
 
     /// The body of an event. Expects a transaction to be open, and ends it.
@@ -510,9 +783,9 @@ impl Ship {
     /// `Error::Rejected` is only returned once the rejection is settled: for a queued event,
     /// that means it is off the queue for good. Any other error means nothing was committed.
     fn execute(&mut self, rt: &Arc<Inner>, event: Event) -> Result<Outcome, Error> {
-        let Event { kind, source, agent, interface, payload, queued, owed } = event;
-        // For a notification: which log it is about, as (publisher, name).
-        let notice = (kind == Kind::Notify).then_some((source.agent.as_str(), interface));
+        let Event { kind, source, agent, interface, payload, queued, owed, spare_before } = event;
+        // For a notification: which log it is about. Its publisher may be on another ship.
+        let notice = (kind == Kind::Notify).then_some(Followed { ship: &source.ship, agent: &source.agent, name: interface });
         // For a checkpoint request: the log, one of the agent's own, that it is about.
         let asking = (kind == Kind::Checkpoint).then_some(interface);
         // Each lock below is taken in a statement of its own, so it is released before
@@ -525,9 +798,9 @@ impl Ship {
             asking
                 .map_or(Ok(()), |log| store::checkpoint_answered(&conn, agent, log))
                 .and_then(|()| {
-                    notice.map_or(Ok(None), |(publisher, log)| {
-                        store::clear_notified(&conn, agent, publisher, log)?;
-                        store::cursor(&conn, agent, publisher, log)
+                    notice.map_or(Ok(None), |log| {
+                        store::clear_notified(&conn, agent, log)?;
+                        store::cursor(&conn, agent, log)
                     })
                 })
                 .and_then(|before| conn.execute_batch("SAVEPOINT handler").map(|()| before))
@@ -540,6 +813,11 @@ impl Ship {
                 return Err(e.into());
             }
         };
+        // A notification about a log on another ship is there because of what that ship
+        // sent. If the agent never gets to handle it, settling it must not cost the file
+        // room it keeps for taking a command, so the room is measured before it comes off
+        // the queue and again after.
+        let frugal = notice.is_some_and(|log| !log.ship.is_empty());
         let env = self.env(rt);
         // Whether the agent's module can be asked for a checkpoint, once that is known.
         let mut can_checkpoint = false;
@@ -588,8 +866,8 @@ impl Ship {
             }
             // A follower that did not take everything is notified again, so it works through a
             // long log one event at a time without anyone having to prompt it.
-            if let Some((publisher, log)) = notice {
-                store::notify_handled(&conn, agent, publisher, log, before)?;
+            if let Some(log) = notice {
+                store::notify_handled(&conn, agent, log, before)?;
             }
             store::audit(&conn, agent, payload, true, rt.cfg.audit_rows)?;
             // The ship that sent this command is told it ran. That is saved with what the
@@ -624,7 +902,16 @@ impl Ship {
                     rt.logs_grew(&self.name);
                 }
                 // And the network can be told there is something to carry to other ships.
-                if done.sent > 0 || owed.is_some() {
+                if done.took > 0 {
+                    // An agent has taken entries held from another ship's log. There is
+                    // room to fetch more, and if it has not taken them all it has been
+                    // prompted again. Seeing that the prompt runs is up to whoever runs
+                    // this ship's queue, and that may be the network: an agent working
+                    // through a long log a few entries at a time must not be left part way
+                    // because nothing else happened. Each such round uses up entries that
+                    // came from another ship, so there are only as many as that ship sent.
+                    rt.work_ready(&self.name);
+                } else if done.sent > 0 || done.net > 0 || owed.is_some() {
                     rt.outbound_ready(&self.name);
                 }
                 self.outbox_bytes += done.effect_bytes;
@@ -655,11 +942,13 @@ impl Ship {
                     // limited number of times, in the same transaction as everything else.
                     !conn.is_autocommit()
                         && conn.execute_batch("ROLLBACK TO handler; RELEASE handler").is_ok()
-                        && notice.is_none_or(|(publisher, log)| store::notify_failed(&conn, agent, publisher, log).is_ok())
+                        && (!frugal || conn.execute_batch("SAVEPOINT settling").is_ok())
+                        && notice.is_none_or(|log| store::notify_failed(&conn, agent, log).is_ok())
                         && (!storage_full || store::reclaim(&conn).is_ok())
                         && full.is_none_or(|log| store::ask_checkpoint_when_full(&conn, agent, log).is_ok())
                         && owed.is_none_or(|(peer, about, verdict, reason)| store::receipt_push(&conn, peer, about, verdict, reason).is_ok())
                         && (unrecorded || store::audit(&conn, agent, payload, false, rt.cfg.audit_rows).is_ok())
+                        && (!frugal || settled_within(&conn, spare_before, &rt.cfg))
                         && conn.execute_batch("COMMIT").is_ok()
                 };
                 if recorded {
@@ -673,10 +962,13 @@ impl Ship {
                 self.rollback();
                 let retried = store::record_rejection(
                     &lock(&self.conn),
-                    !unrecorded,
+                    // (Settling a notification about another ship's log in a transaction of
+                    // its own, after the first was lost, is kept to the least there is to
+                    // do: it comes off the queue, and that is all.)
+                    !unrecorded && !frugal,
                     queued,
                     owed,
-                    notice,
+                    notice.map(|log| (log, !frugal)),
                     asking,
                     full,
                     storage_full,
@@ -702,8 +994,8 @@ impl Ship {
     pub fn run_queued(&mut self, rt: &Arc<Inner>) -> Result<bool, Error> {
         self.begin("BEGIN IMMEDIATE")?;
         let popped = store::inbox_pop(&lock(&self.conn));
-        let queued = match popped {
-            Ok(Some(queued)) => queued,
+        let (queued, spare_before) = match popped {
+            Ok(Some(popped)) => popped,
             Ok(None) => {
                 self.rollback();
                 return Ok(false);
@@ -732,6 +1024,7 @@ impl Ship {
             payload: &queued.payload,
             queued: Some(queued.seq),
             owed,
+            spare_before,
         };
         match self.execute(rt, event) {
             // Run, or rejected and removed: either way it is off the queue.
@@ -789,6 +1082,46 @@ impl Ship {
     }
 }
 
+/// The record of a rejected notification about another ship's log has been written inside
+/// the savepoint `settling`: the failure counted, the agent prompted again, the audit row.
+/// Keep it if it used no room, or left as much as the ship keeps for taking a command. If
+/// not, undo it: the notification then simply comes off the queue, and the agent is next
+/// prompted when more of the log arrives or it asks to follow again. Returns false only if
+/// neither could be done.
+fn settled_within(conn: &Connection, spare_before: Option<u64>, cfg: &crate::Config) -> bool {
+    let within = match (spare_before, store::spare_bytes(conn)) {
+        (Some(before), Ok(now)) => now >= before || now >= room_to_take_one(cfg),
+        _ => false,
+    };
+    conn.execute_batch(if within { "RELEASE settling" } else { "ROLLBACK TO settling; RELEASE settling" }).is_ok()
+}
+
+/// What is left to do for a log followed on another ship, after an answer about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// Ask again: this is what to ask for now.
+    More(FetchJob),
+    /// Nothing more to ask for, until that ship says the log has grown or the agent makes room.
+    Done,
+    /// The log has stopped: that ship will not give it, or what it gives does not carry on.
+    Stopped,
+    /// The ship's file has no room for what came. Try again after a while.
+    NoRoom,
+}
+
+/// What a log followed on another ship stops with when what that ship sends cannot be a
+/// continuation of what this ship holds.
+const NOT_A_CONTINUATION: &str = "what that ship sends does not carry on from the log this ship has been following";
+
+/// Whether there is more to ask the other ship for, and if so what.
+fn left(held: &Replica, job: &FetchJob, cfg: &crate::Config) -> Taken {
+    let wanted = held.stopped.is_empty() && (!held.joined || held.head < held.announced) && held.bytes < cfg.max_follow_bytes;
+    if !wanted {
+        return Taken::Done;
+    }
+    Taken::More(FetchJob { after: held.head, room: cfg.max_follow_bytes - held.bytes, joining: !held.joined, gen: held.gen, ..job.clone() })
+}
+
 /// What the ship that sent a command is told when it was rejected here.
 ///
 /// If the kernel turned the command away, its reason is passed on: it is about the request
@@ -819,7 +1152,7 @@ fn largest_taken(cfg: &crate::Config) -> u64 {
 
 /// Room in a ship's file to take the largest command another ship may send it, and to finish
 /// with it.
-fn room_to_take_one(cfg: &crate::Config) -> u64 {
+pub(crate) fn room_to_take_one(cfg: &crate::Config) -> u64 {
     let largest = largest_taken(cfg).min(cfg.max_event_bytes as u64 + store::MESSAGE_OVERHEAD);
     largest + store::MAX_RECEIPT_BYTES as u64 + STORAGE_SLACK_BYTES
 }

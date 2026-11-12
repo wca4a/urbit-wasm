@@ -23,6 +23,13 @@
 //! carries them, and sees that what a ship has taken gets run: the numbering and the queues
 //! are in each ship's file.
 //!
+//! Ships also follow each other's logs over the link. A ship that publishes a log tells each
+//! ship that follows it when the log has grown. That is only a prompt: the ship that follows
+//! then asks for the entries after the last one it holds, checks each against the publisher's
+//! key and against the entry before it, and keeps them for its agent. Asking is what moves
+//! entries, so a ship takes them when it has room, and one that has been away, or has gone
+//! back to an earlier state, catches up by asking from wherever it stands.
+//!
 //! The directory here is a fixed list handed in by whoever starts the network. In time it
 //! will be Urbit ID: names, keys, and sponsors from Azimuth. A ship's own key does not change
 //! while its runtime runs.
@@ -45,9 +52,11 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
-use ship_proto::{peer_reply, peer_request, Deliver, Delivered, Message, PeerReply, PeerRequest, Ping, Pong};
+use ship_proto::{peer_reply, peer_request, Deliver, Delivered, Fetch, Heard, Message, News, PeerReply, PeerRequest, Ping, Pong};
 use tokio::sync::Semaphore;
 
+use crate::ship::Taken;
+use crate::store::{PeerWork, MAX_BATCH_MESSAGES, MAX_FETCH_ENTRIES, MAX_NEWS_LOGS};
 use crate::{canonical_ship, lock, Error, Runtime};
 
 /// The name of this protocol, agreed while connecting. A connection that does not ask for it
@@ -338,6 +347,9 @@ struct Lane {
     delay: Duration,
     /// The two ships disagree about what has passed between them. Nothing more is carried.
     stalled: bool,
+    /// The last of this ship's logs the other ship was told about, as (agent, log). News
+    /// goes round the logs from there, so that no log is always left out.
+    told: Option<(String, String)>,
 }
 
 impl Carrier {
@@ -387,6 +399,10 @@ impl Network {
         }
         if cfg.max_message_bytes < runtime.inner.cfg.max_event_bytes.saturating_add(MESSAGE_ENVELOPE_BYTES) {
             return Err(io::Error::other("max_message_bytes must have room for the largest command a ship here may send"));
+        }
+        // Likewise a log's checkpoint, which a ship that follows the log may be sent whole.
+        if cfg.max_message_bytes < runtime.inner.cfg.max_checkpoint_bytes.saturating_add(MESSAGE_ENVELOPE_BYTES) {
+            return Err(io::Error::other("max_message_bytes must have room for the largest checkpoint a log here may have"));
         }
         if cfg.retry_delay.is_zero() || cfg.retry_delay > cfg.max_retry_delay || cfg.max_retry_delay > MAX_TIMEOUT {
             return Err(io::Error::other("retry_delay must be more than nothing and at most max_retry_delay, itself at most a day"));
@@ -715,11 +731,17 @@ impl Shared {
     /// Send one request and read its reply, over a connection made for this pair of ships,
     /// all within the time allowed for a request.
     async fn ask(&self, from: &str, to: &str, request: PeerRequest) -> Result<PeerReply, NetError> {
+        self.ask_keyed(from, to, request).await.map(|(reply, _)| reply)
+    }
+
+    /// The same, also returning the key the ship that answered proved it holds: the one the
+    /// directory listed for it when the connection was made.
+    async fn ask_keyed(&self, from: &str, to: &str, request: PeerRequest) -> Result<(PeerReply, [u8; 32]), NetError> {
         let from = canonical_ship(from).map_err(|_| NetError::NotHere(from.to_string()))?;
         let to = canonical_ship(to).map_err(|_| NetError::Unlisted(to.to_string()))?;
         let deadline = tokio::time::Instant::now().checked_add(self.cfg.request_timeout).ok_or(NetError::TimedOut)?;
         let lost = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
-        let connection = tokio::time::timeout_at(deadline, self.connection(&from, &to)).await.map_err(|_| NetError::TimedOut)??;
+        let (connection, key) = tokio::time::timeout_at(deadline, self.connection(&from, &to)).await.map_err(|_| NetError::TimedOut)??;
         let opened = tokio::time::timeout_at(deadline, connection.open_bi()).await.map_err(|_| NetError::TimedOut)?;
         let (mut send, mut receive) = opened.map_err(|e| lost(&e))?;
         // The streams are held out here, so that if time runs out part way they can be told
@@ -735,11 +757,16 @@ impl Shared {
             let _ = receive.stop(VarInt::from_u32(3));
             return Err(NetError::TimedOut);
         };
-        let reply = PeerReply::decode(&*answer?).map_err(|_| NetError::Garbled)?;
+        let answer = answer?;
+        // Counted before it is decoded, as a request is: an answer can be all padding too.
+        if !repeats_within(&answer, 3, 1, MAX_FETCH_ENTRIES) {
+            return Err(NetError::Garbled);
+        }
+        let reply = PeerReply::decode(&*answer).map_err(|_| NetError::Garbled)?;
         if reply.body.is_none() {
             return Err(NetError::Refused(reply.refused));
         }
-        Ok(reply)
+        Ok((reply, key))
     }
 
     /// The place where the connection for a pair of ships is kept, making one if the pair is new.
@@ -769,8 +796,9 @@ impl Shared {
         Ok(made.entry(pair.clone()).or_default().clone())
     }
 
-    /// The connection from one of this runtime's ships to another ship, made if there is none.
-    async fn connection(&self, from: &str, to: &str) -> Result<Connection, NetError> {
+    /// The connection from one of this runtime's ships to another ship, made if there is
+    /// none, and the key the other ship proved it holds when it was made.
+    async fn connection(&self, from: &str, to: &str) -> Result<(Connection, [u8; 32]), NetError> {
         let key = self.runtime.signing_key(from).map_err(|_| NetError::NotHere(from.to_string()))?;
         let shown = key.verifying_key().to_bytes();
         let pair = (from.to_string(), to.to_string());
@@ -806,7 +834,7 @@ impl Shared {
             if made.connection.close_reason().is_none() && made.peer == peer && made.shown == shown {
                 let connection = made.connection.clone();
                 *kept = Some(made);
-                return Ok(connection);
+                return Ok((connection, peer.key));
             }
             made.connection.close(VarInt::from_u32(2), b"the directory changed");
         }
@@ -838,7 +866,7 @@ impl Shared {
             return Err(NetError::Unreachable("the directory changed while connecting".into()));
         }
         *kept = Some(Made { connection: connection.clone(), peer, shown });
-        Ok(connection)
+        Ok((connection, peer.key))
     }
 }
 
@@ -990,8 +1018,9 @@ async fn work<T: Send + 'static>(shared: &Shared, job: impl FnOnce() -> T + Send
 /// Answer one request from `caller` to `called`.
 async fn answer(shared: &Arc<Shared>, caller: &str, called: &str, request: &[u8]) -> PeerReply {
     // Counted before it is decoded. A request of a megabyte can hold half a million empty
-    // messages, and decoding would give each one a few hundred bytes of memory.
-    if !messages_within(request, crate::store::MAX_BATCH_MESSAGES) {
+    // messages, and decoding would give each one a few hundred bytes of memory. The same
+    // goes for the logs in a piece of news.
+    if !repeats_within(request, 2, 1, MAX_BATCH_MESSAGES) || !repeats_within(request, 4, 1, MAX_NEWS_LOGS) {
         return refused("not a request, or one with too many messages");
     }
     let Ok(request) = PeerRequest::decode(request) else { return refused("not a request") };
@@ -1012,14 +1041,36 @@ async fn answer(shared: &Arc<Shared>, caller: &str, called: &str, request: &[u8]
             shared.carrier.run_at(called);
             PeerReply { body: Some(peer_reply::Body::Delivered(Delivered { last })), refused: String::new() }
         }
+        // Entries of one of a ship's logs, for the ship at the other end, which follows it
+        // or wants to. Whether it may is for the log's publisher, and is looked up afresh
+        // each time.
+        Some(peer_request::Body::Fetch(fetch)) => {
+            let (runtime, ship, peer, most) = (shared.runtime.clone(), called.to_string(), caller.to_string(), shared.cfg.max_message_bytes / 2);
+            match work(shared, move || runtime.serve_log(&ship, &peer, &fetch, most)).await {
+                Some(Ok(fetched)) => PeerReply { body: Some(peer_reply::Body::Fetched(fetched)), refused: String::new() },
+                _ => refused("the log could not be read; try again"),
+            }
+        }
+        // News of the caller's logs, for agents here that follow them.
+        Some(peer_request::Body::News(News { logs })) => {
+            let (runtime, ship, peer) = (shared.runtime.clone(), called.to_string(), caller.to_string());
+            let Some(Ok(unknown)) = work(shared, move || runtime.hear_news(&ship, &peer, &logs)).await else {
+                return refused("the news could not be taken; try again");
+            };
+            // There may now be something to ask that ship for.
+            shared.carrier.look_at(called);
+            PeerReply { body: Some(peer_reply::Body::Heard(Heard { unknown })), refused: String::new() }
+        }
         _ => refused("not a request this ship answers"),
     }
 }
 
-/// Whether an encoded request is one that can be walked through field by field and holds at
-/// most `most` messages for delivery. This reads only the sizes written in the request and
-/// keeps nothing, so it costs nothing to run on a request that is all padding.
-fn messages_within(request: &[u8], most: usize) -> bool {
+/// Whether an encoded request or reply is one that can be walked through field by field and
+/// in which field `outer`, a message, holds at most `most` of its field `inner`: the
+/// messages in a delivery, the logs in a piece of news, the entries in an answer. This reads
+/// only the sizes written there and keeps nothing, so it costs nothing to run on something
+/// that is all padding.
+fn repeats_within(request: &[u8], outer: u64, inner: u64, most: usize) -> bool {
     /// Walk the fields of one encoded message, handing each length-delimited one to `each`.
     /// False if the bytes are not fields from end to end, or `each` says to stop.
     fn walk<'a>(mut bytes: &'a [u8], mut each: impl FnMut(u64, &'a [u8]) -> bool) -> bool {
@@ -1057,12 +1108,11 @@ fn messages_within(request: &[u8], most: usize) -> bool {
         true
     }
     let mut count = 0usize;
-    // Field 2 of a request is a delivery, and field 1 of a delivery is one message. A field
-    // may be given more than once, and all of them count.
+    // A field may be given more than once, and all of them count.
     walk(request, |field, body| {
-        field != 2
+        field != outer
             || walk(body, |field, _| {
-                count += usize::from(field == 1);
+                count += usize::from(field == inner);
                 count <= most
             })
     })
@@ -1082,14 +1132,14 @@ async fn carry(shared: Arc<Shared>) {
         for ship in ships {
             let (runtime, name) = (shared.runtime.clone(), ship.clone());
             let peers = work(&shared, move || runtime.outbound_peers(&name)).await;
-            for peer in peers.and_then(Result::ok).unwrap_or_default() {
-                start_lane(&shared, &ship, &peer);
+            for (peer, work) in peers.and_then(Result::ok).unwrap_or_default() {
+                start_lane(&shared, &ship, &peer, work);
             }
         }
         // Then wait for news, or for the earliest moment a failed lane may be tried again.
         let now = tokio::time::Instant::now();
         let mut next = None;
-        for ((ship, _), lane) in lock(&carrier.lanes).iter_mut().filter(|(_, lane)| !lane.busy && !lane.stalled) {
+        for ((ship, _), lane) in lock(&carrier.lanes).iter_mut().filter(|(_, lane)| !lane.busy) {
             match lane.retry_at {
                 Some(at) if at <= now => {
                     lane.retry_at = None;
@@ -1186,21 +1236,24 @@ async fn run_queue(shared: &Arc<Shared>, ship: &str, most: usize) -> Option<Resu
     Some(work(shared, move || runtime.run_pending(&name, most)).await?.map(drop))
 }
 
-/// Start carrying one ship's commands to one other ship, unless that is already under way,
-/// has to wait after a failure, or has stalled.
-fn start_lane(shared: &Arc<Shared>, ship: &str, peer: &str) {
+/// Take up with one other ship whatever one ship has for it, unless that is already under
+/// way or has to wait after a failure. Commands are left alone between two ships that
+/// disagree about them; their logs go on regardless.
+fn start_lane(shared: &Arc<Shared>, ship: &str, peer: &str, work: PeerWork) {
     let pair = (ship.to_string(), peer.to_string());
-    {
+    let messages = {
         let mut lanes = lock(&shared.carrier.lanes);
         let lane = lanes.entry(pair.clone()).or_default();
-        if lane.busy || lane.stalled || lane.retry_at.is_some() {
+        let messages = work.messages && !lane.stalled;
+        if lane.busy || lane.retry_at.is_some() || !(messages || work.logs) {
             return;
         }
         lane.busy = true;
-    }
+        messages
+    };
     let shared = shared.clone();
     tokio::spawn(async move {
-        let carried = carry_lane(&shared, &pair.0, &pair.1).await;
+        let carried = carry_lane(&shared, &pair.0, &pair.1, messages, work.logs).await;
         {
             let mut lanes = lock(&shared.carrier.lanes);
             let lane = lanes.entry(pair.clone()).or_default();
@@ -1220,9 +1273,152 @@ fn start_lane(shared: &Arc<Shared>, ship: &str, peer: &str) {
     });
 }
 
-/// Carry everything one ship has waiting for one other ship, a batch at a time, in order.
-async fn carry_lane(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried {
-    loop {
+/// How one part of what two ships have for each other went.
+enum Step {
+    /// Done, or as far as one turn goes; anything left is found when the ship is looked at again.
+    Done,
+    /// The other ship answered, but something could not be done yet. Try again after a while.
+    Later,
+    /// The other ship could not be reached. Nothing else will get through to it either.
+    Lost,
+}
+
+/// Whether a request failed because the other ship could not be reached at all.
+fn lost(error: &NetError) -> bool {
+    matches!(error, NetError::Unreachable(_) | NetError::TimedOut | NetError::Unlisted(_) | NetError::NotHere(_))
+}
+
+/// Take up with one other ship everything one ship has for it: news of its logs, entries of
+/// the other ship's logs to ask for, and messages waiting to go.
+async fn carry_lane(shared: &Arc<Shared>, ship: &str, peer: &str, messages: bool, logs: bool) -> Carried {
+    let mut later = false;
+    if logs {
+        for step in [tell_news(shared, ship, peer).await, fetch_logs(shared, ship, peer).await] {
+            match step {
+                Step::Done => {}
+                Step::Later => later = true,
+                Step::Lost => return Carried::NotYet,
+            }
+        }
+    }
+    if messages {
+        match carry_messages(shared, ship, peer).await {
+            Carried::All => {}
+            other => return other,
+        }
+    }
+    if later { Carried::NotYet } else { Carried::All }
+}
+
+/// Tell one other ship what it has yet to hear about the logs of this ship that it follows:
+/// that they have grown, or are closed to it.
+async fn tell_news(shared: &Arc<Shared>, ship: &str, peer: &str) -> Step {
+    /// How many rounds go to one ship in one turn.
+    const ROUNDS: usize = 4;
+    for _ in 0..ROUNDS {
+        let Ok(_turn) = shared.carrying.acquire().await else { return Step::Later };
+        let (runtime, from, to) = (shared.runtime.clone(), ship.to_string(), peer.to_string());
+        let pair = (ship.to_string(), peer.to_string());
+        let after = lock(&shared.carrier.lanes).get(&pair).and_then(|lane| lane.told.clone());
+        let Some(Ok(mut told)) = work(shared, move || runtime.outbound_news(&from, &to, after)).await else { return Step::Later };
+        if told.is_empty() {
+            return Step::Done;
+        }
+        // Only as much as the other ship will read in one request. The rest stays marked
+        // as untold, and goes next time round.
+        fitting(&mut told, shared.cfg.max_message_bytes / 2);
+        let logs = told.iter().map(crate::store::NewsItem::as_sent).collect();
+        let unknown = match shared.ask(ship, peer, PeerRequest { body: Some(peer_request::Body::News(News { logs })) }).await {
+            Ok(PeerReply { body: Some(peer_reply::Body::Heard(Heard { unknown })), .. }) if unknown.len() <= told.len() => unknown,
+            Err(error) if lost(&error) => return Step::Lost,
+            _ => return Step::Later,
+        };
+        // The next piece of news starts after the last log in this one.
+        if let (Some(last), Some(lane)) = (told.last(), lock(&shared.carrier.lanes).get_mut(&pair)) {
+            lane.told = Some((last.agent.clone(), last.name.clone()));
+        }
+        let (runtime, from, to) = (shared.runtime.clone(), ship.to_string(), peer.to_string());
+        if !matches!(work(shared, move || runtime.news_heard(&from, &to, &told, &unknown)).await, Some(Ok(()))) {
+            return Step::Later;
+        }
+    }
+    Step::Done
+}
+
+/// Cut a piece of news down to what fits in `most` bytes as it will be sent, keeping at least
+/// one log.
+fn fitting(told: &mut Vec<crate::store::NewsItem>, most: usize) {
+    let mut bytes = 0usize;
+    let fits = told.iter().take_while(|item| {
+        bytes += item.as_sent().encoded_len() + 8;
+        bytes <= most
+    });
+    let keep = fits.count().max(1);
+    told.truncate(keep);
+}
+
+/// Ask one other ship for the entries of its logs that agents on this ship follow and have
+/// room for, and take in what it answers.
+async fn fetch_logs(shared: &Arc<Shared>, ship: &str, peer: &str) -> Step {
+    /// How many times one log is asked for in one turn.
+    const ROUNDS: usize = 8;
+    let (runtime, from, to) = (shared.runtime.clone(), ship.to_string(), peer.to_string());
+    let Some(Ok((jobs, blocked))) = work(shared, move || runtime.follow_work(&from, &to)).await else { return Step::Later };
+    let mut later = blocked;
+    for mut job in jobs {
+        for _ in 0..ROUNDS {
+            let Ok(_turn) = shared.carrying.acquire().await else { return Step::Later };
+            let fetch = Fetch {
+                agent: job.agent.clone(),
+                log: job.name.clone(),
+                after: job.after,
+                max_bytes: job.room.min((shared.cfg.max_message_bytes / 2) as u64) as u32,
+                joining: job.joining,
+            };
+            let (fetched, key) = match shared.ask_keyed(ship, peer, PeerRequest { body: Some(peer_request::Body::Fetch(fetch)) }).await {
+                Ok((PeerReply { body: Some(peer_reply::Body::Fetched(fetched)), .. }, key)) => (fetched, key),
+                Err(error) if lost(&error) => return Step::Lost,
+                _ => {
+                    later = true;
+                    break;
+                }
+            };
+            let (runtime, from, to, asked) = (shared.runtime.clone(), ship.to_string(), peer.to_string(), job.clone());
+            let Some(Ok((taken, queued))) = work(shared, move || runtime.take_entries(&from, &to, &key, &asked, &fetched)).await else {
+                later = true;
+                break;
+            };
+            // What was taken is saved, and the agent that follows the log has been queued a
+            // notice. Running it is up to this runtime.
+            if queued {
+                shared.carrier.run_at(ship);
+            }
+            match taken {
+                Taken::More(next) => job = next,
+                Taken::Done => break,
+                // No room, so wait a while. And a log that has stopped counts as a try that
+                // failed: an agent that answers every refusal by asking again is then held
+                // to the pace at which failed tries are made, however fast the other ship
+                // refuses, and cannot keep its ship and that one busy without end.
+                Taken::NoRoom | Taken::Stopped => {
+                    later = true;
+                    break;
+                }
+            }
+        }
+    }
+    if later { Step::Later } else { Step::Done }
+}
+
+/// Carry what one ship has waiting for one other ship, a batch at a time, in order: a few
+/// batches in one turn. If more is waiting after that, the ship is looked at again and the
+/// lane has another turn, which begins with the two ships' logs. Carrying on here until
+/// nothing was waiting would let a steady run of commands keep news of a log, or the asking
+/// for one, from ever having its turn.
+async fn carry_messages(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried {
+    /// How many batches go to one ship in one turn.
+    const ROUNDS: usize = 8;
+    for _ in 0..ROUNDS {
         // One turn for each batch, taken before the batch is read out and given back when it
         // has gone, so that a busy pair of ships does not keep the others waiting.
         let Ok(_turn) = shared.carrying.acquire().await else { return Carried::NotYet };
@@ -1252,15 +1448,58 @@ async fn carry_lane(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried {
             return Carried::NotYet;
         }
     }
+    Carried::All
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn messages_within(request: &[u8], most: usize) -> bool {
+        repeats_within(request, 2, 1, most)
+    }
+
     fn deliver(count: usize) -> Vec<u8> {
         let messages = (0..count).map(|_| ship_proto::PeerMessage::default()).collect();
         PeerRequest { body: Some(peer_request::Body::Deliver(Deliver { messages })) }.encode_to_vec()
+    }
+
+    #[test]
+    fn news_and_answers_are_counted_before_they_are_decoded() {
+        let news = |logs: usize| PeerRequest { body: Some(peer_request::Body::News(News { logs: vec![Default::default(); logs] })) }.encode_to_vec();
+        assert!(repeats_within(&news(3), 4, 1, 3));
+        assert!(!repeats_within(&news(4), 4, 1, 3));
+        assert!(!repeats_within(&news(500_000), 4, 1, MAX_NEWS_LOGS));
+        let answer = |entries: usize| {
+            let fetched = ship_proto::Fetched { entries: vec![Default::default(); entries], ..Default::default() };
+            PeerReply { body: Some(peer_reply::Body::Fetched(fetched)), refused: String::new() }.encode_to_vec()
+        };
+        assert!(repeats_within(&answer(3), 3, 1, 3));
+        assert!(!repeats_within(&answer(4), 3, 1, 3));
+        assert!(!repeats_within(&answer(500_000), 3, 1, MAX_FETCH_ENTRIES));
+        // Each kind of thing is counted against its own limit and no other.
+        assert!(repeats_within(&deliver(10), 4, 1, 3));
+        assert!(repeats_within(&news(10), 2, 1, 3));
+    }
+
+    #[test]
+    fn news_is_cut_to_what_one_request_can_carry() {
+        let item = |name: &str| crate::store::NewsItem { agent: "a".repeat(64), name: name.repeat(40), head: 7, closed: false, gen: 0 };
+        let all = vec![item("x"), item("y"), item("z")];
+        let size = |told: &[crate::store::NewsItem]| News { logs: told.iter().map(crate::store::NewsItem::as_sent).collect() }.encoded_len();
+        // Everything, when there is room for it.
+        let mut told = all.clone();
+        fitting(&mut told, 4096);
+        assert_eq!(told, all);
+        // Room for two of the three: the first two, in order, and they do fit.
+        let mut told = all.clone();
+        fitting(&mut told, size(&all[..2]) + 20);
+        assert_eq!(told, all[..2]);
+        assert!(size(&told) <= size(&all[..2]) + 20);
+        // Room for none: still one, so that something always gets through.
+        let mut told = all.clone();
+        fitting(&mut told, 10);
+        assert_eq!(told, all[..1]);
     }
 
     #[test]

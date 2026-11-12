@@ -5,6 +5,7 @@ use std::cell::RefCell;
 pub use ship_proto as proto;
 use ship_proto::{
     AppendRequest, CheckpointReply, FollowRequest, Invocation, Message, NextReply, NextRequest, ReadRequest, SendRequest,
+    ShareRequest,
 };
 
 #[link(wasm_import_module = "host")]
@@ -30,6 +31,10 @@ extern "C" {
     fn host_log_follow(req: *const u8, req_len: u32);
     #[link_name = "log_next"]
     fn host_log_next(req: *const u8, req_len: u32, buf: *mut u8, buf_cap: u32) -> i64;
+    #[link_name = "log_unfollow"]
+    fn host_log_unfollow(req: *const u8, req_len: u32);
+    #[link_name = "log_share"]
+    fn host_log_share(req: *const u8, req_len: u32);
 }
 
 /// Call a host function that fills a buffer and reports the full length, growing the buffer and
@@ -108,6 +113,11 @@ pub mod log {
         pub entries: Vec<Entry>,
         /// Whether the log has more beyond this batch.
         pub more: bool,
+        /// For a log on another ship: set when no more of it will come, with a few words on
+        /// why. That ship has stopped sharing the log with this one, or never did, or what
+        /// it sends no longer carries on from what this ship holds. Entries already held
+        /// are still handed over. Following the log again asks afresh.
+        pub stopped: Option<String>,
     }
 
     /// Add an entry to one of this agent's own logs and return its number. The runtime signs
@@ -120,18 +130,65 @@ pub mod log {
     /// Start following another agent's log from its first entry. The agent's notify handler is
     /// then called whenever the log has entries it has not taken. Following twice is harmless.
     pub fn follow(agent: &str, log: &str) {
-        let request = FollowRequest { agent: agent.into(), log: log.into() }.encode_to_vec();
+        follow_on("", agent, log)
+    }
+
+    /// Start following a log published by an agent on another ship, from its first entry.
+    /// This ship fetches the entries, checks that each is signed by that ship and follows on
+    /// from the one before, and keeps them until this agent takes them. The notify handler
+    /// is called whenever there are some to take; `invocation()` then names the ship, the
+    /// agent, and the log, and `next_on` hands them over.
+    ///
+    /// The event is rejected if this agent's manifest does not name that ship, agent, and
+    /// log. Whether the other ship shares the log with this one is up to the agent that
+    /// publishes it. If it does not, the notify handler is called once and `next_on`
+    /// reports the log as stopped. Following again asks afresh; that is also how to pick up
+    /// a log that had stopped. An empty ship name means this ship.
+    pub fn follow_on(ship: &str, agent: &str, log: &str) {
+        let request = FollowRequest { ship: ship.into(), agent: agent.into(), log: log.into() }.encode_to_vec();
         unsafe { host_log_follow(request.as_ptr(), request.len() as u32) }
+    }
+
+    /// Stop following a log, on this ship (an empty ship name) or another. Whatever was being
+    /// held of it for this agent is let go. Following it again starts from its first entry.
+    pub fn unfollow_on(ship: &str, agent: &str, log: &str) {
+        let request = FollowRequest { ship: ship.into(), agent: agent.into(), log: log.into() }.encode_to_vec();
+        unsafe { host_log_unfollow(request.as_ptr(), request.len() as u32) }
     }
 
     /// Take up to `max` entries after this agent's position in a log it follows. The position
     /// moves past them only if this event commits, so an entry is never lost and never handled
     /// twice.
     pub fn next(agent: &str, log: &str, max: u32) -> Batch {
-        let request = NextRequest { agent: agent.into(), log: log.into(), max, checkpoints: true }.encode_to_vec();
+        next_on("", agent, log, max)
+    }
+
+    /// The same, for a log on another ship, or with an empty ship name for one on this ship.
+    pub fn next_on(ship: &str, agent: &str, log: &str, max: u32) -> Batch {
+        let request = NextRequest { ship: ship.into(), agent: agent.into(), log: log.into(), max, checkpoints: true }.encode_to_vec();
         let bytes = once(|buf, cap| unsafe { host_log_next(request.as_ptr(), request.len() as u32, buf, cap) });
         let reply = NextReply::decode(&*bytes).expect("the runtime sent a malformed log reply");
-        Batch { checkpoint: reply.checkpoint, entries: reply.entries, more: reply.more }
+        let stopped = (!reply.stopped.is_empty()).then_some(reply.stopped);
+        Batch { checkpoint: reply.checkpoint, entries: reply.entries, more: reply.more, stopped }
+    }
+
+    /// Let another ship follow one of this agent's own logs. `ship` is a ship's name, or "*"
+    /// for every ship. Who may follow a log is this agent's decision alone: nothing at
+    /// install says which ships it may share with. A ship may ask before it is let in; it is
+    /// refused, and asks again when its own agent follows again. Kept only if this event
+    /// commits.
+    pub fn share(log: &str, ship: &str) {
+        let request = ShareRequest { log: log.into(), ship: ship.into(), stop: false }.encode_to_vec();
+        unsafe { host_log_share(request.as_ptr(), request.len() as u32) }
+    }
+
+    /// Stop letting a ship follow one of this agent's logs. `ship` is whatever was given to
+    /// `share`: taking back "*" leaves the ships that were named one by one. A ship that was
+    /// following and is no longer covered is told the log is closed to it, and gets no more.
+    /// What it already has, it keeps.
+    pub fn unshare(log: &str, ship: &str) {
+        let request = ShareRequest { log: log.into(), ship: ship.into(), stop: true }.encode_to_vec();
+        unsafe { host_log_share(request.as_ptr(), request.len() as u32) }
     }
 }
 

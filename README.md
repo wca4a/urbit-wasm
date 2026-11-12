@@ -4,10 +4,11 @@ A prototype event-based runtime. Multiple ships can run in one
 process. Each ship is one SQLite file, a kernel, and agents, all WASM modules
 written in Rust.
 
-Experimental. There is a runtime, a kernel, logs that agents on one ship can
-follow, an HTTP server that lets an app or a browser sign in to a ship, and an
-encrypted link over which ships send each other commands. Ships cannot yet
-follow each other's logs, and there is no identity or update mechanism yet.
+Experimental. There is a runtime, a kernel, logs that agents can follow, an
+HTTP server that lets an app or a browser sign in to a ship, and an encrypted
+link over which ships send each other commands and follow each other's logs.
+A ship's file is not yet encrypted on disk, and there is no identity or update
+mechanism yet.
 
 ## What it does
 
@@ -55,6 +56,21 @@ follow each other's logs, and there is no identity or update mechanism yet.
 - Every command sent to another ship is answered with one receipt: it ran, or
   it did not and why. A refusal is written to the sender's audit log, and an
   agent can ask to be handed its receipts.
+- An agent can follow a log published on another ship. Its ship fetches the
+  entries, checks each against the publishing ship's key and against the entry
+  before it, and keeps them until the agent takes them: each once, in order,
+  through restarts and lost connections at either end.
+- The agent that publishes a log decides which ships may follow it, by name or
+  all of them, and can change its mind. The owner of the ship that follows
+  agrees at install that the agent may follow logs on other ships.
+- The publishing ship tells its followers when a log has grown, and they ask
+  for what is new when they have room for it. A follower that falls behind is
+  not sent the whole log to hold, and one that is too far behind is handed the
+  log's checkpoint.
+- If what a ship sends stops being a continuation of what a follower holds, as
+  it would after that ship went back to an old backup and wrote something
+  different, the follower stops and its agent is told. The agent can stop
+  following and start again from the beginning.
 
 ## Layout
 

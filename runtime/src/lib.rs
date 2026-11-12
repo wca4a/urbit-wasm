@@ -27,6 +27,7 @@ use ship_proto::{AdminRequest, CheckpointBody, Install, Message, Source};
 use wasmtime::{Engine, InstancePre, Linker, Module};
 
 pub use ship_proto::{Device, EntryBody, Manifest, Provide, SignedCheckpoint, SignedEntry, Use};
+pub use store::RemoteFollow;
 
 use host::Ctx;
 use ship::Ship;
@@ -97,6 +98,17 @@ pub struct Config {
     pub max_log_bytes: u64,
     /// How many logs a ship may have.
     pub max_logs: usize,
+    /// How much of a log on another ship is held for an agent that follows it and has yet to
+    /// take it, counted the same way. No more is fetched while this much is held, so an
+    /// agent that falls behind is not sent the whole log to keep. An entry is fetched
+    /// whenever less than this is held, so what is held can pass it by one entry.
+    pub max_follow_bytes: u64,
+    /// How many ships one log may be shared with by name. Sharing with every ship counts
+    /// as one.
+    pub max_log_shares: usize,
+    /// How many other ships may follow one log at a time. Each is remembered, so as to be
+    /// told when the log grows.
+    pub max_log_followers: usize,
     /// A log's publisher is asked for a checkpoint once the entries added since the last one
     /// outweigh both this and that checkpoint itself.
     pub checkpoint_min_bytes: u64,
@@ -143,6 +155,9 @@ impl Default for Config {
             max_unanswered: 4096,
             max_log_bytes: 64 << 20,
             max_logs: 16_384,
+            max_follow_bytes: 4 << 20,
+            max_log_shares: 4096,
+            max_log_followers: 4096,
             checkpoint_min_bytes: 64 << 10,
             max_checkpoint_bytes: 1 << 20,
             max_queued_per_deliver: 64,
@@ -322,8 +337,9 @@ pub(crate) struct Inner {
     /// is locked while this is held.
     log_growth: Mutex<HashMap<String, u64>>,
     logs_changed: Condvar,
-    /// Called with a ship's name when an event on it has queued commands for other ships.
-    /// The network sets it, to learn there is something to send. It must not block.
+    /// Called with a ship's name when an event on it has left something for the network to
+    /// do: commands for other ships, news of its logs, or room for more of theirs. The
+    /// network sets it, to learn there is something to look at. It must not block.
     outbound_hook: std::sync::RwLock<Option<OutboundHook>>,
     /// Whether a network is running for this runtime. There is one at most: it alone carries
     /// what the ships here have waiting for other ships.
@@ -940,7 +956,7 @@ impl Runtime {
     pub fn log_position(&self, ship: &str, follower: &str, agent: &str, log: &str) -> Result<Option<u64>, Error> {
         check_agent_name(follower)?;
         check_target(agent, log)?;
-        self.inner.with_ship(ship, |ship| Ok(store::cursor(&lock(&ship.conn), follower, agent, log)?))
+        self.inner.with_ship(ship, |ship| Ok(store::cursor(&lock(&ship.conn), follower, store::Followed::here(agent, log))?))
     }
 
     /// The public half of a ship's signing key, for checking its log entries.
@@ -1175,7 +1191,7 @@ impl Runtime {
             // Asked of the ship itself if it is awake, so a write in progress is not read around.
             let has_work = |ship: &mut ship::Ship| {
                 let conn = lock(&ship.conn);
-                Ok(!store::peers_waiting(&conn)?.is_empty() || store::inbox_len(&conn)? > 0)
+                Ok(!store::peers_waiting(&conn, self.inner.cfg.max_follow_bytes)?.is_empty() || store::inbox_len(&conn)? > 0)
             };
             if self.inner.with_ship(&ship, has_work).unwrap_or(false) {
                 found.push(ship);
@@ -1184,9 +1200,86 @@ impl Runtime {
         Ok(found)
     }
 
-    /// The other ships that a ship has commands waiting to go to.
-    pub(crate) fn outbound_peers(&self, ship: &str) -> Result<Vec<String>, Error> {
-        self.inner.with_ship(ship, |ship| Ok(store::peers_waiting(&lock(&ship.conn))?))
+    /// The other ships that a ship has something to take up with, and what: messages
+    /// waiting to go to them, news of its logs for them, or entries of their logs to ask for.
+    pub(crate) fn outbound_peers(&self, ship: &str) -> Result<Vec<(String, store::PeerWork)>, Error> {
+        let max = self.inner.cfg.max_follow_bytes;
+        self.inner.with_ship(ship, |ship| Ok(store::peers_waiting(&lock(&ship.conn), max)?.into_iter().collect()))
+    }
+
+    /// What `peer` has yet to be told about the logs of this ship that it follows, starting
+    /// after the log (agent, name) it was last told about.
+    pub(crate) fn outbound_news(&self, ship: &str, peer: &str, after: Option<(String, String)>) -> Result<Vec<store::NewsItem>, Error> {
+        let after = after.as_ref().map(|(agent, name)| (agent.as_str(), name.as_str()));
+        self.inner.with_ship(ship, |ship| Ok(store::news_for(&lock(&ship.conn), peer, after)?))
+    }
+
+    /// `peer` has taken in what it was told. `unknown` says which logs it does not follow.
+    pub(crate) fn news_heard(&self, ship: &str, peer: &str, told: &[store::NewsItem], unknown: &[bool]) -> Result<(), Error> {
+        // Like anything written on another ship's behalf, this must not use up the room kept
+        // for taking a command. It only strikes rows off and clears marks, but a mark is
+        // also a place in an index, and moving a row there can take a new page.
+        let cfg = &self.inner.cfg;
+        self.inner.with_ship(ship, |ship| ship.transact_for_peer(cfg, |conn| Ok(store::news_heard(conn, peer, told, unknown)?)))
+    }
+
+    /// Take in what `peer` says about logs of its own that agents on a ship here follow.
+    /// Returns which of them no agent follows.
+    pub(crate) fn hear_news(&self, ship: &str, peer: &str, news: &[ship_proto::LogNews]) -> Result<Vec<bool>, Error> {
+        let peer = canonical_ship(peer)?;
+        self.inner.with_ship(ship, |ship| ship.hear_news(&self.inner.cfg, &peer, news))
+    }
+
+    /// What a ship has to ask `peer` for: entries of logs there that its agents follow. The
+    /// second value says there is something to ask for but no room in the ship's file to
+    /// keep it, in which case nothing is listed.
+    pub(crate) fn follow_work(&self, ship: &str, peer: &str) -> Result<(Vec<store::FetchJob>, bool), Error> {
+        let cfg = &self.inner.cfg;
+        self.inner.with_ship(ship, |ship| {
+            let conn = lock(&ship.conn);
+            let jobs = store::replica_work(&conn, peer, cfg.max_follow_bytes)?;
+            if !jobs.is_empty() && store::spare_bytes(&conn)? < ship::room_to_take_one(cfg) {
+                return Ok((Vec::new(), true));
+            }
+            Ok((jobs, false))
+        })
+    }
+
+    /// Answer `peer`, which asks a ship here for entries of one of its logs.
+    pub(crate) fn serve_log(&self, ship: &str, peer: &str, fetch: &ship_proto::Fetch, most: usize) -> Result<ship_proto::Fetched, Error> {
+        let peer = canonical_ship(peer)?;
+        self.inner.with_ship(ship, |ship| ship.serve_log(&self.inner, &peer, fetch, most))
+    }
+
+    /// Take in what `peer`, whose key is `key`, answered when asked for entries of a log.
+    pub(crate) fn take_entries(
+        &self,
+        ship: &str,
+        peer: &str,
+        key: &[u8; 32],
+        job: &store::FetchJob,
+        fetched: &ship_proto::Fetched,
+    ) -> Result<(ship::Taken, bool), Error> {
+        let peer = canonical_ship(peer)?;
+        self.inner.with_ship(ship, |ship| ship.take_entries(&self.inner, &peer, key, job, fetched))
+    }
+
+    /// The logs on other ships that a ship's agents follow, and how far each has got.
+    pub fn remote_follows(&self, ship: &str) -> Result<Vec<RemoteFollow>, Error> {
+        self.inner.with_ship(ship, |ship| Ok(store::remote_follows(&lock(&ship.conn))?))
+    }
+
+    /// The ships one of a ship's logs is shared with, as its publisher has said: names, and
+    /// "*" if every ship is let in.
+    pub fn log_shares(&self, ship: &str, agent: &str, log: &str) -> Result<Vec<String>, Error> {
+        check_target(agent, log)?;
+        self.inner.with_ship(ship, |ship| Ok(store::shares(&lock(&ship.conn), agent, log)?))
+    }
+
+    /// The other ships that follow one of a ship's logs.
+    pub fn log_followers(&self, ship: &str, agent: &str, log: &str) -> Result<Vec<String>, Error> {
+        check_target(agent, log)?;
+        self.inner.with_ship(ship, |ship| Ok(store::log_followers(&lock(&ship.conn), agent, log)?))
     }
 
     /// The oldest commands waiting to go from a ship to `peer`.
