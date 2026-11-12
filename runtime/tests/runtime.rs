@@ -3851,7 +3851,7 @@ fn networked_with(dir: &TempDir, ship: &str, directory: &Arc<Directory>, cfg: Ne
     // that makes messages small makes events small to match.
     // (And likewise the largest checkpoint a log there may have.)
     let most = cfg.max_message_bytes.saturating_sub(4096).min(1 << 20);
-    let events = Config { max_event_bytes: most, max_checkpoint_bytes: most, ..fast() };
+    let events = Config { max_event_bytes: most, max_checkpoint_bytes: most, max_unanswered: 64, ..fast() };
     let rt = Arc::new(Runtime::open(&dir.0, events).unwrap());
     rt.create_ship(ship, &kernel(&rt)).unwrap();
     let net = Network::start(rt.clone(), directory.clone(), cfg).unwrap();
@@ -4237,18 +4237,27 @@ fn stand_in_with(shown: [u8; 32], held: [u8; 32], answers: bool, claims: u64, lo
                         });
                         continue;
                     }
-                    let body = match ship_proto::PeerRequest::decode(&*bytes).ok().and_then(|request| request.body) {
-                        Some(ship_proto::peer_request::Body::Ping(ping)) => {
+                    // What the stand-in was set up to say comes first. Failing that, it answers
+                    // a ping and a delivery in its usual way, and anything else as a ship
+                    // would that does not know that kind of request.
+                    let asked = ship_proto::PeerRequest::decode(&*bytes).ok().and_then(|request| request.body);
+                    let chosen = asked.clone().and_then(|asked| logs.as_ref().and_then(|logs| logs(asked)));
+                    let body = match (chosen, asked) {
+                        (Some(body), _) => body,
+                        (None, Some(ship_proto::peer_request::Body::Ping(ping))) => {
                             // (`claims` also sets how much longer than need be the answer to a ping is.)
                             let ship = format!("nec{}", "x".repeat(claims as usize));
-                            ship_proto::peer_reply::Body::Pong(ship_proto::Pong { nonce: ping.nonce, ship, caller: "zod".into() })
+                            ship_proto::peer_reply::Body::Pong(ship_proto::Pong { nonce: ping.nonce, ship, caller: "zod".into(), incarnation: Vec::new() })
                         }
-                        Some(ship_proto::peer_request::Body::Deliver(_)) => ship_proto::peer_reply::Body::Delivered(ship_proto::Delivered { last: claims }),
-                        Some(about_logs) => match logs.as_ref().and_then(|logs| logs(about_logs)) {
-                            Some(body) => body,
-                            None => return,
-                        },
-                        None => return,
+                        (None, Some(ship_proto::peer_request::Body::Deliver(_))) => ship_proto::peer_reply::Body::Delivered(ship_proto::Delivered { last: claims }),
+                        (None, Some(_)) => {
+                            let reply = ship_proto::PeerReply { body: None, refused: "not a request this ship answers".into() };
+                            let _ = send.write_all(&reply.encode_to_vec()).await;
+                            let _ = send.finish();
+                            let _ = send.stopped().await;
+                            continue;
+                        }
+                        (None, None) => return,
                     };
                     let reply = ship_proto::PeerReply { body: Some(body), refused: String::new() };
                     let _ = send.write_all(&reply.encode_to_vec()).await;
@@ -5658,7 +5667,7 @@ fn a_ship_with_small_events_that_has_had_receipts_can_still_move() {
     let directory = Directory::new();
     // ~zod takes no event of more than thirty bytes. A receipt is the runtime's own record
     // and may be larger than that, and so may what the audit log says about it.
-    let small = Config { max_event_bytes: 30, max_checkpoint_bytes: 30, ..fast() };
+    let small = Config { max_event_bytes: 30, max_checkpoint_bytes: 30, max_unanswered: 64, ..fast() };
     let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
     let sender = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: false }], uses: vec![to("ghost")] };
     let rt = Arc::new(Runtime::open(&a.0, small.clone()).unwrap());
@@ -5755,7 +5764,7 @@ fn a_batch_is_sized_by_what_is_sent_names_and_all() {
     let (a, b) = (TempDir::new("cmd-names-a"), TempDir::new("cmd-names-b"));
     let directory = Directory::new();
     // Both runtimes carry small messages: room for the largest command and little more.
-    let small = Config { max_event_bytes: 200, max_checkpoint_bytes: 200, ..fast() };
+    let small = Config { max_event_bytes: 200, max_checkpoint_bytes: 200, max_unanswered: 64, ..fast() };
     let net = NetConfig { max_message_bytes: 200 + 4096, ..eager() };
     // ~zod's tally agent may send to an agent with as long a name as a name may be.
     let long = "a".repeat(64);
@@ -6525,6 +6534,16 @@ fn a_network_that_could_not_carry_a_logs_checkpoint_does_not_start() {
     let cramped = NetConfig { max_message_bytes: 50_000, ..eager() };
     assert!(Network::start(rt.clone(), directory.clone(), cramped).is_err());
     let roomy = NetConfig { max_message_bytes: 100_000 + 4096, ..eager() };
+    assert!(Network::start(rt, directory.clone(), roomy).is_ok());
+
+    // Likewise the list a ship sends of the commands it has yet to answer another ship,
+    // when the two compare notes: as many numbers as it may owe, at eight bytes each.
+    let other = TempDir::new("flw-cp-size-b");
+    let cfg = Config { max_event_bytes: 1000, max_checkpoint_bytes: 1000, max_unanswered: 1000, ..fast() };
+    let rt = Arc::new(Runtime::open(&other.0, cfg).unwrap());
+    let cramped = NetConfig { max_message_bytes: 15_000, ..eager() };
+    assert!(Network::start(rt.clone(), directory.clone(), cramped).is_err());
+    let roomy = NetConfig { max_message_bytes: 16_000, ..eager() };
     assert!(Network::start(rt, directory, roomy).is_ok());
 }
 
@@ -6911,6 +6930,8 @@ fn import_checks_what_a_ship_holds_of_other_ships_logs_and_who_follows_its_own()
         ("held-hash", "UPDATE remote_logs SET head_hash = x'0102'"),
         ("held-nohash", "UPDATE remote_logs SET head_hash = x''"),
         ("held-reason", "UPDATE remote_logs SET stopped = hex(zeroblob(101))"),
+        // The mark the other ship last showed is sixteen bytes, or none.
+        ("held-mark", "UPDATE remote_logs SET seen = x'0102'"),
         // No entry is numbered beyond what any log could reach, held or only heard of.
         ("held-far", "UPDATE follows SET cursor = 2305843009213693953 WHERE ship = 'zod'; UPDATE remote_logs SET head = 2305843009213693953; DELETE FROM remote_entries"),
         ("held-far-heard", "UPDATE remote_logs SET announced = 2305843009213693953"),
@@ -7031,7 +7052,7 @@ fn an_answer_is_sized_by_what_is_sent_signatures_and_all() {
     // answer is filled by the size it will have on the wire, so it is one the other ship
     // will read. Counted by the entries alone it would be too large, be refused, and be
     // sent again just the same.
-    let small = Config { max_event_bytes: 200, max_checkpoint_bytes: 200, ..fast() };
+    let small = Config { max_event_bytes: 200, max_checkpoint_bytes: 200, max_unanswered: 64, ..fast() };
     let net = NetConfig { max_message_bytes: 200 + 4096, ..eager() };
     let (zod, _zod_net) = crewed_on(&a, "~zod", &directory, small.clone(), net.clone(), open_counter(), far_tally("*"));
     let (nec, _nec_net) = crewed_on(&b, "~nec", &directory, small, net, open_counter(), following_tally("zod"));
@@ -7297,4 +7318,488 @@ fn an_agent_taking_entries_makes_room_and_more_are_fetched() {
     assert_eq!(nec.run_pending("~nec", 1).unwrap(), 1);
     assert_eq!(followed(&nec, "~nec").taken, 3);
     eventually("more is fetched", || followed(&nec, "~nec").fetched > held);
+}
+
+// Putting things right after a ship goes back to an earlier state.
+
+/// A network that asks often whether the ships whose logs are followed are still the copies
+/// of themselves they were.
+fn watchful() -> NetConfig {
+    NetConfig { follow_check: Duration::from_millis(300), ..eager() }
+}
+
+/// Bring a saved copy of a ship into a new runtime on the network, in place of the one that
+/// was there.
+fn brought_back(dir: &TempDir, saved: &TempDir, ship: &str, directory: &Arc<Directory>, net: NetConfig) -> (Arc<Runtime>, Network) {
+    let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
+    let network = Network::start(rt.clone(), directory.clone(), net).unwrap();
+    rt.import_ship(&saved.0, ship).unwrap();
+    directory.set(ship, rt.public_key(ship).unwrap(), network.addr()).unwrap();
+    (rt, network)
+}
+
+/// One number read from a ship's file while its runtime is running.
+fn in_file(dir: &TempDir, ship: &str, query: &str) -> i64 {
+    let file = rusqlite::Connection::open(dir.0.join("ships").join(format!("{ship}.ship"))).unwrap();
+    file.query_row(query, [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn a_ship_brought_in_from_a_saved_copy_shows_a_new_mark() {
+    let (a, b, out) = (TempDir::new("mark-a"), TempDir::new("mark-b"), TempDir::new("mark-out"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let mark = zod.incarnation("~zod").unwrap();
+    assert_ne!(mark, [0; 16]);
+    // Another ship is shown it on asking.
+    let dev = [9u8; 32];
+    directory.set("~dev", public_of(dev), "127.0.0.1:9".parse().unwrap()).unwrap();
+    let shown = |addr| match ask_ship(addr, "zod", dev, Asked::Ping(ship_proto::Ping { nonce: vec![1, 2, 3] })) {
+        Some(Answered::Pong(pong)) => pong.incarnation,
+        other => panic!("not an answer to a ping: {other:?}"),
+    };
+    assert_eq!(shown(zod_net.addr()), mark);
+    // The same ship in the same runtime, stopped and started, is the same copy of itself.
+    zod.export_ship("~zod", &out.0).unwrap();
+    stopped(zod_net, zod);
+    let (zod, zod_net) = back(&a, "~zod", &directory, fast());
+    assert_eq!((zod.incarnation("~zod").unwrap(), shown(zod_net.addr())), (mark, mark.to_vec()));
+    // Brought in from a saved copy, it is not, whatever the copy says of itself.
+    let (other, other_net) = brought_back(&b, &out, "~zod", &directory, eager());
+    let fresh = other.incarnation("~zod").unwrap();
+    assert!(fresh != mark && fresh != [0; 16]);
+    assert_eq!(shown(other_net.addr()), fresh);
+    // And every time it is brought in, it is another copy again.
+    let d = TempDir::new("mark-d");
+    let again = Runtime::open(&d.0, fast()).unwrap();
+    again.import_ship(&out.0, "~zod").unwrap();
+    assert!(again.incarnation("~zod").unwrap() != fresh && again.incarnation("~zod").unwrap() != mark);
+    // Two ships made alike have different marks.
+    let c = TempDir::new("mark-c");
+    let (nec, _nec_net) = crewed(&c, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    assert_ne!(nec.incarnation("~nec").unwrap(), fresh);
+}
+
+#[test]
+fn a_publisher_brought_back_from_before_a_ship_followed_it_is_asked_again() {
+    let (a, b, c, saved) = (TempDir::new("back-a"), TempDir::new("back-b"), TempDir::new("back-c"), TempDir::new("back-saved"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed_on(&b, "~nec", &directory, fast(), watchful(), open_counter(), following_tally("zod"));
+    send(&zod, "~zod", "counter", "share *");
+    for _ in 0..2 {
+        send(&zod, "~zod", "counter", "log hits");
+    }
+    // ~zod is saved as it is now: nobody follows its log yet.
+    zod.export_ship("~zod", &saved.0).unwrap();
+    send(&nec, "~nec", "tally", "follow-on zod");
+    eventually("~nec follows", || seen_on(&nec, "~nec", "zod") == 2);
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+
+    // ~zod is lost, and brought back from the saved copy. It has never heard of ~nec.
+    stopped(zod_net, zod);
+    let (zod, _zod_net) = brought_back(&c, &saved, "~zod", &directory, eager());
+    assert!(zod.log_followers("~zod", "counter", "counter").unwrap().is_empty());
+    // Its log grows. It tells nobody, since as far as it knows nobody follows. ~nec finds
+    // out for itself that ~zod is not the copy it was, asks afresh, and has the entry.
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("~nec asks again and catches up", || seen_on(&nec, "~nec", "zod") == 3);
+    assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["nec"]);
+    // From then on ~zod knows of it, and says when the log grows.
+    send(&zod, "~zod", "counter", "log hits");
+    eventually("~nec is told of the next", || seen_on(&nec, "~nec", "zod") == 4);
+    assert_eq!(stopped_on(&nec, "~nec", "zod"), "");
+}
+
+#[test]
+fn a_follower_asks_again_when_the_publishers_mark_changes_and_not_otherwise() {
+    let (entries, head) = signed_log(BUS, "bus", "counter", "counter", &["a=1", "a=2"]);
+    // ~bus is a stand-in that shows a mark of its choosing, and counts how often it is
+    // asked for its log.
+    let (asked, second) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+    let (count, changed) = (asked.clone(), second.clone());
+    let dir = TempDir::new("mark-follow");
+    let directory = Directory::new();
+    let (addr, _running, _) = stand_in_with(BUS, BUS, true, 0, Some(Arc::new(move |request| match request {
+        Asked::Ping(ping) => {
+            let incarnation = vec![if changed.load(Ordering::SeqCst) { 2u8 } else { 1u8 }; 16];
+            Some(Answered::Pong(ship_proto::Pong { nonce: ping.nonce, ship: "bus".into(), caller: "nec".into(), incarnation }))
+        }
+        Asked::Fetch(fetch) => {
+            count.fetch_add(1, Ordering::SeqCst);
+            let mark = vec![if changed.load(Ordering::SeqCst) { 2u8 } else { 1u8 }; 16];
+            Some(Answered::Fetched(ship_proto::Fetched {
+                entries: entries.iter().skip(fetch.after as usize).cloned().collect(),
+                head: Some(head.clone()),
+                incarnation: mark,
+                ..Default::default()
+            }))
+        }
+        _ => None,
+    })));
+    directory.set("~bus", public_of(BUS), addr).unwrap();
+    let (nec, nec_net) = crewed_on(&dir, "~nec", &directory, fast(), watchful(), open_counter(), following_tally("*"));
+    send(&nec, "~nec", "tally", "follow-on bus");
+    eventually("the log is taken", || seen_on(&nec, "~nec", "bus") == 2);
+
+    // ~bus is asked for its mark every so often. While the mark is the one it showed when
+    // ~nec last heard from it, that is all that happens.
+    std::thread::sleep(Duration::from_millis(1200));
+    let before = asked.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(asked.load(Ordering::SeqCst), before);
+    // That holds when ~nec's network is stopped and started. What it knew of ~bus's mark
+    // in memory is gone, but the mark ~bus showed is in ~nec's file, and it still has ~bus
+    // down as a ship to ask, though it has nothing to fetch from it.
+    drop(nec_net);
+    let _nec_net = Network::start(nec.clone(), directory.clone(), watchful()).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(asked.load(Ordering::SeqCst), before);
+    // The mark changes. ~nec asks for the log afresh, once.
+    second.store(true, Ordering::SeqCst);
+    eventually("~nec asks afresh", || asked.load(Ordering::SeqCst) == before + 1);
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(asked.load(Ordering::SeqCst), before + 1);
+    assert_eq!((seen_on(&nec, "~nec", "bus"), followed(&nec, "~nec").stopped), (2, None));
+}
+
+#[test]
+fn a_ship_brought_back_from_a_saved_copy_gets_back_in_step_with_one_it_took_commands_from() {
+    let (a, b, c, saved) = (TempDir::new("step-a"), TempDir::new("step-b"), TempDir::new("step-c"), TempDir::new("step-saved"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    for _ in 0..3 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    eventually("three run on ~nec and are answered", || count(&nec, "~nec", "hits") == "3" && zod.unanswered("~zod").unwrap() == 0);
+    eventually("and ~nec has nothing left to send", || nec.outbound_pending("~nec").unwrap() == 0);
+    // ~nec is saved as it is now, and then takes four more.
+    nec.export_ship("~nec", &saved.0).unwrap();
+    for _ in 0..4 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    eventually("seven have run and been answered", || count(&nec, "~nec", "hits") == "7" && zod.unanswered("~zod").unwrap() == 0);
+
+    // ~nec is lost and brought back from the saved copy. It remembers three commands from
+    // ~zod, which has long let go of the other four. Those are gone, with what they did.
+    stopped(nec_net, nec);
+    let (nec, _nec_net) = brought_back(&c, &saved, "~nec", &directory, eager());
+    assert_eq!(count(&nec, "~nec", "hits"), "3");
+    // The two do not stop there. They say where each stands and carry on: ~zod's next
+    // command is taken, runs, and is answered, though it is numbered eight and ~nec last
+    // saw three, and though ~nec's answer has to be numbered past the seven ~zod has had.
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("the next command runs on ~nec", || count(&nec, "~nec", "hits") == "4");
+    eventually("and is answered", || zod.unanswered("~zod").unwrap() == 0);
+    assert!(zod_net.stalled().is_empty());
+    eventually("and ~zod's agent is handed the answer", || view(&zod, "~zod", "tally", "receipts").contains("8 ~nec/counter counter ran"));
+    assert_eq!(view(&zod, "~zod", "tally", "receipts").lines().count(), 8);
+    // And the other way: ~nec sends ~zod a command, numbered so that ~zod takes it as new.
+    send(&nec, "~nec", "tally", "tell zod inc hits");
+    eventually("~nec's command runs on ~zod", || count(&zod, "~zod", "hits") == "1");
+    eventually("and is answered", || nec.unanswered("~nec").unwrap() == 0);
+}
+
+#[test]
+fn a_ship_brought_back_from_a_saved_copy_does_not_reuse_numbers_the_other_ship_has_seen() {
+    let (a, b, c, saved) = (TempDir::new("reuse-a"), TempDir::new("reuse-b"), TempDir::new("reuse-c"), TempDir::new("reuse-saved"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    for _ in 0..3 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    eventually("three run and are answered", || count(&nec, "~nec", "hits") == "3" && zod.unanswered("~zod").unwrap() == 0);
+    // ~zod is saved, sends four more, and is then brought back from the saved copy. It
+    // remembers sending three. ~nec has had seven.
+    zod.export_ship("~zod", &saved.0).unwrap();
+    for _ in 0..4 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    eventually("seven have run", || count(&nec, "~nec", "hits") == "7" && zod.unanswered("~zod").unwrap() == 0);
+    stopped(zod_net, zod);
+    let (zod, zod_net) = brought_back(&c, &saved, "~zod", &directory, eager());
+
+    // On being brought in it tells ~nec where it stands, unasked, and hears that ~nec holds
+    // seven. Its next command is numbered eight. Numbered four, as it would have been, ~nec
+    // would have taken it for the fourth it already has, and dropped it.
+    eventually("the two are back in step", || in_file(&c, "zod", "SELECT resync FROM peers WHERE peer = 'nec'") == 0);
+    assert_eq!(in_file(&c, "zod", "SELECT sent FROM peers WHERE peer = 'nec'"), 7);
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("the new command runs on ~nec", || count(&nec, "~nec", "hits") == "8");
+    eventually("and is answered", || zod.unanswered("~zod").unwrap() == 0);
+    assert_eq!(view(&zod, "~zod", "tally", "last-sent"), "8");
+    assert!(zod_net.stalled().is_empty());
+}
+
+/// Where a ship says it stands, as a stand-in sends it.
+fn stands(sent: u64, received: u64, oldest: u64, owed: &[u64]) -> ship_proto::Standing {
+    let owed = owed.iter().flat_map(|seq| seq.to_le_bytes()).collect();
+    ship_proto::Standing { sent, received, oldest, owed, owed_complete: true }
+}
+
+/// ~zod sends a stand-in ~bus three commands, which ~bus takes and never answers. Handed a
+/// fourth, ~bus says it holds one: it has gone back to an earlier state. Asked where it
+/// stands, it says `standing`. Returns ~zod once the fourth has gone.
+fn falls_out_of_step_with(label: &str, standing: ship_proto::Standing) -> (Arc<Runtime>, (TempDir, Network, tokio::runtime::Runtime)) {
+    let dir = TempDir::new(label);
+    let directory = Directory::new();
+    // (One delivery in hand at a time: getting back in step happens in the middle of one,
+    // and must not wait for a turn of its own.)
+    let one = NetConfig { max_carrying: 1, ..eager() };
+    let (zod, zod_net) = crewed_on(&dir, "~zod", &directory, fast(), one, open_counter(), far_tally("*"));
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let count = delivered.clone();
+    let (addr, running, _) = stand_in_with(BUS, BUS, true, 0, Some(Arc::new(move |request| match request {
+        Asked::Deliver(deliver) => {
+            let newest = deliver.messages.last().map_or(0, |message| message.seq);
+            let last = if newest == 4 && count.fetch_add(1, Ordering::SeqCst) == 0 { 1 } else { newest };
+            Some(Answered::Delivered(ship_proto::Delivered { last }))
+        }
+        Asked::Resync(_) => Some(Answered::Resynced(ship_proto::Resynced { standing: Some(standing.clone()) })),
+        _ => None,
+    })));
+    directory.set("~bus", public_of(BUS), addr).unwrap();
+    for _ in 0..3 {
+        send(&zod, "~zod", "tally", "tell bus inc hits");
+    }
+    eventually("~bus has them", || zod.outbound_pending("~zod").unwrap() == 0);
+    assert_eq!(zod.unanswered("~zod").unwrap(), 3);
+    send(&zod, "~zod", "tally", "tell bus inc hits");
+    eventually("the fourth has gone", || zod.outbound_pending("~zod").unwrap() == 0);
+    assert!(zod_net.stalled().is_empty());
+    (zod, (dir, zod_net, running))
+}
+
+#[test]
+fn commands_whose_answers_are_lost_are_given_up_and_their_agents_told() {
+    // ~bus says it holds three of ~zod's commands and owes an answer to the third alone.
+    // The first two will never be answered: ~bus held them and owes nothing for them. ~zod
+    // gives them up, writes that down, and tells the agent that sent them. The third is
+    // still owed, and the fourth has only now been handed over. They are waited for.
+    let (zod, _kept) = falls_out_of_step_with("lost", stands(0, 3, 1, &[3]));
+    eventually("the two are given up", || zod.unanswered("~zod").unwrap() == 2);
+    eventually("and the agent is told", || view(&zod, "~zod", "tally", "receipts").lines().count() == 2);
+    let receipts = view(&zod, "~zod", "tally", "receipts");
+    assert!(receipts.contains("1 ~bus/counter counter lost [") && receipts.contains("2 ~bus/counter counter lost ["), "{receipts}");
+    assert!(receipts.contains("went back to an earlier state"), "{receipts}");
+    let written = refusals(&zod, "~zod", "tally");
+    assert!(written.len() == 2 && written[0].starts_with("~bus command 1 to counter counter: it is not known whether it ran"), "{written:?}");
+
+    // ~bus says it holds two, and owes nothing. The first two are given up as before. The
+    // third is not: ~bus does not say it has had it, so nothing ~bus says is about it. (It
+    // would be so if the third had been handed over after ~bus said where it stood.)
+    let (zod, _kept) = falls_out_of_step_with("lost-two", stands(0, 2, 1, &[]));
+    eventually("the two are given up", || zod.unanswered("~zod").unwrap() == 2);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(zod.unanswered("~zod").unwrap(), 2);
+    assert_eq!(view(&zod, "~zod", "tally", "receipts").matches(" lost ").count(), 2);
+}
+
+#[test]
+fn a_ship_is_believed_about_where_it_stands_only_within_bounds() {
+    let (dir, out, other) = (TempDir::new("stand"), TempDir::new("stand-out"), TempDir::new("stand-other"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&dir, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    directory.set("~bus", public_of(BUS), "127.0.0.1:9".parse().unwrap()).unwrap();
+    let ask = |standing: ship_proto::Standing| ask_ship(zod_net.addr(), "zod", BUS, Asked::Resync(ship_proto::Resync { standing: Some(standing) }));
+    let stood = |answer: Option<Answered>| match answer {
+        Some(Answered::Resynced(resynced)) => resynced.standing.unwrap(),
+        other => panic!("not where a ship stands: {other:?}"),
+    };
+
+    // Two ships that have never dealt with each other agree, and nothing is written down.
+    assert_eq!(stood(ask(stands(0, 0, 1, &[]))), stands(0, 0, 1, &[]));
+    assert_eq!(in_file(&dir, "zod", "SELECT COUNT(*) FROM peers"), 0);
+    // An account that cannot be right is not acted on: an oldest waiting message past the
+    // last one sent, numbers beyond anything a ship would get to, a list out of order, or
+    // one that is not whole numbers.
+    let far = 1u64 << 61;
+    // (The answer is that it cannot be so: an answer with nothing in it, which is final,
+    // and not a refusal, which would be a reason to ask again.)
+    let unsound = Some(Answered::Resynced(ship_proto::Resynced { standing: None }));
+    assert_eq!(ask(stands(2, 0, 9, &[])), unsound);
+    assert_eq!(ask(stands(0, 0, 0, &[])), unsound);
+    assert_eq!(ask(stands(0, far, 1, &[])), unsound);
+    assert_eq!(ask(stands(far, 0, far, &[])), unsound);
+    assert_eq!(ask(stands(0, 0, 1, &[5, 3])), unsound);
+    assert_eq!(ask(ship_proto::Standing { owed: vec![1, 2, 3], ..stands(0, 0, 1, &[]) }), unsound);
+    assert_eq!(in_file(&dir, "zod", "SELECT COUNT(*) FROM peers"), 0);
+
+    // ~bus says it holds five messages from ~zod, which remembers sending none, and that
+    // its own oldest waiting is its ninth. ~zod takes its word on both: its next message
+    // to ~bus is numbered six, and it expects ~bus's ninth.
+    assert_eq!(stood(ask(stands(8, 5, 9, &[]))), stands(5, 8, 6, &[]));
+    // Said again, or said of an earlier time, it changes nothing: accounts only move on.
+    assert_eq!(stood(ask(stands(8, 5, 9, &[]))), stands(5, 8, 6, &[]));
+    assert_eq!(stood(ask(stands(8, 2, 3, &[]))), stands(5, 8, 6, &[]));
+    // What was done leaves a file the ship can still be moved with.
+    zod.export_ship("~zod", &out.0).unwrap();
+    Runtime::open(&other.0, fast()).unwrap().import_ship(&out.0, "~zod").unwrap();
+}
+
+#[test]
+fn a_ship_that_is_moved_says_where_it_stands_and_nothing_is_lost() {
+    let (a, b, c, out) = (TempDir::new("moved-a"), TempDir::new("moved-b"), TempDir::new("moved-c"), TempDir::new("moved-out"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    for _ in 0..3 {
+        send(&zod, "~zod", "tally", "tell nec inc hits");
+    }
+    eventually("three run and are answered", || count(&nec, "~nec", "hits") == "3" && zod.unanswered("~zod").unwrap() == 0);
+    // ~zod is moved, as it is, to another runtime. It did not go back to anything, but it
+    // cannot know that, so it says where it stands. The two agree, and that is the end of it.
+    zod.export_ship("~zod", &out.0).unwrap();
+    stopped(zod_net, zod);
+    let (zod, zod_net) = brought_back(&c, &out, "~zod", &directory, eager());
+    eventually("the two have compared notes", || in_file(&c, "zod", "SELECT resync FROM peers WHERE peer = 'nec'") == 0);
+    assert_eq!(in_file(&c, "zod", "SELECT sent FROM peers WHERE peer = 'nec'"), 3);
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("the next command runs", || count(&nec, "~nec", "hits") == "4" && zod.unanswered("~zod").unwrap() == 0);
+    assert_eq!(view(&zod, "~zod", "tally", "last-sent"), "4");
+    assert_eq!(view(&zod, "~zod", "tally", "receipts").matches(" lost ").count(), 0);
+    assert!(zod_net.stalled().is_empty() && refusals(&zod, "~zod", "tally").is_empty());
+}
+
+#[test]
+fn an_acknowledgement_from_before_two_ships_compared_notes_is_not_acted_on() {
+    let dir = TempDir::new("stale-ack");
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&dir, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    // ~bus is a stand-in. Handed ~zod's second command, it does three things in order. It
+    // takes the command. It goes back to an earlier state, in which it had only the first,
+    // and tells ~zod where it now stands. And then the acknowledgement it sent before all
+    // that reaches ~zod: "I hold two". Acted on, ~zod would let go of a command that ~bus
+    // no longer has, and wait for ever for an answer to it.
+    let (addr_of_zod, handed) = (zod_net.addr(), Arc::new(AtomicUsize::new(0)));
+    let count = handed.clone();
+    let (addr, _running, _) = stand_in_with(BUS, BUS, true, 0, Some(Arc::new(move |asked| match asked {
+        Asked::Deliver(deliver) => {
+            let newest = deliver.messages.last().map_or(0, |message| message.seq);
+            if newest == 2 && count.fetch_add(1, Ordering::SeqCst) == 0 {
+                let standing = Some(stands(0, 1, 1, &[]));
+                std::thread::spawn(move || ask_ship(addr_of_zod, "zod", BUS, Asked::Resync(ship_proto::Resync { standing }))).join().unwrap();
+            }
+            Some(Answered::Delivered(ship_proto::Delivered { last: newest }))
+        }
+        _ => None,
+    })));
+    directory.set("~bus", public_of(BUS), addr).unwrap();
+    send(&zod, "~zod", "tally", "tell bus inc hits");
+    eventually("~bus has the first", || zod.outbound_pending("~zod").unwrap() == 0);
+
+    send(&zod, "~zod", "tally", "tell bus inc hits");
+    // ~zod hands the second command over again, to ~bus as it now is, and only then lets
+    // go of it.
+    eventually("the second is handed over twice", || handed.load(Ordering::SeqCst) == 2);
+    eventually("and then let go of", || zod.outbound_pending("~zod").unwrap() == 0);
+    assert!(zod_net.stalled().is_empty());
+}
+
+#[test]
+fn a_command_taken_by_a_ship_that_then_went_back_to_before_it_knew_the_sender_is_given_up() {
+    let (a, b, c, saved) = (TempDir::new("never-a"), TempDir::new("never-b"), TempDir::new("never-c"), TempDir::new("never-saved"));
+    let directory = Directory::new();
+    let (zod, _zod_net) = crewed_on(&a, "~zod", &directory, fast(), watchful(), open_counter(), far_tally("*"));
+    // ~nec takes what it is sent and runs none of it, so nothing it takes is answered.
+    let idle = Config { max_queued_per_deliver: 0, ..fast() };
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, idle, open_counter(), far_tally("*"));
+    // ~nec is saved before it has had any dealings with ~zod.
+    nec.export_ship("~nec", &saved.0).unwrap();
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("~nec has the command", || zod.outbound_pending("~zod").unwrap() == 0);
+    assert_eq!((nec.pending("~nec").unwrap(), zod.unanswered("~zod").unwrap()), (1, 1));
+
+    // ~nec is lost and brought back from the saved copy, in which it has never heard of
+    // ~zod: nothing in its file says there is anything to put right. ~zod has nothing
+    // waiting to go to it either. But ~zod is still owed an answer, and after a while it
+    // compares notes with ~nec, learns that none is coming, and tells the agent.
+    stopped(nec_net, nec);
+    let (nec, _nec_net) = brought_back(&c, &saved, "~nec", &directory, eager());
+    assert_eq!(nec.pending("~nec").unwrap(), 0);
+    eventually("the command is given up", || zod.unanswered("~zod").unwrap() == 0);
+    eventually("and the agent is told", || view(&zod, "~zod", "tally", "receipts").contains("1 ~nec/counter counter lost ["));
+    assert_eq!(count(&nec, "~nec", "hits"), "0");
+    // The two are in step: ~zod's next command is taken as new.
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    eventually("the next command runs and is answered", || count(&nec, "~nec", "hits") == "1" && zod.unanswered("~zod").unwrap() == 0);
+}
+
+#[test]
+fn two_ships_that_both_have_to_compare_notes_get_it_done() {
+    let (a, b, c, d) = (TempDir::new("both-a"), TempDir::new("both-b"), TempDir::new("both-c"), TempDir::new("both-d"));
+    let (out_a, out_b) = (TempDir::new("both-out-a"), TempDir::new("both-out-b"));
+    let directory = Directory::new();
+    let (zod, zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
+    let (nec, nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    send(&nec, "~nec", "tally", "tell zod inc hits");
+    eventually("each has run the other's and been answered", || {
+        count(&nec, "~nec", "hits") == "1" && count(&zod, "~zod", "hits") == "1" && zod.unanswered("~zod").unwrap() + nec.unanswered("~nec").unwrap() == 0
+    });
+    eventually("nothing is left to send", || zod.outbound_pending("~zod").unwrap() + nec.outbound_pending("~nec").unwrap() == 0);
+    // Both are moved at once, so each has to tell the other where it stands, and each
+    // has a command waiting to go as soon as it has.
+    zod.export_ship("~zod", &out_a.0).unwrap();
+    nec.export_ship("~nec", &out_b.0).unwrap();
+    stopped(zod_net, zod);
+    stopped(nec_net, nec);
+    let (zod, _zod_net) = brought_back(&c, &out_a, "~zod", &directory, eager());
+    let (nec, _nec_net) = brought_back(&d, &out_b, "~nec", &directory, eager());
+    send(&zod, "~zod", "tally", "tell nec inc hits");
+    send(&nec, "~nec", "tally", "tell zod inc hits");
+    eventually("both are done comparing notes", || {
+        in_file(&c, "zod", "SELECT resync FROM peers WHERE peer = 'nec'") == 0 && in_file(&d, "nec", "SELECT resync FROM peers WHERE peer = 'zod'") == 0
+    });
+    eventually("and both commands run and are answered", || {
+        count(&nec, "~nec", "hits") == "2" && count(&zod, "~zod", "hits") == "2" && zod.unanswered("~zod").unwrap() + nec.unanswered("~nec").unwrap() == 0
+    });
+}
+
+#[test]
+fn what_arrives_on_a_connection_that_has_been_replaced_is_not_acted_on() {
+    use ship_proto::{peer_request::Body, Deliver, PeerRequest, Resync};
+    let dir = TempDir::new("replaced");
+    let directory = Directory::new();
+    // An event on ~zod may run for a second and a half, and one is made to: while it runs,
+    // nothing else can be done on the ship, and whatever arrives for it waits.
+    let slow = Config { fuel_per_event: u64::MAX / 2, max_event_millis: 1500, ..fast() };
+    let (zod, zod_net) = crewed(&dir, "~zod", &directory, slow, open_counter(), far_tally("*"));
+    directory.set("~bus", public_of(BUS), "127.0.0.1:9".parse().unwrap()).unwrap();
+    let busy = {
+        let zod = zod.clone();
+        std::thread::spawn(move || zod.deliver("~zod", "counter", b"spin"))
+    };
+    std::thread::sleep(Duration::from_millis(200));
+
+    // ~bus hands ~zod a command, and says where it stands, on one connection. Before ~zod
+    // gets to either, ~bus connects again. A ship that has come back as an earlier copy of
+    // itself does exactly that, and what it said on the old connection it said as it was.
+    let addr = zod_net.addr();
+    let command = ship_proto::PeerMessage { seq: 1, from_agent: "tally".into(), agent: "counter".into(), interface: "counter".into(), payload: b"inc hits".to_vec(), receipt: None };
+    let delivery = PeerRequest { body: Some(Body::Deliver(Deliver { messages: vec![command.clone()] })) }.encode_to_vec();
+    let account = PeerRequest { body: Some(Body::Resync(Resync { standing: Some(stands(8, 5, 9, &[])) })) }.encode_to_vec();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let old = endpoint.connect_with(stranger_client(Some((BUS, BUS)), b"ship/1"), addr, "zod").unwrap().await.unwrap();
+        for request in [&delivery, &account] {
+            let (mut send, _) = old.open_bi().await.unwrap();
+            send.write_all(request).await.unwrap();
+            send.finish().unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _newer = endpoint.connect_with(stranger_client(Some((BUS, BUS)), b"ship/1"), addr, "zod").unwrap().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+    assert!(busy.join().unwrap().is_err());
+    std::thread::sleep(Duration::from_millis(500));
+    // Neither was acted on: the command was not taken, and ~zod's account of ~bus did not move.
+    assert_eq!((count(&zod, "~zod", "hits"), zod.pending("~zod").unwrap()), ("0".to_string(), 0));
+    assert_eq!(in_file(&dir, "zod", "SELECT COUNT(*) FROM peers"), 0);
+    // The same command on a connection that is still the newest is taken.
+    assert_eq!(hand_over(addr, "zod", BUS, vec![command]), 1);
+    eventually("it runs", || count(&zod, "~zod", "hits") == "1");
 }

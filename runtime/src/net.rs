@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -52,12 +52,15 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
-use ship_proto::{peer_reply, peer_request, Deliver, Delivered, Fetch, Heard, Message, News, PeerReply, PeerRequest, Ping, Pong};
+use ship_proto::{
+    peer_reply, peer_request, Deliver, Delivered, Fetch, Heard, Message, News, PeerReply, PeerRequest, Ping, Pong, Resync, Resynced,
+    Standing,
+};
 use tokio::sync::Semaphore;
 
 use crate::ship::Taken;
-use crate::store::{PeerWork, MAX_BATCH_MESSAGES, MAX_FETCH_ENTRIES, MAX_NEWS_LOGS};
-use crate::{canonical_ship, lock, Error, Runtime};
+use crate::store::{PeerWork, Stand, MAX_BATCH_MESSAGES, MAX_FETCH_ENTRIES, MAX_NEWS_LOGS};
+use crate::{canonical_ship, lock, Acked, Error, Runtime};
 
 /// The name of this protocol, agreed while connecting. A connection that does not ask for it
 /// is not one of ours.
@@ -168,6 +171,15 @@ pub struct NetConfig {
     /// with each failure, up to `max_retry_delay`, and starts over after a success.
     pub retry_delay: Duration,
     pub max_retry_delay: Duration,
+    /// How often each ship that follows logs on another ship asks that ship for its mark,
+    /// to see whether it is still the copy of itself it was. A ship brought back from a
+    /// saved copy may no longer know who follows it, and would never say when its logs
+    /// grow. Asking costs one small request and wakes neither ship unless the mark changed.
+    ///
+    /// Also how often a ship with commands another ship has yet to answer compares notes
+    /// with it, for the like reason: that ship may have gone back to a state in which it
+    /// never had them.
+    pub follow_check: Duration,
 }
 
 impl Default for NetConfig {
@@ -187,6 +199,7 @@ impl Default for NetConfig {
             max_carrying: 16,
             retry_delay: Duration::from_millis(200),
             max_retry_delay: Duration::from_secs(30),
+            follow_check: Duration::from_secs(600),
         }
     }
 }
@@ -308,7 +321,10 @@ struct Shared {
     /// Connections from other ships, counting those still being set up.
     taken: AtomicUsize,
     /// The newest connection from each (calling ship, called ship).
-    callers: Mutex<HashMap<Pair, Connection>>,
+    callers: Mutex<HashMap<Pair, Caller>>,
+    /// How many connections from other ships have been let in so far. Each is given the
+    /// next number as it arrives, before anything is done about it.
+    admitted: AtomicU64,
     /// Room left for requests being read. See `NetConfig::max_reading_bytes`.
     reading: Arc<Semaphore>,
     /// Requests this runtime may still send. See `NetConfig::max_requests`.
@@ -335,6 +351,20 @@ struct Carrier {
     queued: Mutex<HashSet<String>>,
     /// Ships whose queues are being run now. The flag says more arrived meanwhile.
     tending: Mutex<HashMap<String, bool>>,
+    /// Each (ship, other ship) where the first follows logs on the second, with the mark
+    /// the second showed when last asked, once that has been checked against the first
+    /// ship's file.
+    watching: Mutex<HashMap<Pair, Option<[u8; 16]>>>,
+    /// Whether a round of asking those ships for their marks is under way.
+    checking: std::sync::atomic::AtomicBool,
+    /// Each (ship, other ship) where the first may have commands the second has yet to
+    /// answer. Looked at in the same rounds: if the answers are still owed after a while,
+    /// the two compare notes, in case the second has gone back to a state it never had
+    /// them in.
+    awaiting: Mutex<HashSet<Pair>>,
+    /// Each (ship, other ship) where the first is comparing notes with the second, at its
+    /// own asking, right now.
+    resyncing: Mutex<HashSet<Pair>>,
 }
 
 #[derive(Default)]
@@ -404,6 +434,15 @@ impl Network {
         if cfg.max_message_bytes < runtime.inner.cfg.max_checkpoint_bytes.saturating_add(MESSAGE_ENVELOPE_BYTES) {
             return Err(io::Error::other("max_message_bytes must have room for the largest checkpoint a log here may have"));
         }
+        // And for a ship to say where it stands with another: the list of that ship's
+        // commands it has yet to answer, at eight bytes each. A list cut short would leave
+        // commands that nobody could ever say were lost.
+        if cfg.max_message_bytes / 2 < runtime.inner.cfg.max_unanswered.saturating_mul(8) {
+            return Err(io::Error::other("max_message_bytes must have room for max_unanswered command numbers, twice over"));
+        }
+        if cfg.follow_check.is_zero() || cfg.follow_check > MAX_TIMEOUT {
+            return Err(io::Error::other("follow_check must be more than nothing and at most a day"));
+        }
         if cfg.retry_delay.is_zero() || cfg.retry_delay > cfg.max_retry_delay || cfg.max_retry_delay > MAX_TIMEOUT {
             return Err(io::Error::other("retry_delay must be more than nothing and at most max_retry_delay, itself at most a day"));
         }
@@ -458,6 +497,7 @@ impl Network {
             made: Mutex::new(HashMap::new()),
             taken: AtomicUsize::new(0),
             callers: Mutex::new(HashMap::new()),
+            admitted: AtomicU64::new(0),
             reading,
             asking,
             working,
@@ -482,10 +522,15 @@ impl Network {
         tokio.spawn(async move {
             let runtime = starting.runtime.clone();
             let found = work(&starting, move || runtime.ships_with_work()).await;
-            for ship in found.and_then(Result::ok).unwrap_or_default() {
+            let (busy, following, awaiting) = found.and_then(Result::ok).unwrap_or_default();
+            lock(&starting.carrier.awaiting).extend(awaiting);
+            for ship in busy {
                 starting.carrier.look_at(&ship);
                 starting.carrier.run_at(&ship);
             }
+            // And every ship that follows logs elsewhere is known, so that the ships it
+            // follows can be asked now and then whether they are still what they were.
+            lock(&starting.carrier.watching).extend(following.into_iter().map(|pair| (pair, None)));
         });
         Ok(Network { shared, threads, _claim: claim })
     }
@@ -904,13 +949,31 @@ async fn answer_calls(shared: Arc<Shared>) {
             incoming.refuse();
             continue;
         };
-        tokio::spawn(answer_caller(shared.clone(), incoming, place));
+        // Numbered now, in the order they arrive. Which of two connections from one ship
+        // is the newer is decided by this, and not by which gets through its handshake
+        // first: an old one that is slow to finish must not take the place of a new one.
+        let admission = shared.admitted.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::spawn(answer_caller(shared.clone(), incoming, place, admission));
     }
+}
+
+/// The newest connection from one ship to a ship here: the number it was let in under, and
+/// the connection while it is open. The number is kept after the connection has gone, so
+/// that an older one still finishing its handshake does not then count as the newest.
+struct Caller {
+    admission: u64,
+    connection: Option<Connection>,
+}
+
+/// Whether the connection `id` is still the newest from that ship to the ship here.
+fn newest_from(shared: &Shared, pair: &Pair, id: usize) -> bool {
+    let callers = lock(&shared.callers);
+    callers.get(pair).and_then(|caller| caller.connection.as_ref()).is_some_and(|newest| newest.stable_id() == id)
 }
 
 /// One connection from another ship: learn who is calling and which ship they called, then
 /// answer their requests until the connection closes.
-async fn answer_caller(shared: Arc<Shared>, incoming: Incoming, _place: Place) {
+async fn answer_caller(shared: Arc<Shared>, incoming: Incoming, _place: Place, admission: u64) {
     let Ok(connecting) = incoming.accept() else { return };
     let Ok(Ok(connection)) = tokio::time::timeout(shared.cfg.request_timeout, connecting).await else { return };
     let Some(pair) = parties(&shared, &connection) else {
@@ -919,15 +982,26 @@ async fn answer_caller(shared: Arc<Shared>, incoming: Incoming, _place: Place) {
     };
     // One connection from each calling ship to each ship here. A newer one takes the place
     // of the older, so a ship cannot use up the places by connecting over and over.
-    if let Some(older) = lock(&shared.callers).insert(pair.clone(), connection.clone()) {
-        older.close(VarInt::from_u32(5), b"replaced by a newer connection");
+    // Newer by when it arrived. A connection that arrived before the one already here is
+    // the older of the two, however late it comes to this point, and is closed.
+    {
+        let mut callers = lock(&shared.callers);
+        if callers.get(&pair).is_some_and(|newest| newest.admission > admission) {
+            connection.close(VarInt::from_u32(5), b"replaced by a newer connection");
+            return;
+        }
+        let older = callers.insert(pair.clone(), Caller { admission, connection: Some(connection.clone()) });
+        if let Some(older) = older.and_then(|older| older.connection) {
+            older.close(VarInt::from_u32(5), b"replaced by a newer connection");
+        }
     }
     while let Ok((send, receive)) = connection.accept_bi().await {
         tokio::spawn(answer_request(shared.clone(), connection.clone(), pair.clone(), send, receive));
     }
+    // The connection has gone. Its number stays, as the newest there has been.
     let mut callers = lock(&shared.callers);
-    if callers.get(&pair).is_some_and(|kept| kept.stable_id() == connection.stable_id()) {
-        callers.remove(&pair);
+    if let Some(caller) = callers.get_mut(&pair).filter(|caller| caller.admission == admission) {
+        caller.connection = None;
     }
 }
 
@@ -952,7 +1026,7 @@ async fn answer_request(shared: Arc<Shared>, connection: Connection, pair: Pair,
             connection.close(VarInt::from_u32(2), b"the directory changed");
             return;
         }
-        reply(&mut send, &answer(&shared, &pair.0, &pair.1, &bytes).await).await;
+        reply(&mut send, &answer(&shared, &connection, &pair.0, &pair.1, &bytes).await).await;
     })
     .await;
     if served.is_err() {
@@ -998,6 +1072,9 @@ fn parties(shared: &Shared, connection: &Connection) -> Option<Pair> {
     Some((caller, called))
 }
 
+/// What a ship says to a request of a kind it does not know.
+const UNKNOWN_REQUEST: &str = "not a request this ship answers";
+
 fn refused(why: &str) -> PeerReply {
     PeerReply { body: None, refused: why.to_string() }
 }
@@ -1016,7 +1093,7 @@ async fn work<T: Send + 'static>(shared: &Shared, job: impl FnOnce() -> T + Send
 }
 
 /// Answer one request from `caller` to `called`.
-async fn answer(shared: &Arc<Shared>, caller: &str, called: &str, request: &[u8]) -> PeerReply {
+async fn answer(shared: &Arc<Shared>, connection: &Connection, caller: &str, called: &str, request: &[u8]) -> PeerReply {
     // Counted before it is decoded. A request of a megabyte can hold half a million empty
     // messages, and decoding would give each one a few hundred bytes of memory. The same
     // goes for the logs in a piece of news.
@@ -1026,15 +1103,63 @@ async fn answer(shared: &Arc<Shared>, caller: &str, called: &str, request: &[u8]
     let Ok(request) = PeerRequest::decode(request) else { return refused("not a request") };
     match request.body {
         Some(peer_request::Body::Ping(Ping { nonce })) if nonce.len() <= 64 => {
-            let pong = Pong { nonce, ship: called.to_string(), caller: caller.to_string() };
+            // The ship's mark is kept in memory once it has been read, so this wakes the
+            // ship at most once.
+            let (runtime, ship) = (shared.runtime.clone(), called.to_string());
+            let mark = work(shared, move || runtime.incarnation(&ship)).await.and_then(Result::ok);
+            let incarnation = mark.map_or(Vec::new(), |mark| mark.to_vec());
+            let pong = Pong { nonce, ship: called.to_string(), caller: caller.to_string(), incarnation };
             PeerReply { body: Some(peer_reply::Body::Pong(pong)), refused: String::new() }
+        }
+        // Where the caller stands with a ship here, for the two to get back in step. The
+        // ship here brings its account into line and says where it stands in turn.
+        Some(peer_request::Body::Resync(Resync { standing: Some(standing) })) => {
+            // An account that cannot be so is answered with none. That is an answer, and a
+            // final one, where a refusal would be taken as a reason to try again.
+            let unsound = PeerReply { body: Some(peer_reply::Body::Resynced(Resynced { standing: None })), refused: String::new() };
+            let Some(theirs) = stand_read(&standing) else { return unsound };
+            // If the ship here is comparing notes with that one at its own asking right now,
+            // one of the two has to wait: each taking the other's account in would make
+            // the answer each is waiting for out of date, and they could go on like that.
+            // The ship whose name comes first goes first. The other is told to try again,
+            // and nothing of its account is taken in.
+            if called < caller && lock(&shared.carrier.resyncing).contains(&(called.to_string(), caller.to_string())) {
+                return refused("comparing notes the other way just now; try again");
+            }
+            let (runtime, ship, peer, most) = (shared.runtime.clone(), called.to_string(), caller.to_string(), most_owed(shared));
+            // The account is acted on only if this is still the newest connection from that
+            // ship when the ship here comes to act on it. If that ship has since come back
+            // as an earlier copy of itself, it has connected afresh, and this account is of
+            // a ship that is no longer there.
+            let (callers, pair, id) = (shared.clone(), (caller.to_string(), called.to_string()), connection.stable_id());
+            let current = move || newest_from(&callers, &pair, id);
+            match work(shared, move || runtime.resync(&ship, &peer, &theirs, most, current)).await {
+                Some(Ok(None)) => refused("that account is no longer the newest; try again"),
+                Some(Ok(Some((ours, _, queued)))) => {
+                    if queued {
+                        shared.carrier.run_at(called);
+                    }
+                    // Whatever had stopped commands between the two may be put right now.
+                    if let Some(lane) = lock(&shared.carrier.lanes).get_mut(&(called.to_string(), caller.to_string())) {
+                        lane.stalled = false;
+                    }
+                    shared.carrier.look_at(called);
+                    PeerReply { body: Some(peer_reply::Body::Resynced(Resynced { standing: Some(stand_sent(&ours)) })), refused: String::new() }
+                }
+                Some(Err(Error::OutOfStep(_))) => unsound,
+                _ => refused("the account could not be taken; try again"),
+            }
         }
         // Commands for a ship here, from the ship at the other end. Who that is was proved
         // when the connection was made and checked again just now, so they are filed as
         // coming from it and nobody else.
         Some(peer_request::Body::Deliver(Deliver { messages })) => {
             let (runtime, ship, peer) = (shared.runtime.clone(), called.to_string(), caller.to_string());
-            let taken = work(shared, move || runtime.accept_commands(&ship, &peer, &messages)).await;
+            // Taken only if this is still the newest connection from that ship when the
+            // ship here comes to take them: see the same check on comparing notes, below.
+            let (callers, pair, id) = (shared.clone(), (caller.to_string(), called.to_string()), connection.stable_id());
+            let current = move || newest_from(&callers, &pair, id);
+            let taken = work(shared, move || runtime.accept_commands(&ship, &peer, &messages, current)).await;
             let Some(Ok(last)) = taken else { return refused("the commands could not be taken; try again") };
             // They are saved. Running them is the ship's own business and is not waited for:
             // the sender is told only that they arrived.
@@ -1061,7 +1186,7 @@ async fn answer(shared: &Arc<Shared>, caller: &str, called: &str, request: &[u8]
             shared.carrier.look_at(called);
             PeerReply { body: Some(peer_reply::Body::Heard(Heard { unknown })), refused: String::new() }
         }
-        _ => refused("not a request this ship answers"),
+        _ => refused(UNKNOWN_REQUEST),
     }
 }
 
@@ -1121,7 +1246,16 @@ fn repeats_within(request: &[u8], outer: u64, inner: u64, most: usize) -> bool {
 /// Carry commands from this runtime's ships to other ships, for as long as the network runs.
 async fn carry(shared: Arc<Shared>) {
     let carrier = &shared.carrier;
+    let mut check_at = tokio::time::Instant::now() + shared.cfg.follow_check;
     loop {
+        // Now and then, ask the ships whose logs are followed from here whether they are
+        // still the copies of themselves they were. One round at a time.
+        if tokio::time::Instant::now() >= check_at {
+            check_at = tokio::time::Instant::now() + shared.cfg.follow_check;
+            if !carrier.checking.swap(true, Ordering::SeqCst) {
+                tokio::spawn(check_publishers(shared.clone()));
+            }
+        }
         // Ships that may have events queued: see that they are run.
         let ships: Vec<String> = lock(&carrier.queued).drain().collect();
         for ship in ships {
@@ -1138,7 +1272,7 @@ async fn carry(shared: Arc<Shared>) {
         }
         // Then wait for news, or for the earliest moment a failed lane may be tried again.
         let now = tokio::time::Instant::now();
-        let mut next = None;
+        let mut next = Some(check_at);
         for ((ship, _), lane) in lock(&carrier.lanes).iter_mut().filter(|(_, lane)| !lane.busy) {
             match lane.retry_at {
                 Some(at) if at <= now => {
@@ -1364,6 +1498,11 @@ async fn fetch_logs(shared: &Arc<Shared>, ship: &str, peer: &str) -> Step {
     const ROUNDS: usize = 8;
     let (runtime, from, to) = (shared.runtime.clone(), ship.to_string(), peer.to_string());
     let Some(Ok((jobs, blocked))) = work(shared, move || runtime.follow_work(&from, &to)).await else { return Step::Later };
+    // This ship follows logs on that one, so that one is among the ships asked now and
+    // then whether they are still what they were.
+    if !jobs.is_empty() || blocked {
+        lock(&shared.carrier.watching).entry((ship.to_string(), peer.to_string())).or_insert(None);
+    }
     let mut later = blocked;
     for mut job in jobs {
         for _ in 0..ROUNDS {
@@ -1410,6 +1549,172 @@ async fn fetch_logs(shared: &Arc<Shared>, ship: &str, peer: &str) -> Step {
     if later { Step::Later } else { Step::Done }
 }
 
+/// How many of the other ship's commands a ship lists as owed when it says where it stands:
+/// as many as it may owe at all. The network does not start unless a message has room for
+/// them, so the list is always whole.
+fn most_owed(shared: &Shared) -> usize {
+    shared.runtime.inner.cfg.max_unanswered
+}
+
+/// Where a ship stands, as it is sent.
+fn stand_sent(stand: &Stand) -> Standing {
+    let owed = stand.owed.iter().flat_map(|seq| seq.to_le_bytes()).collect();
+    Standing { sent: stand.sent, received: stand.received, oldest: stand.oldest, owed, owed_complete: stand.owed_complete }
+}
+
+/// Where a ship stands, as it was sent. `None` if the list of what it owes is not whole numbers.
+fn stand_read(standing: &Standing) -> Option<Stand> {
+    if standing.owed.len() % 8 != 0 {
+        return None;
+    }
+    let owed = standing.owed.chunks_exact(8).map(|seq| u64::from_le_bytes(seq.try_into().expect("eight bytes"))).collect();
+    Some(Stand { sent: standing.sent, received: standing.received, oldest: standing.oldest, owed, owed_complete: standing.owed_complete, mark: 0, epoch: 0 })
+}
+
+/// Get one ship back in step with another: say where it stands, hear where the other
+/// stands, and bring its own account into line. If that moved its account, the other ship
+/// has to hear the new one, so it goes round again, a few times at most.
+///
+/// `All` means the two agree and nothing is left to settle. `NotYet` means try again after a
+/// while. `OutOfStep` means the other ship will not do this, or what it says cannot be so.
+async fn resync(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried {
+    const ROUNDS: usize = 4;
+    let most = most_owed(shared);
+    // For as long as this goes on, the pair is down as comparing notes at this ship's
+    // asking: see where a request to compare notes is answered.
+    struct Comparing<'a>(&'a Shared, Pair);
+    impl Drop for Comparing<'_> {
+        fn drop(&mut self) {
+            lock(&self.0.carrier.resyncing).remove(&self.1);
+        }
+    }
+    let pair = (ship.to_string(), peer.to_string());
+    lock(&shared.carrier.resyncing).insert(pair.clone());
+    let _comparing = Comparing(shared, pair.clone());
+    // If there are commands the other ship has yet to answer, the pair is looked at again
+    // later, in case the answers never come.
+    lock(&shared.carrier.awaiting).insert(pair);
+    // (Whoever calls this holds a turn among the deliveries in hand. It takes none of its own.)
+    for _ in 0..ROUNDS {
+        let (runtime, from, to) = (shared.runtime.clone(), ship.to_string(), peer.to_string());
+        let Some(Ok(ours)) = work(shared, move || runtime.standing(&from, &to, most)).await else { return Carried::NotYet };
+        let request = PeerRequest { body: Some(peer_request::Body::Resync(Resync { standing: Some(stand_sent(&ours)) })) };
+        let theirs = match shared.ask(ship, peer, request).await {
+            // Where it stands, or its word that what this ship said cannot be so.
+            Ok(PeerReply { body: Some(peer_reply::Body::Resynced(Resynced { standing })), .. }) => standing.as_ref().and_then(stand_read),
+            // A ship that does not know this request cannot be got back in step with.
+            Err(NetError::Refused(why)) if why == UNKNOWN_REQUEST => None,
+            // Anything else is a reason to try again: it could not be reached, was busy, or
+            // had no room just now.
+            _ => return Carried::NotYet,
+        };
+        let Some(theirs) = theirs else { return Carried::OutOfStep };
+        let (runtime, from, to) = (shared.runtime.clone(), ship.to_string(), peer.to_string());
+        match work(shared, move || runtime.resync_answered(&from, &to, &theirs, most, ours.epoch)).await {
+            // The two compared notes again while this was on its way, so the answer is to
+            // an account that no longer holds. Round again, from where things stand now.
+            Some(Ok(None)) => continue,
+            Some(Ok(Some((_, finished, queued)))) => {
+                if queued {
+                    shared.carrier.run_at(ship);
+                }
+                // Something could not be settled for want of room. It is gone over again later.
+                if !finished {
+                    return Carried::NotYet;
+                }
+            }
+            Some(Err(Error::OutOfStep(_))) => return Carried::OutOfStep,
+            _ => return Carried::NotYet,
+        }
+        // The other ship has heard where this one stood before this round. If that is
+        // still where it stands, they are done.
+        let (runtime, from, to) = (shared.runtime.clone(), ship.to_string(), peer.to_string());
+        match work(shared, move || runtime.resync_heard(&from, &to, ours.mark)).await {
+            Some(Ok(false)) => return Carried::All,
+            Some(Ok(true)) => {}
+            _ => return Carried::NotYet,
+        }
+    }
+    Carried::NotYet
+}
+
+/// Ask each ship whose logs are followed from here for its mark, and where the mark is not
+/// the one that ship showed before, have the ship that follows it ask afresh.
+///
+/// A ship that has been brought back from a saved copy may no longer know that a ship
+/// follows it, if that ship started following after the copy was saved. It would never
+/// say when its logs grow, and the follower would wait for ever. Only the follower can
+/// find that out, by asking.
+async fn check_publishers(shared: Arc<Shared>) {
+    let pairs: Vec<(Pair, Option<[u8; 16]>)> = lock(&shared.carrier.watching).iter().map(|(pair, mark)| (pair.clone(), *mark)).collect();
+    for ((ship, peer), known) in pairs {
+        let Ok(_turn) = shared.carrying.acquire().await else { break };
+        let nonce = crate::store::now_ms().to_le_bytes().to_vec();
+        let asked = PeerRequest { body: Some(peer_request::Body::Ping(Ping { nonce: nonce.clone() })) };
+        let Ok(PeerReply { body: Some(peer_reply::Body::Pong(pong)), .. }) = shared.ask(&ship, &peer, asked).await else { continue };
+        // A ship that shows no mark is one from before there were marks: nothing to go by.
+        let Ok(mark) = <[u8; 16]>::try_from(&pong.incarnation[..]) else { continue };
+        if pong.nonce != nonce || known == Some(mark) {
+            continue;
+        }
+        // Not the mark it showed before, or the first time of asking since this runtime
+        // started: checked against what the ship's own file says it last saw.
+        let (runtime, from, to) = (shared.runtime.clone(), ship.clone(), peer.clone());
+        match work(&shared, move || runtime.publisher_seen(&from, &to, &mark)).await {
+            // Nothing is followed there any more. The pair is struck off, and then looked
+            // at once more: an agent may have started following again in the meantime,
+            // and its being put back on the list must not be what is struck off.
+            Some(Ok((0, _))) => {
+                lock(&shared.carrier.watching).remove(&(ship.clone(), peer.clone()));
+                let (runtime, from, to) = (shared.runtime.clone(), ship.clone(), peer.clone());
+                match work(&shared, move || runtime.publisher_seen(&from, &to, &mark)).await {
+                    Some(Ok((0, _))) => {}
+                    Some(Ok((_, stale))) => {
+                        lock(&shared.carrier.watching).insert((ship.clone(), peer), Some(mark));
+                        if stale {
+                            shared.carrier.look_at(&ship);
+                        }
+                    }
+                    // It could not be looked at. Kept on the list, as not yet checked.
+                    _ => drop(lock(&shared.carrier.watching).insert((ship, peer), None)),
+                }
+            }
+            Some(Ok((_, stale))) => {
+                lock(&shared.carrier.watching).insert((ship.clone(), peer), Some(mark));
+                if stale {
+                    shared.carrier.look_at(&ship);
+                }
+            }
+            _ => {}
+        }
+    }
+    // And each ship that may have commands another has yet to answer. A ship that has
+    // gone back to a state from before it ever dealt with this one does not know there is
+    // anything to put right, and with nothing waiting to go to it, nothing here would find
+    // out. So where answers are still owed, the two compare notes: no change between ships
+    // that are in step, and the only way to learn that an answer is never coming.
+    let pairs: Vec<Pair> = lock(&shared.carrier.awaiting).iter().cloned().collect();
+    for (ship, peer) in pairs {
+        // The pair is taken off the list before it is looked at, and put back unless
+        // everything turns out to have been answered. Taken off afterwards, on the strength
+        // of what was seen a moment before, it could take with it a command that went in
+        // between.
+        lock(&shared.carrier.awaiting).remove(&(ship.clone(), peer.clone()));
+        let (runtime, from, to) = (shared.runtime.clone(), ship.clone(), peer.clone());
+        match work(&shared, move || runtime.probe_waits(&from, &to)).await {
+            // Everything has been answered. The pair goes back on when more commands go.
+            Some(Ok(false)) => {}
+            Some(Ok(true)) => {
+                lock(&shared.carrier.awaiting).insert((ship.clone(), peer));
+                shared.carrier.look_at(&ship);
+            }
+            // It could not be looked at. Kept, to be looked at next time.
+            _ => drop(lock(&shared.carrier.awaiting).insert((ship, peer))),
+        }
+    }
+    shared.carrier.checking.store(false, Ordering::SeqCst);
+}
+
 /// Carry what one ship has waiting for one other ship, a batch at a time, in order: a few
 /// batches in one turn. If more is waiting after that, the ship is looked at again and the
 /// lane has another turn, which begins with the two ships' logs. Carrying on here until
@@ -1418,12 +1723,23 @@ async fn fetch_logs(shared: &Arc<Shared>, ship: &str, peer: &str) -> Step {
 async fn carry_messages(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried {
     /// How many batches go to one ship in one turn.
     const ROUNDS: usize = 8;
+    // If this ship's account of the other has moved, or it has been brought in from a saved
+    // copy, the other ship has to hear where it stands before anything else goes.
+    let (runtime, from, to) = (shared.runtime.clone(), ship.to_string(), peer.to_string());
+    let mut resynced = false;
+    if let Some(Ok(true)) = work(shared, move || runtime.resync_due(&from, &to)).await {
+        let Ok(_turn) = shared.carrying.acquire().await else { return Carried::NotYet };
+        match resync(shared, ship, peer).await {
+            Carried::All => {}
+            other => return other,
+        }
+    }
     for _ in 0..ROUNDS {
         // One turn for each batch, taken before the batch is read out and given back when it
         // has gone, so that a busy pair of ships does not keep the others waiting.
         let Ok(_turn) = shared.carrying.acquire().await else { return Carried::NotYet };
         let (runtime, from, to, most) = (shared.runtime.clone(), ship.to_string(), peer.to_string(), shared.cfg.max_message_bytes / 2);
-        let Some(Ok(batch)) = work(shared, move || runtime.outbound_batch(&from, &to, most)).await else { return Carried::NotYet };
+        let Some(Ok((batch, epoch))) = work(shared, move || runtime.outbound_batch(&from, &to, most)).await else { return Carried::NotYet };
         let (Some(first), Some(newest)) = (batch.first().map(|message| message.seq), batch.last().map(|message| message.seq)) else {
             return Carried::All;
         };
@@ -1431,16 +1747,26 @@ async fn carry_messages(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried
         let Ok(PeerReply { body: Some(peer_reply::Body::Delivered(Delivered { last })), .. }) = shared.ask(ship, peer, request).await else {
             return Carried::NotYet;
         };
-        // The other ship holds everything up to `last`. If that is short of where this batch
-        // began, it is missing commands this ship has already let go of.
-        if last.saturating_add(1) < first {
-            return Carried::OutOfStep;
-        }
         let (runtime, from, to) = (shared.runtime.clone(), ship.to_string(), peer.to_string());
-        match work(shared, move || runtime.outbound_acked(&from, &to, last)).await {
-            Some(Ok(())) => {}
-            // It claims to hold a command this ship never sent.
-            Some(Err(Error::OutOfStep(_))) => return Carried::OutOfStep,
+        match work(shared, move || runtime.outbound_acked(&from, &to, first, last, epoch)).await {
+            // Commands have gone that the other ship now has to answer.
+            Some(Ok(Acked::Taken)) => drop(lock(&shared.carrier.awaiting).insert((ship.to_string(), peer.to_string()))),
+            // The two compared notes while this delivery was under way, so what the other
+            // ship said it held, it said as it was before. The delivery is made again.
+            Some(Ok(Acked::Stale)) => continue,
+            // The other ship holds less than this ship has let go of, or more than it
+            // remembers sending. One of the two has gone back to an earlier state. They
+            // say where each stands and bring their accounts into line, once. If they are
+            // still out of step after that, something is wrong that this cannot put right.
+            Some(Ok(Acked::Short)) | Some(Err(Error::OutOfStep(_))) => {
+                if std::mem::replace(&mut resynced, true) {
+                    return Carried::OutOfStep;
+                }
+                match resync(shared, ship, peer).await {
+                    Carried::All => continue,
+                    other => return other,
+                }
+            }
             _ => return Carried::NotYet,
         }
         // It had no room for some of them. They wait, and go again later.

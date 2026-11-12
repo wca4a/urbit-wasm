@@ -316,6 +316,7 @@ message PeerRequest {
     Deliver deliver = 2;
     Fetch fetch = 3;
     News news = 4;
+    Resync resync = 5;
   }
 }
 
@@ -325,6 +326,7 @@ message PeerReply {
     Delivered delivered = 2;
     Fetched fetched = 3;
     Heard heard = 4;
+    Resynced resynced = 5;
   }
   // Set, with no body, when the request was not one the other ship would answer.
   string refused = 15;
@@ -343,6 +345,10 @@ message Pong {
   // The ship the answerer says it was shown proof of at the other end of the connection.
   // This is the answerer's word. The asker cannot check it.
   string caller = 3;
+  // A mark that changes whenever the ship that answers is brought back from a saved copy
+  // of itself. A ship that follows its logs keeps the mark it last saw. If the mark has
+  // changed, that ship may no longer know who follows what, so its followers ask afresh.
+  bytes incarnation = 4;
 }
 
 // Commands from one ship to another, and the answers to them. Each ship numbers what it sends
@@ -383,6 +389,11 @@ enum Verdict {
   VERDICT_LIMIT = 4;
   // It was not something that could be run at all.
   VERDICT_MALFORMED = 5;
+  // Nobody can say. One of the two ships went back to an earlier state, such as a restored
+  // backup, and the record of this command, or of the answer to it, went with that. The
+  // command may have run. This is made up by the sender's own ship when the two ships
+  // find that their accounts of what has passed between them no longer agree.
+  VERDICT_LOST = 6;
 }
 
 message Receipt {
@@ -439,6 +450,8 @@ message Fetched {
   // Set, with nothing else, when the asker may not follow this log. The same is said
   // whether or not there is such a log.
   string denied = 4;
+  // The answering ship's mark, as in Pong. Empty when the asker is refused.
+  bytes incarnation = 5;
 }
 
 // The ship that publishes to a ship that follows: these logs have grown, or are closed to it.
@@ -459,4 +472,37 @@ message LogNews {
 // publisher then stops telling it.
 message Heard {
   repeated bool unknown = 1;
+}
+
+// Putting two ships back in step. Each ship numbers what it sends the other and remembers
+// how far it has got in what the other sends. If one of them goes back to an earlier state,
+// such as a restored backup, those accounts no longer agree: it may reuse numbers the other
+// has seen, or wait for messages the other let go of long ago. Nothing can bring back what
+// was lost with the earlier state. What can be done is to agree where things stand now, and
+// to tell the agents whose commands were caught up in it. Each ship says where it stands,
+// and each brings its own account into line with what the other says.
+
+// Where one ship stands with another.
+message Standing {
+  // The number of the last message this ship has sent the other.
+  uint64 sent = 1;
+  // The number of the last message of the other's that this ship holds.
+  uint64 received = 2;
+  // The number of the oldest message this ship still has waiting to go to the other: one
+  // more than the last the other said it held. One more than `sent` if nothing is waiting.
+  uint64 oldest = 3;
+  // The other ship's commands that this ship holds and has yet to answer, or has answered
+  // in a receipt still waiting to go: their numbers, eight bytes each, lowest first.
+  bytes owed = 4;
+  // Whether `owed` is all of them. If not, nothing is said about any above the last listed.
+  bool owed_complete = 5;
+}
+
+message Resync {
+  Standing standing = 1;
+}
+
+message Resynced {
+  // Where the answering ship stands, once it has taken the asker's account into its own.
+  Standing standing = 1;
 }

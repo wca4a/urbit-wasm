@@ -210,6 +210,11 @@ pub fn send(agent: &str, interface: &str, payload: &[u8]) {
 /// once. A refusal is written to this ship's audit log. An agent declared with `receipt = f`
 /// is also handed each receipt, carrying the number returned here.
 ///
+/// One other thing can become of a command. If either ship goes back to an earlier state,
+/// such as a restored backup, the record of the command or of its answer may go with it.
+/// The two ships find that out when they next talk, and the receipt then says the command
+/// is lost: it may have run, and nobody can say.
+///
 /// Naming this ship itself is the same as `send`: the command is queued here, the number
 /// returned is 0, and there is no receipt.
 pub fn send_to(ship: &str, agent: &str, interface: &str, payload: &[u8]) -> u64 {

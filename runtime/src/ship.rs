@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use ship_proto::admin_request::Op;
 use ship_proto::{
     AdminReply, AdminRequest, CheckpointBody, CheckpointReply, EntryBody, Fetch, Fetched, Grant, Invocation, Kind, LogHead,
-    LogNews, Message, RouteReply, RouteRequest, SignedCheckpoint, SignedEntry, Source, Verdict,
+    LogNews, Message, Receipt, RouteReply, RouteRequest, SignedCheckpoint, SignedEntry, Source, Verdict,
 };
 use wasmtime::{Store, StoreLimitsBuilder, Trap};
 
@@ -27,6 +27,8 @@ pub struct Ship {
     pub kernel: Arc<AgentModule>,
     /// Signs this ship's log entries.
     pub key: Arc<SigningKey>,
+    /// The mark this copy of the ship was given when it was made or brought in.
+    pub incarnation: [u8; 16],
     /// Bytes held in the outbox and inbox, kept in step with the file so quota checks are
     /// cheap.
     pub outbox_bytes: u64,
@@ -527,7 +529,7 @@ impl Ship {
     /// can check them for itself. If those have been dropped it is given the log's
     /// checkpoint, and asks again from there.
     pub fn serve_log(&mut self, rt: &Arc<Inner>, peer: &str, fetch: &Fetch, most: usize) -> Result<Fetched, Error> {
-        let (cfg, name) = (&rt.cfg, self.name.clone());
+        let (cfg, name, incarnation) = (&rt.cfg, self.name.clone(), self.incarnation.to_vec());
         self.transact_for_peer(cfg, |conn| {
             let (agent, log) = (fetch.agent.as_str(), fetch.log.as_str());
             if check_target(agent, log).is_err() || !store::shared_with(conn, agent, log, peer)? {
@@ -550,7 +552,7 @@ impl Ship {
                 let stored = store::checkpoint(conn, agent, log)?
                     .ok_or_else(|| Error::BadShipFile("a log has lost its early entries but has no checkpoint".into()))?;
                 let checkpoint = Some(SignedCheckpoint { body: stored.body, signature: stored.signature });
-                return Ok(Fetched { head, checkpoint, ..Fetched::default() });
+                return Ok(Fetched { head, checkpoint, incarnation, ..Fetched::default() });
             }
             // As many as fit in `budget` bytes as they will be sent, signatures and framing
             // included, and always one. Counting the entries' bodies alone would let many
@@ -567,7 +569,7 @@ impl Ship {
                 bytes += len;
                 entries.push(entry);
             }
-            Ok(Fetched { entries, head, ..Fetched::default() })
+            Ok(Fetched { entries, head, incarnation, ..Fetched::default() })
         })
     }
 
@@ -710,6 +712,11 @@ impl Ship {
                 }
             }
             let stopped = !held.stopped.is_empty();
+            // That ship has answered, so it knows of this follower as it is now. The mark it
+            // shows is kept, to tell later whether it is still the same copy of that ship.
+            if !stopped && fetched.incarnation.len() == 16 {
+                held.seen = fetched.incarnation.clone();
+            }
             store::replica_save(conn, follower, log, &held)?;
             if took {
                 // Something new to take starts the follower off afresh, as a new entry
@@ -756,6 +763,96 @@ impl Ship {
             }
             Ok(unknown)
         })
+    }
+
+    /// Where this ship stands with another ship.
+    pub fn standing(&mut self, peer: &str, most_owed: usize) -> Result<store::Stand, Error> {
+        Ok(store::standing(&lock(&self.conn), peer, most_owed)?)
+    }
+
+    /// Bring this ship's account of another ship into line with where that ship says it
+    /// stands, and settle the commands whose answers will now never come. Returns where
+    /// this ship stands afterwards, whether everything could be settled, and whether any
+    /// agent was queued a receipt.
+    ///
+    /// Two ships fall out of step when one goes back to an earlier state: a restored
+    /// backup. What happened after that state was saved is gone from it, and cannot be
+    /// brought back. The numbering is put right so that new commands flow, and each agent
+    /// whose command was caught up in it is told so, with a receipt whose verdict is that
+    /// nobody can say what became of it. That is written to the audit log too.
+    ///
+    /// The other ship is believed about its own side only. What it says can make this
+    /// ship skip numbers, let go of messages that ship says it holds, and give up waiting
+    /// for answers that ship says it does not owe. All of that is between the two of them.
+    ///
+    /// `current` is asked, with the ship's file in hand and nothing else able to change it,
+    /// whether the other ship's account is still one to act on. An account is of a moment.
+    /// If the two have compared notes again since it was given, or the ship that gave it
+    /// has since come back as an earlier copy of itself, it describes a ship that is no
+    /// longer there, and acting on it could let go of a command the ship that is there
+    /// does not hold. Then nothing is done, and `None` is returned.
+    pub fn resync(
+        &mut self,
+        rt: &Arc<Inner>,
+        peer: &str,
+        theirs: &store::Stand,
+        most_owed: usize,
+        current: impl FnOnce(&Connection) -> Result<bool, Error>,
+    ) -> Result<Option<(store::Stand, bool, bool)>, Error> {
+        let (cfg, room) = (&rt.cfg, rt.cfg.max_inbox_bytes.saturating_sub(self.inbox_bytes));
+        let settled = self.transact_for_peer(cfg, |conn| {
+            if !current(conn)? {
+                return Ok(None);
+            }
+            if !store::peer_known(conn, peer)? && store::peer_count(conn)? >= cfg.max_peers {
+                return Err(Error::TooMany("other ships it exchanges commands with"));
+            }
+            let Some(orphans) = store::reconcile(conn, peer, theirs)? else { return Err(Error::OutOfStep(peer.to_string())) };
+            let (mut added, mut finished) = (0u64, true);
+            for orphan in orphans {
+                if orphan.tell {
+                    let told = Receipt {
+                        about: orphan.seq,
+                        verdict: Verdict::Lost as i32,
+                        reason: LOST.to_string(),
+                        ship: peer.to_string(),
+                        agent: orphan.agent.clone(),
+                        interface: orphan.interface.clone(),
+                    }
+                    .encode_to_vec();
+                    let cost = told.len() as u64 + store::MESSAGE_OVERHEAD;
+                    // No room to tell the agent yet: this one waits, and is settled when
+                    // the two ships go over it again. (One that could never be queued is
+                    // only written down, as a receipt from the other ship would be.)
+                    if cost <= cfg.max_inbox_bytes {
+                        if added + cost > room {
+                            finished = false;
+                            break;
+                        }
+                        store::inbox_push_receipt(conn, peer, &orphan.agent, &orphan.source, &orphan.interface, &told)?;
+                        added += cost;
+                    }
+                }
+                let line = format!("~{peer} command {} to {} {}: {}: {LOST}", orphan.seq, orphan.agent, orphan.interface, verdict_words(Verdict::Lost as i32));
+                store::audit(conn, &orphan.source, audit_line(line.as_bytes()), false, cfg.audit_rows)?;
+                store::peer_wait_done(conn, peer, orphan.seq)?;
+            }
+            if !finished {
+                store::resync_mark(conn, peer)?;
+            }
+            Ok(Some((store::standing(conn, peer, most_owed)?, added, finished)))
+        })?;
+        let Some((ours, added, finished)) = settled else { return Ok(None) };
+        self.inbox_bytes += added;
+        // An agent has been queued a receipt. Seeing that it runs must not depend on
+        // whoever asked for this still being there to do it: asked for over the network,
+        // the asking may have been given up on while this was waiting its turn.
+        if added > 0 {
+            rt.work_ready(&self.name);
+        } else if store::resync_due(&lock(&self.conn), peer)? {
+            rt.outbound_ready(&self.name);
+        }
+        Ok(Some((ours, finished, added > 0)))
     }
 
     /// The setting for one operation, with its time limit starting now.
@@ -1109,6 +1206,9 @@ pub enum Taken {
     NoRoom,
 }
 
+/// What an agent is told of a command whose answer was lost when two ships fell out of step.
+const LOST: &str = "one of the two ships went back to an earlier state, and the record of this went with it";
+
 /// What a log followed on another ship stops with when what that ship sends cannot be a
 /// continuation of what this ship holds.
 const NOT_A_CONTINUATION: &str = "what that ship sends does not carry on from the log this ship has been following";
@@ -1175,6 +1275,7 @@ fn verdict_words(verdict: i32) -> &'static str {
         Ok(Verdict::Failed) => "the agent failed",
         Ok(Verdict::Limit) => "a limit was reached",
         Ok(Verdict::Malformed) => "it could not be run",
+        Ok(Verdict::Lost) => "it is not known whether it ran",
         Ok(Verdict::Unspecified) | Err(_) => "for a reason this runtime does not know",
     }
 }

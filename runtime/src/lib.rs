@@ -326,6 +326,10 @@ pub(crate) struct Inner {
     /// that nothing ever sees one without the matching other. Only `identities` is locked
     /// under it.
     lifecycle: Mutex<()>,
+    /// The mark of each ship that has been woken since the runtime started. A ship's mark
+    /// does not change while the runtime runs, so once read it can be answered from here
+    /// without waking the ship. Nothing else is locked while this is held.
+    incarnations: Mutex<HashMap<String, [u8; 16]>>,
     /// The signing keys of the ships this runtime holds, kept in memory once the network has
     /// started. The network asks on every connection and every request, from places that must
     /// not wait on a disk. A ship's key does not change while the runtime runs: nothing here
@@ -345,6 +349,22 @@ pub(crate) struct Inner {
     /// what the ships here have waiting for other ships.
     networked: AtomicBool,
 }
+
+/// What came of another ship's word on how much of a delivery it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Acked {
+    /// It was given before the two last compared notes, and nothing is concluded from it.
+    Stale,
+    /// It holds less than this ship has let go of.
+    Short,
+    /// What it holds is done with.
+    Taken,
+}
+
+/// What a look through every ship's file finds: the ships with something to be done, each
+/// (ship, other ship) where the first follows logs on the second, and each where the first
+/// has commands the second has yet to answer.
+pub(crate) type WorkFound = (Vec<String>, Vec<(String, String)>, Vec<(String, String)>);
 
 /// Called with a ship's name when it has something waiting to go to other ships. The second
 /// argument says the ship may also have events queued that nothing is about to run.
@@ -761,6 +781,7 @@ impl Runtime {
                 slots: Mutex::new(HashMap::new()),
                 awake: Mutex::new(HashMap::new()),
                 lifecycle: Mutex::new(()),
+                incarnations: Mutex::new(HashMap::new()),
                 identities: std::sync::RwLock::new(None),
                 awake_changed: Condvar::new(),
                 log_growth: Mutex::new(HashMap::new()),
@@ -799,7 +820,7 @@ impl Runtime {
         // Built under a private name and then published, so a failure part way through cannot
         // leave a broken file sitting on the ship's name for ever.
         let fresh = Scratch::new(&self.inner.tmp_dir);
-        store::create(&fresh.0, &name, kernel_hash, self.inner.cfg.max_ship_bytes)?;
+        store::create(&fresh.0, &name, kernel_hash, self.inner.cfg.max_ship_bytes, &random_bytes::<16>()?)?;
         self.inner.publish(&name, &fresh.0, &SigningKey::from_bytes(&seed))
     }
 
@@ -1179,25 +1200,110 @@ impl Runtime {
         *self.inner.outbound_hook.write().unwrap_or_else(PoisonError::into_inner) = hook;
     }
 
-    /// The ships that have messages waiting to go to other ships, or events queued. Looks in
-    /// every ship's file, so it is for when the network starts, not for every moment.
-    pub(crate) fn ships_with_work(&self) -> Result<Vec<String>, Error> {
-        let mut found = Vec::new();
+    /// The mark a ship was given when it was made or brought into this runtime. It changes
+    /// when a ship is imported, and other ships use it to tell that it may be an older copy
+    /// of itself than the one they last dealt with.
+    pub fn incarnation(&self, ship: &str) -> Result<[u8; 16], Error> {
+        let name = canonical_ship(ship)?;
+        if let Some(mark) = lock(&self.inner.incarnations).get(&name) {
+            return Ok(*mark);
+        }
+        self.inner.with_ship(&name, |ship| Ok(ship.incarnation))
+    }
+
+    /// Where a ship stands with `peer`: what it has sent it, what it holds of what that
+    /// ship sent, and which of that ship's commands it has yet to answer.
+    pub(crate) fn standing(&self, ship: &str, peer: &str, most_owed: usize) -> Result<store::Stand, Error> {
+        self.inner.with_ship(ship, |ship| ship.standing(peer, most_owed))
+    }
+
+    /// Bring a ship's account of `peer` into line with where `peer` says it stands. Returns
+    /// where the ship stands afterwards, whether everything could be settled, and whether
+    /// anything was queued to run.
+    ///
+    /// `current` says whether that account is still one to act on: see `Ship::resync`.
+    /// `None` if it is not, in which case nothing was done.
+    pub(crate) fn resync(
+        &self,
+        ship: &str,
+        peer: &str,
+        theirs: &store::Stand,
+        most_owed: usize,
+        current: impl FnOnce() -> bool,
+    ) -> Result<Option<(store::Stand, bool, bool)>, Error> {
+        let peer = canonical_ship(peer)?;
+        self.inner.with_ship(ship, |ship| ship.resync(&self.inner, &peer, theirs, most_owed, |_| Ok(current())))
+    }
+
+    /// The same, for the answer to an account this ship gave of itself when its record of
+    /// `peer` was of the round `epoch`. If the two have compared notes since, the answer is
+    /// to an account that no longer holds, and is not acted on.
+    pub(crate) fn resync_answered(
+        &self,
+        ship: &str,
+        peer: &str,
+        theirs: &store::Stand,
+        most_owed: usize,
+        epoch: i64,
+    ) -> Result<Option<(store::Stand, bool, bool)>, Error> {
+        let peer = canonical_ship(peer)?;
+        self.inner.with_ship(ship, |ship| {
+            let at = peer.clone();
+            ship.resync(&self.inner, &peer, theirs, most_owed, move |conn| Ok(store::peer_epoch(conn, &at)? == epoch))
+        })
+    }
+
+    /// Whether `peer` has yet to hear where a ship stands since its account of it moved.
+    pub(crate) fn resync_due(&self, ship: &str, peer: &str) -> Result<bool, Error> {
+        self.inner.with_ship(ship, |ship| Ok(store::resync_due(&lock(&ship.conn), peer)?))
+    }
+
+    /// `peer` has heard where a ship stood when its record of `peer` carried `mark`.
+    /// Returns whether it still has more to hear.
+    pub(crate) fn resync_heard(&self, ship: &str, peer: &str, mark: i64) -> Result<bool, Error> {
+        self.inner.with_ship(ship, |ship| {
+            ship.transact(|conn| {
+                store::resync_heard(conn, peer, mark)?;
+                Ok(store::resync_due(conn, peer)?)
+            })
+        })
+    }
+
+    /// `peer` shows the mark `now`. If that is not the mark it showed when a ship here last
+    /// heard from it about a log, the ship asks afresh. Returns how many logs the ship
+    /// follows there, and whether any now has to be asked for again.
+    pub(crate) fn publisher_seen(&self, ship: &str, peer: &str, now: &[u8; 16]) -> Result<(usize, bool), Error> {
+        let cfg = &self.inner.cfg;
+        self.inner.with_ship(ship, |ship| ship.transact_for_peer(cfg, |conn| Ok(store::replica_reborn(conn, peer, now)?)))
+    }
+
+    /// The ships that have messages waiting to go to other ships, or events queued, and for
+    /// every ship the other ships on which its agents follow logs, and those that have yet
+    /// to answer its commands. Looks in every ship's file, so it is for when the network
+    /// starts, not for every moment.
+    pub(crate) fn ships_with_work(&self) -> Result<WorkFound, Error> {
+        let (mut found, mut following, mut awaiting) = (Vec::new(), Vec::new(), Vec::new());
         for entry in fs::read_dir(&self.inner.ships_dir)? {
             let file = entry?.file_name();
             let Some(ship) = file.to_str().and_then(|file| file.strip_suffix(".ship")).and_then(|ship| canonical_ship(ship).ok()) else {
                 continue;
             };
             // Asked of the ship itself if it is awake, so a write in progress is not read around.
+            let (mut follows, mut waits) = (Vec::new(), Vec::new());
             let has_work = |ship: &mut ship::Ship| {
                 let conn = lock(&ship.conn);
+                follows = store::follow_peers(&conn)?;
+                waits = store::wait_peers(&conn)?;
                 Ok(!store::peers_waiting(&conn, self.inner.cfg.max_follow_bytes)?.is_empty() || store::inbox_len(&conn)? > 0)
             };
-            if self.inner.with_ship(&ship, has_work).unwrap_or(false) {
+            let busy = self.inner.with_ship(&ship, has_work).unwrap_or(false);
+            following.extend(follows.into_iter().map(|peer| (ship.clone(), peer)));
+            awaiting.extend(waits.into_iter().map(|peer| (ship.clone(), peer)));
+            if busy {
                 found.push(ship);
             }
         }
-        Ok(found)
+        Ok((found, following, awaiting))
     }
 
     /// The other ships that a ship has something to take up with, and what: messages
@@ -1282,15 +1388,36 @@ impl Runtime {
         self.inner.with_ship(ship, |ship| Ok(store::log_followers(&lock(&ship.conn), agent, log)?))
     }
 
-    /// The oldest commands waiting to go from a ship to `peer`.
-    pub(crate) fn outbound_batch(&self, ship: &str, peer: &str, max_bytes: usize) -> Result<Vec<ship_proto::PeerMessage>, Error> {
-        self.inner.with_ship(ship, |ship| Ok(store::peer_batch(&lock(&ship.conn), peer, max_bytes)?))
+    /// The oldest commands waiting to go from a ship to `peer`, and which round of
+    /// comparing notes with `peer` the ship's record is of.
+    pub(crate) fn outbound_batch(&self, ship: &str, peer: &str, max_bytes: usize) -> Result<(Vec<ship_proto::PeerMessage>, i64), Error> {
+        self.inner.with_ship(ship, |ship| {
+            let conn = lock(&ship.conn);
+            Ok((store::peer_batch(&conn, peer, max_bytes)?, store::peer_epoch(&conn, peer)?))
+        })
     }
 
-    /// `peer` says it holds every command from this ship up to `last`, so those are done with.
-    pub(crate) fn outbound_acked(&self, ship: &str, peer: &str, last: u64) -> Result<(), Error> {
+    /// `peer` says it holds every command from this ship up to `last`, in answer to a
+    /// delivery that began with the command numbered `first`. That is its word as of the
+    /// round `epoch`, when the delivery was made. What it comes to is decided in one step:
+    ///
+    /// - If the two have compared notes since, the ship that said it may have gone back to
+    ///   an earlier state in between, and what it said then is no guide to what it holds
+    ///   now. Nothing is concluded from it, either way. The delivery is made again.
+    /// - If it holds less than this ship has let go of, the two are out of step.
+    /// - If it holds more than this ship remembers sending, likewise: `Error::OutOfStep`.
+    /// - Otherwise those commands are done with.
+    pub(crate) fn outbound_acked(&self, ship: &str, peer: &str, first: u64, last: u64, epoch: i64) -> Result<Acked, Error> {
         self.inner.with_ship(ship, |ship| {
-            ship.transact(|conn| store::peer_acked(conn, peer, last)?.ok_or_else(|| Error::OutOfStep(peer.to_string())))
+            ship.transact(|conn| {
+                if store::peer_epoch(conn, peer)? != epoch {
+                    return Ok(Acked::Stale);
+                }
+                if last.saturating_add(1) < first {
+                    return Ok(Acked::Short);
+                }
+                store::peer_acked(conn, peer, last)?.map(|()| Acked::Taken).ok_or_else(|| Error::OutOfStep(peer.to_string()))
+            })
         })
     }
 
@@ -1299,9 +1426,35 @@ impl Runtime {
     /// queue, a receipt to the agent whose command it answers. One that has been taken before
     /// is passed over. If there is no room for some, the number returned says how far it
     /// got, and the rest are for the sender to send again.
-    pub(crate) fn accept_commands(&self, ship: &str, peer: &str, messages: &[ship_proto::PeerMessage]) -> Result<u64, Error> {
+    ///
+    /// `current` is asked, once the ship is in hand, whether the delivery is still one to
+    /// take: whether it came on what is still the newest connection from that ship. A
+    /// delivery from a ship that has since come back as an earlier copy of itself, and
+    /// compared notes, would otherwise use up a number that the ship as it now is has
+    /// given to a different command.
+    pub(crate) fn accept_commands(&self, ship: &str, peer: &str, messages: &[ship_proto::PeerMessage], current: impl FnOnce() -> bool) -> Result<u64, Error> {
         let peer = canonical_ship(peer)?;
-        self.inner.with_ship(ship, |ship| ship.accept(&self.inner, &peer, messages))
+        self.inner.with_ship(ship, |ship| {
+            if !current() {
+                return Err(Error::TooMany("connections from that ship: a newer one has taken the place of this one"));
+            }
+            ship.accept(&self.inner, &peer, messages)
+        })
+    }
+
+    /// Whether a ship still has commands that `peer` has yet to answer. If it has, the two
+    /// are marked to compare notes: `peer` may have gone back to a state in which it never
+    /// had them, and then only comparing notes will show that no answer is coming.
+    pub(crate) fn probe_waits(&self, ship: &str, peer: &str) -> Result<bool, Error> {
+        self.inner.with_ship(ship, |ship| {
+            ship.transact(|conn| {
+                let waiting = store::peer_unanswered(conn, peer)? > 0;
+                if waiting {
+                    store::resync_mark(conn, peer)?;
+                }
+                Ok(waiting)
+            })
+        })
     }
 
     /// The newest audit entries, newest first.
@@ -1372,7 +1525,7 @@ impl Runtime {
         }
         let public = key.verifying_key();
         let kernel_hash =
-            store::import(&copy.0, &fresh.0, &name, &self.inner.cfg, deadline, &public, check_agent_name, check_hash)?;
+            store::import(&copy.0, &fresh.0, &name, &self.inner.cfg, deadline, &public, check_agent_name, check_hash, &random_bytes::<16>()?)?;
         let fetch = |hash: &str| -> Result<(), Error> {
             // Check the bytes on disk, not the compiled cache, which could hide a damaged blob.
             if self.inner.read_blob(hash).is_err() {
@@ -1393,6 +1546,7 @@ impl Runtime {
                 conn: Arc::new(Mutex::new(conn)),
                 kernel,
                 key: Arc::new(key.clone()),
+                incarnation: [0; 16],
                 outbox_bytes: 0,
                 inbox_bytes: 0,
             };
@@ -1601,7 +1755,9 @@ impl Inner {
             Arc::new(load_key(&self.key_path(name))?)
         };
         let (outbox_bytes, inbox_bytes) = (store::outbox_bytes(&conn)?, store::inbox_bytes(&conn)?);
-        Ok(Ship { name: name.into(), conn: Arc::new(Mutex::new(conn)), kernel, key, outbox_bytes, inbox_bytes })
+        let incarnation = store::incarnation(&conn)?;
+        lock(&self.incarnations).insert(name.to_string(), incarnation);
+        Ok(Ship { name: name.into(), conn: Arc::new(Mutex::new(conn)), kernel, key, incarnation, outbox_bytes, inbox_bytes })
     }
 
     fn with_ship<R>(&self, name: &str, f: impl FnOnce(&mut Ship) -> Result<R, Error>) -> Result<R, Error> {

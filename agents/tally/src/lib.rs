@@ -329,6 +329,7 @@ fn receipted(receipt: &ship_sdk::Receipt) {
         ship_sdk::Verdict::Failed => "failed",
         ship_sdk::Verdict::Limit => "limit",
         ship_sdk::Verdict::Malformed => "malformed",
+        ship_sdk::Verdict::Lost => "lost",
         ship_sdk::Verdict::Unspecified => "unknown",
     };
     let line = format!(

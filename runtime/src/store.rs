@@ -15,7 +15,7 @@ use ship_proto::{CheckpointBody, Device, Kind, LogNews, Message, PeerMessage, Re
 
 use crate::{signed_bytes, AuditEntry, ChainCheck, Config, Durability, Effect, Error, CHECKPOINT_DOMAIN};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 // The schema and one query name a command by its number, where SQLite needs to see it written out.
 const _: () = assert!(Kind::Command as i32 == 1);
@@ -113,7 +113,9 @@ CREATE TABLE peers (
     peer TEXT PRIMARY KEY,
     sent INTEGER NOT NULL,
     received INTEGER NOT NULL,
-    out_bytes INTEGER NOT NULL
+    out_bytes INTEGER NOT NULL,
+    resync INTEGER NOT NULL,
+    epoch INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE peer_out (
     peer TEXT NOT NULL,
@@ -185,6 +187,7 @@ CREATE TABLE remote_logs (
     joined INTEGER NOT NULL,
     stopped TEXT NOT NULL,
     gen INTEGER NOT NULL,
+    seen BLOB NOT NULL,
     PRIMARY KEY (peer, agent, name, follower)
 ) WITHOUT ROWID;
 CREATE TABLE remote_entries (
@@ -246,7 +249,7 @@ pub const MAX_LABEL_BYTES: usize = 64;
 
 /// Create a ship file at `path`, which must not exist. The caller creates it under a private
 /// name and publishes it afterwards, so a failure here never leaves a half-made ship behind.
-pub fn create(path: &Path, name: &str, kernel: &str, max_bytes: u64) -> Result<(), Error> {
+pub fn create(path: &Path, name: &str, kernel: &str, max_bytes: u64, incarnation: &[u8; 16]) -> Result<(), Error> {
     // create_new makes "does this ship already exist" atomic.
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(_) => {}
@@ -265,11 +268,20 @@ pub fn create(path: &Path, name: &str, kernel: &str, max_bytes: u64) -> Result<(
     conn.execute_batch("BEGIN")?;
     conn.execute_batch(SCHEMA)?;
     conn.execute(
-        "INSERT INTO meta VALUES ('schema', ?1), ('name', ?2), ('kernel', ?3)",
-        params![SCHEMA_VERSION, name, kernel],
+        "INSERT INTO meta VALUES ('schema', ?1), ('name', ?2), ('kernel', ?3), ('incarnation', ?4)",
+        params![SCHEMA_VERSION, name, kernel, &incarnation[..]],
     )?;
     conn.execute_batch("COMMIT")?;
     Ok(())
+}
+
+/// The mark this copy of the ship was given when it was made or brought in. Every ship file
+/// made by this runtime has one. It is a way to tell that a ship has been brought back from
+/// a saved copy of itself, and so may have forgotten things it knew: it changes on every
+/// import. It is not a secret, and proves nothing.
+pub fn incarnation(conn: &Connection) -> rusqlite::Result<[u8; 16]> {
+    let stored: Option<Vec<u8>> = conn.query_row("SELECT value FROM meta WHERE key = 'incarnation'", [], |r| r.get(0)).optional()?;
+    Ok(stored.and_then(|mark| <[u8; 16]>::try_from(mark).ok()).unwrap_or_default())
 }
 
 pub fn open(path: &Path, durability: Durability, max_bytes: u64) -> Result<Connection, Error> {
@@ -387,7 +399,7 @@ pub fn peer_received(conn: &Connection, peer: &str) -> rusqlite::Result<u64> {
 
 pub fn peer_set_received(conn: &Connection, peer: &str, received: u64) -> rusqlite::Result<()> {
     conn.prepare_cached(
-        "INSERT INTO peers VALUES (?1, 0, ?2, 0) ON CONFLICT (peer) DO UPDATE SET received = excluded.received",
+        "INSERT INTO peers VALUES (?1, 0, ?2, 0, 0, 0) ON CONFLICT (peer) DO UPDATE SET received = excluded.received",
     )?
     .execute(params![peer, received as i64])
     .map(drop)
@@ -398,7 +410,7 @@ pub fn peer_set_received(conn: &Connection, peer: &str, received: u64) -> rusqli
 fn peer_out_push(conn: &Connection, peer: &str, source: &str, agent: &str, interface: &str, payload: &[u8], receipt: bool) -> rusqlite::Result<u64> {
     let cost = (payload.len() as u64 + MESSAGE_OVERHEAD) as i64;
     conn.prepare_cached(
-        "INSERT INTO peers VALUES (?1, 1, 0, ?2) ON CONFLICT (peer) DO UPDATE SET sent = sent + 1, out_bytes = out_bytes + ?2",
+        "INSERT INTO peers VALUES (?1, 1, 0, ?2, 0, 0) ON CONFLICT (peer) DO UPDATE SET sent = sent + 1, out_bytes = out_bytes + ?2",
     )?
     .execute(params![peer, cost])?;
     let (seq, _, _) = peer_row(conn, peer)?.expect("written above");
@@ -475,6 +487,199 @@ pub fn peer_owed(conn: &Connection, peer: &str) -> rusqlite::Result<(usize, usiz
     Ok((waiting as usize, queued as usize))
 }
 
+/// Where this ship stands with another: what it has sent it, what it holds of what that
+/// ship sent, and which of that ship's commands it has yet to answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stand {
+    pub sent: u64,
+    pub received: u64,
+    /// The oldest message still waiting to go: one more than the last that ship said it
+    /// held. One more than `sent` if nothing is waiting.
+    pub oldest: u64,
+    /// That ship's commands held here and not yet answered, or answered in a receipt still
+    /// waiting to go: lowest first.
+    pub owed: Vec<u64>,
+    /// Whether `owed` is all of them. If not, nothing is said about any above the last.
+    pub owed_complete: bool,
+    /// Not sent: the mark on this ship's record of the other when this was read. Nothing
+    /// if the other ship is up to date with where this ship stands. See `resync_heard`.
+    pub mark: i64,
+    /// Not sent: which round of comparing notes the record was of when this was read.
+    pub epoch: i64,
+}
+
+/// The highest number either ship's account of the other is moved to on the other's word.
+/// A ship whose account is moved there still has as far again to go before its numbers pass
+/// what an import accepts, so another ship cannot talk it into a file it could not read back.
+pub const MAX_RESYNC_SEQ: u64 = (MAX_SEQ / 4) as u64;
+
+/// Where this ship stands with `peer`, listing at most `most_owed` commands as owed.
+pub fn standing(conn: &Connection, peer: &str, most_owed: usize) -> rusqlite::Result<Stand> {
+    let (sent, received, _) = peer_row(conn, peer)?.unwrap_or_default();
+    let mark = resync_mark_of(conn, peer)?;
+    let oldest = conn
+        .prepare_cached("SELECT MIN(seq) FROM peer_out WHERE peer = ?1")?
+        .query_row([peer], |r| r.get::<_, Option<i64>>(0))?
+        .map_or(sent + 1, |seq| seq as u64);
+    // Commands from that ship still queued, and those answered in receipts not yet gone.
+    let mut owed: Vec<u64> = conn
+        .prepare_cached("SELECT ship_seq FROM inbox WHERE ship = ?1 AND ship != '' AND kind = 1")?
+        .query_map([peer], |r| r.get::<_, i64>(0).map(|seq| seq as u64))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut stmt = conn.prepare_cached("SELECT payload FROM peer_out WHERE peer = ?1 AND receipt")?;
+    let mut rows = stmt.query([peer])?;
+    while let Some(row) = rows.next()? {
+        // Written by this runtime, or checked when the ship was imported.
+        if let Ok(receipt) = Receipt::decode(&*row.get::<_, Vec<u8>>(0)?) {
+            owed.push(receipt.about);
+        }
+    }
+    owed.sort_unstable();
+    owed.dedup();
+    let owed_complete = owed.len() <= most_owed;
+    owed.truncate(most_owed);
+    Ok(Stand { sent, received, oldest, owed, owed_complete, mark, epoch: peer_epoch(conn, peer)? })
+}
+
+/// The mark on this ship's record of `peer`: nothing if that ship is up to date with where
+/// this ship stands, and otherwise a number given when this ship's account last moved.
+fn resync_mark_of(conn: &Connection, peer: &str) -> rusqlite::Result<i64> {
+    conn.prepare_cached("SELECT resync FROM peers WHERE peer = ?1")?.query_row([peer], |r| r.get(0)).optional().map(|mark| mark.unwrap_or(0))
+}
+
+/// A command this ship sent whose answer will never come.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Orphan {
+    pub seq: u64,
+    pub source: String,
+    pub agent: String,
+    pub interface: String,
+    pub tell: bool,
+}
+
+/// Bring this ship's account of `peer` into line with where `peer` says it stands, and
+/// return the commands this ship sent it whose answers will never come. `None` if what the
+/// other ship says cannot be so, in which case nothing is changed.
+///
+/// Three things are put right, each only ever moving forward, so that doing it again with
+/// the same or a later account changes nothing more:
+///
+/// - That ship holds messages numbered beyond the last this ship remembers sending. This
+///   ship went back to an earlier state. Its next message is numbered after those, or it
+///   would be taken for one of them and dropped.
+/// - That ship's oldest waiting message is numbered beyond the next one this ship expects.
+///   The ones between went to this ship in a state it has since gone back on, and that ship
+///   let go of them. They are gone. This ship takes up from where that ship now starts.
+/// - Whatever that ship says it holds is done with here, as when it acknowledges a delivery.
+///
+/// A command is an orphan if that ship has held it and does not list it as owed: it was
+/// answered, and the answer went to a state of this ship that is gone, or it was taken by a
+/// state of that ship that is gone. Either way no answer is coming.
+///
+/// Sets the mark that says the other ship has yet to hear where this ship now stands, if
+/// anything moved.
+pub fn reconcile(conn: &Connection, peer: &str, theirs: &Stand) -> rusqlite::Result<Option<Vec<Orphan>>> {
+    let sound = theirs.sent <= MAX_RESYNC_SEQ
+        && theirs.received <= MAX_RESYNC_SEQ
+        && theirs.oldest >= 1
+        && theirs.oldest <= theirs.sent + 1
+        && theirs.owed.windows(2).all(|pair| pair[0] < pair[1])
+        && theirs.owed.last().is_none_or(|last| *last <= MAX_RESYNC_SEQ);
+    if !sound {
+        return Ok(None);
+    }
+    let known = peer_row(conn, peer)?;
+    let (mut sent, mut received, _) = known.unwrap_or_default();
+    let before = (sent, received);
+    sent = sent.max(theirs.received);
+    received = received.max(theirs.oldest - 1);
+    if known.is_some() || (sent, received) != before {
+        // If the account moved, the other ship has to hear the new one. The record is given
+        // a mark no earlier state of it has had, so that an answer to where this ship stood
+        // before cannot be taken as the other ship having heard where it stands now.
+        //
+        // The record is also given a new `epoch` every time, moved or not. A delivery that
+        // was under way when the two compared notes was acknowledged by the other ship as
+        // it was before: that acknowledgement is of the epoch before, and is not acted on.
+        let moved = (sent, received) != before;
+        let mark = fresh_mark(conn, "resync_gen")? as i64;
+        conn.prepare_cached(
+            "INSERT INTO peers VALUES (?1, ?2, ?3, 0, CASE WHEN ?5 THEN ?4 ELSE 0 END, ?4) ON CONFLICT (peer) DO UPDATE
+             SET sent = excluded.sent, received = excluded.received, epoch = ?4, resync = CASE WHEN ?5 THEN ?4 ELSE resync END",
+        )?
+        .execute(params![peer, sent as i64, received as i64, mark, moved])?;
+        // The call cannot fail to find the row: it was written, or was there already.
+        peer_acked(conn, peer, theirs.received.min(sent))?;
+    }
+    let oldest = conn
+        .prepare_cached("SELECT MIN(seq) FROM peer_out WHERE peer = ?1")?
+        .query_row([peer], |r| r.get::<_, Option<i64>>(0))?
+        .map_or(sent + 1, |seq| seq as u64);
+    // Commands that ship has held: numbered up to what it holds now, and no longer waiting
+    // to go from here. Of those, the ones it does not owe an answer to.
+    let listed_to = if theirs.owed_complete { u64::MAX } else { theirs.owed.last().copied().unwrap_or(0) };
+    let mut stmt = conn.prepare_cached("SELECT seq, source, agent, interface, tell FROM peer_wait WHERE peer = ?1 AND seq < ?2 AND seq <= ?3 ORDER BY seq")?;
+    let waiting = stmt.query_map(params![peer, oldest as i64, theirs.received as i64], |r| {
+        Ok(Orphan { seq: r.get::<_, i64>(0)? as u64, source: r.get(1)?, agent: r.get(2)?, interface: r.get(3)?, tell: r.get(4)? })
+    })?;
+    let mut orphans = Vec::new();
+    for wait in waiting {
+        let wait = wait?;
+        if wait.seq <= listed_to && theirs.owed.binary_search(&wait.seq).is_err() {
+            orphans.push(wait);
+        }
+    }
+    Ok(Some(orphans))
+}
+
+/// Not everything could be settled just now, so the two ships have to go over it again.
+pub fn resync_mark(conn: &Connection, peer: &str) -> rusqlite::Result<()> {
+    let mark = fresh_mark(conn, "resync_gen")? as i64;
+    conn.prepare_cached("UPDATE peers SET resync = ?2 WHERE peer = ?1")?.execute(params![peer, mark]).map(drop)
+}
+
+/// Whether the other ship has yet to hear where this ship stands since its account moved.
+pub fn resync_due(conn: &Connection, peer: &str) -> rusqlite::Result<bool> {
+    Ok(resync_mark_of(conn, peer)? != 0)
+}
+
+/// The other ship has heard where this ship stood when its record carried `mark`. If the
+/// record carries another mark by now, the account has moved since, and that ship has yet
+/// to hear of it. Commands going back and forth in the ordinary way do not change the mark,
+/// so they do not keep two busy ships from ever being done with this.
+pub fn resync_heard(conn: &Connection, peer: &str, mark: i64) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE peers SET resync = 0 WHERE peer = ?1 AND resync = ?2")?.execute(params![peer, mark]).map(drop)
+}
+
+/// The ships that have yet to answer commands this ship sent them.
+pub fn wait_peers(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    conn.prepare_cached("SELECT DISTINCT peer FROM peer_wait")?.query_map([], |r| r.get(0))?.collect()
+}
+
+/// The ships on which agents here follow logs.
+pub fn follow_peers(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    conn.prepare_cached("SELECT DISTINCT peer FROM remote_logs")?.query_map([], |r| r.get(0))?.collect()
+}
+
+/// The ship `peer` shows the mark `now`. Every copy of its logs here that last heard from a
+/// ship showing another mark, or has yet to hear from it at all, asks afresh: that ship has
+/// been brought back from a saved copy and may no longer know that this ship follows it.
+/// A copy that is already asking is numbered anew as well: the answer on its way may be
+/// from the ship as it was before, and must not be taken for an answer from the ship as it
+/// is. Returns how many copies there are of that ship's logs, and whether any now has to ask.
+pub fn replica_reborn(conn: &Connection, peer: &str, now: &[u8; 16]) -> rusqlite::Result<(usize, bool)> {
+    let copies: i64 = conn.prepare_cached("SELECT COUNT(*) FROM remote_logs WHERE peer = ?1")?.query_row([peer], |r| r.get(0))?;
+    let stale: bool = conn
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM remote_logs WHERE peer = ?1 AND stopped = '' AND seen != ?2)")?
+        .query_row(params![peer, &now[..]], |r| r.get(0))?;
+    if stale {
+        let gen = fresh_mark(conn, "follow_gen")?;
+        conn.prepare_cached("UPDATE remote_logs SET joined = 0, gen = ?3 WHERE peer = ?1 AND stopped = '' AND seen != ?2")?
+            .execute(params![peer, &now[..], gen as i64])?;
+    }
+    Ok((copies as usize, stale))
+}
+
 /// What a ship has to take up with another ship.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PeerWork {
@@ -488,7 +693,7 @@ pub struct PeerWork {
 /// how much of another ship's log is held for an agent before no more is asked for.
 pub fn peers_waiting(conn: &Connection, max_follow_bytes: u64) -> rusqlite::Result<BTreeMap<String, PeerWork>> {
     let mut found: BTreeMap<String, PeerWork> = BTreeMap::new();
-    let mut stmt = conn.prepare_cached("SELECT peer FROM peers WHERE out_bytes > 0")?;
+    let mut stmt = conn.prepare_cached("SELECT peer FROM peers WHERE out_bytes > 0 OR resync != 0")?;
     for peer in stmt.query_map([], |r| r.get::<_, String>(0))? {
         found.entry(peer?).or_default().messages = true;
     }
@@ -538,6 +743,13 @@ pub fn peer_batch(conn: &Connection, peer: &str, max_bytes: usize) -> rusqlite::
         batch.push(message);
     }
     Ok(batch)
+}
+
+/// Which round of comparing notes this ship's record of `peer` is of. It changes every time
+/// the two compare notes, and a delivery is acknowledged only within the round it was
+/// made in.
+pub fn peer_epoch(conn: &Connection, peer: &str) -> rusqlite::Result<i64> {
+    conn.prepare_cached("SELECT epoch FROM peers WHERE peer = ?1")?.query_row([peer], |r| r.get(0)).optional().map(|epoch| epoch.unwrap_or(0))
 }
 
 /// The other ship says it holds every message up to `last`. Those are done with. `None` if
@@ -1169,11 +1381,13 @@ pub struct Replica {
     /// one ship share one. An answer from the other ship is for the asking it was put under,
     /// and is not taken for a later one.
     pub gen: u64,
+    /// The mark the publishing ship showed when it last answered. Empty if it never has.
+    pub seen: Vec<u8>,
 }
 
 pub fn replica(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Result<Option<Replica>> {
     conn.prepare_cached(
-        "SELECT head, head_hash, announced, bytes, joined, stopped, gen FROM remote_logs
+        "SELECT head, head_hash, announced, bytes, joined, stopped, gen, seen FROM remote_logs
          WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4",
     )?
     .query_row(params![log.ship, log.agent, log.name, follower], |r| {
@@ -1185,6 +1399,7 @@ pub fn replica(conn: &Connection, follower: &str, log: Followed) -> rusqlite::Re
             joined: r.get(4)?,
             stopped: r.get(5)?,
             gen: r.get::<_, i64>(6)? as u64,
+            seen: r.get(7)?,
         })
     })
     .optional()
@@ -1197,7 +1412,7 @@ pub fn replica_start(conn: &Connection, follower: &str, log: Followed) -> rusqli
     // followed. An answer still on its way to an earlier asking then fits no copy.
     let gen = fresh_mark(conn, "follow_gen")?;
     conn.prepare_cached(
-        "INSERT INTO remote_logs VALUES (?1, ?2, ?3, ?4, 0, x'', 0, 0, 0, '', ?5)
+        "INSERT INTO remote_logs VALUES (?1, ?2, ?3, ?4, 0, x'', 0, 0, 0, '', ?5, x'')
          ON CONFLICT (peer, agent, name, follower) DO UPDATE SET joined = 0, stopped = '', gen = ?5",
     )?
     .execute(params![log.ship, log.agent, log.name, follower, gen as i64])
@@ -1206,7 +1421,7 @@ pub fn replica_start(conn: &Connection, follower: &str, log: Followed) -> rusqli
 
 pub fn replica_save(conn: &Connection, follower: &str, log: Followed, held: &Replica) -> rusqlite::Result<()> {
     conn.prepare_cached(
-        "UPDATE remote_logs SET head = ?5, head_hash = ?6, announced = ?7, bytes = ?8, joined = ?9, stopped = ?10
+        "UPDATE remote_logs SET head = ?5, head_hash = ?6, announced = ?7, bytes = ?8, joined = ?9, stopped = ?10, seen = ?11
          WHERE peer = ?1 AND agent = ?2 AND name = ?3 AND follower = ?4",
     )?
     .execute(params![
@@ -1219,7 +1434,8 @@ pub fn replica_save(conn: &Connection, follower: &str, log: Followed, held: &Rep
         held.announced as i64,
         held.bytes as i64,
         held.joined,
-        held.stopped
+        held.stopped,
+        held.seen
     ])
     .map(drop)
 }
@@ -1885,6 +2101,7 @@ pub fn import(
     key: &VerifyingKey,
     check_agent: fn(&str) -> Result<(), Error>,
     check_hash: fn(&str) -> Result<(), Error>,
+    incarnation: &[u8; 16],
 ) -> Result<String, Error> {
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA)?;
@@ -1923,7 +2140,10 @@ pub fn import(
     let kernel_hash = kernel(&from)?;
     check_hash(&kernel_hash)?;
 
-    create(dest, name, &kernel_hash, cfg.max_ship_bytes)?;
+    // The copy is given a mark of its own, whatever mark the source had: it may be an old
+    // copy of the ship, brought back, and other ships tell by the mark that it may have
+    // forgotten what it once knew of them.
+    create(dest, name, &kernel_hash, cfg.max_ship_bytes, incarnation)?;
     let to = open(dest, Durability::Full, cfg.max_ship_bytes)?;
     // Leave WAL mode so that a commit means the data is in the main file, which is the only
     // file that gets published. The switch itself fails if earlier writes cannot be folded in.
@@ -2155,7 +2375,7 @@ pub fn import(
     }
     type Copy = (String, String, String, String);
     let mut held: HashMap<Copy, Held> = HashMap::new();
-    let mut stmt = from.prepare("SELECT peer, agent, name, follower, head, head_hash, announced, stopped FROM remote_logs")?;
+    let mut stmt = from.prepare("SELECT peer, agent, name, follower, head, head_hash, announced, stopped, seen FROM remote_logs")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         in_time()?;
@@ -2163,7 +2383,8 @@ pub fn import(
         let (head, head_hash, announced, stopped) = (integer(row, 4)? as u64, blob(row, 5, 32)?, integer(row, 6)?, text(row, 7)?);
         check_agent(&agent)?;
         check_agent(&follower)?;
-        let linked = if head == 0 { head_hash.is_empty() } else { head_hash.len() == 32 };
+        let seen = blob(row, 8, 16)?;
+        let linked = (if head == 0 { head_hash.is_empty() } else { head_hash.len() == 32 }) && (seen.is_empty() || seen.len() == 16);
         if !ship_name_ok(&peer) || peer == name || !interface_ok(&log) || !linked || stopped.len() > MAX_REASON_BYTES {
             return Err(bad_row("a log followed on another ship is recorded wrongly"));
         }
@@ -2177,8 +2398,8 @@ pub fn import(
         // state, and asking again is how the two find out where they stand. (The number that
         // tells one asking from the next starts again too.)
         to.execute(
-            "INSERT INTO remote_logs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, 0)",
-            params![peer, agent, log, follower, head as i64, head_hash, announced, stopped],
+            "INSERT INTO remote_logs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, 0, ?9)",
+            params![peer, agent, log, follower, head as i64, head_hash, announced, stopped, seen],
         )?;
         let fresh = Held { head, checkpoint: None, first: None, last: 0, bytes: 0, newest_cost: 0, followed: false };
         held.insert((peer, agent, log, follower), fresh);
@@ -2326,7 +2547,10 @@ pub fn import(
             return Err(bad_row("another ship's message numbers are beyond what this runtime allows"));
         }
         taken_from.insert(peer.clone(), received as u64);
-        to.execute("INSERT INTO peers VALUES (?1, ?2, ?3, 0)", params![peer, sent, received])?;
+        // Every ship this one has exchanged commands with is told afresh where this ship
+        // stands, and asked where it stands. An import may be a return to an earlier state,
+        // and that is how the two find out, and put right what can be.
+        to.execute("INSERT INTO peers VALUES (?1, ?2, ?3, 0, 1, 0)", params![peer, sent, received])?;
     }
     /// What is waiting to go to one other ship.
     #[derive(Default)]
@@ -2584,6 +2808,10 @@ pub fn import(
         to.execute("INSERT INTO signin_codes VALUES (?1, ?2, ?3)", params![hash, expires, reusable])?;
     }
 
+    // Every record of another ship was written above with the mark 1. Marks handed out
+    // from now on start after it.
+    meta_set(&to, "resync_gen", 1)?;
+
     // Carry the counters across so sequence numbers are never reused after an import. `integer`
     // bounds them, so a source cannot hand over a counter that is already exhausted.
     let mut counters = [("outbox", None), ("inbox", None), ("audit", None), ("devices", None)];
@@ -2610,6 +2838,29 @@ pub fn import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_mark_makes_every_copy_ask_afresh_whether_or_not_it_was_already_asking() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let (old, new) = ([1u8; 16], [2u8; 16]);
+        let copy = |log: &str, joined: bool, stopped: &str, seen: &[u8]| {
+            conn.execute("INSERT INTO remote_logs VALUES ('bus', 'agent', ?1, 'tally', 0, x'', 0, 0, ?2, ?3, 7, ?4)", params![log, joined, stopped, seen]).unwrap();
+        };
+        copy("joined", true, "", &old);
+        copy("asking", false, "", &[]);
+        copy("stopped", true, "no", &old);
+        copy("current", true, "", &new);
+        let state = |log: &str| conn.query_row("SELECT joined, gen FROM remote_logs WHERE name = ?1", [log], |r| Ok((r.get::<_, bool>(0)?, r.get::<_, i64>(1)?))).unwrap();
+        assert_eq!(replica_reborn(&conn, "bus", &new).unwrap(), (4, true));
+        // The copy that had joined the ship as it was asks again, under a new number. So
+        // does the one that was already asking: its answer may come from the ship as it was.
+        assert!(state("joined") == (false, 1) && state("asking") == (false, 1));
+        // One that has stopped, and one that has heard from the ship as it is, are left be.
+        assert!(state("stopped") == (true, 7) && state("current") == (true, 7));
+        // Another ship's logs are not touched, and a ship nobody follows has no copies.
+        assert_eq!(replica_reborn(&conn, "nec", &new).unwrap(), (0, false));
+    }
 
     #[test]
     fn news_goes_round_every_log_a_ship_follows() {

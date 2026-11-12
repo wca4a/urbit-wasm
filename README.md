@@ -71,6 +71,17 @@ mechanism yet.
   it would after that ship went back to an old backup and wrote something
   different, the follower stops and its agent is told. The agent can stop
   following and start again from the beginning.
+- A ship can go back to an earlier state: a backup brought in with import.
+  What happened after the backup was taken is gone from it and cannot be
+  brought back, but the ships it deals with carry on. Every copy of a ship
+  has a mark that changes when it is imported. A ship that follows its logs
+  notices the new mark and asks afresh, so a publisher that no longer
+  remembers a follower hears from it again.
+- Two ships whose counts of the commands between them no longer agree tell
+  each other where they stand and bring their numbering into line, so new
+  commands flow both ways. A command whose answer can no longer come is given
+  up: that is written to the sender's audit log, and its agent is handed a
+  receipt saying the command is lost and may or may not have run.
 
 ## Layout
 
