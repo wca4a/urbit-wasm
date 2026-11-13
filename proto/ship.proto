@@ -317,6 +317,7 @@ message PeerRequest {
     Fetch fetch = 3;
     News news = 4;
     Resync resync = 5;
+    Hello hello = 6;
   }
 }
 
@@ -327,9 +328,33 @@ message PeerReply {
     Fetched fetched = 3;
     Heard heard = 4;
     Resynced resynced = 5;
+    Welcome welcome = 6;
   }
   // Set, with no body, when the request was not one the other ship would answer.
   string refused = 15;
+}
+
+// The first thing said on a connection, by the ship that made it: which ship it is. The
+// connection has already shown that the caller holds some key. The ship called looks the
+// name up and goes on only if that key is the one listed for it.
+message Hello {
+  string ship = 1;
+  // For a moon, which no list has: its parent's word for its key.
+  MoonProof proof = 2;
+}
+
+// The answer to a Hello that was believed.
+message Welcome {
+  // If the ship called is a moon, its parent's word for its key. A caller that did not
+  // already know the moon's key checks the key the connection showed against this.
+  MoonProof proof = 1;
+}
+
+// A moon's parent says: this moon, at this revision of its keys, has this key. The moon and
+// the key are known from the connection, so only the revision and the signature travel.
+message MoonProof {
+  uint32 revision = 1;
+  bytes signed = 2;
 }
 
 // Asks the other ship to say who it is and who it takes the asker to be.

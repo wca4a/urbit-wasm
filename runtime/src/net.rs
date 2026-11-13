@@ -30,9 +30,17 @@
 //! entries, so a ship takes them when it has room, and one that has been away, or has gone
 //! back to an earlier state, catches up by asking from wherever it stands.
 //!
-//! The directory here is a fixed list handed in by whoever starts the network. In time it
-//! will be Urbit ID: names, keys, and sponsors from Azimuth. A ship's own key does not change
-//! while its runtime runs.
+//! The directory's keys come from Urbit ID: a ship's key is the one Azimuth lists for its
+//! name, read when the ship is first met and again every so often (see `crate::azimuth`).
+//! A moon, which Azimuth does not list, shows its parent's signed word for its key (see
+//! `crate::moon`). Since nothing can be looked up by key, the ship that makes a connection
+//! says which ship it is, as the first thing on it, and is believed only if the key it
+//! proved it holds is the one listed for that name. A directory can also be a fixed list,
+//! handed in by whoever starts the network, which is how the tests run.
+//!
+//! Where a ship is to be found is not in Urbit ID, and is still a list handed in. A wrong
+//! address there cannot pass one ship off as another: whatever answers must still prove
+//! the key. A ship's own key does not change while its runtime runs.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -53,11 +61,15 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use ship_proto::{
-    peer_reply, peer_request, Deliver, Delivered, Fetch, Heard, Message, News, PeerReply, PeerRequest, Ping, Pong, Resync, Resynced,
-    Standing,
+    peer_reply, peer_request, Deliver, Delivered, Fetch, Heard, Hello, Message, MoonProof, News, PeerReply, PeerRequest, Ping, Pong, Resync,
+    Resynced, Standing, Welcome,
 };
 use tokio::sync::Semaphore;
 
+use urbit_id::ob;
+
+use crate::azimuth::{Keys, Listing};
+use crate::moon;
 use crate::ship::Taken;
 use crate::store::{PeerWork, Stand, MAX_BATCH_MESSAGES, MAX_FETCH_ENTRIES, MAX_NEWS_LOGS};
 use crate::{canonical_ship, lock, Acked, Error, Runtime};
@@ -68,6 +80,24 @@ const PROTOCOL: &[u8] = b"ship/1";
 
 /// The longest any time limit here may be set to.
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The most a ship's first words on a connection, or the answer to them, may come to.
+const MOST_HELLO_BYTES: usize = 1024;
+
+/// How many callers nothing is known of may be looked up in Urbit ID in a second, and at a
+/// stroke. Anyone can say any name, and each name not yet known costs questions to an
+/// Ethereum node: without a limit, callers could have this runtime ask as fast as they
+/// can connect. Past it a new caller is turned away, and tries again.
+const MOST_MEETINGS: u32 = 32;
+
+/// How many ships may be waiting to be asked about, or being asked about, at once. Past
+/// this a new name is not asked about, and whoever wanted it tries again later. Half are
+/// kept back for the ships this runtime's own ships want to call, so that callers saying
+/// names cannot take them all.
+const MOST_LOOKUPS: usize = 64;
+
+/// How many questions to Urbit ID may be out at once.
+const MOST_READING: usize = 8;
 
 /// Room in a request for what goes round a command: names, numbers, and framing.
 const MESSAGE_ENVELOPE_BYTES: usize = 4096;
@@ -86,10 +116,97 @@ pub struct Peer {
     pub addr: SocketAddr,
 }
 
-/// Which key belongs to which ship, and where each ship is. A stand-in for Urbit ID.
+/// How a ship's key came to be listed.
+#[derive(Clone, Copy)]
+enum From {
+    /// Put there by whoever runs this runtime. It stands until they change it.
+    Set,
+    /// Read from Urbit ID, at this moment, as this revision of the ship's keys. `doubted`
+    /// once something has suggested it is out of date: it still stands, and is read again
+    /// at the next chance.
+    Read { at: Instant, revision: u32, doubted: bool },
+    /// Urbit ID said, at this moment, that the ship's keys had been taken away, as of this
+    /// revision. Kept in the place of a key that was held, so that an answer from before
+    /// they were taken away is known for the old one it is. There is no key here.
+    Cleared { at: Instant, revision: u32 },
+    /// A moon's: its parent has given its word for it, at this revision, signing with the
+    /// key `by`. It stands for as long as that is the parent's key.
+    Vouched { revision: u32, by: [u8; 32] },
+}
+
+#[derive(Clone, Copy)]
+struct Entry {
+    key: [u8; 32],
+    from: From,
+    /// Whether the ship has ever proved, on a connection, that it holds the key held for
+    /// it here, or has had a moon's proof checked against that key. Until then the key is
+    /// here only because someone said the ship's name, and it may be dropped to make room
+    /// for another like it. After, what is kept of the ship is never dropped for room
+    /// while it is still believed, through every later change of its keys: it is what
+    /// keeps an older key of the ship's from being taken for a newer one.
+    proved: bool,
+}
+
 #[derive(Default)]
+struct Listed {
+    keys: HashMap<String, Entry>,
+    places: HashMap<String, SocketAddr>,
+    /// When Urbit ID was last asked about a ship, and whether it gave an answer.
+    asked: HashMap<String, (Instant, bool)>,
+    /// Why the last question to Urbit ID that failed did, or the last key that could not
+    /// be kept was not.
+    trouble: Option<String>,
+}
+
+/// How many ships a directory keeps keys for.
+#[derive(Clone, Copy, Debug)]
+pub struct Bounds {
+    /// Ships that have proved their keys, moons included. These are never dropped for room
+    /// while they are believed, so past this a new ship cannot be met until some lapse.
+    pub proved: usize,
+    /// Ships whose keys were read because their names were said, and that have proved
+    /// nothing yet. Past this the oldest are dropped. Anyone can say any name, so this is
+    /// kept apart from the ships that have proved their keys, and small. There is always
+    /// room for one: a ship cannot prove its key before its key has been read.
+    pub unproved: usize,
+    /// Moons in all, and moons of any one ship. A moon costs its parent nothing to make,
+    /// so without these one ship, or a few, could take all the room there is.
+    pub moons: usize,
+    pub moons_each: usize,
+}
+
+impl Default for Bounds {
+    fn default() -> Self {
+        Bounds { proved: 1 << 16, unproved: 4096, moons: 1 << 15, moons_each: 256 }
+    }
+}
+
+/// The most ships a directory remembers having asked about.
+const MOST_ASKED: usize = 1 << 16;
+
+/// Which key belongs to which ship, and where each ship is.
 pub struct Directory {
-    peers: RwLock<HashMap<String, Peer>>,
+    /// Where keys are read from. With none, the directory is a fixed list.
+    keys: Option<Arc<dyn Keys>>,
+    fresh_for: Duration,
+    good_for: Duration,
+    bounds: Bounds,
+    listed: RwLock<Listed>,
+    /// Ships Urbit ID is being asked about at this moment. One question about a ship at a
+    /// time: two answers arriving out of order could otherwise put an old key back.
+    reading: Mutex<HashSet<String>>,
+    read_done: std::sync::Condvar,
+}
+
+/// A ship's place among those being asked about, given up when the asking is over,
+/// however it ends.
+struct Reading<'a>(&'a Directory, &'a str);
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.reading).remove(self.1);
+        self.0.read_done.notify_all();
+    }
 }
 
 impl fmt::Debug for Directory {
@@ -98,38 +215,384 @@ impl fmt::Debug for Directory {
     }
 }
 
+/// Whether Urbit ID should be asked about a ship.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Due {
+    /// No: what is held is recent, or was just asked for, or does not come from Urbit ID.
+    No,
+    /// What is held will do for now, and should be read again.
+    Soon,
+    /// Nothing usable is held. Ask before going on.
+    Now,
+}
+
+/// After Urbit ID has failed to answer about a ship, how long before it is asked again.
+/// Also how often a ship can be asked about again because its key looked out of date.
+const ASK_AGAIN: Duration = Duration::from_secs(5);
+
+/// The ship a moon belongs to, by name, if the name is a moon's.
+fn parent_of(name: &str) -> Option<String> {
+    let moon = ob::moon_number(name)?;
+    Some(ob::ship_name(ob::moon_parent(moon)).trim_start_matches('~').to_string())
+}
+
+/// What is needed to call a ship: where it is, and its key if that is known. For a moon
+/// met for the first time the key is not known, and its parent's is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Reach {
+    key: Option<[u8; 32]>,
+    addr: SocketAddr,
+}
+
 impl Directory {
+    /// A directory that is a fixed list: every ship in it is put there with `set`.
     pub fn new() -> Arc<Directory> {
-        Arc::new(Directory::default())
+        Directory::made(None, Duration::MAX, Duration::MAX, Bounds::default())
     }
 
-    /// List a ship, or change what is listed for it. A key can stand for only one ship: a
-    /// caller is recognised by its key alone, so two ships with one key could not be told apart.
+    /// A directory whose keys are read from Urbit ID. A key is read again once it is five
+    /// minutes old, and is no longer believed once it is a day old and cannot be read again.
+    pub fn reading(keys: Arc<dyn Keys>) -> Arc<Directory> {
+        Directory::reading_with(keys, Duration::from_secs(300), Duration::from_secs(24 * 60 * 60))
+    }
+
+    /// The same, saying how old a key may be before it is read again (`fresh_for`), and how
+    /// old before it is no longer believed (`good_for`), which is the longer.
+    pub fn reading_with(keys: Arc<dyn Keys>, fresh_for: Duration, good_for: Duration) -> Arc<Directory> {
+        Directory::reading_within(keys, fresh_for, good_for, Bounds::default())
+    }
+
+    /// The same, saying also how many ships it keeps keys for.
+    pub fn reading_within(keys: Arc<dyn Keys>, fresh_for: Duration, good_for: Duration, bounds: Bounds) -> Arc<Directory> {
+        Directory::made(Some(keys), fresh_for, good_for.max(fresh_for), bounds)
+    }
+
+    fn made(keys: Option<Arc<dyn Keys>>, fresh_for: Duration, good_for: Duration, bounds: Bounds) -> Arc<Directory> {
+        let bounds = Bounds { unproved: bounds.unproved.max(1), ..bounds };
+        Arc::new(Directory { keys, fresh_for, good_for, bounds, listed: RwLock::default(), reading: Mutex::default(), read_done: std::sync::Condvar::new() })
+    }
+
+    /// List a ship, or change what is listed for it. A key can be set for only one ship.
+    /// What is set this way is not read from Urbit ID, and stands until it is changed.
     pub fn set(&self, ship: &str, key: [u8; 32], addr: SocketAddr) -> Result<(), Error> {
         let name = canonical_ship(ship)?;
-        let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
-        if peers.iter().any(|(other, peer)| *other != name && peer.key == key) {
+        let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
+        if listed.keys.iter().any(|(other, entry)| *other != name && entry.key == key && matches!(entry.from, From::Set)) {
             return Err(Error::InvalidName(format!("{name}: its key is already listed for another ship")));
         }
-        peers.insert(name, Peer { key, addr });
+        listed.keys.insert(name.clone(), Entry { key, from: From::Set, proved: true });
+        listed.places.insert(name, addr);
+        Ok(())
+    }
+
+    /// Say where a ship is to be found, and leave its key to Urbit ID, or for a moon to its
+    /// parent's word.
+    pub fn place(&self, ship: &str, addr: SocketAddr) -> Result<(), Error> {
+        let name = canonical_ship(ship)?;
+        let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
+        if !listed.places.contains_key(&name) && listed.places.len() >= MOST_ASKED {
+            return Err(Error::InvalidName(format!("{name}: this directory has places for as many ships as it may")));
+        }
+        listed.places.insert(name, addr);
         Ok(())
     }
 
     pub fn remove(&self, ship: &str) {
         if let Ok(name) = canonical_ship(ship) {
-            self.peers.write().unwrap_or_else(|e| e.into_inner()).remove(&name);
+            let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
+            listed.keys.remove(&name);
+            listed.places.remove(&name);
         }
     }
 
+    /// A ship's key and where it is, if both are known.
     pub fn lookup(&self, ship: &str) -> Option<Peer> {
         let name = canonical_ship(ship).ok()?;
-        self.peers.read().unwrap_or_else(|e| e.into_inner()).get(&name).copied()
+        let listed = self.listed.read().unwrap_or_else(|e| e.into_inner());
+        Some(Peer { key: self.held(&listed, &name)?, addr: *listed.places.get(&name)? })
     }
 
-    /// The ship a key is listed for, if any.
-    pub fn who(&self, key: &[u8; 32]) -> Option<String> {
-        let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
-        peers.iter().find(|(_, peer)| peer.key == *key).map(|(name, _)| name.clone())
+    /// The key listed for a ship, if one is, and is still to be believed.
+    pub fn key_of(&self, ship: &str) -> Option<[u8; 32]> {
+        let name = canonical_ship(ship).ok()?;
+        self.held(&self.listed.read().unwrap_or_else(|e| e.into_inner()), &name)
+    }
+
+    /// Why the last question to Urbit ID that failed did, or why the last key that could
+    /// not be kept was not, if either has happened.
+    pub fn trouble(&self) -> Option<String> {
+        self.listed.read().unwrap_or_else(|e| e.into_inner()).trouble.clone()
+    }
+
+    fn held(&self, listed: &Listed, name: &str) -> Option<[u8; 32]> {
+        let entry = listed.keys.get(name)?;
+        match entry.from {
+            From::Set => Some(entry.key),
+            From::Read { at, .. } => (at.elapsed() < self.good_for).then_some(entry.key),
+            From::Cleared { .. } => None,
+            // A moon's key stands on its parent's. A moon has no moons, so this goes one
+            // step and no further.
+            From::Vouched { by, .. } => {
+                let parent = parent_of(name)?;
+                let stands = listed.keys.get(&parent).is_some_and(|parent| !matches!(parent.from, From::Vouched { .. }));
+                (stands && self.held(listed, &parent) == Some(by)).then_some(entry.key)
+            }
+        }
+    }
+
+    /// The key held for a ship that has proved it holds it: the key a connection from
+    /// that ship is taken on.
+    fn proved_key_of(&self, name: &str) -> Option<[u8; 32]> {
+        let listed = self.listed.read().unwrap_or_else(|e| e.into_inner());
+        self.held(&listed, name).filter(|_| listed.keys.get(name).is_some_and(|entry| entry.proved))
+    }
+
+    /// What is needed to call a ship, as things stand.
+    fn reach(&self, name: &str) -> Option<Reach> {
+        let listed = self.listed.read().unwrap_or_else(|e| e.into_inner());
+        let addr = *listed.places.get(name)?;
+        match self.held(&listed, name) {
+            Some(key) => Some(Reach { key: Some(key), addr }),
+            // A moon whose key is not known can be asked for its parent's word, provided
+            // the parent's key is known to check that word against.
+            None => self.held(&listed, &parent_of(name)?).map(|_| Reach { key: None, addr }),
+        }
+    }
+
+    /// Whether Urbit ID should be asked about a ship. Only galaxies, stars and planets are
+    /// asked about: for a moon, the ship to ask about is its parent.
+    fn due(&self, name: &str) -> Due {
+        if self.keys.is_none() || ob::ship_number(name).is_none() {
+            return Due::No;
+        }
+        let listed = self.listed.read().unwrap_or_else(|e| e.into_inner());
+        let asked = listed.asked.get(name).map(|(at, answered)| (at.elapsed(), *answered));
+        let lately = asked.is_some_and(|(since, _)| since < ASK_AGAIN.min(self.fresh_for));
+        match listed.keys.get(name).map(|entry| entry.from) {
+            Some(From::Set | From::Vouched { .. }) => Due::No,
+            Some(From::Read { at, doubted, .. }) if at.elapsed() < self.good_for => {
+                if (doubted || at.elapsed() >= self.fresh_for) && !lately { Due::Soon } else { Due::No }
+            }
+            Some(From::Cleared { at, .. }) if at.elapsed() < self.fresh_for => Due::No,
+            // Nothing held. If Urbit ID said so itself not long ago, that answer stands.
+            _ if lately || asked.is_some_and(|(since, answered)| answered && since < self.fresh_for) => Due::No,
+            _ => Due::Now,
+        }
+    }
+
+    /// Ask Urbit ID about a ship and keep the answer. This waits on the network.
+    ///
+    /// One question about a ship is out at a time. A second asker waits for the first one's
+    /// answer and takes that. And by the time this gets to ask, the answer may already be
+    /// there, in which case nothing is asked.
+    fn read(&self, name: &str) {
+        let (Some(keys), Some(number)) = (&self.keys, ob::ship_number(name)) else { return };
+        {
+            let mut reading = lock(&self.reading);
+            if reading.contains(name) {
+                while reading.contains(name) {
+                    reading = self.read_done.wait(reading).unwrap_or_else(|e| e.into_inner());
+                }
+                return;
+            }
+            reading.insert(name.to_string());
+        }
+        let _asking = Reading(self, name);
+        if self.due(name) == Due::No {
+            return;
+        }
+        let answer = keys.listing(number);
+        let now = Instant::now();
+        let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
+        if !listed.asked.contains_key(name) && listed.asked.len() >= MOST_ASKED {
+            // Forget having asked about ships nothing is held for, and if that is not
+            // enough, about all of them. The cost is asking again sooner than need be.
+            let Listed { keys, asked, .. } = &mut *listed;
+            asked.retain(|name, _| keys.contains_key(name));
+            if asked.len() >= MOST_ASKED {
+                asked.clear();
+            }
+        }
+        listed.asked.insert(name.to_string(), (now, answer.is_ok()));
+        let held = listed.keys.get(name).copied();
+        // How many times the ship's keys had been set, as far as is still believed here,
+        // and as far as this answer says. No such ship is none at all.
+        let believed = match held.map(|entry| entry.from) {
+            Some(From::Read { at, revision, .. } | From::Cleared { at, revision }) if at.elapsed() < self.good_for => Some(revision),
+            _ => None,
+        };
+        let said = match &answer {
+            Ok(listing) => Some(listing.map_or(0, |listing| listing.revision)),
+            Err(_) => None,
+        };
+        // Whether the ship has ever proved a key goes with the ship, whatever its keys
+        // become.
+        let proved = held.is_some_and(|entry| entry.proved);
+        match answer {
+            _ if matches!(held, Some(Entry { from: From::Set, .. })) => {}
+            // A ship's keys are counted upwards and never back. An answer with a lower
+            // count than the one still believed is from somewhere that is behind, and is
+            // not taken, whatever it says: it would put back a key that has been replaced,
+            // or take away one that has since been set.
+            Ok(_) if believed.zip(said).is_some_and(|(believed, said)| said < believed) => {
+                listed.trouble = Some(format!("{name}: an answer gave an earlier revision of its keys than the one held"));
+            }
+            Ok(Some(Listing { key: Some(key), revision, .. })) => {
+                if held.is_none() {
+                    self.room_for_unproved(&mut listed);
+                }
+                listed.keys.insert(name.to_string(), Entry { key, from: From::Read { at: now, revision, doubted: false }, proved });
+            }
+            // The ship has no keys. If it had, what is kept in their place is how many
+            // times they have now been set, so that the old ones are not taken back.
+            Ok(Some(Listing { key: None, revision, .. })) => {
+                if held.is_some() {
+                    listed.keys.insert(name.to_string(), Entry { key: [0; 32], from: From::Cleared { at: now, revision }, proved });
+                }
+            }
+            // There is no such ship, and nothing still believed says there was.
+            Ok(None) => {
+                listed.keys.remove(name);
+            }
+            // No answer. What was held stands, until it is too old to believe.
+            Err(why) => listed.trouble = Some(format!("{name}: {why}")),
+        }
+    }
+
+    /// Make room for the key of one more ship that has proved nothing yet. There always is
+    /// some: past the bound, the older half of such keys are dropped, with the record of
+    /// having asked about them, so that they are asked about afresh if they are wanted.
+    /// Nothing is lost that meeting those ships for the first time would have had.
+    fn room_for_unproved(&self, listed: &mut Listed) {
+        if listed.keys.len() < self.bounds.unproved {
+            return;
+        }
+        let read_at = |entry: &Entry| match entry.from {
+            From::Read { at, .. } | From::Cleared { at, .. } if !entry.proved => Some(at),
+            _ => None,
+        };
+        let mut unproved: Vec<(Instant, String)> = listed.keys.iter().filter_map(|(name, entry)| Some((read_at(entry)?, name.clone()))).collect();
+        if unproved.len() < self.bounds.unproved {
+            return;
+        }
+        unproved.sort();
+        for (_, name) in unproved.into_iter().take(self.bounds.unproved / 2 + 1) {
+            listed.keys.remove(&name);
+            listed.asked.remove(&name);
+        }
+    }
+
+    /// Whether there is room among the ships that are kept for one more. Only what is no
+    /// longer believed is dropped to make it: keys too old, and moons whose parent's word
+    /// has lapsed. If that is not enough there is no room, and the ship cannot be met
+    /// until there is.
+    fn room_for_proved(&self, listed: &mut Listed) -> bool {
+        let kept = |listed: &Listed| listed.keys.values().filter(|entry| entry.proved && !matches!(entry.from, From::Set)).count();
+        if listed.keys.len() < self.bounds.proved || kept(listed) < self.bounds.proved {
+            return true;
+        }
+        self.drop_lapsed(listed);
+        kept(listed) < self.bounds.proved
+    }
+
+    /// Drop what is kept and no longer believed, with the record of having asked about it.
+    fn drop_lapsed(&self, listed: &mut Listed) {
+        let gone = |(name, entry): (&String, &Entry)| match entry.from {
+            From::Set => false,
+            From::Read { at, .. } | From::Cleared { at, .. } => at.elapsed() >= self.good_for,
+            From::Vouched { .. } => self.held(listed, name).is_none(),
+        };
+        let lapsed: Vec<String> = listed.keys.iter().filter(|(name, entry)| gone((*name, *entry))).map(|(name, _)| name.clone()).collect();
+        for name in lapsed {
+            listed.keys.remove(&name);
+            listed.asked.remove(&name);
+        }
+    }
+
+    /// A ship has proved, on a connection, that it holds `key`. Whether that is the key
+    /// held for it here, and it is now among the ships that are kept. Both are settled in
+    /// one step: a connection is taken on the strength of this and nothing looser.
+    fn prove(&self, name: &str, key: &[u8; 32]) -> bool {
+        let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
+        if self.held(&listed, name) != Some(*key) {
+            return false;
+        }
+        if listed.keys.get(name).is_some_and(|entry| entry.proved) {
+            return true;
+        }
+        if !self.room_for_proved(&mut listed) {
+            listed.trouble = Some(format!("{name}: there is no room to keep another ship's key"));
+            return false;
+        }
+        // Still there: making room drops only what is no longer believed, and this is.
+        match listed.keys.get_mut(name) {
+            Some(entry) => entry.proved = true,
+            None => return false,
+        }
+        true
+    }
+
+    /// Something suggests the key held for a ship is out of date: a ship answering to the
+    /// name showed another. The key stands, and is read again at the next chance.
+    fn doubt(&self, name: &str) {
+        let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(Entry { from: From::Read { doubted, .. }, .. }) = listed.keys.get_mut(name) {
+            *doubted = true;
+        }
+    }
+
+    /// Take a moon's key on its parent's word, if the word is good: signed with the key
+    /// held for the parent, and not for an earlier revision than one already seen. The
+    /// moon has proved it holds the key, so it is kept from here on, and so is its parent,
+    /// whose key now has something standing on it.
+    fn vouched(&self, name: &str, key: [u8; 32], proof: &moon::Proof) -> Result<(), &'static str> {
+        let (Some(number), Some(parent)) = (ob::moon_number(name), parent_of(name)) else { return Err("not a moon") };
+        let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
+        let by = self.held(&listed, &parent).ok_or("the moon's parent is not listed")?;
+        if !moon::holds(&by, number, &key, proof) {
+            return Err("not the word of the moon's parent for the key shown");
+        }
+        match listed.keys.get(name) {
+            // Set by whoever runs this runtime, which no word from elsewhere changes.
+            Some(Entry { key: set, from: From::Set, .. }) => return if *set == key { Ok(()) } else { Err("another key is set for the moon here") },
+            // Under the same key of the parent's: only forwards, and one key to a revision.
+            Some(Entry { key: seen, from: From::Vouched { revision, by: then }, .. }) if *then == by => {
+                if proof.revision < *revision || (proof.revision == *revision && *seen != key) {
+                    return Err("the moon has shown a later key than this one");
+                }
+            }
+            _ => {}
+        }
+        // The parent first: its key now has something standing on it, and it is kept.
+        if listed.keys.get(&parent).is_some_and(|parent| !parent.proved) {
+            if !self.room_for_proved(&mut listed) {
+                return Err("there is no room to keep the key of the moon's parent");
+            }
+            if let Some(parent) = listed.keys.get_mut(&parent) {
+                parent.proved = true;
+            }
+        }
+        if !listed.keys.contains_key(name) {
+            // A moon's name ends with its parent's, written at a planet's length.
+            let family = &name[name.len().saturating_sub(14)..];
+            let counted = |listed: &Listed| {
+                let moons = listed.keys.iter().filter(|(_, entry)| matches!(entry.from, From::Vouched { .. }));
+                moons.fold((0, 0), |(all, kin), (other, _)| (all + 1, kin + other.ends_with(family) as usize))
+            };
+            let full = |(all, kin): (usize, usize)| all >= self.bounds.moons || kin >= self.bounds.moons_each;
+            if full(counted(&listed)) {
+                self.drop_lapsed(&mut listed);
+            }
+            if full(counted(&listed)) || !self.room_for_proved(&mut listed) {
+                return Err("there is no room to keep another moon's key");
+            }
+        }
+        // Making room drops only what is no longer believed, and the parent is believed.
+        if self.held(&listed, &parent) != Some(by) {
+            return Err("the moon's parent is not listed");
+        }
+        listed.keys.insert(name.to_string(), Entry { key, from: From::Vouched { revision: proof.revision, by }, proved: true });
+        Ok(())
     }
 }
 
@@ -322,6 +785,10 @@ struct Shared {
     taken: AtomicUsize,
     /// The newest connection from each (calling ship, called ship).
     callers: Mutex<HashMap<Pair, Caller>>,
+    /// The highest number among the callers that have been forgotten to make room. A
+    /// connection numbered at or below it, from a pair nothing is remembered of, may be
+    /// older than one that came and went, and is turned away to try again.
+    forgotten: AtomicU64,
     /// How many connections from other ships have been let in so far. Each is given the
     /// next number as it arrives, before anything is done about it.
     admitted: AtomicU64,
@@ -334,6 +801,14 @@ struct Shared {
     /// Deliveries to other ships the network may still take on. See `NetConfig::max_carrying`.
     carrying: Arc<Semaphore>,
     carrier: Arc<Carrier>,
+    /// Questions to Urbit ID that may still be started.
+    reading_keys: Arc<Semaphore>,
+    /// Ships Urbit ID is being asked about right now, each with the means to wait for the
+    /// answer. Everyone who wants to know about a ship waits on the one question.
+    looking_up: Mutex<HashMap<String, tokio::sync::watch::Receiver<()>>>,
+    /// How many callers nothing is known of may still be looked up in Urbit ID just now,
+    /// and when that was last topped up.
+    meeting: Mutex<(u32, Instant)>,
 }
 
 /// What the network knows about commands waiting to go to other ships.
@@ -459,11 +934,11 @@ impl Network {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
 
         // The side that answers: it shows the key of whichever ship was asked for, and wants
-        // proof of a key the directory lists.
+        // proof of some key. Whose key it is, the caller says once connected.
         let mut answering = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(io::Error::other)?
-            .with_client_cert_verifier(Arc::new(ListedCallers { directory: directory.clone(), supported: provider.signature_verification_algorithms }))
+            .with_client_cert_verifier(Arc::new(AnyCaller { supported: provider.signature_verification_algorithms }))
             .with_cert_resolver(Arc::new(ShipKeys { runtime: runtime.clone(), provider: provider.clone() }));
         answering.alpn_protocols = vec![PROTOCOL.to_vec()];
         // Every connection proves its keys afresh. None picks up where an earlier one left off.
@@ -497,12 +972,16 @@ impl Network {
             made: Mutex::new(HashMap::new()),
             taken: AtomicUsize::new(0),
             callers: Mutex::new(HashMap::new()),
+            forgotten: AtomicU64::new(0),
             admitted: AtomicU64::new(0),
             reading,
             asking,
             working,
             carrying,
             carrier: carrier.clone(),
+            reading_keys: Arc::new(Semaphore::new(MOST_READING)),
+            looking_up: Mutex::new(HashMap::new()),
+            meeting: Mutex::new((MOST_MEETINGS, Instant::now())),
         });
         tokio.spawn(answer_calls(shared.clone()));
         tokio.spawn(carry(shared.clone()));
@@ -538,6 +1017,12 @@ impl Network {
     /// The address other ships reach this runtime at.
     pub fn addr(&self) -> SocketAddr {
         self.shared.endpoint.local_addr().expect("the endpoint is bound")
+    }
+
+    /// How many (calling ship, called ship) pairs this network remembers a connection from.
+    /// It stays within bounds however many ships have called.
+    pub fn callers_remembered(&self) -> usize {
+        lock(&self.shared.callers).len()
     }
 
     /// How many connections are open, made or taken.
@@ -694,24 +1179,23 @@ impl ResolvesServerCert for ShipKeys {
     }
 }
 
-/// For the side that answers: whether a caller's key is one the directory lists.
+/// For the side that answers: a caller must show a ship's key and prove it holds it. Which
+/// ship it is cannot be told from the key, since Urbit ID is looked up by name. The caller
+/// says its name as the first thing on the connection, and nothing is done for it until
+/// the key shown here has been checked against that name.
 #[derive(Debug)]
-struct ListedCallers {
-    directory: Arc<Directory>,
+struct AnyCaller {
     supported: WebPkiSupportedAlgorithms,
 }
 
-impl ClientCertVerifier for ListedCallers {
+impl ClientCertVerifier for AnyCaller {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &[]
     }
 
     fn verify_client_cert(&self, shown: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: UnixTime) -> Result<ClientCertVerified, rustls::Error> {
-        let key = unwrapped(shown.as_ref()).ok_or_else(|| refuse("the caller did not show a ship's key"))?;
-        match self.directory.who(&key) {
-            Some(_) => Ok(ClientCertVerified::assertion()),
-            None => Err(refuse("the caller's key is not listed for any ship")),
-        }
+        unwrapped(shown.as_ref()).ok_or_else(|| refuse("the caller did not show a ship's key"))?;
+        Ok(ClientCertVerified::assertion())
     }
 
     fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
@@ -732,10 +1216,12 @@ impl ClientCertVerifier for ListedCallers {
 }
 
 /// For the side that calls: whether the ship that answered showed the key listed for the ship
-/// that was called.
+/// that was called. With no key expected, any ship's key will do here: that is for a moon
+/// met for the first time, whose key is then checked against its parent's word for it
+/// before anything is asked of it.
 #[derive(Debug)]
 struct ListedKey {
-    expected: Vec<u8>,
+    expected: Option<Vec<u8>>,
     supported: WebPkiSupportedAlgorithms,
 }
 
@@ -748,7 +1234,11 @@ impl ServerCertVerifier for ListedKey {
         _: &[u8],
         _: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if shown.as_ref() == self.expected {
+        let fits = match &self.expected {
+            Some(expected) => shown.as_ref() == expected,
+            None => unwrapped(shown.as_ref()).is_some(),
+        };
+        if fits {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(refuse("the ship that answered did not show the key listed for the ship that was called"))
@@ -775,13 +1265,13 @@ impl ServerCertVerifier for ListedKey {
 impl Shared {
     /// Send one request and read its reply, over a connection made for this pair of ships,
     /// all within the time allowed for a request.
-    async fn ask(&self, from: &str, to: &str, request: PeerRequest) -> Result<PeerReply, NetError> {
+    async fn ask(self: &Arc<Self>, from: &str, to: &str, request: PeerRequest) -> Result<PeerReply, NetError> {
         self.ask_keyed(from, to, request).await.map(|(reply, _)| reply)
     }
 
     /// The same, also returning the key the ship that answered proved it holds: the one the
     /// directory listed for it when the connection was made.
-    async fn ask_keyed(&self, from: &str, to: &str, request: PeerRequest) -> Result<(PeerReply, [u8; 32]), NetError> {
+    async fn ask_keyed(self: &Arc<Self>, from: &str, to: &str, request: PeerRequest) -> Result<(PeerReply, [u8; 32]), NetError> {
         let from = canonical_ship(from).map_err(|_| NetError::NotHere(from.to_string()))?;
         let to = canonical_ship(to).map_err(|_| NetError::Unlisted(to.to_string()))?;
         let deadline = tokio::time::Instant::now().checked_add(self.cfg.request_timeout).ok_or(NetError::TimedOut)?;
@@ -827,7 +1317,11 @@ impl Shared {
             made.retain(|(_, to), kept| {
                 let in_use = Arc::strong_count(kept) > 1;
                 in_use || kept.try_lock().map_or(true, |held| {
-                    let keep = held.as_ref().is_some_and(|made| made.connection.close_reason().is_none() && self.directory.lookup(to) == Some(made.peer));
+                    // And neither does one to a ship that is no longer among those that are
+                    // kept, and cannot be again: it could not be used either.
+                    let keep = held.as_ref().is_some_and(|made| {
+                        made.connection.close_reason().is_none() && self.directory.lookup(to) == Some(made.peer) && self.directory.prove(to, &made.peer.key)
+                    });
                     if let Some(made) = held.as_ref().filter(|_| !keep) {
                         made.connection.close(VarInt::from_u32(2), b"no longer needed");
                     }
@@ -843,11 +1337,13 @@ impl Shared {
 
     /// The connection from one of this runtime's ships to another ship, made if there is
     /// none, and the key the other ship proved it holds when it was made.
-    async fn connection(&self, from: &str, to: &str) -> Result<(Connection, [u8; 32]), NetError> {
+    async fn connection(self: &Arc<Self>, from: &str, to: &str) -> Result<(Connection, [u8; 32]), NetError> {
         let key = self.runtime.signing_key(from).map_err(|_| NetError::NotHere(from.to_string()))?;
         let shown = key.verifying_key().to_bytes();
         let pair = (from.to_string(), to.to_string());
-        if self.directory.lookup(to).is_none() {
+        // If the directory reads its keys from Urbit ID, see that it has this ship's.
+        self.know(to, 0).await;
+        if self.directory.reach(to).is_none() {
             // Not listed, so not called, whatever room there is for calls. A connection made
             // while it was listed is closed, unless some call is still holding it.
             let mut made = lock(&self.made);
@@ -864,7 +1360,7 @@ impl Shared {
         // and does not make another. Calls to other ships have their own.
         let mut kept = slot.lock().await;
         // Read after any wait, so it is what the directory says now.
-        let Some(peer) = self.directory.lookup(to) else {
+        let Some(reach) = self.directory.reach(to) else {
             // The ship is no longer listed. A connection made while it was is closed, not left
             // open with nothing to use it.
             if let Some(made) = kept.take() {
@@ -876,10 +1372,15 @@ impl Shared {
             // A connection proves what was true when it was made. If the directory now lists
             // a different key or address for the ship, or the calling ship would now show a
             // different key, that proof is stale: start again.
-            if made.connection.close_reason().is_none() && made.peer == peer && made.shown == shown {
-                let connection = made.connection.clone();
+            // And the ship must still be among those that are kept. What was held for it
+            // when the connection was made may since have lapsed and been read afresh, as
+            // the key of a ship that has proved nothing: the connection is the proof, and
+            // counts again here, if there is room.
+            let stands = made.connection.close_reason().is_none() && Some(made.peer.key) == reach.key && made.peer.addr == reach.addr && made.shown == shown;
+            if stands && self.directory.prove(to, &made.peer.key) {
+                let (connection, proved) = (made.connection.clone(), made.peer.key);
                 *kept = Some(made);
-                return Ok((connection, peer.key));
+                return Ok((connection, proved));
             }
             made.connection.close(VarInt::from_u32(2), b"the directory changed");
         }
@@ -888,7 +1389,10 @@ impl Shared {
         // This side shows the calling ship's key, and accepts only the key listed for the ship
         // being called.
         let shows = proof(&key, &self.provider).map_err(|e| unreachable(&e))?;
-        let expects = ListedKey { expected: wrapped(&peer.key), supported: self.provider.signature_verification_algorithms };
+        // A moon may have been given a new key since it was last met, which only the moon
+        // can show. So any key is let through here for a moon, and looked at below.
+        let expected = if ob::moon_number(to).is_some() { None } else { reach.key };
+        let expects = ListedKey { expected: expected.as_ref().map(wrapped), supported: self.provider.signature_verification_algorithms };
         let mut calling = rustls::ClientConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| unreachable(&e))?
@@ -902,8 +1406,50 @@ impl Shared {
         // start any of its own on it.
         client.transport_config(Arc::new(transport(&self.cfg, 0).map_err(|e| unreachable(&e))?));
 
-        let connecting = self.endpoint.connect_with(client, peer.addr, to).map_err(|e| unreachable(&e))?;
-        let connection = connecting.await.map_err(|e| unreachable(&e))?;
+        let connecting = self.endpoint.connect_with(client, reach.addr, to).map_err(|e| unreachable(&e))?;
+        let connection = match connecting.await {
+            Ok(connection) => connection,
+            Err(e) => {
+                // It may be that the ship has a new key, and the one held for it is old.
+                self.directory.doubt(to);
+                return Err(unreachable(&e));
+            }
+        };
+        // Say which ship is calling, and hear that it is believed. Nothing else is said on
+        // the connection before that.
+        let welcome = match self.hello(&connection, from).await {
+            Ok(welcome) => welcome,
+            Err(e) => {
+                connection.close(VarInt::from_u32(1), b"no welcome");
+                return Err(e);
+            }
+        };
+        let Some(proved) = shown_key(&connection) else {
+            connection.close(VarInt::from_u32(1), b"no key shown");
+            return Err(NetError::Unreachable("the ship that answered showed no key".into()));
+        };
+        // A moon shows its parent's word for its key, and that word is taken in whether or
+        // not the key is the one already held: it may be for a later revision, and what
+        // was seen latest is what holds earlier ones off.
+        let word = welcome.proof.as_ref().and_then(proof_read).ok_or("the moon did not show its parent's word for its key");
+        let vouched = word.and_then(|proof| self.directory.vouched(to, proved, &proof));
+        if reach.key != Some(proved) {
+            // Only a moon gets this far having shown a key other than the one held for it:
+            // one never met, or one that has been given a new key. It has proved it holds
+            // the key it showed, and that key is the moon's if the moon's parent has given
+            // its word for it, at no earlier a revision than any seen before.
+            if let Err(why) = vouched {
+                connection.close(VarInt::from_u32(1), b"not the moon that was called");
+                return Err(NetError::Unreachable(why.to_string()));
+            }
+        }
+        // The ship has proved it holds the key held for it. From now on it is among the
+        // ships that are kept; if there is no room for it there, it cannot be called.
+        if !self.directory.prove(to, &proved) {
+            connection.close(VarInt::from_u32(2), b"the directory changed");
+            return Err(NetError::Unreachable("the key the ship proved is no longer the one held for it, or there is no room to keep it".into()));
+        }
+        let peer = Peer { key: proved, addr: reach.addr };
         // Connecting took time. If the directory changed meanwhile, what was just proved is
         // already out of date.
         if self.directory.lookup(to) != Some(peer) {
@@ -913,7 +1459,149 @@ impl Shared {
         *kept = Some(Made { connection: connection.clone(), peer, shown });
         Ok((connection, peer.key))
     }
+
+    /// The first thing said on a connection this runtime has made: which ship is calling,
+    /// and for a moon its parent's word for its key. The answer says the caller is believed.
+    async fn hello(&self, connection: &Connection, from: &str) -> Result<Welcome, NetError> {
+        let lost = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
+        let proof = self.runtime.moon_proof(from).map(|proof| MoonProof { revision: proof.revision, signed: proof.signed.to_vec() });
+        let said = PeerRequest { body: Some(peer_request::Body::Hello(Hello { ship: from.to_string(), proof })) };
+        let (mut send, mut receive) = connection.open_bi().await.map_err(|e| lost(&e))?;
+        send.write_all(&said.encode_to_vec()).await.map_err(|e| lost(&e))?;
+        send.finish().map_err(|e| lost(&e))?;
+        let answer = read_whole(&mut receive, MOST_HELLO_BYTES).await.ok_or_else(|| lost(&"the ship called did not say whether the caller is believed"))?;
+        match PeerReply::decode(&*answer) {
+            Ok(PeerReply { body: Some(peer_reply::Body::Welcome(welcome)), .. }) => Ok(welcome),
+            Ok(PeerReply { body: None, refused }) => Err(NetError::Refused(refused)),
+            _ => Err(NetError::Garbled),
+        }
+    }
+
+    /// See that what the directory holds for a ship is recent enough to go on with, asking
+    /// Urbit ID if need be. For a moon, the ship that matters is its parent. A directory
+    /// that is a fixed list has nothing to ask.
+    async fn know(self: &Arc<Self>, ship: &str, spare: usize) {
+        let subject = parent_of(ship).unwrap_or_else(|| ship.to_string());
+        match self.directory.due(&subject) {
+            Due::No => {}
+            Due::Soon => self.read_soon(subject, spare),
+            Due::Now => self.read(&subject, spare).await,
+        }
+    }
+
+    /// Whether one more caller that nothing is known of may be looked up just now.
+    fn may_meet(&self) -> bool {
+        let mut meeting = lock(&self.meeting);
+        let (left, at) = *meeting;
+        let earned = (at.elapsed().as_secs_f64() * MOST_MEETINGS as f64) as u32;
+        if earned > 0 {
+            *meeting = (left.saturating_add(earned).min(MOST_MEETINGS), Instant::now());
+        }
+        if meeting.0 == 0 {
+            return false;
+        }
+        meeting.0 -= 1;
+        true
+    }
+
+    /// If the key held for a ship that has called (or, for a moon, its parent) is due to
+    /// be read again, start that, and do not wait for it. Like anything done because of
+    /// who is calling, it gets only half the places for questions.
+    fn freshen(self: &Arc<Self>, ship: &str) {
+        let subject = parent_of(ship).unwrap_or_else(|| ship.to_string());
+        if self.directory.due(&subject) != Due::No {
+            self.read_soon(subject, MOST_LOOKUPS / 2);
+        }
+    }
+
+    /// Ask Urbit ID about a ship, without waiting for the answer, if there is room for
+    /// one more question with `spare` places left free.
+    fn read_soon(self: &Arc<Self>, ship: String, spare: usize) {
+        drop(self.asked(&ship, spare));
+    }
+
+    /// Ask Urbit ID about a ship and wait for the directory to have the answer, if there
+    /// is room for one more question. If the one waiting here gives up, the question is
+    /// still seen through. `spare` is how many of the places for questions are to be left
+    /// free for others.
+    async fn read(self: &Arc<Self>, ship: &str, spare: usize) {
+        if let Some(mut answered) = self.asked(ship, spare) {
+            // Done when the asking ends, however it ends.
+            let _ = answered.changed().await;
+        }
+    }
+
+    /// The means to wait for an answer about a ship: the question already out about it, or
+    /// a new one. One question about a ship is out at a time, and those who wait for it
+    /// hold nothing while they wait. Asking waits on the network, so it is done on a thread
+    /// that may wait, and only so many questions are out at once. `None` if this would be
+    /// a new question and there are as many waiting as there may be.
+    fn asked(self: &Arc<Self>, ship: &str, spare: usize) -> Option<tokio::sync::watch::Receiver<()>> {
+        let mut looking_up = lock(&self.looking_up);
+        if let Some(answered) = looking_up.get(ship) {
+            return Some(answered.clone());
+        }
+        if looking_up.len() >= MOST_LOOKUPS.saturating_sub(spare) {
+            return None;
+        }
+        let (done, answered) = tokio::sync::watch::channel(());
+        looking_up.insert(ship.to_string(), answered.clone());
+        let (shared, ship) = (self.clone(), ship.to_string());
+        tokio::spawn(async move {
+            if let Ok(turn) = shared.reading_keys.clone().acquire_owned().await {
+                let (directory, name) = (shared.directory.clone(), ship.clone());
+                let asked = tokio::task::spawn_blocking(move || {
+                    directory.read(&name);
+                    drop(turn);
+                });
+                let _ = asked.await;
+            }
+            lock(&shared.looking_up).remove(&ship);
+            drop(done);
+        });
+        Some(answered)
+    }
+
+    /// Whether a ship that has said its name, and proved it holds the key `shown`, is the
+    /// ship of that name. Its canonical name if so.
+    async fn admit(self: &Arc<Self>, shown: [u8; 32], hello: &Hello) -> Option<String> {
+        let caller = canonical_ship(&hello.ship).ok()?;
+        let subject = parent_of(&caller).unwrap_or_else(|| caller.clone());
+        if self.directory.due(&subject) == Due::Now && !self.may_meet() {
+            return None;
+        }
+        // A caller's say-so gets only half the places for questions.
+        self.know(&caller, MOST_LOOKUPS / 2).await;
+        if ob::moon_number(&caller).is_some() {
+            // A moon is believed on its parent's word, if it brings one.
+            if let Some(proof) = hello.proof.as_ref().and_then(proof_read) {
+                self.directory.vouched(&caller, shown, &proof).ok()?;
+            }
+        } else if self.directory.key_of(&caller) != Some(shown) {
+            // The key held for that name may be from before the ship was given a new one.
+            // Read it again, if that has not just been done, and then see.
+            self.directory.doubt(&caller);
+            if self.directory.due(&caller) != Due::No {
+                self.read(&caller, MOST_LOOKUPS / 2).await;
+            }
+        }
+        // Believed only if the key shown is the one held for the name, and the ship is from
+        // now on among those that are kept: settled together, in one step.
+        self.directory.prove(&caller, &shown).then_some(caller)
+    }
 }
+
+/// The key the other end of a connection proved it holds.
+fn shown_key(connection: &Connection) -> Option<[u8; 32]> {
+    let shown = connection.peer_identity()?.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    unwrapped(shown.first()?.as_ref())
+}
+
+/// A moon's proof as it travels, if it is the right shape.
+fn proof_read(proof: &MoonProof) -> Option<moon::Proof> {
+    Some(moon::Proof { revision: proof.revision, signed: proof.signed.as_slice().try_into().ok()? })
+}
+
 
 /// A place among the connections from other ships, given up when the connection ends.
 struct Place(Arc<Shared>);
@@ -965,6 +1653,13 @@ struct Caller {
     connection: Option<Connection>,
 }
 
+/// How many (calling ship, called ship) pairs are remembered before those with no
+/// connection open are forgotten. Open connections are within `max_connections`, so this
+/// always leaves room for them.
+fn most_callers(cfg: &NetConfig) -> usize {
+    cfg.max_connections.saturating_mul(2).saturating_add(16)
+}
+
 /// Whether the connection `id` is still the newest from that ship to the ship here.
 fn newest_from(shared: &Shared, pair: &Pair, id: usize) -> bool {
     let callers = lock(&shared.callers);
@@ -976,7 +1671,10 @@ fn newest_from(shared: &Shared, pair: &Pair, id: usize) -> bool {
 async fn answer_caller(shared: Arc<Shared>, incoming: Incoming, _place: Place, admission: u64) {
     let Ok(connecting) = incoming.accept() else { return };
     let Ok(Ok(connection)) = tokio::time::timeout(shared.cfg.request_timeout, connecting).await else { return };
-    let Some(pair) = parties(&shared, &connection) else {
+    // The caller has proved it holds a key. It now says which ship it is, and is believed
+    // if that key is the one listed for the name.
+    let greeted = tokio::time::timeout(shared.cfg.request_timeout, greet(&shared, &connection)).await;
+    let Some(pair) = greeted.ok().flatten().and_then(|caller| parties(&shared, &connection, &caller)) else {
         connection.close(VarInt::from_u32(1), b"not a ship this runtime knows");
         return;
     };
@@ -986,9 +1684,23 @@ async fn answer_caller(shared: Arc<Shared>, incoming: Incoming, _place: Place, a
     // the older of the two, however late it comes to this point, and is closed.
     {
         let mut callers = lock(&shared.callers);
-        if callers.get(&pair).is_some_and(|newest| newest.admission > admission) {
+        let newest = callers.get(&pair).map(|newest| newest.admission);
+        if newest.is_some_and(|newest| newest > admission) || (newest.is_none() && admission <= shared.forgotten.load(Ordering::SeqCst)) {
             connection.close(VarInt::from_u32(5), b"replaced by a newer connection");
             return;
+        }
+        // Only so many pairs are remembered. Past that, those with no connection open are
+        // forgotten, and the highest of their numbers is kept in their place.
+        if newest.is_none() && callers.len() >= most_callers(&shared.cfg) {
+            let mut highest = 0;
+            callers.retain(|_, caller| {
+                let open = caller.connection.as_ref().is_some_and(|connection| connection.close_reason().is_none());
+                if !open {
+                    highest = highest.max(caller.admission);
+                }
+                open
+            });
+            shared.forgotten.fetch_max(highest, Ordering::SeqCst);
         }
         let older = callers.insert(pair.clone(), Caller { admission, connection: Some(connection.clone()) });
         if let Some(older) = older.and_then(|older| older.connection) {
@@ -1022,7 +1734,9 @@ async fn answer_request(shared: Arc<Shared>, connection: Connection, pair: Pair,
         // with the whole request in hand and just before acting on it: the directory may
         // since have given that ship a new key or dropped it. A request that began arriving
         // while its sender was still listed is not acted on once it is not.
-        if parties(&shared, &connection).as_ref() != Some(&pair) {
+        // If its key was read from Urbit ID a while ago, it is read again, behind this.
+        shared.freshen(&pair.0);
+        if parties(&shared, &connection, &pair.0).as_ref() != Some(&pair) {
             connection.close(VarInt::from_u32(2), b"the directory changed");
             return;
         }
@@ -1061,15 +1775,38 @@ async fn reply(send: &mut SendStream, reply: &PeerReply) {
 }
 
 /// Who is at each end of a connection from another ship, as things stand now: the calling
-/// ship, known by the key it proved it holds, and the ship of this runtime that it asked for.
-fn parties(shared: &Shared, connection: &Connection) -> Option<Pair> {
-    let shown = connection.peer_identity()?.downcast::<Vec<CertificateDer<'static>>>().ok()?;
-    let caller = shared.directory.who(&unwrapped(shown.first()?.as_ref())?)?;
+/// ship, if the key it proved it holds is the one listed for the name it gave, and the
+/// ship of this runtime that it asked for.
+fn parties(shared: &Shared, connection: &Connection, caller: &str) -> Option<Pair> {
+    if shared.directory.proved_key_of(caller)? != shown_key(connection)? {
+        return None;
+    }
+    Some((caller.to_string(), called(shared, connection)?))
+}
+
+/// The ship of this runtime that a connection from another ship asked for.
+fn called(shared: &Shared, connection: &Connection) -> Option<String> {
     let handshake = connection.handshake_data()?.downcast::<HandshakeData>().ok()?;
     let called = canonical_ship(handshake.server_name.as_deref()?).ok()?;
     // The ship is one this runtime holds, or no key could have been shown for it.
     shared.runtime.signing_key(&called).ok()?;
-    Some((caller, called))
+    Some(called)
+}
+
+/// Hear which ship is calling, on the first stream of its connection, and answer if it is
+/// believed. The name of the caller if so. Nothing else on the connection is looked at
+/// until this is done.
+async fn greet(shared: &Arc<Shared>, connection: &Connection) -> Option<String> {
+    let (mut send, mut receive) = connection.accept_bi().await.ok()?;
+    let said = read_whole(&mut receive, MOST_HELLO_BYTES).await?;
+    let Ok(PeerRequest { body: Some(peer_request::Body::Hello(hello)) }) = PeerRequest::decode(&*said) else { return None };
+    let called = called(shared, connection)?;
+    let caller = shared.admit(shown_key(connection)?, &hello).await?;
+    // If the ship called is a moon, the caller may not know its key, and is shown its
+    // parent's word for it.
+    let proof = shared.runtime.moon_proof(&called).map(|proof| MoonProof { revision: proof.revision, signed: proof.signed.to_vec() });
+    reply(&mut send, &PeerReply { body: Some(peer_reply::Body::Welcome(Welcome { proof })), refused: String::new() }).await;
+    Some(caller)
 }
 
 /// What a ship says to a request of a kind it does not know.
@@ -1780,6 +2517,333 @@ async fn carry_messages(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for Urbit ID in which every galaxy, star and planet has a key at
+    /// revision one, made from its number, unless the test has said otherwise for it:
+    /// a key (or none) at some revision, or that there is no such ship.
+    #[derive(Default)]
+    struct Told(Mutex<HashMap<u32, Option<(Option<[u8; 32]>, u32)>>>, AtomicUsize, AtomicU64);
+
+    impl Told {
+        /// How many times it has been asked.
+        fn asked(&self) -> usize {
+            self.1.load(Ordering::SeqCst)
+        }
+
+        /// Take this many milliseconds over every answer from now on.
+        fn slow(&self, millis: u64) {
+            self.2.store(millis, Ordering::SeqCst);
+        }
+    }
+
+    impl Told {
+        fn say(&self, ship: u32, listing: Option<(Option<[u8; 32]>, u32)>) {
+            lock(&self.0).insert(ship, listing);
+        }
+    }
+
+    impl Keys for Told {
+        fn listing(&self, ship: u32) -> Result<Option<Listing>, String> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(self.2.load(Ordering::SeqCst)));
+            let (key, revision) = match lock(&self.0).get(&ship) {
+                Some(None) => return Ok(None),
+                Some(Some(told)) => *told,
+                None => (Some(key_of_number(ship)), 1),
+            };
+            Ok(Some(Listing { key, revision, continuity: 0, sponsor: None }))
+        }
+    }
+
+    fn key_of_number(ship: u32) -> [u8; 32] {
+        let mut key = [0x55; 32];
+        key[..4].copy_from_slice(&ship.to_be_bytes());
+        key
+    }
+
+    fn name(ship: u32) -> String {
+        ob::ship_name(ship).trim_start_matches('~').to_string()
+    }
+
+    fn moon_of(planet: u32, nth: u64) -> (u64, String) {
+        let moon = nth << 32 | planet as u64;
+        (moon, ob::moon_name(moon).unwrap().trim_start_matches('~').to_string())
+    }
+
+    /// A directory with little room, whose keys are read again as soon as they are a
+    /// moment old and are believed for `good_for`.
+    fn small(told: &Arc<Told>, good_for: Duration) -> Arc<Directory> {
+        let bounds = Bounds { proved: 12, unproved: 8, moons: 5, moons_each: 3 };
+        Directory::made(Some(told.clone()), Duration::from_millis(1), good_for, bounds)
+    }
+
+    /// Read a ship's key again, as the network would once something had cast doubt on it.
+    fn reread(directory: &Directory, ship: u32) {
+        std::thread::sleep(Duration::from_millis(3));
+        directory.doubt(&name(ship));
+        directory.read(&name(ship));
+    }
+
+    /// Have `count` planets nobody has heard of looked up, starting from `first`.
+    fn crowd(directory: &Directory, first: u32, count: u32) {
+        for ship in first..first + count {
+            directory.read(&name(ship));
+        }
+    }
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn keys_nobody_has_proved_make_way_for_each_other_and_for_nothing_else() {
+        let told = Arc::new(Told::default());
+        let directory = small(&told, HOUR);
+        let count = |directory: &Directory| directory.listed.read().unwrap().keys.len();
+        // Eight planets are looked up because someone said their names. None proves
+        // anything. There is room for eight such.
+        crowd(&directory, 0x1000_0000, 8);
+        assert_eq!(count(&directory), 8);
+        assert_eq!(directory.key_of(&name(0x1000_0000)), Some(key_of_number(0x1000_0000)));
+        // The ninth has the older half dropped, and the record of asking about them, so
+        // that they are asked about afresh if they are wanted. The newer ones stay.
+        std::thread::sleep(Duration::from_millis(3));
+        crowd(&directory, 0x1000_0008, 1);
+        assert_eq!(count(&directory), 4);
+        assert_eq!(directory.key_of(&name(0x1000_0000)), None);
+        assert_eq!(directory.due(&name(0x1000_0000)), Due::Now);
+        // Only what was dropped is forgotten: not the ones that stay, not the one room
+        // was made for, and not a ship that was asked about and found to have no keys.
+        let asked = |ship: u32| directory.listed.read().unwrap().asked.contains_key(&name(ship));
+        assert!((0x1000_0000..0x1000_0005).all(|ship| !asked(ship)));
+        assert!((0x1000_0005..0x1000_0009).all(asked));
+        assert_eq!(directory.key_of(&name(0x1000_0007)), Some(key_of_number(0x1000_0007)));
+        assert_eq!(directory.key_of(&name(0x1000_0008)), Some(key_of_number(0x1000_0008)));
+        // A key nobody has proved is a key all the same, to call a ship by. It is not one
+        // a connection from that ship is taken on.
+        assert_eq!(directory.proved_key_of(&name(0x1000_0008)), None);
+        told.say(0x2000_0003, Some((None, 9)));
+        directory.read(&name(0x2000_0003));
+        std::thread::sleep(Duration::from_millis(3));
+        crowd(&directory, 0x1000_0010, 12);
+        assert!(asked(0x2000_0003) && asked(0x1000_001b) && !asked(0x1000_0005));
+
+        // A ship that proves its key is kept, however many names are said after it. So is
+        // one set by hand. Proving takes the key held, and no other, and a ship held.
+        let (proved, set) = (0x2000_0000u32, 0x2000_0001u32);
+        directory.read(&name(proved));
+        assert!(!directory.prove(&name(proved), &[9; 32]));
+        assert!(!directory.prove(&name(0x2000_0009), &key_of_number(0x2000_0009)));
+        assert_eq!(directory.proved_key_of(&name(proved)), None);
+        assert!(directory.prove(&name(proved), &key_of_number(proved)));
+        assert_eq!(directory.proved_key_of(&name(proved)), Some(key_of_number(proved)));
+        directory.set(&name(set), [4; 32], "127.0.0.1:9".parse().unwrap()).unwrap();
+        crowd(&directory, 0x1100_0000, 40);
+        assert!(count(&directory) <= 8 + 2);
+        assert_eq!(directory.key_of(&name(proved)), Some(key_of_number(proved)));
+        assert_eq!(directory.key_of(&name(set)), Some([4; 32]));
+
+        // Its keys are replaced in Urbit ID: revision two. It was kept for having proved
+        // the old one, and it is kept still, though nobody has proved the new one. So what
+        // is known of it is still there after another crowd, and an answer from somewhere
+        // that is behind, with the old key, is not news.
+        let later = [7; 32];
+        told.say(proved, Some((Some(later), 2)));
+        reread(&directory, proved);
+        assert_eq!(directory.key_of(&name(proved)), Some(later));
+        crowd(&directory, 0x1200_0000, 40);
+        assert_eq!(directory.key_of(&name(proved)), Some(later));
+        told.say(proved, Some((Some(key_of_number(proved)), 1)));
+        reread(&directory, proved);
+        assert_eq!(directory.key_of(&name(proved)), Some(later));
+        // The same when its keys are taken away: revision three. Nothing answers to its
+        // name, and the keys it had do not come back, crowd or no crowd.
+        told.say(proved, Some((None, 3)));
+        reread(&directory, proved);
+        assert_eq!(directory.key_of(&name(proved)), None);
+        crowd(&directory, 0x1300_0000, 40);
+        for behind in [Some((Some(later), 2)), Some((Some(key_of_number(proved)), 1)), None] {
+            told.say(proved, behind);
+            std::thread::sleep(Duration::from_millis(3));
+            directory.read(&name(proved));
+            assert_eq!(directory.key_of(&name(proved)), None, "{behind:?}");
+        }
+        // A key set after that is taken, and the ship is still one that is kept.
+        told.say(proved, Some((Some([8; 32]), 4)));
+        std::thread::sleep(Duration::from_millis(3));
+        directory.read(&name(proved));
+        assert_eq!(directory.proved_key_of(&name(proved)), Some([8; 32]));
+
+        // A ship nobody has proved, whose keys are taken away, is only as well remembered
+        // as its key was: a crowd has it forgotten, and then an old answer is taken.
+        let unproved = 0x2000_0002u32;
+        directory.read(&name(unproved));
+        told.say(unproved, Some((None, 5)));
+        reread(&directory, unproved);
+        assert_eq!(directory.key_of(&name(unproved)), None);
+        // A directory told to keep none of these keeps one all the same, and only one.
+        let none = Directory::made(Some(told.clone()), Duration::from_millis(1), HOUR, Bounds { unproved: 0, ..Bounds::default() });
+        crowd(&none, 0x1400_0000, 5);
+        assert_eq!(count(&none), 1);
+        assert_eq!(none.key_of(&name(0x1400_0004)), Some(key_of_number(0x1400_0004)));
+        // A ship never held, with no keys, takes no room at all.
+        let before = count(&directory);
+        told.say(0x2000_0003, Some((None, 9)));
+        directory.read(&name(0x2000_0003));
+        assert_eq!(count(&directory), before);
+    }
+
+    #[test]
+    fn only_so_many_ships_are_kept_and_none_is_dropped_while_it_is_believed() {
+        let told = Arc::new(Told::default());
+        let directory = small(&told, HOUR);
+        // Twelve ships prove their keys. That is as many as are kept.
+        for ship in 0x3000_0000..0x3000_000cu32 {
+            directory.read(&name(ship));
+            assert!(directory.prove(&name(ship), &key_of_number(ship)), "{ship:x}");
+        }
+        // A thirteenth is looked up, and can be called by its key, but there is no room
+        // to keep it: no connection from it is taken, and none of the twelve is lost.
+        // (Two more are looked up beside it. Ships that have proved nothing make way only
+        // for each other, when there are too many of them, and three is not too many
+        // however many ships of the other kind there are.)
+        let extra = 0x3000_00ffu32;
+        directory.read(&name(extra - 2));
+        directory.read(&name(extra - 1));
+        directory.read(&name(extra));
+        assert_eq!(directory.key_of(&name(extra - 2)), Some(key_of_number(extra - 2)));
+        assert_eq!(directory.key_of(&name(extra - 1)), Some(key_of_number(extra - 1)));
+        assert_eq!(directory.key_of(&name(extra)), Some(key_of_number(extra)));
+        assert!(!directory.prove(&name(extra), &key_of_number(extra)));
+        assert!(directory.trouble().is_some_and(|why| why.contains("no room")));
+        assert_eq!(directory.proved_key_of(&name(extra)), None);
+        for ship in 0x3000_0000..0x3000_000cu32 {
+            assert_eq!(directory.proved_key_of(&name(ship)), Some(key_of_number(ship)));
+        }
+        // One of the twelve proving its key again is no trouble.
+        assert!(directory.prove(&name(0x3000_0000), &key_of_number(0x3000_0000)));
+
+        // Where keys are believed only briefly, the ones that have lapsed make way.
+        let brief = small(&told, Duration::from_millis(40));
+        for ship in 0x3000_0000..0x3000_000cu32 {
+            brief.read(&name(ship));
+            assert!(brief.prove(&name(ship), &key_of_number(ship)));
+        }
+        brief.read(&name(extra));
+        assert!(!brief.prove(&name(extra), &key_of_number(extra)));
+        std::thread::sleep(Duration::from_millis(60));
+        brief.read(&name(extra));
+        assert!(brief.prove(&name(extra), &key_of_number(extra)));
+        assert!(brief.listed.read().unwrap().keys.len() <= 2);
+    }
+
+    #[test]
+    fn a_ship_is_asked_about_once_at_a_time_and_not_again_at_once() {
+        let told = Arc::new(Told::default());
+        // Keys here are good for a while, as they usually are.
+        let directory = Directory::made(Some(told.clone()), Duration::from_secs(60), HOUR, Bounds::default());
+        let ship = name(0x5000_0000);
+        // Several want to know about one ship at the same moment, as happens when one
+        // directory serves more than one network. Urbit ID is slow. It is asked once, and
+        // the rest wait for that answer and take it.
+        told.slow(200);
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                scope.spawn(|| directory.read(&ship));
+            }
+        });
+        assert_eq!(told.asked(), 1);
+        assert_eq!(directory.key_of(&ship), Some(key_of_number(0x5000_0000)));
+        // And one whose turn to ask comes after the answer is in does not ask again.
+        told.slow(0);
+        directory.read(&ship);
+        directory.read(&ship);
+        assert_eq!(told.asked(), 1);
+        // Another ship is another question.
+        directory.read(&name(0x5000_0001));
+        assert_eq!(told.asked(), 2);
+    }
+
+    #[test]
+    fn moons_are_kept_within_bounds_and_with_the_ship_they_stand_on() {
+        let told = Arc::new(Told::default());
+        let directory = small(&told, HOUR);
+        let key = |nth: u8| [nth; 32];
+        // Three planets with real keys, as Urbit ID has them. Nobody has proved them.
+        let planets = [0x4000_0000u32, 0x4000_0001, 0x4000_0002];
+        let parents: Vec<ed25519_dalek::SigningKey> = (1..=3).map(|n| ed25519_dalek::SigningKey::from_bytes(&[n; 32])).collect();
+        for (planet, parent) in planets.iter().zip(&parents) {
+            told.say(*planet, Some((Some(parent.verifying_key().to_bytes()), 1)));
+        }
+        // The directory is as full as it gets of names that were only said, the first
+        // planet's among them. Its moon shows the planet's word, at revision two.
+        directory.read(&name(planets[0]));
+        crowd(&directory, 0x1000_0000, 7);
+        let (moon, moon_name) = moon_of(planets[0], 1);
+        directory.vouched(&moon_name, key(2), &moon::vouch(&parents[0], moon, 2, &key(2))).unwrap();
+        // The planet now has something standing on it, and is kept with its moon however
+        // many names are said afterwards. And what was seen of the moon is kept: its
+        // earlier key does not come back.
+        crowd(&directory, 0x1100_0000, 40);
+        assert_eq!(directory.key_of(&name(planets[0])), Some(parents[0].verifying_key().to_bytes()));
+        assert_eq!(directory.proved_key_of(&moon_name), Some(key(2)));
+        assert!(directory.vouched(&moon_name, key(1), &moon::vouch(&parents[0], moon, 1, &key(1))).is_err());
+
+        // A ship has room for three moons here. A fourth is not kept, and the three are
+        // untouched.
+        for nth in 2..=3 {
+            let (moon, moon_name) = moon_of(planets[0], nth);
+            directory.vouched(&moon_name, key(10 + nth as u8), &moon::vouch(&parents[0], moon, 1, &key(10 + nth as u8))).unwrap();
+        }
+        let (fourth, fourth_name) = moon_of(planets[0], 4);
+        assert_eq!(directory.vouched(&fourth_name, key(9), &moon::vouch(&parents[0], fourth, 1, &key(9))), Err("there is no room to keep another moon's key"));
+        assert_eq!(directory.key_of(&moon_name), Some(key(2)));
+        // There is room for five moons in all: two of the second planet's, and then none
+        // of the third's, though it has none here yet.
+        directory.read(&name(planets[1]));
+        directory.read(&name(planets[2]));
+        for nth in 1..=2 {
+            let (moon, moon_name) = moon_of(planets[1], nth);
+            directory.vouched(&moon_name, key(20 + nth as u8), &moon::vouch(&parents[1], moon, 1, &key(20 + nth as u8))).unwrap();
+        }
+        let (sixth, sixth_name) = moon_of(planets[2], 1);
+        assert_eq!(directory.vouched(&sixth_name, key(30), &moon::vouch(&parents[2], sixth, 1, &key(30))), Err("there is no room to keep another moon's key"));
+        // A moon already kept still moves on to a later key.
+        directory.vouched(&moon_name, key(3), &moon::vouch(&parents[0], moon, 3, &key(3))).unwrap();
+        assert_eq!(directory.key_of(&moon_name), Some(key(3)));
+
+        // The first planet's key is replaced in Urbit ID. Its word for its moons has
+        // lapsed with it, and they make way: for its own moons under the new key, and for
+        // other ships' moons.
+        let renewed = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        told.say(planets[0], Some((Some(renewed.verifying_key().to_bytes()), 2)));
+        reread(&directory, planets[0]);
+        assert_eq!(directory.key_of(&moon_name), None);
+        directory.vouched(&sixth_name, key(30), &moon::vouch(&parents[2], sixth, 1, &key(30))).unwrap();
+        directory.vouched(&fourth_name, key(9), &moon::vouch(&renewed, fourth, 1, &key(9))).unwrap();
+        assert_eq!(directory.key_of(&fourth_name), Some(key(9)));
+        assert_eq!(directory.key_of(&sixth_name), Some(key(30)));
+        let moons = directory.listed.read().unwrap().keys.values().filter(|entry| matches!(entry.from, From::Vouched { .. })).count();
+        assert_eq!(moons, 4);
+
+        // A moon is among the ships that are kept, and so is the planet it stands on. With
+        // no room among those, a moon is not kept, though its parent's word is good.
+        let full = small(&told, HOUR);
+        for ship in 0x3000_0000..0x3000_000bu32 {
+            full.read(&name(ship));
+            assert!(full.prove(&name(ship), &key_of_number(ship)));
+        }
+        full.read(&name(planets[1]));
+        let (moon, moon_name) = moon_of(planets[1], 1);
+        // Room for one more: the planet takes it, and then its moon has none.
+        assert_eq!(full.vouched(&moon_name, key(1), &moon::vouch(&parents[1], moon, 1, &key(1))), Err("there is no room to keep another moon's key"));
+        assert_eq!(full.key_of(&moon_name), None);
+        assert_eq!(full.listed.read().unwrap().keys.values().filter(|entry| entry.proved).count(), 12);
+        // And with none at all, the planet is not kept either.
+        let (other, other_name) = moon_of(planets[2], 1);
+        full.read(&name(planets[2]));
+        assert_eq!(full.vouched(&other_name, key(1), &moon::vouch(&parents[2], other, 1, &key(1))), Err("there is no room to keep the key of the moon's parent"));
+        assert_eq!(full.proved_key_of(&name(planets[2])), None);
+        assert_eq!(full.proved_key_of(&name(0x3000_0000)), Some(key_of_number(0x3000_0000)));
+    }
 
     fn messages_within(request: &[u8], most: usize) -> bool {
         repeats_within(request, 2, 1, most)

@@ -9,8 +9,11 @@
 //! not hide anything from whoever runs the runtime: a ship cannot run unless its file can be
 //! read, so that person has to have the key.
 //!
-//! The recovery code belongs to the ship's owner, and to nobody else. An exported copy of a
-//! ship is sealed so that only someone who has the code can open it. The ship keeps the
+//! The recovery code belongs to the ship's owner. It is not something more to keep: it is
+//! derived from the master ticket the owner already holds for the ship's Urbit ID, as a
+//! branch of its own (`urbit_id::Wallet::backup_code`), so whoever holds the ticket holds
+//! the code. An exported copy of a ship is sealed so that only someone who has the code
+//! can open it. The ship keeps the
 //! public half of a key pair made from the code, which is enough to seal a copy and no use
 //! for opening one. So a copy can be made at any time with nobody present, by a host on a
 //! schedule for instance, and the host cannot read what it has made.
@@ -196,23 +199,6 @@ pub fn open_export(code: &str, ship: &str, mut sealed: Vec<u8>) -> Option<([u8; 
     Some((seed, sealed))
 }
 
-/// A new recovery code as its owner sees it: 160 random bits as thirty-two letters and digits
-/// in eight groups, from an alphabet with no pairs that look alike (no i, l, o, or u). It is
-/// long because nothing slows down someone guessing at it: whoever has a sealed copy can try
-/// codes against it for as long as they like.
-pub fn recovery_code(random: &[u8; 20]) -> String {
-    const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
-    let letters: Vec<u8> = (0..32)
-        .map(|index| {
-            // Five bits at a time, counted from the front.
-            let (byte, shift) = (index * 5 / 8, index * 5 % 8);
-            let pair = (random[byte] as u16) << 8 | random.get(byte + 1).copied().unwrap_or(0) as u16;
-            ALPHABET[((pair >> (11 - shift)) & 31) as usize]
-        })
-        .collect();
-    letters.chunks(4).map(|group| String::from_utf8_lossy(group).into_owned()).collect::<Vec<_>>().join("-")
-}
-
 /// Whether a public key is one a copy can safely be sealed to. A handful of values make
 /// every agreement come out the same whatever the other side brings, so a copy sealed to
 /// one of them could be opened by anyone.
@@ -315,19 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn a_recovery_code_carries_all_its_random_bits_and_a_weak_key_is_told_apart() {
-        assert_eq!(recovery_code(&[0; 20]), "0000-0000-0000-0000-0000-0000-0000-0000");
-        assert_eq!(recovery_code(&[255; 20]), "zzzz-zzzz-zzzz-zzzz-zzzz-zzzz-zzzz-zzzz");
-        // Every bit of the twenty bytes changes the code.
-        let plain = recovery_code(&[0; 20]);
-        for bit in 0..160 {
-            let mut random = [0u8; 20];
-            random[bit / 8] |= 0x80 >> (bit % 8);
-            let code = recovery_code(&random);
-            assert_eq!(code.chars().zip(plain.chars()).filter(|(a, b)| a != b).count(), 1, "bit {bit}");
-            assert_eq!(code.replace('-', "").find(|letter| letter != '0'), Some(bit / 5), "bit {bit}");
-        }
-        assert!(recovery_key_usable(&recovery_public(&plain)));
+    fn a_recovery_key_that_is_no_use_is_told_apart() {
+        let plain = "0000-0000-0000-0000-0000-0000-0000-0000";
+        assert!(recovery_key_usable(&recovery_public(plain)));
         assert!(!recovery_key_usable(&[0; 32]));
         let mut one = [0u8; 32];
         one[0] = 1;

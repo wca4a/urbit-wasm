@@ -7,8 +7,9 @@ written in Rust.
 Experimental. There is a runtime, a kernel, logs that agents can follow, an
 HTTP server that lets an app or a browser sign in to a ship, and an encrypted
 link over which ships send each other commands and follow each other's logs.
-A ship's file is encrypted on disk. There is no identity or update mechanism
-yet.
+A ship's file is encrypted on disk. A ship's keys can be derived from its Urbit
+ID master ticket, but ships do not yet look each other up in Azimuth, and there
+is no update mechanism yet.
 
 ## What it does
 
@@ -19,8 +20,10 @@ yet.
 - Each event has limits on compute, time, and memory.
 - A ship's file and its signing key are encrypted on disk, under a key held by
   whoever runs the runtime.
+- A ship can be made from its Urbit ID master ticket or its keyfile, and then
+  runs with the networking key Urbit's own wallet derives for it.
 - A ship can be exported as one sealed file and imported into another runtime.
-  Only the owner's recovery code opens the file.
+  Only the owner opens the file, with the master ticket.
 - The kernel is itself a WASM module. It keeps the list of installed agents and
   decides what each may do; the runtime enforces it.
 - Agents declare what they offer and what they use in a manifest. Without a
@@ -47,8 +50,11 @@ yet.
   sign-in page. The ship stores only hashes of codes and tokens.
 - Two ships reach each other over QUIC, which is encrypted. There is no
   certificate authority: each end shows its key and proves it holds it, and the
-  other end checks that key against a directory of ships. The directory is a
-  fixed list for now, standing in for Urbit ID.
+  other end checks that key against Urbit ID: the key Azimuth lists for the
+  ship's name, read from Ethereum, and for a ship on layer 2 from the roller.
+  Or, without the roller: from a copy of all of Azimuth kept in a local file,
+  worked out from Ethereum under Urbit's own rules, layer 2 included. A moon,
+  which Azimuth does not list, shows its parent's signed word for its key.
 - An agent can send a command to an agent on another ship. The command is saved
   with the event that sent it and kept until the other ship has it, through
   restarts and lost connections at either end. It arrives exactly once, in the
@@ -112,7 +118,7 @@ command line tools.
 Tests (these build the kernel and agents themselves):
 
 ```sh
-cargo test -p runtime
+cargo test
 ```
 
 Load test:
@@ -128,6 +134,33 @@ link; open the link in a browser:
 ```sh
 cargo build -p kernel -p counter --release --target wasm32-unknown-unknown --target-dir target/wasm
 cargo run -p runtime --release --bin serve -- --dir /tmp/ships --demo
+```
+
+Look a ship up in Urbit ID, through any Ethereum node. This is read-only and
+needs no data directory:
+
+```sh
+cargo run -p runtime --release --bin serve -- --ethereum https://ethereum.publicnode.com --lookup '~zod'
+```
+
+The same from a copy of Azimuth kept in a file, worked out from Ethereum
+without the roller. The first run reads all of Azimuth's history, which took
+under ten minutes through a free public node; after that it starts at once. The
+node must answer `eth_getLogs` for old blocks (many free ones do not; see
+Reading Azimuth):
+
+```sh
+cargo run -p runtime --release --bin serve -- --ethereum https://gateway.tenderly.co/public/mainnet \
+  --azimuth-copy /tmp/azimuth.sqlite --lookup '~zod'
+```
+
+Run a real ship on the network, from its keyfile, with other ships' keys read
+from Urbit ID. `--peer` says where another ship is to be found (add
+`--azimuth-copy <file>` to read keys from a copy instead of the roller):
+
+```sh
+cargo run -p runtime --release --bin serve -- --dir /tmp/ships --keyfile my-planet.key \
+  --ethereum https://ethereum.publicnode.com --net 0.0.0.0:4433 --peer '~sampel-palnet=203.0.113.7:4433'
 ```
 
 The server speaks plain HTTP on localhost. Before reaching it from anywhere
@@ -153,8 +186,13 @@ source rather than something the tests prove.
 | `runtime/src/ship.rs` | An awake ship: runs one event as one transaction, calls the kernel, runs handlers in fresh instances, takes commands and log entries from other ships, settles a ship that has fallen out of step |
 | `runtime/src/host.rs` | The host functions agents import, and the fuel each costs |
 | `runtime/src/store.rs` | The SQLite schema and every query; import validation |
-| `runtime/src/seal.rs` | Keys: the storage key, the keys derived from it, the recovery code, and sealing and opening an exported copy |
-| `runtime/src/net.rs` | QUIC transport, identity checks against the directory, carrying commands and log entries between ships |
+| `runtime/src/seal.rs` | Keys: the storage key, the keys derived from it, the recovery key, and sealing and opening an exported copy |
+| `urbit-id/src/` | Urbit ID's keys as Urbit derives them: `wallet.rs` (master ticket to networking keys, UP 8), `argon2.rs` (Urbit's Argon2 variant), `ob.rs` (ship and moon names, tickets), `keyfile.rs` (reading and writing keyfiles), `naive.rs` (Azimuth's state worked out from its logs and layer 2 batches: a port of Urbit's `naive.hoon`) |
+| `runtime/src/azimuth.rs` | Reading Urbit ID: a ship's key from the Azimuth contract on Ethereum, or from the roller for a ship on layer 2 |
+| `runtime/src/chain.rs` | Reading Ethereum's history over JSON-RPC: logs over a range of blocks, transaction inputs, the finalised block |
+| `runtime/src/replica.rs` | A copy of Azimuth in a local SQLite file, kept up to date from Ethereum alone, answering the same lookups as `azimuth.rs` |
+| `runtime/src/moon.rs` | A parent's signed word for its moon's key |
+| `runtime/src/net.rs` | QUIC transport, the directory of keys and addresses, identity checks against it, carrying commands and log entries between ships |
 | `runtime/src/server.rs` | The HTTP server for apps and browsers |
 | `runtime/src/bin/serve.rs` | Command-line wrapper around the HTTP server, with a demo ship |
 | `runtime/src/bin/loadtest.rs` | Load test |
@@ -164,8 +202,8 @@ source rather than something the tests prove.
 | `sdk/src/lib.rs` | Guest-side bindings and the `agent!` macro |
 | `agents/counter`, `agents/tally` | Toy agents. `counter` keeps counters and publishes a log; `tally` reads and sends to `counter`, follows logs, and takes receipts |
 
-The workspace's default member is `runtime`, so a plain `cargo build` or
-`cargo test` covers only the runtime. The SDK, kernel, and agents only link for
+The workspace's default members are `runtime` and `urbit-id`, so a plain
+`cargo build` or `cargo test` covers those two. The SDK, kernel, and agents only link for
 `wasm32-unknown-unknown`.
 
 ## Data directory
@@ -447,17 +485,326 @@ fails with `Error::BadShipFile`.
 The storage key does not hide a ship from whoever runs it. A ship cannot run
 unless its file can be read, so that person has to hold the key.
 
-The **recovery code** belongs to the ship's owner. It is 160 random bits
-written as 32 letters and digits in eight groups. The ship keeps only the
-public half of an X25519 key pair derived from the code (in `meta`), which can
-seal a copy and cannot open one:
+The **recovery key** belongs to the ship's owner, and comes from the master
+ticket the owner already holds (see "Keys from Urbit ID" below), so there is
+no second secret to keep. The ticket gives a code, the code gives an X25519
+key pair, and the ship keeps only the public half (in `meta`), which can seal
+a copy and cannot open one:
 
-- `set_recovery_key(ship, public)` takes the public half, so an owner's device
-  can make the code (`seal::recovery_code`, `seal::recovery_public`) and never
-  show it to the machine the ship runs on. Keys that would be unsafe or that
-  the code could not open are refused.
-- `new_recovery_code(ship)` is the simple way: the runtime makes the code, sets
-  the key, returns the code once, and keeps no copy.
+- A ship made with `create_ship_from_ticket` has its recovery key from the
+  start.
+- `set_recovery_key(ship, public)` takes just the public half, which
+  `Runtime::recovery_key_of_ticket(ship, ticket)` works out. So whoever holds
+  the ticket can give a ship its recovery key without showing the ticket to
+  the machine the ship runs on. Keys that would be unsafe or that the code
+  could not open are refused.
+
+### Keys from Urbit ID
+
+A planet's owner holds one secret, the master ticket. Urbit's HD wallet
+(proposal UP 8) derives everything else from it. The `urbit-id` crate does the
+part a ship needs, and is checked against the test vectors of Urbit's own
+key-generation library, so a real planet's ticket gives here the keys it gives
+there:
+
+| Step | How |
+| --- | --- |
+| Ticket and ship number to master seed | Argon2u, salt `urbitkeygen<number>`, 4 lanes, 512,000 KiB, 1 pass. Argon2u is Urbit's own variant, so it is implemented here (`argon2.rs`) and its engine is tested against a standard Argon2id library |
+| Master seed to a branch | SHA-256 of the seed and the branch's name, written as a 24-word phrase (BIP39). Branches: ownership, transfer, spawn, voting, management |
+| Management phrase to network seed | SHA-256 of the phrase's BIP39 seed, `network`, and the revision number; hashed once more for revisions above 0 |
+| Network seed to networking keys | SHA-512 of the seed; the first half is the authentication key, the second the encryption key, both ed25519 |
+| Master seed to backup code | SHA-256 of the seed and `ship.v1.backup`. This branch is this runtime's own, not part of UP 8 |
+
+- `create_ship_from_ticket(name, kernel, ticket, revision)` makes a ship that
+  proves who it is with the ticket's authentication key for that revision,
+  which is the key Azimuth lists for the planet. The ticket is used and not
+  kept. Deriving from a ticket takes about half a gigabyte of memory and under
+  a second, by design, and one derivation runs at a time.
+- `create_ship_from_keyfile(kernel, keyfile)` makes a ship from an Urbit
+  keyfile, which names the ship and holds only its networking keys. This is
+  how a ship is started by someone who is not given the ticket. Both keyfile
+  shapes in use are read. `Runtime::keyfile(name, revision, keys)` writes one.
+- `import_ship_with_ticket(src, ship, ticket)` opens an exported copy with the
+  ticket.
+- `create_ship(name, kernel)` still makes a ship with a random key, for trying
+  things out.
+- The planet's encryption key is not used and not kept. Traffic between ships
+  is encrypted with keys made for each connection (TLS 1.3 inside QUIC); the
+  Urbit key only proves who each ship is.
+- Names are galaxies, stars, planets, and moons. A moon is started from the
+  keyfile its parent makes for it (see Moons). Comets are refused.
+
+### Reading Azimuth
+
+`runtime/src/azimuth.rs` answers one question: which key does Urbit ID list
+for this galaxy, star, or planet. It asks one ship at a time, over JSON-RPC,
+and keeps nothing itself (the network's directory keeps the answers).
+
+1. It asks an Ethereum node for the ship's row in the Azimuth contract's
+   `rights` table, which gives the owner.
+2. If the owner is an ordinary address, the ship is on layer 1, and its keys
+   are read from the contract's `points` table. The roller is not asked.
+3. If the owner is the deposit address (`0x1111...1111`), the ship has been
+   moved to layer 2. If Ethereum has no owner for it, and the star or galaxy
+   above it has given its ownership or its right to spawn to the deposit
+   address, the ship may have been made on layer 2. In both cases the keys
+   are asked of the roller (`getPoint`). If Ethereum has no owner for that
+   star either, the galaxy above it is checked the same way. The contract
+   makes both conditions permanent, and refuses a layer 1 spawn under a star
+   in either state.
+4. Otherwise the ship does not exist.
+
+A ship has a usable key only if its key revision is above zero, its crypto
+suite is 1, and its key is not zero. Otherwise the answer is "a ship with no
+key, as of revision N", which is different from "no such ship". Azimuth stores a key as a number, which is the
+key's bytes reversed. The roller answers only requests whose JSON-RPC `id` is
+a string, and says `Resource not found` for a ship it has never heard of.
+Answers are read up to 64 KiB, redirects are not followed, and each question
+has a 10 second limit.
+
+Who is trusted: the Ethereum endpoint, for everything; and the roller, for
+ships Ethereum places on layer 2 and for nothing else. This file does not
+replay the layer 2 batches to check the roller; the copy below does. The
+block asked about is `latest`.
+
+`serve --ethereum <url> --lookup <ship>` prints what is listed for a ship.
+
+### A copy of Azimuth, without the roller
+
+`runtime/src/replica.rs` answers the same question from a copy of Azimuth's
+whole state, kept in a local file and worked out from Ethereum alone, the way
+every Urbit ship works it out for itself. Only the Ethereum node is trusted.
+`serve --azimuth-copy <file> --ethereum <url>` uses it in place of the roller,
+for `--net` and for `--lookup`.
+
+What it reads:
+
+- Every log of the Azimuth contract
+  (`0x223c067F8CF28ae173EE5CafEa60cA44C335fecB`, from block 6,784,880) of a
+  kind `naive.hoon` applies: owner, proxies, keys, continuity, escapes and
+  sponsors. The node is asked for those kinds alone. `Activated`, `Spawned`
+  (a ship starts from the ship above it, so `naive.hoon` ignores them),
+  `OwnershipTransferred` (who owns the contract itself) and `ChangedDns` (the
+  network's domain names, whose data can be of any length) are not asked
+  for.
+- Every `Batch` log of the layer 2 contract
+  (`0xeb70029cfb3c53c778eaf68cd28de725390a1fe9`, from block 13,369,829), and
+  for each, the input of the transaction that made it
+  (`eth_getTransactionByHash`). That input, whole, is the batch.
+- Both in Ethereum's order, by block and then place in the block, layer 1
+  and layer 2 interleaved. A layer 2 transaction is judged by what layer 1
+  said at that moment: a proxy changed on layer 1 after a layer 2 transaction
+  does not undo it.
+
+The rules are Urbit's `naive.hoon`, ported to `urbit-id/src/naive.rs`, which
+says in its comments which part of `naive.hoon` each piece follows:
+
+- A layer 1 log changes the ship it names. Once a ship is on layer 2, only
+  its sponsor's doings on layer 1 (accepting an escape, letting it go) still
+  reach it. Giving a ship, or a star's right to spawn, to the deposit address
+  `0x1111...1111` moves it, or where its children are made, to layer 2.
+- A batch is read as one number, from its low end, which is from the end of
+  the input back to its start. Zero bytes at the very start are not part of
+  it, and a transaction that runs past the start reads zeros there. Each
+  transaction, from its end back: a 65-byte signature (r, s, v as written), a
+  byte whose low 3 bits say in which role it is signed, the ship (4 bytes), a
+  byte whose low 7 bits say what is asked and whose top bit is a flag (on when
+  zero), then what is asked. One transaction that cannot be read voids the
+  whole batch.
+- What is signed is `UrbitIDV1Chain1:`, the signer's count of transactions so
+  far (4 bytes, least significant first), and the transaction's bytes in
+  reverse, wrapped as Ethereum wallets wrap a message. The signature must
+  recover to whoever holds that role for that ship at that moment. A
+  transaction that is not so signed changes nothing. One that is counts as
+  sent (its count goes up) even if the rules then refuse it.
+- Signatures are recovered with the `k256` crate, taking either value of `s`
+  as Ethereum does, and `v` with or without 27 added.
+
+The file is plain SQLite (public data, not encrypted): a `points` table, one
+row per ship, and a `meta` table with the last block read, counts of what was
+read, and which chain and contracts the file is a copy of (a file is never
+opened as a copy of another). Each step forward, a range of blocks applied and
+the new last block, is one transaction: a crash or a failed question leaves
+the file where it was, and the next poll carries on from there. Only one copy
+may have the file open at a time: it holds an exclusive lock on
+`<file>.lock` for as long as it is open, and a second opener, in the same
+program or another (such as `serve --lookup` on the file a running server
+uses), is refused at once with a message saying so. Links are followed first,
+so the file is locked under one name however it is reached; a file with a
+second name of its own (a hard link) is refused; and SQLite opens the file
+without following a link, so a link put in its place after its name was
+worked out is refused too.
+
+A lookup decides that the copy may answer and reads its answer in one step,
+holding the copy's status throughout, so it never reads a file part way
+through catching up. A poll holds the status only for a moment, never while
+asking the node anything.
+
+Only blocks Ethereum has finalised (`eth_getBlockByNumber("finalized")`) are
+read, and lookups are answered from the file alone. So a change on Ethereum is
+seen once its block is final, about 15 minutes after it lands, and a layer 2
+change about 15 minutes after the roller has put its batch on Ethereum (which
+the roller itself does only every so often). The newest blocks are not read
+because they can still be replaced, and a copy that never has to undo
+anything is simpler to trust: an answer is never older than one given before
+it, so a ship's key revision as looked up never goes down, which the
+network's directory relies on when it refuses a lower revision than it has
+seen. The copy asks how far the chain is final once a minute, and asks for
+nothing else when that has not moved.
+
+Lookups are refused until the file has reached the newest finalised block
+heard of in this run, with no allowance: a file part way through its history
+would hand out keys that have since changed. (So for the second or so after
+each new final block is heard of, while it is read, lookups are refused and
+the directory goes on with what it had.) After that, if the node goes away,
+lookups go on being answered from what the copy has. A node whose final block
+goes back, behind one it gave before or behind what the file has read, is not
+followed. A ship has a listing if it is in the table; its key follows the same
+rules as above.
+
+Ethereum nodes differ, and the code copes:
+
+- A range of blocks starts at 10,000, is cut to an eighth whenever a question
+  about it is refused, fails, or has too long an answer, and doubles whenever
+  an answer holds fewer than 1,000 events, up to 100,000.
+- A node that asks to be asked less often (HTTP 429, or a message saying so)
+  is asked the same again after a wait that starts at the pause between
+  questions (500 ms) and doubles up to a minute. After 8 tries in a row
+  without an answer, the poll gives up until the next.
+- Transaction inputs are asked for 20 to a request where the node takes
+  several questions at once, and one at a time where it does not. An input,
+  once had, is kept until its block is in the file, so a range that is tried
+  again does not ask for it again.
+- A failed question is never taken as an empty answer, and how much is read
+  of an answer is bounded (table below). Answers are read straight into the
+  shapes asked for, passing over fields not asked for without keeping them:
+  something not of the shape asked for is refused where it is met, and a list
+  of logs longer than is taken is refused as it is read. So reading one answer
+  holds at most about five times its size (its bytes, the logs read from them,
+  and the logs made of those), and an answer that is all small pieces cannot
+  grow into gigabytes. Inputs of transactions are taken in one by one as they
+  come, against the room there is, so that no more than one is in hand beyond
+  it; and before a range is fetched, inputs kept from before that it does not
+  want are let go. A transaction is asked for once
+  however many batches it logged, and two different inputs for one
+  transaction in one block are refused. Every answer must be JSON-RPC 2.0 and
+  carry the number of the question it answers. Logs must be from the contract, of a kind asked
+  for, from the blocks asked about, in order, not removed, and shaped as the
+  contract declares their kind: as many topics and bytes of data
+  (`ChangedKeys` 128 bytes, `BrokeContinuity` 32, `Batch()` one topic and
+  none), and every argument no wider than its type (a `uint32` with 28 zero
+  bytes in front of it, an address with 12). This is checked before
+  `naive.hoon`'s rules run, since some of them return before reading every
+  argument. A transaction must be the one asked for, in the block its log
+  says (by number and by hash), and in only one block across a range; and a
+  block number must have only one hash across a range, both contracts'
+  logs together, and a block hash only one number. An input is kept for, and
+  used for, the one block (number and hash) it was had for. Block numbers must fit in what
+  SQLite keeps. Anything else is an error that stops the step, and nothing is
+  written; an answer that cannot be right (a wrong shape, one transaction in
+  two blocks) is not asked for again in smaller pieces, which could hide it.
+- Dropping the copy stops it at once: no question is asked after that, a
+  pause between questions ends, a step being applied gives up before its next
+  event and between one layer 2 transaction and the next, and nothing of that
+  step is written.
+  Each question to the node is asked on a thread of its own and waited on,
+  so a stop ends the wait at once even while the node says nothing or stalls
+  part way through its answer; the thread left behind ends by itself at the
+  question's own limit, which also covers finding the node's address (the
+  HTTP library itself does not limit that). Only one look-up of the node's address runs at a
+  time: one that does not answer is waited on again by the next question, and
+  no other is started, so a resolver that never answers holds one thread.
+
+What is read from the node, and what each field is checked against (the list is also at
+the top of `runtime/src/chain.rs`). Two fields that are read and contradict each other are
+an error; any field not listed is not read. A range is the blocks read in one step.
+
+| Answer | Field | Checked against |
+| --- | --- | --- |
+| Every answer | `jsonrpc` | text, "2.0" (on every answer that is not a refusal) |
+| Every answer | `id` | the number of the question asked, as text; a refusal may carry another number, however written, or `null`, and among answers to questions asked at once a refusal is taken first |
+| Every answer | `result` | the shape asked for; `null` is an answer with nothing in it, an error |
+| Every answer | `error` | when there, an object, never `null`; its `message` text or `null`, only reported; never beside a result that is not `null` |
+| Final block | `number` | never behind a final block heard of before, or behind the file |
+| Log | `address` | the contract asked about |
+| Log | `removed` | absent or false (not `null`) |
+| Log | `blockNumber` | within the blocks asked; with `logIndex`, strictly increasing; one hash per number and one number per hash in a range |
+| Log | `blockHash` | as above; the same as a batch's transaction's |
+| Log | `logIndex` | with `blockNumber`, strictly increasing; never the same as another log's in a range |
+| Log | `transactionHash` | in one block in a range; its logs together in its block; for a batch, the transaction asked for |
+| Log | `transactionIndex` | in a block, one per transaction and one transaction per index, never going down as `logIndex` goes up; for a batch, the same as its transaction's |
+| Log | `topics` | one to four, 32 bytes each; the first a kind asked for; as many as its event has, each no wider than its type |
+| Log | `data` | at most 16 KiB; as long as its event's, each word no wider than its type |
+| Transaction | `hash` | the hash asked for |
+| Transaction | `blockNumber`, `blockHash`, `transactionIndex` | those of its batch's log |
+| Transaction | `input` | at most the limit for one input; the same in every answer for one transaction at one place |
+
+Not read: a final block's hash, parent and transactions; a log's `blockTimestamp`; a
+transaction's `from`, `to`, `value`, `gas`, `nonce` and signature (a batch may be sent
+through another contract, and its input is taken as Urbit's own software takes it). Not
+compared across ranges: that a transaction or block hash read in one range does not come
+again in a later one, which an honest node cannot give, since ranges cover different blocks.
+Numbers must be written as Ethereum writes a quantity (hexadecimal digits, no zero in front
+but `0` itself), and bytes as an even number of hexadecimal digits. Every value is read only
+as the kind listed: an object as an object (never its fields in order as a list), text as
+text, a list as a list, and `null` nowhere but where the table says: a refusal's `id` and
+`message`, and an answer's `result` (which is then an error).
+
+No block Ethereum allows may stop the copy. Anyone can call the layer 2
+contract (it logs a batch for any call), so anyone willing to pay for the gas
+can put a block at Ethereum's limits on chain, and one too big to read would
+stop every copy for good. So the limits on what is read are there to bound
+memory against a broken node, are sized from Ethereum's limits with room to
+spare, and are used to read a range of blocks in smaller pieces, never to
+refuse a single block. A single block is refused only past what Ethereum
+could ever put in one, which only a broken node can claim. All are settings
+(`ReplicaConfig`, `Limits`):
+
+| Limit | For a range (read in pieces past it) | For one block (refused past it) | Sized against |
+| --- | --- | --- | --- |
+| Logs in one answer | 10,000 | 250,000 | The cheapest log is a `Batch` from a call to the layer 2 contract, about 850 gas each: 250,000 is over 210 million gas, several times a block's limit |
+| Bytes of an answer of logs | 16 MiB | 256 MiB | 250,000 logs at about 450 bytes each as written |
+| Input of one transaction | 32 MiB | same | Input costs at least 4 gas a byte, so at most a quarter of a block's gas in bytes (15 MB at 60 million gas; newer rules cap a block at 10 MiB) |
+| Batches held in memory, each input once | 64 MiB | 128 MiB | A block's inputs together are under a quarter of its gas in bytes |
+| Batches applied, each logged batch counted | 64 MiB | none: one block is applied whatever its work, and a stop is noticed between events and between transactions | One transaction can log its input many times over |
+| Data of one log | 16 KiB | same | Only applied kinds are asked for; the longest has 128 bytes |
+| Topics of one log | 4 | same | Ethereum's own maximum |
+| The answer about the final block | 16 MiB | | Every transaction's hash, 69 bytes each, at 21,000 gas a transaction: blocks of over five billion gas |
+| Several transactions asked for in one request | 20, and 8 MiB of answer | | Past either, they are asked for one at a time |
+| Time for one question | 30 s | ten times that, for one block's logs or one transaction | Longer answers |
+
+Measured in November 2026: `ethereum.publicnode.com` refuses old ranges
+("Archive requests require a personal token"); `gateway.tenderly.co/public/mainnet`
+takes 100,000 blocks to a question and several questions to a request, and
+answers HTTP 429 when asked too often; flashbots takes 2,000 blocks,
+Cloudflare 800; drpc's free plan refuses. A full read of the main network
+through Tenderly is described under Tests.
+
+### Moons
+
+A moon's number is its parent's with 32 more bits in front, and its name ends
+with its parent's name (`~doznec-sampel-palnet` is a moon of
+`~sampel-palnet`). Azimuth does not list moons. On Urbit, other ships learn a
+moon's key by asking its parent, so the parent must be running. Here the
+parent signs a statement and the moon carries it:
+
+- `moon_keyfile(parent, moon, revision)` makes new keys for the moon, has the
+  parent sign `ship.v1.moon\n`, the moon's number, the revision, and the
+  moon's public key, and returns a keyfile. The keyfile is Urbit's older
+  shape, with the signature in the slot that shape has for one (Urbit leaves
+  it empty). The parent must be on this runtime, and keeps no list of its
+  moons.
+- `create_ship_from_keyfile` starts the moon on any runtime. The signature
+  and revision (68 bytes, not secret) are kept in the moon's ship file, so
+  they travel with an exported copy.
+- When the moon calls a ship, it sends the proof with its name. When a ship
+  calls the moon without holding its current key, the moon sends the proof in
+  its answer. Either way the other ship checks the signature against the
+  parent's key from the directory, and checks that the key in the statement
+  is the one the connection proved.
+- A ship remembers the highest revision it has seen for each moon, and
+  refuses a lower one, or a different key at the same revision. When the
+  parent's own key changes, every proof it signed stops being accepted.
 
 ### Export and import
 
@@ -483,7 +830,8 @@ made. The seal keeps a copy secret. It does not prove who made it: anyone who
 knows a ship's recovery public key can seal something to it. That is why
 import still checks everything.
 
-`import_ship(src, ship, code)` opens the copy with the recovery code and then
+`import_ship(src, ship, code)` opens the copy with the recovery code (the one
+`import_ship_with_ticket` derives from the master ticket) and then
 treats what is inside as untrusted:
 
 - It reads only regular files, without following symlinks, up to
@@ -592,12 +940,48 @@ starts it, and a runtime has at most one.
   (no certificates) and prove they hold the private half by signing the
   handshake. The caller names the ship it wants in the TLS server name, and the
   answering runtime shows that ship's key. The caller accepts only the key the
-  directory lists for that ship; the answerer accepts only a caller whose key
-  the directory lists, and knows from it which ship is calling.
-- The `Directory` maps ship name to (public key, socket address). It is a
-  fixed list handed in by whoever starts the network, standing in for Urbit ID.
-  One key can be listed for only one ship. If the directory changes, existing
-  connections made under the old listing are closed.
+  directory holds for that ship (for a moon, any key, which is then checked
+  against the moon's proof before anything is asked of it).
+- Urbit ID is looked up by name, not by key, so the answerer cannot tell who
+  is calling from the key alone. The first stream of every connection carries
+  a `Hello` with the caller's name (and a moon's proof). The answerer looks
+  the name up and goes on only if the key the handshake proved is the one
+  listed for it. No other request on the connection is read before that, and
+  the check is made again before each request is acted on.
+- The `Directory` holds, for each ship, its key and where it is. Keys come
+  from one of three places: Urbit ID (`Directory::reading(keys)`, where `keys`
+  is an `Azimuth` or anything else that implements `Keys`); a moon's proof; or
+  `set(ship, key, addr)`, by hand, which is how the tests run and which is
+  never overwritten by the other two.
+- A key read from Urbit ID is used for 5 minutes without asking again. After
+  that it is still used, and read again in the background. If it cannot be
+  read again it is believed for a day and then no longer. A ship that shows a
+  key other than the one held causes one fresh read, at most every 5 seconds
+  per ship. A failed read is retried no sooner than 5 seconds later.
+- Azimuth counts how many times a ship's keys have been set, and the count
+  only goes up. The directory keeps the count with the key. An answer with a
+  lower count than the one still believed is refused, whatever it says, so an
+  Ethereum node that is behind cannot put back a key that has been replaced.
+  When a ship's keys are taken away, the count is kept in the key's place for
+  the same reason.
+- Only one question about a ship is out at a time, and everyone who wants the
+  answer waits on that one. At most 8 questions run at once and at most 64
+  ships are waiting to be asked about; half of those places are kept for
+  ships this runtime's own ships want to call. At most 32 callers a second
+  that nothing is known of are looked up. The rest are turned away unasked.
+- A ship that has proved its key on a connection, or whose key a moon's proof
+  was checked against, is kept for as long as what is held for it is believed,
+  through any later change of its keys. There is room for 65,536 such ships,
+  moons included (at most 32,768 moons, 256 per parent). When that is full, a
+  new ship cannot be met until entries lapse. Keys that were looked up only
+  because someone said a name have their own allowance of 4,096, and the
+  older half are dropped when it fills. A connection is taken only on a key
+  that has been proved.
+- Where a ship is (its socket address) is not in Urbit ID. It is given with
+  `place(ship, addr)`. A wrong address cannot pass one ship off as another,
+  since whatever answers must still prove the key.
+- If what the directory holds for a ship changes, connections made under the
+  old listing are closed.
 - Session resumption is off, so every connection proves its keys afresh.
   Connection migration is off.
 - Each request and its reply travel on one bidirectional stream. Unidirectional
@@ -621,6 +1005,7 @@ matching answer, or only `refused` with a reason.
 | `Fetch { agent, log, after, max_bytes, joining }` | `Fetched { entries, head, checkpoint, denied, incarnation }` | Entries of a log after `after`, as signed; or the checkpoint if they were dropped; or a refusal |
 | `News { logs }` | `Heard { unknown }` | The publisher says these logs grew (or are closed to you). The follower says which it no longer follows |
 | `Resync { standing }` | `Resynced { standing }` | Two ships say where each stands, to get back in step after a restore |
+| `Hello { ship, proof }` | `Welcome { proof }` | First on every connection: which ship is calling. Each side sends its moon proof if it is a moon |
 
 ### Commands between ships, exactly once
 
@@ -766,6 +1151,19 @@ directory), `--secure-cookies`, `--access-code <ship>`,
 with optional `--kernel` and `--counter` paths. `--demo` creates `~zod` with
 the counter agent offering `counter` and `journal`, if it does not exist.
 
+For talking to other ships it takes `--ethereum <url>` (an Ethereum JSON-RPC
+node to read Azimuth through), `--roller <url>` (default: Urbit's roller),
+`--azimuth-copy <file>` (keep a copy of Azimuth in this file, worked out from
+Ethereum, and read keys from it instead of the roller; with `--lookup` it
+first waits for the copy to catch up, saying how far along it is; otherwise
+it says on standard error, once each, when the copy runs into trouble and
+when it is out of it, and a lookup refused while the copy is held up says
+why),
+`--net <address>` (start the ship network on this UDP address, with keys from
+Urbit ID), `--peer <ship>=<address>` (where another ship is; repeatable),
+`--keyfile <file>` (start the ship that keyfile is for, if it is not there),
+and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
+
 ## Configuration
 
 ### `Config` (runtime)
@@ -833,6 +1231,26 @@ below 256 KiB, a `max_message_bytes` without room for the largest command or
 checkpoint plus 4 KiB, or without room for `max_unanswered` command numbers
 twice over, and any time limit that is zero or over a day.
 
+### `ReplicaConfig` (copy of Azimuth)
+
+`ReplicaConfig::mainnet(ethereum)` gives:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `ethereum` | given | The Ethereum node's JSON-RPC address |
+| `azimuth`, `azimuth_from` | `0x223c...fecb`, 6,784,880 | The Azimuth contract and the block it was made in |
+| `naive`, `naive_from` | `0xeb70...1fe9`, 13,369,829 | The layer 2 contract and the block it was made in |
+| `chain` | 1 | Ethereum's chain number, part of every layer 2 signature |
+| `timeout` | 30 s | One question to the node, connecting included |
+| `every` | 60 s | How often to ask whether more blocks are final |
+| `pause` | 500 ms | Least time between two questions, and the first wait after one goes unanswered |
+| `widest` | 100,000 | Most blocks asked about in one question |
+| `limits` | `Limits::default()` | How much of the node's answers is read, for a range and for one block (table under Reading Azimuth) |
+| `most_batch_bytes` | 64 MiB | Most bytes of batches held in memory for a range of blocks, each input once |
+| `most_block_batch_bytes` | 128 MiB | The same for one block, which cannot be split |
+| `most_work_bytes` | 64 MiB | Most work for a range of blocks, each logged batch counted; one block is applied whatever its work |
+| `tries` | 8 | Questions in a row that may go unanswered before a poll gives up |
+
 ### `ServerConfig` (HTTP)
 
 | Field | Default | Meaning |
@@ -847,7 +1265,7 @@ twice over, and any time limit that is zero or over a day.
 
 ## Tests
 
-`cargo test -p runtime` runs:
+`cargo test` runs:
 
 - Integration tests in `runtime/tests/runtime.rs`. The first test to need a
   module runs `cargo build -p kernel -p counter -p tally --release --target
@@ -856,7 +1274,98 @@ twice over, and any time limit that is zero or over a day.
   inline in WebAssembly text and compiled with the `wat` crate. Each test uses
   its own temporary data directory, and most use `Durability::Normal` to skip
   per-commit syncs.
-- Unit tests in `net.rs`, `seal.rs`, `server.rs`, and `store.rs`.
+- Unit tests in `net.rs`, `seal.rs`, `server.rs`, `store.rs`, `moon.rs`, and
+  `azimuth.rs`. The Azimuth tests run against a stand-in JSON-RPC server on
+  localhost that replays what Ethereum and the roller really answered for
+  `~zod`, and answers like them for made-up ships. One more test asks the real
+  Ethereum and the real roller; it is not run by default
+  (`cargo test -p runtime --lib -- --ignored`, with `ETHEREUM_RPC` to choose
+  the node).
+- Unit tests of `urbit-id/src/naive.rs`, written from the rules of
+  `naive.hoon`: every kind of layer 2 transaction and every check of role,
+  rank, and where a ship is; counts going up for a signed transaction the
+  rules refuse and not for a badly signed one; a high `s` and a `v` without
+  27; one unreadable transaction voiding its batch; zeros left off the front
+  of a batch; ships never seen taking where they are from the ship above;
+  every layer 1 log, including the two that still reach a ship on layer 2;
+  logs not shaped as the contract makes them. Transactions are signed with
+  real secp256k1 keys, and a signature whose point lies past the curve's
+  order (v of 2 or 3) is made by working backwards from a chosen point and
+  recovered. go-azimuth's examples of batches from the main network
+  are read, and their signatures recovered to the addresses go-azimuth gives.
+- Unit tests in `replica.rs`, against a stand-in Ethereum node on localhost
+  that answers from a made-up chain: both contracts interleaved (a layer 2
+  spawn signed just before a layer 1 change of owner fails, one just after
+  works), a node that takes only 7 blocks to a question, fails, and asks to be
+  asked less often, inputs not asked for twice, a file closed and opened
+  again carrying on where it was, lookups refused while the file is even one
+  block short of the final block and answered after the node goes away,
+  blocks past the final one never read and a revision that never goes down
+  across polls, a second opener of the file refused, logs of the wrong shape,
+  answers to another question or not in JSON-RPC 2.0 (one at a time and
+  several at once), a final block that goes back or is too big to write
+  down, a step whose second log fails after its first was applied (nothing
+  of it in the file when opened again), batches too big to hold at once, a
+  node that takes one question per request, and dropping the copy while it
+  is reading.
+- Unit tests in `urbit-id`, against the test vectors of Urbit's key-generation
+  library (wallets, networking keys, keyfiles, ship names) and against a
+  standard Argon2 library. Moon names are checked against the example in
+  Urbit's naming library.
+
+The copy of Azimuth was also checked against the real main network, by hand
+and not as part of `cargo test` (13 November 2026). Read from nothing through
+Tenderly's public node it took 560 seconds (30 seconds of it computing), 974
+requests of which 112 were answered "too many requests" and asked again, and
+69 MB of memory at most. To block 26,407,242 it read 355,837 Azimuth logs
+(of every kind, as it then asked for) and 7,035 batches (none unreadable):
+276,132 layer 2 transactions done, none refused by the rules, 898 not
+properly signed. Of those 898, 886 are in 262
+batches that repeat an earlier batch byte for byte (their counts were already
+used), 10 are ten calls to the layer 2 contract that are not batches at all
+(68 bytes each, an Ethereum function call), 1 is a note written to the
+contract as a batch, and 1 is an adopt whose signature does not match the
+proxy and count the star holds at that point (the roller has not counted it
+either). The result was compared with:
+
+- go-azimuth, another reading of the same rules, fed the very same answers
+  from the node (recorded on the way): all 144,503 points the same in every
+  field (where each ship is, owner and every proxy with its count, keys and
+  their revision, kind, continuity, sponsor, escape). go-azimuth reports one
+  failed signature fewer: it drops the note as not a batch, where
+  `naive.hoon` reads it as one transaction with a missing signature.
+- Urbit's roller (`getPoint`), for every star not on layer 1 (106), 50 planets
+  on layer 1, and 749 planets on layer 2 from all 132 stars that have any:
+  every field the same.
+- The Azimuth contract itself (`points` and `rights`, read at the same block)
+  for all 256 galaxies, 100 stars and 100 planets on layer 1, and the 46 ships
+  that make their children on layer 2. The differences are ones `naive.hoon`
+  makes on purpose, and the roller agrees with the copy on each: a planet made
+  on layer 1 for someone who has not yet taken it is not active in the
+  contract and has no sponsor there, where `naive.hoon` gives it its star
+  from the start (14 of the 100 planets); a ship that moved its children to
+  layer 2 keeps the spawn proxy it had, where the contract has the deposit
+  address (all 46); and ships whose sponsor took them in through layer 2 have
+  that sponsor, where the contract still has the old one and the escape
+  outstanding (8).
+
+After lookups were limited to final blocks and the checks on answers were
+tightened, the same recorded answers were replayed to the copy through a
+local stand-in for the node, and the file came out the same as before, row
+for row (144,503 points, and the same counts). A fresh read from Tenderly
+then reached block 26,407,625 in 553 seconds: the same rows again, and one
+planet more, made on layer 1 after the earlier read, which matches the
+contract.
+
+Since then the copy asks for Azimuth's logs by kind, only the kinds it applies.
+Replayed from the same recording it again came out the same, row for row; it
+now reads 193,701 logs, which is exactly how many of the 355,837 logs in the
+recording (made without asking by kind) are of the kinds applied. The rest
+are 82,160 `Spawned`, 79,968 `Activated`, 6 `OwnershipTransferred` and 2
+`ChangedDns`, and no kind it does not know of. A fresh read from Tenderly,
+asking by kind, reached block 26,407,753 in 512 seconds: every row of the
+earlier fresh read the same, and one planet more, which again matches the
+contract.
 
 The integration tests are grouped roughly in this order: transactions and
 rollback; fuel, time, memory, table, and stack limits, including bulk memory
@@ -866,8 +1375,10 @@ commands; logs, followers, and checkpoints; sign-in and devices; the HTTP
 server over real sockets, including slow and malformed clients; the QUIC
 network with two runtimes on localhost, including directory changes and
 connection limits; commands and receipts between ships; following logs on
-other ships; recovery after one ship is restored from a backup; and
-encryption at rest and sealed copies.
+other ships; recovery after one ship is restored from a backup; encryption
+at rest and sealed copies; ships made from a master ticket or a keyfile; a
+directory that reads keys from a stand-in for Urbit ID (key changes, removed
+keys, outages, impostors, the limit on unknown callers); and moons.
 
 The load test (`runtime/src/bin/loadtest.rs`) takes `--ships` (500),
 `--active` (50), `--events` (20,000), `--threads` (8), `--max-awake` (64),
@@ -884,17 +1395,50 @@ p99, p99.9, max), cold wake latency (p50, p99, max), and disk per ship.
 
 These are stated in the source.
 
-- There is no identity or update mechanism. The directory of ships is a fixed
-  list standing in for Urbit ID, and a ship's key does not change while its
-  runtime runs.
+- Reading Azimuth with `azimuth.rs` trusts the Ethereum endpoint for
+  everything and the roller for ships on layer 2, and uses the `latest` block,
+  so a reorganised block can briefly show a key that does not last. The copy
+  (`replica.rs`) needs no roller but still trusts the Ethereum endpoint for
+  everything; removing that trust means running one's own node. The copy sees
+  a change only once its block is final, about 15 minutes after it lands.
+- The copy's first read of all of Azimuth takes about ten minutes through a
+  free public node, and needs one that answers `eth_getLogs` for old blocks. It
+  then asks the node once a minute how far the chain is final, and more only
+  when that has moved.
+- A hard link to the copy's file made by someone else at the moment it is
+  opened, after its name has been checked, is not caught. It takes someone
+  who can already write to the directory.
+- The copy skips Azimuth's domain names and the operators of `ApprovalForAll`,
+  which `naive.hoon` keeps and nothing here needs. Counts of transactions, key
+  revisions and continuity are kept in 32 bits, where `naive.hoon`'s have no
+  limit; each would take four billion signed transactions on Ethereum to go
+  round.
+- Where a ship is to be found is still a list handed in. Nothing finds a ship
+  through its sponsor yet.
+- A moon's key cannot be taken back at once. A ship that has not seen a later
+  proof goes on accepting an earlier one until the parent changes its own
+  key. A parent keeps no list of its moons.
+- What a directory has learned (keys, key revisions, moon revisions) is kept
+  in memory only. It is lost when the runtime restarts, and for a ship whose
+  key has not been readable for a day.
+- The directory is bounded and never drops a ship that has proved its key
+  while that key is believed. Someone with tens of thousands of real ships,
+  or enough ships to vouch for 32,768 moons, could fill it and keep new ships
+  from being met until entries lapse.
+- A ship's own key does not change while its runtime runs. The planet's keys
+  on Ethereum (ownership and the rest) are derived only as phrases. There is
+  no update mechanism.
+- Whoever holds a ship's master ticket can open its backups and controls the
+  planet. A host that makes the ticket holds it until the owner takes over,
+  and that handover is not built.
 - Encryption at rest does not hide a ship from whoever runs it, and a storage
   key kept in the data directory does not protect a stolen disk. Ship names,
   file sizes, and which modules exist are not hidden. Keys are not wiped from
   memory, and the storage key cannot be changed for a directory once made.
 - There is no way yet for an owner's device to hand its recovery public key to
   a ship over HTTP; it is a runtime call. Changing a ship's recovery key is
-  not recorded in its audit log. A recovery code is not slowed against
-  guessing, so one a person makes up is as weak as they make it.
+  not recorded in its audit log. A ship started from a keyfile has no
+  recovery key until it is given one.
 - An exported copy holds the ship's private key, inside the seal. Running both
   the original and an imported copy gives two writers of the same logs, which
   nothing prevents yet.

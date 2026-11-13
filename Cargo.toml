@@ -1,12 +1,37 @@
 [workspace]
 resolver = "3"
-members = ["runtime", "proto", "sdk", "kernel", "agents/counter", "agents/tally"]
+members = ["runtime", "urbit-id", "proto", "sdk", "kernel", "agents/counter", "agents/tally"]
 # The SDK, kernel, and agents only link for wasm32, so plain `cargo build` / `cargo test` cover the runtime.
-default-members = ["runtime"]
+default-members = ["runtime", "urbit-id"]
 
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"
 
 [profile.release]
+opt-level = 3
+
+# Deriving keys from a master ticket fills half a gigabyte of memory with hashes, by design.
+# Unoptimised it takes most of a minute, so this one crate is always built optimised.
+[profile.dev.package.urbit-id]
+opt-level = 3
+
+# Checking who signed each layer 2 transaction means a curve operation per transaction, and
+# there are a great many of them on Ethereum. These crates are built optimised for that.
+[profile.dev.package.k256]
+opt-level = 3
+
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+
+[profile.dev.package.ecdsa]
+opt-level = 3
+
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+
+[profile.dev.package.sha3]
+opt-level = 3
+
+[profile.dev.package.keccak]
 opt-level = 3

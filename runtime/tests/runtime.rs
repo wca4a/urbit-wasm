@@ -3990,10 +3990,11 @@ fn a_ship_that_cannot_prove_its_key_is_not_believed() {
     // Calling as ~nec: the impostor dials ~zod. Its key is listed for no ship, so ~zod does
     // not answer it.
     assert!(fake_net.ping("~nec", "~zod").is_err());
-    // A key is what a caller is known by. Listed under another name, the same runtime is
-    // answered, and is taken for that name, not the one it gives its own ship.
+    // A caller is taken for the ship it says it is, and only if it holds that ship's key.
+    // Listing the impostor's key under another name does not help it: it says it is ~nec,
+    // and the key listed for ~nec is not the one it holds.
     directory.set("~bus", fake.public_key("~nec").unwrap(), fake_net.addr()).unwrap();
-    assert_eq!(fake_net.ping("~nec", "~zod").unwrap().seen_as, "bus");
+    assert!(fake_net.ping("~nec", "~zod").is_err());
     // One key cannot be listed for two ships.
     assert!(directory.set("~doz", nec_key, nec_net.addr()).is_err());
 }
@@ -4078,6 +4079,7 @@ fn the_network_keeps_working_through_noise_and_refuses_what_is_too_big() {
     let reply = tokio.block_on(async {
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let connection = endpoint.connect_with(stranger_client(Some((doz, doz)), b"ship/1"), bus_net.addr(), "bus").unwrap().await.unwrap();
+        assert!(hello(&connection, "doz").await);
         exchange(&connection, &large).await.unwrap()
     });
     assert!(reply.body.is_none() && reply.refused.contains("too large"), "{reply:?}");
@@ -4171,7 +4173,15 @@ async fn exchange(connection: &quinn::Connection, request: &[u8]) -> Option<ship
     tokio::time::timeout(Duration::from_secs(3), attempt).await.ok().flatten()
 }
 
+/// Say which ship is calling, as a ship does first on a connection it has made. Whether it
+/// was believed.
+async fn hello(connection: &quinn::Connection, ship: &str) -> bool {
+    let said = ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Hello(ship_proto::Hello { ship: ship.into(), proof: None })) };
+    exchange(connection, &said.encode_to_vec()).await.is_some_and(|reply| matches!(reply.body, Some(ship_proto::peer_reply::Body::Welcome(_))))
+}
+
 /// The same, where the caller may show the public key of one seed while signing with another.
+/// It says it is ~bus.
 fn stranger_showing(ship_addr: std::net::SocketAddr, shows: Option<([u8; 32], [u8; 32])>, protocol: &[u8]) -> bool {
     let client = stranger_client(shows, protocol);
     let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -4179,6 +4189,7 @@ fn stranger_showing(ship_addr: std::net::SocketAddr, shows: Option<([u8; 32], [u
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let attempt = async {
             let connection = endpoint.connect_with(client, ship_addr, "nec").ok()?.await.ok()?;
+            hello(&connection, "bus").await.then_some(())?;
             exchange(&connection, &ping_bytes()).await?.body
         };
         matches!(tokio::time::timeout(Duration::from_secs(3), attempt).await, Ok(Some(_)))
@@ -4202,6 +4213,37 @@ fn a_caller_is_answered_only_if_the_directory_lists_its_key() {
     assert!(stranger_is_answered(nec_net.addr(), Some(seed), b"ship/1"));
     // A listed caller that asks for some other protocol is not speaking to ships.
     assert!(!stranger_is_answered(nec_net.addr(), Some(seed), b"h3"));
+    // The key is listed for ~bus. Its holder is ~bus and no other ship: saying it is one
+    // whose key it does not hold, or one that is not listed, or saying nothing and going
+    // straight to a request, gets no answer.
+    directory.set("~doz", [3; 32], "127.0.0.1:9".parse().unwrap()).unwrap();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connect = || endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap();
+        for not in ["doz", "nec", "fen", "", "~~", "Bus"] {
+            let connection = connect().await.unwrap();
+            assert!(!hello(&connection, not).await, "{not:?}");
+            assert!(exchange(&connection, &ping_bytes()).await.is_none(), "{not:?}");
+        }
+        let silent = connect().await.unwrap();
+        assert!(exchange(&silent, &ping_bytes()).await.is_none_or(|reply| reply.body.is_none()));
+        assert!(exchange(&silent, &ping_bytes()).await.is_none());
+        // Nor may a name be said at great length, or with a great deal said beside it:
+        // the right name, with two thousand bytes of something else, is not listened to.
+        let long = connect().await.unwrap();
+        assert!(!hello(&long, &"b".repeat(2000)).await);
+        let padded = connect().await.unwrap();
+        let padding = ship_proto::MoonProof { revision: 0, signed: vec![0; 2000] };
+        let said = ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Hello(ship_proto::Hello { ship: "bus".into(), proof: Some(padding) })) };
+        assert!(exchange(&padded, &said.encode_to_vec()).await.is_none());
+        // Said properly, it is welcome, and saying hello a second time is only a request
+        // the ship does not know.
+        let good = connect().await.unwrap();
+        assert!(hello(&good, "~bus").await);
+        assert!(!hello(&good, "bus").await);
+        assert!(exchange(&good, &ping_bytes()).await.is_some_and(|reply| reply.body.is_some()));
+    });
     // Showing a listed key is not enough. The caller has to sign with it, and one that shows
     // that key while holding a different one is found out.
     assert!(!stranger_showing(nec_net.addr(), Some((seed, [6; 32])), b"ship/1"));
@@ -4285,6 +4327,14 @@ fn stand_in_with(shown: [u8; 32], held: [u8; 32], answers: bool, claims: u64, lo
                 });
                 while let Ok((mut send, mut receive)) = connection.accept_bi().await {
                     let Ok(bytes) = receive.read_to_end(4096).await else { return };
+                    // Whoever says hello is welcome, as the first thing on a connection.
+                    if let Ok(ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Hello(_)) }) = ship_proto::PeerRequest::decode(&*bytes) {
+                        let welcome = ship_proto::PeerReply { body: Some(ship_proto::peer_reply::Body::Welcome(ship_proto::Welcome { proof: None })), refused: String::new() };
+                        let _ = send.write_all(&welcome.encode_to_vec()).await;
+                        let _ = send.finish();
+                        let _ = send.stopped().await;
+                        continue;
+                    }
                     if !answers {
                         // Keep the stream open and say nothing.
                         tokio::spawn(async move {
@@ -4407,6 +4457,7 @@ fn a_request_is_not_acted_on_once_its_sender_is_no_longer_listed() {
     tokio.block_on(async {
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+        assert!(hello(&connection, "bus").await);
         assert!(exchange(&connection, &ping_bytes()).await.is_some_and(|reply| reply.body.is_some()));
 
         // A request is begun while its sender is listed, and finished after it has been
@@ -4423,6 +4474,16 @@ fn a_request_is_not_acted_on_once_its_sender_is_no_longer_listed() {
         let answered = matches!(late, Ok(Ok(bytes)) if ship_proto::PeerReply::decode(&*bytes).is_ok_and(|reply| reply.body.is_some()));
         assert!(!answered, "a request from a ship no longer listed was answered");
         // And the connection it came on is closed.
+        assert!(exchange(&connection, &ping_bytes()).await.is_none());
+
+        // The same when the ship is still listed, with another key: the holder of the key
+        // it had is no longer that ship, on a connection it already has.
+        directory.set("~bus", public, "127.0.0.1:9".parse().unwrap()).unwrap();
+        let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+        assert!(hello(&connection, "bus").await);
+        assert!(exchange(&connection, &ping_bytes()).await.is_some_and(|reply| reply.body.is_some()));
+        directory.set("~bus", [9; 32], "127.0.0.1:9".parse().unwrap()).unwrap();
+        assert!(exchange(&connection, &ping_bytes()).await.is_none_or(|reply| reply.body.is_none()));
         assert!(exchange(&connection, &ping_bytes()).await.is_none());
     });
 }
@@ -4451,7 +4512,7 @@ fn callers_arriving_together_cannot_get_past_the_limit() {
                         gate.wait();
                         let connecting = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), addr, "nec").unwrap();
                         let Ok(Ok(connection)) = tokio::time::timeout(Duration::from_secs(3), connecting).await else { return false };
-                        let answered = exchange(&connection, &ping_bytes()).await.is_some_and(|reply| reply.body.is_some());
+                        let answered = hello(&connection, names[n]).await && exchange(&connection, &ping_bytes()).await.is_some_and(|reply| reply.body.is_some());
                         tokio::time::sleep(Duration::from_millis(1500)).await;
                         answered
                     })
@@ -4478,6 +4539,7 @@ fn a_ship_reads_only_so_many_requests_at_once() {
     tokio.block_on(async {
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+        assert!(hello(&connection, "bus").await);
         // One request is begun and left unfinished. It holds the room.
         let request = ping_bytes();
         let (mut slow, mut slow_reply) = connection.open_bi().await.unwrap();
@@ -4499,6 +4561,7 @@ fn a_ship_reads_only_so_many_requests_at_once() {
     tokio.block_on(async {
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+        assert!(hello(&connection, "bus").await);
         let (mut send, mut receive) = connection.open_bi().await.unwrap();
         for byte in ping_bytes() {
             send.write_all(&[byte]).await.unwrap();
@@ -4624,10 +4687,12 @@ fn a_newer_connection_from_a_ship_takes_the_place_of_its_older_one() {
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let connect = || endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap();
         let first = connect().await.unwrap();
+        assert!(hello(&first, "bus").await);
         assert!(exchange(&first, &ping_bytes()).await.is_some());
         // The same ship connects again, to the same ship. It holds one place, not two: the
         // first connection is closed, so connecting over and over gains it nothing.
         let second = connect().await.unwrap();
+        assert!(hello(&second, "bus").await);
         assert!(exchange(&second, &ping_bytes()).await.is_some());
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(first.close_reason().is_some(), "the older connection was left open");
@@ -4635,10 +4700,19 @@ fn a_newer_connection_from_a_ship_takes_the_place_of_its_older_one() {
         // And again. The first connection's ending must not have upset the record of the
         // second, or the second would now be left open beside the third.
         let third = connect().await.unwrap();
+        assert!(hello(&third, "bus").await);
         assert!(exchange(&third, &ping_bytes()).await.is_some());
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(second.close_reason().is_some(), "the second connection was left open beside the third");
         assert!(exchange(&third, &ping_bytes()).await.is_some());
+        // (A closed connection is counted until it has finished closing, which on a busy
+        // machine can take a moment longer.)
+        for _ in 0..100 {
+            if nec_net.open_connections() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert_eq!(nec_net.open_connections(), 1);
     });
 }
@@ -4765,12 +4839,13 @@ fn receipt(seq: u64, about: u64, verdict: ship_proto::Verdict, reason: &str) -> 
 
 /// Deliver messages to the ship `called` at `addr` as whoever holds `seed`, and return the
 /// number it says it now holds up to.
-fn hand_over(addr: std::net::SocketAddr, called: &str, seed: [u8; 32], messages: Vec<ship_proto::PeerMessage>) -> u64 {
+fn hand_over(addr: std::net::SocketAddr, called: &str, (seed, caller): ([u8; 32], &str), messages: Vec<ship_proto::PeerMessage>) -> u64 {
     let request = ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Deliver(ship_proto::Deliver { messages })) }.encode_to_vec();
     let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     tokio.block_on(async {
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), addr, called).unwrap().await.unwrap();
+        assert!(hello(&connection, caller).await);
         match exchange(&connection, &request).await.and_then(|reply| reply.body) {
             Some(ship_proto::peer_reply::Body::Delivered(delivered)) => delivered.last,
             other => panic!("not a delivery receipt: {other:?}"),
@@ -4879,6 +4954,7 @@ fn a_command_delivered_twice_is_taken_once_and_one_out_of_turn_is_not_taken() {
         tokio.block_on(async {
             let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
             let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+            assert!(hello(&connection, "bus").await);
             match exchange(&connection, &request).await.and_then(|reply| reply.body) {
                 Some(ship_proto::peer_reply::Body::Delivered(delivered)) => delivered.last,
                 other => panic!("not a delivery receipt: {other:?}"),
@@ -5397,9 +5473,9 @@ fn a_receipt_is_believed_only_for_a_command_that_was_sent_to_that_ship() {
 
     // ~doz says command 1 ran. ~nec sent ~doz nothing, so that answers nothing. It is taken,
     // so that it does not hold up what ~doz sends next, and dropped.
-    assert_eq!(hand_over(nec_net.addr(), "nec", doz, vec![receipt(1, 1, Verdict::Ran, "")]), 1);
+    assert_eq!(hand_over(nec_net.addr(), "nec", (doz, "doz"), vec![receipt(1, 1, Verdict::Ran, "")]), 1);
     // ~bus answers a command ~nec never sent it.
-    assert_eq!(hand_over(nec_net.addr(), "nec", bus, vec![receipt(1, 7, Verdict::Ran, "")]), 1);
+    assert_eq!(hand_over(nec_net.addr(), "nec", (bus, "bus"), vec![receipt(1, 7, Verdict::Ran, "")]), 1);
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(nec.unanswered("~nec").unwrap(), 1);
     assert_eq!(receipts(), "");
@@ -5408,7 +5484,7 @@ fn a_receipt_is_believed_only_for_a_command_that_was_sent_to_that_ship() {
     // ~bus answers the command it was sent. The reason is the other ship's words: it is cut
     // to length and anything that is not plain text is taken out before it is kept.
     let long = format!("no\u{7}\nway {}", "x".repeat(500));
-    assert_eq!(hand_over(nec_net.addr(), "nec", bus, vec![receipt(2, 1, Verdict::Denied, &long)]), 2);
+    assert_eq!(hand_over(nec_net.addr(), "nec", (bus, "bus"), vec![receipt(2, 1, Verdict::Denied, &long)]), 2);
     eventually("the agent is told", || receipts().lines().count() == 1);
     let told = receipts();
     assert!(told.starts_with("1 ~bus/counter counter denied [no  way xxx"), "{told}");
@@ -5419,7 +5495,7 @@ fn a_receipt_is_believed_only_for_a_command_that_was_sent_to_that_ship() {
     assert!(noted[0].starts_with("~bus did not run command 1 to counter counter: it was not allowed: no  way xxx"), "{noted:?}");
 
     // A second answer to the same command, and the first one sent again, change nothing.
-    assert_eq!(hand_over(nec_net.addr(), "nec", bus, vec![receipt(2, 1, Verdict::Denied, "again"), receipt(3, 1, Verdict::Ran, "")]), 3);
+    assert_eq!(hand_over(nec_net.addr(), "nec", (bus, "bus"), vec![receipt(2, 1, Verdict::Denied, "again"), receipt(3, 1, Verdict::Ran, "")]), 3);
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(receipts(), told);
     assert_eq!(refusals(&nec, "~nec", "tally").len(), 1);
@@ -5428,7 +5504,7 @@ fn a_receipt_is_believed_only_for_a_command_that_was_sent_to_that_ship() {
     send(&nec, "~nec", "tally", "tell bus inc hits");
     let mut strange = receipt(4, 2, Verdict::Ran, "");
     strange.receipt.as_mut().unwrap().verdict = 77;
-    assert_eq!(hand_over(nec_net.addr(), "nec", bus, vec![strange]), 4);
+    assert_eq!(hand_over(nec_net.addr(), "nec", (bus, "bus"), vec![strange]), 4);
     eventually("the agent is told", || receipts().lines().count() == 2);
     assert!(receipts().lines().last().unwrap().starts_with("2 ~bus/counter counter unknown []"), "{}", receipts());
     assert_eq!(refusals(&nec, "~nec", "tally").len(), 2);
@@ -5459,7 +5535,7 @@ fn only_so_many_commands_may_be_unanswered() {
     let hand = || {
         let request = ship_proto::PeerRequest::decode(&*delivery(&five)).unwrap();
         let Some(ship_proto::peer_request::Body::Deliver(deliver)) = request.body else { unreachable!() };
-        hand_over(nec_net.addr(), "nec", seed, deliver.messages)
+        hand_over(nec_net.addr(), "nec", (seed, "bus"), deliver.messages)
     };
     assert_eq!(hand(), 2);
     // Sent again, the rest are still not taken: the two that are queued count as owed.
@@ -5539,6 +5615,7 @@ fn a_delivery_holds_only_so_many_messages() {
         tokio.block_on(async {
             let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
             let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), nec_net.addr(), "nec").unwrap().await.unwrap();
+            assert!(hello(&connection, "bus").await);
             exchange(&connection, &request).await.unwrap()
         })
     };
@@ -5938,7 +6015,7 @@ fn receipts_already_written_do_not_keep_a_small_ship_from_taking_more() {
         let messages: Vec<(u64, &str, &str)> = (1..=64).map(|n| (batch * 64 + n, "counter", "inc hits")).collect();
         let request = ship_proto::PeerRequest::decode(&*delivery(&messages)).unwrap();
         let Some(ship_proto::peer_request::Body::Deliver(deliver)) = request.body else { unreachable!() };
-        assert_eq!(hand_over(nec_net.addr(), "nec", seed, deliver.messages), (batch + 1) * 64);
+        assert_eq!(hand_over(nec_net.addr(), "nec", (seed, "bus"), deliver.messages), (batch + 1) * 64);
         eventually("the batch runs", || count(&nec, "~nec", "hits") == ((batch + 1) * 64).to_string());
     }
     assert_eq!(nec.outbound_pending("~nec").unwrap(), 640);
@@ -5988,12 +6065,13 @@ fn back(dir: &TempDir, ship: &str, directory: &Arc<Directory>, cfg: Config) -> (
 }
 
 /// Send one request to the ship `called` at `addr` as whoever holds `seed`, and return its answer.
-fn ask_ship(addr: std::net::SocketAddr, called: &str, seed: [u8; 32], request: Asked) -> Option<Answered> {
+fn ask_ship(addr: std::net::SocketAddr, called: &str, (seed, caller): ([u8; 32], &str), request: Asked) -> Option<Answered> {
     let request = ship_proto::PeerRequest { body: Some(request) }.encode_to_vec();
     let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     tokio.block_on(async {
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), addr, called).unwrap().await.unwrap();
+        assert!(hello(&connection, caller).await);
         exchange(&connection, &request).await.and_then(|reply| reply.body)
     })
 }
@@ -6184,7 +6262,7 @@ fn only_the_ships_its_publisher_lets_in_may_follow_a_log() {
     // A ship that is not let in is told the same whether or not there is such a log.
     let dev = [9u8; 32];
     directory.set("~dev", public_of(dev), "127.0.0.1:9".parse().unwrap()).unwrap();
-    let ask = |agent: &str, log: &str| match ask_ship(zod_net.addr(), "zod", dev, fetch(agent, log, 0, true)) {
+    let ask = |agent: &str, log: &str| match ask_ship(zod_net.addr(), "zod", (dev, "dev"), fetch(agent, log, 0, true)) {
         Some(Answered::Fetched(answer)) => answer,
         other => panic!("not an answer about a log: {other:?}"),
     };
@@ -6513,7 +6591,7 @@ fn a_number_no_log_could_reach_is_not_believed() {
     // that is only a prompt to ask, and this one is not even that: kept, it would be a
     // number ~nec's own file could not be read back with.
     let far = ship_proto::LogNews { agent: "counter".into(), log: "counter".into(), head: (1 << 62) + 5, closed: false };
-    let heard = ask_ship(kept.1.addr(), "nec", BUS, Asked::News(ship_proto::News { logs: vec![far] }));
+    let heard = ask_ship(kept.1.addr(), "nec", (BUS, "bus"), Asked::News(ship_proto::News { logs: vec![far] }));
     assert_eq!(heard, Some(Answered::Heard(ship_proto::Heard { unknown: vec![false] })));
     assert_eq!(followed(&nec, "~nec").announced, 3);
     let (out, other) = (TempDir::new("flw-far-out"), TempDir::new("flw-far-other"));
@@ -6540,7 +6618,7 @@ fn a_follower_is_told_again_when_the_log_grew_while_it_was_being_told() {
         _ => None,
     })));
     directory.set("~bus", public_of(BUS), addr).unwrap();
-    assert!(matches!(ask_ship(zod_net.addr(), "zod", BUS, fetch("counter", "counter", 0, true)), Some(Answered::Fetched(_))));
+    assert!(matches!(ask_ship(zod_net.addr(), "zod", (BUS, "bus"), fetch("counter", "counter", 0, true)), Some(Answered::Fetched(_))));
 
     // The log gets its first entry, and ~bus is told. While ~bus is still taking that in,
     // the log gets a second. ~bus's answer is to news of the first, so it is told again.
@@ -6804,14 +6882,14 @@ fn an_answer_to_old_news_does_not_strike_off_a_ship_that_has_asked_afresh() {
     let (addr, _running, _) = stand_in_with(BUS, BUS, true, 0, Some(Arc::new(move |asked| match asked {
         Asked::News(news) => {
             if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                std::thread::spawn(move || ask_ship(addr_of_zod, "zod", BUS, fetch("counter", "counter", 0, true))).join().unwrap();
+                std::thread::spawn(move || ask_ship(addr_of_zod, "zod", (BUS, "bus"), fetch("counter", "counter", 0, true))).join().unwrap();
             }
             Some(Answered::Heard(ship_proto::Heard { unknown: vec![true; news.logs.len()] }))
         }
         _ => None,
     })));
     directory.set("~bus", public_of(BUS), addr).unwrap();
-    assert!(matches!(ask_ship(zod_net.addr(), "zod", BUS, fetch("counter", "counter", 0, true)), Some(Answered::Fetched(_))));
+    assert!(matches!(ask_ship(zod_net.addr(), "zod", (BUS, "bus"), fetch("counter", "counter", 0, true)), Some(Answered::Fetched(_))));
     assert_eq!(zod.log_followers("~zod", "counter", "counter").unwrap(), ["bus"]);
 
     send(&zod, "~zod", "counter", "log hits");
@@ -6910,11 +6988,11 @@ fn news_and_answers_with_too_many_parts_are_not_taken_in() {
     // A piece of news may name a few hundred logs. One that names more is refused whole,
     // before any of it is unpacked.
     let news = |logs: usize| Asked::News(ship_proto::News { logs: vec![ship_proto::LogNews::default(); logs] });
-    match ask_ship(zod_net.addr(), "zod", dev, news(256)) {
+    match ask_ship(zod_net.addr(), "zod", (dev, "dev"), news(256)) {
         Some(Answered::Heard(heard)) => assert_eq!(heard.unknown, vec![true; 256]),
         other => panic!("not an answer to news: {other:?}"),
     }
-    assert_eq!(ask_ship(zod_net.addr(), "zod", dev, news(257)), None);
+    assert_eq!(ask_ship(zod_net.addr(), "zod", (dev, "dev"), news(257)), None);
 
     // Likewise an answer with more entries than are ever sent at once. It is not looked at,
     // so nothing in it can stop the log or be kept: the ship asks again later.
@@ -7185,7 +7263,7 @@ fn being_told_a_log_is_closed_is_a_reason_to_ask_and_no_more() {
     // stop on the strength of it. It asks ~zod, which shares the log, and carries on.
     let seed = seed_of(&a.0, "zod");
     let closed = ship_proto::LogNews { agent: "counter".into(), log: "counter".into(), head: 0, closed: true };
-    let heard = ask_ship(nec_net.addr(), "nec", seed, Asked::News(ship_proto::News { logs: vec![closed] }));
+    let heard = ask_ship(nec_net.addr(), "nec", (seed, "zod"), Asked::News(ship_proto::News { logs: vec![closed] }));
     assert_eq!(heard, Some(Answered::Heard(ship_proto::Heard { unknown: vec![false] })));
     send(&zod, "~zod", "counter", "log hits");
     eventually("~nec carries on", || seen_on(&nec, "~nec", "zod") == 2);
@@ -7237,7 +7315,7 @@ fn an_answer_given_before_a_log_was_closed_does_not_call_off_the_asking() {
     }));
     eventually("the first question is put", || asked.load(Ordering::SeqCst) == 1);
     let closed = ship_proto::LogNews { agent: "counter".into(), log: "counter".into(), head: 0, closed: true };
-    let heard = ask_ship(kept.1.addr(), "nec", BUS, Asked::News(ship_proto::News { logs: vec![closed] }));
+    let heard = ask_ship(kept.1.addr(), "nec", (BUS, "bus"), Asked::News(ship_proto::News { logs: vec![closed] }));
     assert_eq!(heard, Some(Answered::Heard(ship_proto::Heard { unknown: vec![false] })));
     eventually("~nec asks again and is told the log has stopped", || stopped_on(&nec, "~nec", "bus").contains("does not share"));
     assert_eq!(asked.load(Ordering::SeqCst), 2);
@@ -7316,7 +7394,7 @@ fn a_ship_shut_out_of_a_log_is_not_told_how_far_it_has_got_since() {
         _ => None,
     })));
     directory.set("~bus", public_of(BUS), addr).unwrap();
-    assert!(matches!(ask_ship(zod_net.addr(), "zod", BUS, fetch("counter", "counter", 0, true)), Some(Answered::Fetched(_))));
+    assert!(matches!(ask_ship(zod_net.addr(), "zod", (BUS, "bus"), fetch("counter", "counter", 0, true)), Some(Answered::Fetched(_))));
 
     // While ~zod is off the network, its counter shuts ~bus out, and then the log grows.
     // Back on, ~zod tells ~bus the log is closed to it. It does not say where the log has
@@ -7412,7 +7490,7 @@ fn a_ship_brought_in_from_a_saved_copy_shows_a_new_mark() {
     // Another ship is shown it on asking.
     let dev = [9u8; 32];
     directory.set("~dev", public_of(dev), "127.0.0.1:9".parse().unwrap()).unwrap();
-    let shown = |addr| match ask_ship(addr, "zod", dev, Asked::Ping(ship_proto::Ping { nonce: vec![1, 2, 3] })) {
+    let shown = |addr| match ask_ship(addr, "zod", (dev, "dev"), Asked::Ping(ship_proto::Ping { nonce: vec![1, 2, 3] })) {
         Some(Answered::Pong(pong)) => pong.incarnation,
         other => panic!("not an answer to a ping: {other:?}"),
     };
@@ -7661,7 +7739,7 @@ fn a_ship_is_believed_about_where_it_stands_only_within_bounds() {
     let directory = Directory::new();
     let (zod, zod_net) = crewed(&dir, "~zod", &directory, fast(), open_counter(), far_tally("*"));
     directory.set("~bus", public_of(BUS), "127.0.0.1:9".parse().unwrap()).unwrap();
-    let ask = |standing: ship_proto::Standing| ask_ship(zod_net.addr(), "zod", BUS, Asked::Resync(ship_proto::Resync { standing: Some(standing) }));
+    let ask = |standing: ship_proto::Standing| ask_ship(zod_net.addr(), "zod", (BUS, "bus"), Asked::Resync(ship_proto::Resync { standing: Some(standing) }));
     let stood = |answer: Option<Answered>| match answer {
         Some(Answered::Resynced(resynced)) => resynced.standing.unwrap(),
         other => panic!("not where a ship stands: {other:?}"),
@@ -7738,7 +7816,7 @@ fn an_acknowledgement_from_before_two_ships_compared_notes_is_not_acted_on() {
             let newest = deliver.messages.last().map_or(0, |message| message.seq);
             if newest == 2 && count.fetch_add(1, Ordering::SeqCst) == 0 {
                 let standing = Some(stands(0, 1, 1, &[]));
-                std::thread::spawn(move || ask_ship(addr_of_zod, "zod", BUS, Asked::Resync(ship_proto::Resync { standing }))).join().unwrap();
+                std::thread::spawn(move || ask_ship(addr_of_zod, "zod", (BUS, "bus"), Asked::Resync(ship_proto::Resync { standing }))).join().unwrap();
             }
             Some(Answered::Delivered(ship_proto::Delivered { last: newest }))
         }
@@ -7843,13 +7921,15 @@ fn what_arrives_on_a_connection_that_has_been_replaced_is_not_acted_on() {
     tokio.block_on(async {
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let old = endpoint.connect_with(stranger_client(Some((BUS, BUS)), b"ship/1"), addr, "zod").unwrap().await.unwrap();
+        assert!(hello(&old, "bus").await);
         for request in [&delivery, &account] {
             let (mut send, _) = old.open_bi().await.unwrap();
             send.write_all(request).await.unwrap();
             send.finish().unwrap();
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let _newer = endpoint.connect_with(stranger_client(Some((BUS, BUS)), b"ship/1"), addr, "zod").unwrap().await.unwrap();
+        let newer = endpoint.connect_with(stranger_client(Some((BUS, BUS)), b"ship/1"), addr, "zod").unwrap().await.unwrap();
+        assert!(hello(&newer, "bus").await);
         tokio::time::sleep(Duration::from_millis(300)).await;
     });
     assert!(busy.join().unwrap().is_err());
@@ -7858,7 +7938,7 @@ fn what_arrives_on_a_connection_that_has_been_replaced_is_not_acted_on() {
     assert_eq!((count(&zod, "~zod", "hits"), zod.pending("~zod").unwrap()), ("0".to_string(), 0));
     assert_eq!(in_file(&dir, "zod", "SELECT COUNT(*) FROM peers"), 0);
     // The same command on a connection that is still the newest is taken.
-    assert_eq!(hand_over(addr, "zod", BUS, vec![command]), 1);
+    assert_eq!(hand_over(addr, "zod", (BUS, "bus"), vec![command]), 1);
     eventually("it runs", || count(&zod, "~zod", "hits") == "1");
 }
 
@@ -8028,8 +8108,8 @@ fn a_ship_is_exported_only_once_it_has_a_recovery_key_and_only_the_code_opens_th
     }
     assert!(!rt.has_recovery_key("~zod").unwrap());
 
-    let code = rt.new_recovery_code("~zod").unwrap();
-    assert_eq!(code.split('-').map(str::len).collect::<Vec<_>>(), vec![4; 8]);
+    let code = "9f3c-11d0-77aa-0b52-e4c8-6d19-a0f7-3b2e".to_string();
+    rt.set_recovery_key("~zod", seal::recovery_public(&code)).unwrap();
     assert!(rt.has_recovery_key("~zod").unwrap());
     rt.export_ship("~zod", &out.0).unwrap();
 
@@ -8056,8 +8136,8 @@ fn a_ship_is_exported_only_once_it_has_a_recovery_key_and_only_the_code_opens_th
 
     // Given a new code, the ship seals to that from then on. Copies made before still open
     // with the code they were sealed to, and only with that.
-    let newer = rt.new_recovery_code("~zod").unwrap();
-    assert_ne!(newer, code);
+    let newer = "another code altogether".to_string();
+    rt.set_recovery_key("~zod", seal::recovery_public(&newer)).unwrap();
     rt.export_ship("~zod", &later.0).unwrap();
     let sealed = |dir: &TempDir| fs::read(dir.0.join("zod.ship")).unwrap();
     assert!(seal::open_export(&newer, "zod", sealed(&later)).is_some() && seal::open_export(&code, "zod", sealed(&later)).is_none());
@@ -8206,4 +8286,1114 @@ fn an_export_that_fails_leaves_the_copy_that_was_there() {
     let other = Runtime::open(&b.0, fast()).unwrap();
     other.import_ship(&out.0, "~zod", CODE).unwrap();
     assert_eq!(send(&other, "~zod", "counter", "get hits"), "2");
+}
+
+/// A key as bytes, from the way Urbit writes it: as a number, highest byte first.
+fn urbit_key(written: &str) -> [u8; 32] {
+    std::array::from_fn(|i| u8::from_str_radix(&written[62 - 2 * i..64 - 2 * i], 16).unwrap())
+}
+
+/// The star and master ticket of one of the test wallets of Urbit's own key-generation
+/// library, and the public half of the key that library gives its ship to prove who it is.
+const STAR: &str = "~matbyr";
+const STAR_TICKET: &str = "~marbud-tidsev-litsut-hidfep";
+const STAR_KEY: &str = "25bd0bb620181c1c80f807a04bb7d7701711bdf6793ddbf9ed49d6f03fbba34f";
+
+#[test]
+fn a_ship_made_from_its_master_ticket_runs_with_the_keys_urbit_gives_it() {
+    let (a, b, c, out) = (TempDir::new("ticket-a"), TempDir::new("ticket-b"), TempDir::new("ticket-c"), TempDir::new("ticket-out"));
+    let rt = Runtime::open(&a.0, fast()).unwrap();
+    let (kernel, counter) = (kernel(&rt), rt.add_module(&counter_wasm()).unwrap());
+
+    // What is not a ticket, or not a ship a ticket can be for, makes nothing.
+    for (name, ticket) in [(STAR, "~marbud-tidsev-litsut"), (STAR, "not a ticket"), (STAR, ""), ("~matbyr-matbyr-matbyr", STAR_TICKET), ("~some-ship", STAR_TICKET)] {
+        let refused = rt.create_ship_from_ticket(name, &kernel, ticket, 0);
+        assert!(matches!(&refused, Err(Error::BadKeys(_)) | Err(Error::InvalidName(_))), "{name} {ticket}: {refused:?}");
+    }
+    assert!(matches!(rt.public_key(STAR), Err(Error::UnknownShip(_))));
+
+    // The ship proves who it is with the key Urbit's wallet gives that ticket for that ship:
+    // the one Azimuth would list for it.
+    rt.create_ship_from_ticket(STAR, &kernel, STAR_TICKET, 0).unwrap();
+    assert_eq!(rt.public_key(STAR).unwrap(), urbit_key(STAR_KEY));
+    assert!(matches!(rt.create_ship_from_ticket(STAR, &kernel, STAR_TICKET, 0), Err(Error::ShipExists(_))));
+    // It signs its logs with it.
+    rt.install(STAR, "counter", &counter, &counter_manifest(false)).unwrap();
+    send(&rt, STAR, "counter", "log hits");
+    let entries = rt.log_entries(STAR, "counter", "counter", 0, 10).unwrap();
+    assert!(verify_log(&urbit_key(STAR_KEY), STAR, "counter", "counter", None, &entries).is_ok());
+
+    // Copies of it are sealed to the ticket from the start, with nothing more to set up,
+    // and the ticket is what brings one back. It was not kept anywhere to do that.
+    assert!(rt.has_recovery_key(STAR).unwrap());
+    send(&rt, STAR, "counter", "inc hits 3");
+    rt.export_ship(STAR, &out.0).unwrap();
+    for kept in ["storage.key", "ships/matbyr.ship", "keys/matbyr.key"] {
+        assert!(!holds(&fs::read(a.0.join(kept)).unwrap(), b"marbud"), "{kept} holds the ticket");
+    }
+    let other = Runtime::open(&b.0, fast()).unwrap();
+    // Another ticket, the right ticket for another ship's name, and what is not a ticket.
+    let wrong = other.import_ship_with_ticket(&out.0, STAR, "~marbud-tidsev-litsut-hidfes");
+    assert!(matches!(&wrong, Err(Error::BadShipFile(why)) if why.contains("recovery code")), "{wrong:?}");
+    // What is wrong is said: the ticket, not the ship's name.
+    assert!(matches!(other.import_ship_with_ticket(&out.0, STAR, "not a ticket"), Err(Error::BadKeys(why)) if why.contains("master ticket")));
+    assert!(matches!(other.import_ship_with_ticket(&out.0, "~some-ship", STAR_TICKET), Err(Error::BadKeys(why)) if why.contains("name")));
+    fs::copy(out.0.join("matbyr.ship"), out.0.join("zod.ship")).unwrap();
+    assert!(matches!(other.import_ship_with_ticket(&out.0, "~zod", STAR_TICKET), Err(Error::BadShipFile(_))));
+    assert!(matches!(other.public_key(STAR), Err(Error::UnknownShip(_))));
+    other.import_ship_with_ticket(&out.0, STAR, STAR_TICKET).unwrap();
+    assert_eq!(send(&other, STAR, "counter", "get hits"), "4");
+    assert_eq!(other.public_key(STAR).unwrap(), urbit_key(STAR_KEY));
+    // And it goes on sealing its copies to the same ticket.
+    assert!(other.has_recovery_key(STAR).unwrap());
+    assert_eq!(Runtime::recovery_key_of_ticket(STAR, STAR_TICKET).unwrap(), seal::recovery_public(&runtime::urbit_id::Wallet::from_ticket(STAR_TICKET, STAR).unwrap().backup_code()));
+
+    // When a ship's keys are replaced, the revision goes up, and the same ticket gives the
+    // ship a new key.
+    let later = Runtime::open(&c.0, fast()).unwrap();
+    later.create_ship_from_ticket(STAR, &crate::kernel(&later), STAR_TICKET, 1).unwrap();
+    assert_ne!(later.public_key(STAR).unwrap(), urbit_key(STAR_KEY));
+    // A copy sealed under the first revision still opens with the ticket: the code that
+    // opens copies does not come from the networking keys.
+    assert!(seal::open_export(&runtime::urbit_id::Wallet::from_ticket(STAR_TICKET, STAR).unwrap().backup_code(), "matbyr", fs::read(out.0.join("matbyr.ship")).unwrap()).is_some());
+}
+
+#[test]
+fn a_ship_started_from_a_keyfile_needs_no_ticket_and_cannot_seal_copies_until_it_is_given_the_key() {
+    let (a, out) = (TempDir::new("keyfile-a"), TempDir::new("keyfile-out"));
+    let rt = Runtime::open(&a.0, fast()).unwrap();
+    let kernel = kernel(&rt);
+    // A keyfile from the tests of Urbit's key-generation library: ship number 1,000,000 at
+    // revision 1, and the public half of the key in it.
+    let keyfile = "0w2D5.4W8DB.hhSoi.deWxf.KnWmN.GbC-Q.qFb7f.x~qYY.ReLGb.JiO33.d09Fc.ppBTy.OmfG8.CcKbi.tRN9V.NYFgb.b1cbR.cduA8.4g0ef.Ei0A1";
+    let key = urbit_key("9a09b7e816467b10ebdcd47d71861a2d0896189f2e66690b636ad3bdf8fcc343");
+    for not in ["", "0w", "not a keyfile", &keyfile[..40]] {
+        assert!(matches!(rt.create_ship_from_keyfile(&kernel, not), Err(Error::BadKeys(_))), "{not:?}");
+    }
+
+    // The keyfile says which ship it is for.
+    let name = rt.create_ship_from_keyfile(&kernel, keyfile).unwrap();
+    assert_eq!(format!("~{name}"), runtime::urbit_id::ob::ship_name(1_000_000));
+    assert_eq!(rt.public_key(&name).unwrap(), key);
+    assert!(matches!(rt.create_ship_from_keyfile(&kernel, keyfile), Err(Error::ShipExists(_))));
+
+    // A keyfile holds the keys the ship runs with and nothing of the rest of the wallet, so
+    // there is nothing yet to seal a copy to.
+    assert!(!rt.has_recovery_key(&name).unwrap());
+    assert!(matches!(rt.export_ship(&name, &out.0), Err(Error::NoRecoveryKey(_))));
+    // Whoever holds the ticket hands over the public half of what it gives, and no more.
+    let ticket = "~marbud-tidsev-litsut-hidfep";
+    rt.set_recovery_key(&name, Runtime::recovery_key_of_ticket(&name, ticket).unwrap()).unwrap();
+    rt.export_ship(&name, &out.0).unwrap();
+    let other = TempDir::new("keyfile-b");
+    let moved = Runtime::open(&other.0, fast()).unwrap();
+    moved.import_ship_with_ticket(&out.0, &name, ticket).unwrap();
+    assert_eq!(moved.public_key(&name).unwrap(), key);
+
+    // The keyfile for a ship's keys, written here, is the one Urbit's library writes.
+    let keys = runtime::urbit_id::NetworkKeys::from_seed(&std::array::from_fn(|i| u8::from_str_radix(&"88359ba61d766e1c2ec9598831668d4233b0f8f58b29da8cf33d25b2590d62a0"[2 * i..2 * i + 2], 16).unwrap()));
+    assert_eq!(Runtime::keyfile(&name, 1, &keys).unwrap(), keyfile);
+    assert!(matches!(Runtime::keyfile("~not-a-ship", 1, &keys), Err(Error::BadKeys(_))));
+}
+
+/// A stand-in for Urbit ID: it lists whatever the test says, can be made to give no answer,
+/// and counts how often it is asked.
+#[derive(Default)]
+struct Listings {
+    listed: std::sync::Mutex<std::collections::HashMap<u32, ([u8; 32], u32)>>,
+    down: AtomicBool,
+    asked: AtomicUsize,
+    /// How long it takes to answer, in milliseconds.
+    slow: AtomicUsize,
+    /// If set, only questions about this ship are slow.
+    slow_about: std::sync::Mutex<Option<u32>>,
+    /// If set, only questions about planets are slow.
+    slow_planets: AtomicBool,
+}
+
+impl Listings {
+    /// List a key for a ship, as the next revision of its keys.
+    fn list(&self, ship: &str, key: [u8; 32]) {
+        let number = runtime::urbit_id::ob::ship_number(ship).unwrap();
+        let mut listed = self.listed.lock().unwrap();
+        let revision = listed.get(&number).map_or(1, |(_, revision)| revision + 1);
+        listed.insert(number, (key, revision));
+    }
+
+    /// List a key for a ship as a revision of the test's choosing.
+    fn list_as(&self, ship: &str, key: [u8; 32], revision: u32) {
+        self.listed.lock().unwrap().insert(runtime::urbit_id::ob::ship_number(ship).unwrap(), (key, revision));
+    }
+
+    fn unlist(&self, ship: &str) {
+        self.listed.lock().unwrap().remove(&runtime::urbit_id::ob::ship_number(ship).unwrap());
+    }
+}
+
+impl runtime::azimuth::Keys for Listings {
+    fn listing(&self, ship: u32) -> Result<Option<runtime::azimuth::Listing>, String> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        if self.down.load(Ordering::SeqCst) {
+            return Err("nobody answered".into());
+        }
+        if self.slow_about.lock().unwrap().is_none_or(|slow| slow == ship) && (ship > 0xffff || !self.slow_planets.load(Ordering::SeqCst)) {
+            std::thread::sleep(Duration::from_millis(self.slow.load(Ordering::SeqCst) as u64));
+        }
+        // A key of nothing but zeros stands for a ship whose keys have been taken away.
+        Ok(self.listed.lock().unwrap().get(&ship).map(|(key, revision)| runtime::azimuth::Listing { key: (*key != [0; 32]).then_some(*key), revision: *revision, continuity: 0, sponsor: None }))
+    }
+}
+
+/// A runtime with one ship, on a network whose directory is its own and reads its keys from
+/// `urbit`. Keys are read again once they are `FRESH` old, and not believed once `GOOD` old.
+fn on_urbit_id(dir: &TempDir, ship: &str, urbit: &Arc<Listings>) -> (Arc<Runtime>, Network, Arc<Directory>) {
+    on_urbit_id_for(dir, ship, urbit, GOOD)
+}
+
+/// The same, saying how long a key is believed without being read again.
+fn on_urbit_id_for(dir: &TempDir, ship: &str, urbit: &Arc<Listings>, good_for: Duration) -> (Arc<Runtime>, Network, Arc<Directory>) {
+    let directory = Directory::reading_with(urbit.clone(), FRESH, good_for);
+    let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
+    rt.create_ship(ship, &kernel(&rt)).unwrap();
+    let net = Network::start(rt.clone(), directory.clone(), impatient()).unwrap();
+    (rt, net, directory)
+}
+
+const FRESH: Duration = Duration::from_millis(400);
+const GOOD: Duration = Duration::from_millis(3000);
+
+#[test]
+fn ships_are_known_by_the_keys_urbit_id_lists_for_them() {
+    let (a, b, c) = (TempDir::new("id-a"), TempDir::new("id-b"), TempDir::new("id-c"));
+    let urbit = Arc::new(Listings::default());
+    let (zod, zod_net, zod_dir) = on_urbit_id(&a, "~zod", &urbit);
+    let (nec, nec_net, nec_dir) = on_urbit_id(&b, "~nec", &urbit);
+    // Another runtime with a ship it also calls ~nec, and a key of its own.
+    let (other, other_net, other_dir) = on_urbit_id(&c, "~nec", &urbit);
+    let (zod_key, nec_key, other_key) = (zod.public_key("~zod").unwrap(), nec.public_key("~nec").unwrap(), other.public_key("~nec").unwrap());
+    // Where ships are is not in Urbit ID. Each runtime is told.
+    zod_dir.place("~nec", nec_net.addr()).unwrap();
+    nec_dir.place("~zod", zod_net.addr()).unwrap();
+    other_dir.place("~zod", zod_net.addr()).unwrap();
+
+    // Urbit ID lists neither ship, so neither can call the other: one because it has no
+    // key to expect, the other because the caller is nobody it can look up.
+    assert!(matches!(zod_net.ping("~zod", "~nec"), Err(NetError::Unlisted(_))));
+    urbit.list("~nec", nec_key);
+    eventually("~zod reads ~nec's key", || !matches!(zod_net.ping("~zod", "~nec"), Err(NetError::Unlisted(_))));
+    assert!(zod_net.ping("~zod", "~nec").is_err(), "~nec took a caller Urbit ID does not list");
+    urbit.list("~zod", zod_key);
+    eventually("~nec reads ~zod's key", || zod_net.ping("~zod", "~nec").is_ok());
+    let answered = zod_net.ping("~zod", "~nec").unwrap();
+    assert_eq!((answered.ship.as_str(), answered.seen_as.as_str()), ("nec", "zod"));
+    assert_eq!(nec_net.ping("~nec", "~zod").unwrap().seen_as, "nec");
+    assert_eq!((zod_dir.key_of("~nec"), nec_dir.key_of("~zod")), (Some(nec_key), Some(zod_key)));
+    // A key just read is not read again for every request.
+    std::thread::sleep(FRESH + Duration::from_millis(100));
+    zod_net.ping("~zod", "~nec").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let asked = urbit.asked.load(Ordering::SeqCst);
+    for _ in 0..20 {
+        zod_net.ping("~zod", "~nec").unwrap();
+        nec_net.ping("~nec", "~zod").unwrap();
+    }
+    assert!(urbit.asked.load(Ordering::SeqCst) <= asked + 2, "asked {} times more", urbit.asked.load(Ordering::SeqCst) - asked);
+
+    // The other ~nec is not the one Urbit ID lists. Calling as ~nec, it is not believed.
+    // Answering as ~nec, at the address ~zod has been given for ~nec, it is not believed.
+    assert!(other_net.ping("~nec", "~zod").is_err());
+    zod_dir.place("~nec", other_net.addr()).unwrap();
+    assert!(matches!(zod_net.ping("~zod", "~nec"), Err(NetError::Unreachable(_))));
+    zod_dir.place("~nec", nec_net.addr()).unwrap();
+    eventually("~zod reaches the real ~nec again", || zod_net.ping("~zod", "~nec").is_ok());
+
+    // ~nec's owner gives it a new key in Urbit ID: the one the other runtime holds. Once
+    // that has been read, the ship with the old key is no longer ~nec to anyone, calling
+    // or called, and the ship with the new one is.
+    urbit.list("~nec", other_key);
+    eventually("the old key stops answering as ~nec", || zod_net.ping("~zod", "~nec").is_err());
+    eventually("the old key stops calling as ~nec", || nec_net.ping("~nec", "~zod").is_err());
+    assert_eq!(zod_dir.key_of("~nec"), Some(other_key));
+    zod_dir.place("~nec", other_net.addr()).unwrap();
+    eventually("the new key answers as ~nec", || zod_net.ping("~zod", "~nec").is_ok());
+    assert_eq!(other_net.ping("~nec", "~zod").unwrap().seen_as, "nec");
+    assert!(nec_net.ping("~nec", "~zod").is_err());
+
+    // A ship whose keys are taken away in Urbit ID is nobody. (Taking them away is one
+    // more revision of them, with nothing there.)
+    urbit.list("~nec", [0; 32]);
+    eventually("~nec is no longer listed", || matches!(zod_net.ping("~zod", "~nec"), Err(NetError::Unlisted(_))));
+    eventually("and no longer calls", || other_net.ping("~nec", "~zod").is_err());
+    assert_eq!(zod_dir.key_of("~nec"), None);
+    urbit.list("~nec", other_key);
+    eventually("~nec is listed again", || zod_net.ping("~zod", "~nec").is_ok());
+    assert_eq!(zod_dir.trouble(), None);
+}
+
+#[test]
+fn a_key_from_urbit_id_is_believed_for_a_while_without_it_and_not_for_ever() {
+    let (a, b) = (TempDir::new("id-down-a"), TempDir::new("id-down-b"));
+    let urbit = Arc::new(Listings::default());
+    let (zod, zod_net, zod_dir) = on_urbit_id(&a, "~zod", &urbit);
+    let (nec, nec_net, nec_dir) = on_urbit_id(&b, "~nec", &urbit);
+    zod_dir.place("~nec", nec_net.addr()).unwrap();
+    nec_dir.place("~zod", zod_net.addr()).unwrap();
+    urbit.list("~zod", zod.public_key("~zod").unwrap());
+    urbit.list("~nec", nec.public_key("~nec").unwrap());
+    zod_net.ping("~zod", "~nec").unwrap();
+
+    // Urbit ID stops answering. The ships go on talking on the keys they have.
+    urbit.down.store(true, Ordering::SeqCst);
+    let stopped = Instant::now();
+    std::thread::sleep(FRESH + Duration::from_millis(200));
+    let asked = urbit.asked.load(Ordering::SeqCst);
+    zod_net.ping("~zod", "~nec").unwrap();
+    nec_net.ping("~nec", "~zod").unwrap();
+    // It was asked, in the background, and the failure is there to be seen. It is not
+    // asked again for every request while it is failing.
+    eventually("the failure is noted", || zod_dir.trouble().is_some_and(|why| why.contains("nec") && why.contains("nobody answered")));
+    assert!(urbit.asked.load(Ordering::SeqCst) > asked);
+    let asked = urbit.asked.load(Ordering::SeqCst);
+    for _ in 0..10 {
+        zod_net.ping("~zod", "~nec").unwrap();
+    }
+    assert!(urbit.asked.load(Ordering::SeqCst) <= asked + 2);
+    assert!(stopped.elapsed() < GOOD - Duration::from_millis(500), "the test ran too slowly to show anything");
+
+    // A key too old to believe, with no way to read it again, is no key.
+    std::thread::sleep(GOOD);
+    assert!(matches!(zod_net.ping("~zod", "~nec"), Err(NetError::Unlisted(_))));
+    assert!(nec_net.ping("~nec", "~zod").is_err());
+    assert_eq!(zod_dir.key_of("~nec"), None);
+    // When Urbit ID answers again, so do the ships.
+    urbit.down.store(false, Ordering::SeqCst);
+    eventually("~zod reaches ~nec again", || zod_net.ping("~zod", "~nec").is_ok());
+    eventually("~nec reaches ~zod again", || nec_net.ping("~nec", "~zod").is_ok());
+
+    // A name that is not a galaxy's, star's or planet's is never asked about, and a ship
+    // set by hand is not read from Urbit ID, whatever Urbit ID says of it.
+    let asked = urbit.asked.load(Ordering::SeqCst);
+    assert!(matches!(zod_net.ping("~zod", "~not-a-ship"), Err(NetError::Unlisted(_))));
+    zod_dir.place("~not-a-ship", nec_net.addr()).unwrap();
+    assert!(matches!(zod_net.ping("~zod", "~not-a-ship"), Err(NetError::Unlisted(_))));
+    assert_eq!(urbit.asked.load(Ordering::SeqCst), asked);
+    urbit.list("~nec", [9; 32]);
+    zod_dir.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    std::thread::sleep(FRESH + Duration::from_millis(200));
+    for _ in 0..3 {
+        assert_eq!(zod_net.ping("~zod", "~nec").unwrap().ship, "nec");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(zod_dir.key_of("~nec"), Some(nec.public_key("~nec").unwrap()));
+}
+
+const PLANET: &str = "~sampel-palnet";
+const MOON: &str = "~doznec-sampel-palnet";
+
+/// A runtime holding a moon made from `keyfile`, on a network with `directory`.
+fn moon_on(dir: &TempDir, keyfile: &str, directory: &Arc<Directory>) -> (Arc<Runtime>, Network) {
+    let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
+    assert_eq!(format!("~{}", rt.create_ship_from_keyfile(&kernel(&rt), keyfile).unwrap()), MOON);
+    let net = Network::start(rt.clone(), directory.clone(), impatient()).unwrap();
+    (rt, net)
+}
+
+/// Say hello as a moon, showing a proof.
+async fn hello_as_moon(connection: &quinn::Connection, proof: &[u8]) -> bool {
+    let proof = ship_proto::MoonProof { revision: u32::from_be_bytes(proof[..4].try_into().unwrap()), signed: proof[4..].to_vec() };
+    let said = ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Hello(ship_proto::Hello { ship: MOON.into(), proof: Some(proof) })) };
+    exchange(connection, &said.encode_to_vec()).await.is_some_and(|reply| matches!(reply.body, Some(ship_proto::peer_reply::Body::Welcome(_))))
+}
+
+#[test]
+fn a_moon_is_known_by_its_parents_word_for_its_key() {
+    let dirs: Vec<TempDir> = (0..8).map(|n| TempDir::new(&format!("moon-{n}"))).collect();
+    let directory = Directory::new();
+    let (planet, _planet_net) = networked_with(&dirs[0], PLANET, &directory, impatient());
+    let (_zod, zod_net) = networked_with(&dirs[1], "~zod", &directory, impatient());
+    let planet_key = planet.public_key(PLANET).unwrap();
+
+    // The planet makes a moon: a keyfile, which is all the moon is started from, on a
+    // runtime that holds nothing of the planet's.
+    let keyfile = planet.moon_keyfile(PLANET, MOON, 1).unwrap();
+    let (moon, moon_net) = moon_on(&dirs[2], &keyfile, &directory);
+    let moon_key = moon.public_key(MOON).unwrap();
+    assert_ne!(moon_key, planet_key);
+    directory.place(MOON, moon_net.addr()).unwrap();
+    assert_eq!(directory.key_of(MOON), None, "nobody has met the moon yet");
+
+    // The moon calls ~zod, which has never heard of it, and is believed: it shows the
+    // planet's word for its key, and ~zod knows the planet's key.
+    let answered = moon_net.ping(MOON, "~zod").unwrap();
+    assert_eq!((answered.ship.as_str(), answered.seen_as.as_str()), ("zod", "doznec-sampel-palnet"));
+    assert_eq!(directory.key_of(MOON), Some(moon_key));
+
+    // A ship that has never heard of the moon calls it. It knows the planet's key, and
+    // where the moon is, and learns the moon's key from the moon, on the planet's word.
+    let apart = Directory::new();
+    let (nec, nec_net) = networked_with(&dirs[3], "~nec", &apart, impatient());
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    apart.place(MOON, moon_net.addr()).unwrap();
+    // Without the planet's key there is nothing to check the moon against.
+    assert!(matches!(nec_net.ping("~nec", MOON), Err(NetError::Unlisted(_))));
+    apart.set(PLANET, planet_key, "127.0.0.1:9".parse().unwrap()).unwrap();
+    assert_eq!(nec_net.ping("~nec", MOON).unwrap().ship, "doznec-sampel-palnet");
+    assert_eq!(apart.key_of(MOON), Some(moon_key));
+    assert_eq!(nec_net.ping("~nec", MOON).unwrap().seen_as, "nec");
+    // The moon's word is the planet's, signed with the planet's key. A ship that has
+    // another key for the planet does not believe it, calling or called.
+    let wrong = Directory::new();
+    let (bud, bud_net) = networked_with(&dirs[4], "~bud", &wrong, impatient());
+    directory.set("~bud", bud.public_key("~bud").unwrap(), bud_net.addr()).unwrap();
+    wrong.place(MOON, moon_net.addr()).unwrap();
+    wrong.set(PLANET, [8; 32], "127.0.0.1:9".parse().unwrap()).unwrap();
+    assert!(matches!(nec_net.ping("~nec", MOON), Ok(_)));
+    match bud_net.ping("~bud", MOON) {
+        Err(NetError::Unreachable(why)) => assert!(why.contains("not the word of the moon's parent"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(wrong.key_of(MOON), None);
+
+    // Someone else's ship called ~sampel-palnet makes a moon of the same name. Its word is
+    // not the planet's, so its moon is not the moon.
+    let elsewhere = Runtime::open(&dirs[5].0, fast()).unwrap();
+    elsewhere.create_ship(PLANET, &kernel(&elsewhere)).unwrap();
+    let forged = elsewhere.moon_keyfile(PLANET, MOON, 9).unwrap();
+    drop(elsewhere);
+    let (_false_moon, false_net) = moon_on(&dirs[6], &forged, &directory);
+    assert!(false_net.ping(MOON, "~zod").is_err());
+    assert_eq!(directory.key_of(MOON), Some(moon_key));
+    drop(false_net);
+
+    // The proof is no secret: it is in the moon's file, and goes to every ship the moon
+    // meets. It is of use only to the holder of the moon's key.
+    let proof: Vec<u8> = live(&dirs[2].0, "doznec-sampel-palnet").query_row("SELECT value FROM meta WHERE key = 'moon'", [], |row| row.get(0)).unwrap();
+    assert_eq!(proof.len(), 68);
+    let thief = [0x31u8; 32];
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connect = || endpoint.connect_with(stranger_client(Some((thief, thief)), b"ship/1"), zod_net.addr(), "zod").unwrap();
+        assert!(!hello_as_moon(&connect().await.unwrap(), &proof).await);
+        // A moon that shows no word at all, or one that has been touched, or cut short.
+        assert!(!hello(&connect().await.unwrap(), MOON).await);
+        let mut touched = proof.clone();
+        touched[40] ^= 1;
+        assert!(!hello_as_moon(&connect().await.unwrap(), &touched).await);
+        assert!(!hello_as_moon(&connect().await.unwrap(), &proof[..67]).await);
+    });
+    assert_eq!(directory.key_of(MOON), Some(moon_key));
+    assert_eq!(moon_net.ping(MOON, "~zod").unwrap().seen_as, "doznec-sampel-palnet");
+    // The same, to a ship that has never met the moon and has nothing to go on but the
+    // planet's key. Here it is the moon's own key that is shown, and only the word for it
+    // that is wrong: touched, or right but for another holder. Then the moon's own key
+    // with the word as it was given, which is believed.
+    let unmet = Directory::new();
+    let wes_dir = TempDir::new("moon-wes");
+    let (_wes, wes_net) = networked_with(&wes_dir, "~wes", &unmet, impatient());
+    unmet.set(PLANET, planet_key, "127.0.0.1:9".parse().unwrap()).unwrap();
+    let own = seed_of(&dirs[2].0, "doznec-sampel-palnet");
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connect = |seed: [u8; 32]| endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), wes_net.addr(), "wes").unwrap();
+        let mut touched = proof.clone();
+        touched[40] ^= 1;
+        assert!(!hello_as_moon(&connect(own).await.unwrap(), &touched).await);
+        let mut later = proof.clone();
+        later[3] ^= 2;
+        assert!(!hello_as_moon(&connect(own).await.unwrap(), &later).await, "the word is for one revision and no other");
+        assert!(!hello(&connect(own).await.unwrap(), MOON).await);
+        assert!(!hello_as_moon(&connect(thief).await.unwrap(), &proof).await);
+        assert_eq!(unmet.key_of(MOON), None);
+        assert!(hello_as_moon(&connect(own).await.unwrap(), &proof).await);
+    });
+    assert_eq!(unmet.key_of(MOON), Some(moon_key));
+
+    // The planet gives the moon new keys, at a later revision. A ship that has seen the
+    // later one no longer takes the earlier: whoever still holds the old key and the old
+    // word is not the moon to it.
+    let later = planet.moon_keyfile(PLANET, MOON, 2).unwrap();
+    let (newer, newer_net) = moon_on(&dirs[7], &later, &directory);
+    let newer_key = newer.public_key(MOON).unwrap();
+    assert_ne!(newer_key, moon_key);
+    assert_eq!(newer_net.ping(MOON, "~zod").unwrap().seen_as, "doznec-sampel-palnet");
+    assert_eq!(directory.key_of(MOON), Some(newer_key));
+    assert!(moon_net.ping(MOON, "~zod").is_err());
+    assert_eq!(directory.key_of(MOON), Some(newer_key));
+    // One revision, one key. The planet gives its word for other keys at the revision ~zod
+    // has already seen: whoever holds those is not the moon to ~zod either.
+    let twin = TempDir::new("moon-twin");
+    let (_twin, twin_net) = moon_on(&twin, &planet.moon_keyfile(PLANET, MOON, 2).unwrap(), &directory);
+    assert!(twin_net.ping(MOON, "~zod").is_err());
+    assert_eq!(directory.key_of(MOON), Some(newer_key));
+    drop(twin_net);
+    assert_eq!(newer_net.ping(MOON, "~zod").unwrap().seen_as, "doznec-sampel-palnet");
+
+    // A ship that has not seen the later one still takes the earlier. That is the limit
+    // of a word that is carried and not asked for.
+    assert_eq!(apart.key_of(MOON), Some(moon_key));
+    assert!(nec_net.ping("~nec", MOON).is_ok());
+    // It sees the later one when it next calls the moon where the moon now is: the moon
+    // shows its new key and the planet's word for it. After that there is no going back.
+    apart.place(MOON, newer_net.addr()).unwrap();
+    assert_eq!(nec_net.ping("~nec", MOON).unwrap().ship, "doznec-sampel-palnet");
+    assert_eq!(apart.key_of(MOON), Some(newer_key));
+    apart.place(MOON, moon_net.addr()).unwrap();
+    match nec_net.ping("~nec", MOON) {
+        Err(NetError::Unreachable(why)) => assert!(why.contains("a later key"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(apart.key_of(MOON), Some(newer_key));
+    apart.place(MOON, newer_net.addr()).unwrap();
+    assert!(nec_net.ping("~nec", MOON).is_ok());
+
+    // When the planet's own key changes, every word it gave under the old one lapses.
+    directory.set(PLANET, [8; 32], "127.0.0.1:9".parse().unwrap()).unwrap();
+    assert_eq!(directory.key_of(MOON), None);
+    assert!(newer_net.ping(MOON, "~zod").is_err());
+    directory.set(PLANET, planet_key, "127.0.0.1:9".parse().unwrap()).unwrap();
+    assert_eq!(newer_net.ping(MOON, "~zod").unwrap().seen_as, "doznec-sampel-palnet");
+}
+
+#[test]
+fn a_moon_is_made_by_its_parent_and_keeps_its_word_through_a_copy() {
+    let (a, b, c, out) = (TempDir::new("moonfile-a"), TempDir::new("moonfile-b"), TempDir::new("moonfile-c"), TempDir::new("moonfile-out"));
+    let directory = Directory::new();
+    let (planet, _planet_net) = networked_with(&a, PLANET, &directory, impatient());
+    let (_zod, zod_net) = networked_with(&b, "~zod", &directory, impatient());
+    planet.create_ship("~marzod", &kernel(&planet)).unwrap();
+
+    // Only the moon's own parent can make it, and only as a moon.
+    for (parent, moon, revision) in [("~marzod", MOON, 1), (PLANET, "~doznec-sampel-palnex", 1), (PLANET, "~sampel-palnet", 1), (PLANET, "~zod", 1), (PLANET, MOON, 0), (PLANET, "~doznec-dozzod-marzod", 1)] {
+        assert!(matches!(planet.moon_keyfile(parent, moon, revision), Err(Error::BadKeys(_))), "{parent} {moon} {revision}");
+    }
+    assert!(matches!(planet.moon_keyfile("~nec", "~doznec-dozzod-dozzod", 1), Err(Error::BadKeys(_))));
+    assert!(matches!(planet.moon_keyfile("~dozzod-dozzod", "~doznec-dozzod-dozzod", 1), Err(Error::BadKeys(_) | Error::UnknownShip(_))));
+    // A star has moons too, written with the star's name at a planet's length.
+    let of_a_star = runtime::urbit_id::ob::moon_name(5 << 32 | 256).unwrap();
+    assert!(planet.moon_keyfile("~marzod", &of_a_star, 1).is_ok());
+
+    // Each keyfile made is for new keys.
+    let keyfile = planet.moon_keyfile(PLANET, MOON, 3).unwrap();
+    assert_ne!(planet.moon_keyfile(PLANET, MOON, 3).unwrap(), keyfile);
+    let read = runtime::urbit_id::Keyfile::parse(&keyfile).unwrap();
+    assert_eq!((read.ship, read.revision), (runtime::urbit_id::ob::moon_number(MOON).unwrap(), 3));
+
+    // A moon's keyfile with the signature taken out starts nothing, nor does a planet's
+    // keyfile with one put in.
+    let rt = Arc::new(Runtime::open(&c.0, fast()).unwrap());
+    let kernel = kernel(&rt);
+    let unsigned = runtime::urbit_id::Keyfile { signed: None, ..read.clone() }.write();
+    assert!(matches!(rt.create_ship_from_keyfile(&kernel, &unsigned), Err(Error::BadKeys(why)) if why.contains("moon")));
+    let signed_planet = runtime::urbit_id::Keyfile { ship: 1_624_961_343, ..read.clone() }.write();
+    assert!(matches!(rt.create_ship_from_keyfile(&kernel, &signed_planet), Err(Error::BadKeys(why)) if why.contains("not a moon")));
+    assert!(fs::read_dir(c.0.join("ships")).unwrap().next().is_none());
+
+    // The moon is started, sealed up, and brought back on another runtime. The parent's
+    // word is in its file and comes with it: the moon is believed there as it was here.
+    let name = rt.create_ship_from_keyfile(&kernel, &keyfile).unwrap();
+    let key = rt.public_key(&name).unwrap();
+    export(&rt, &name, &out.0).unwrap();
+    drop(rt);
+    let moved_dir = TempDir::new("moonfile-d");
+    let moved = Arc::new(Runtime::open(&moved_dir.0, fast()).unwrap());
+    moved.import_ship(&out.0, &name, CODE).unwrap();
+    assert_eq!(moved.public_key(&name).unwrap(), key);
+    let moved_net = Network::start(moved.clone(), directory.clone(), impatient()).unwrap();
+    directory.place(MOON, moved_net.addr()).unwrap();
+    assert_eq!(moved_net.ping(MOON, "~zod").unwrap().seen_as, name);
+    assert_eq!(zod_net.ping("~zod", MOON).unwrap().ship, name);
+    // And a runtime started again finds it where it was.
+    drop(moved_net);
+    drop(moved);
+    // (The network that was stopped lets go of the runtime a moment after.)
+    eventually("the first runtime lets go of its directory", || !matches!(Runtime::open(&moved_dir.0, fast()), Err(Error::DataDirInUse)));
+    let again = Arc::new(Runtime::open(&moved_dir.0, fast()).unwrap());
+    let again_net = Network::start(again.clone(), directory.clone(), impatient()).unwrap();
+    directory.place(MOON, again_net.addr()).unwrap();
+    assert_eq!(again_net.ping(MOON, "~zod").unwrap().seen_as, name);
+}
+
+#[test]
+fn callers_nobody_knows_are_looked_up_only_so_fast() {
+    let a = TempDir::new("id-rush");
+    let urbit = Arc::new(Listings::default());
+    let (_zod, zod_net, _zod_dir) = on_urbit_id(&a, "~zod", &urbit);
+    // A crowd of callers, each saying it is a different planet nobody has heard of. Every
+    // name would cost a question to Urbit ID. Only so many are asked about: the rest are
+    // turned away unasked.
+    let (addr, started) = (zod_net.addr(), Instant::now());
+    let tokio = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let welcomed: usize = tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut callers = Vec::new();
+        for n in 0..200u32 {
+            let endpoint = endpoint.clone();
+            callers.push(tokio::spawn(async move {
+                let seed = [(n % 250) as u8 + 1; 32];
+                let name = runtime::urbit_id::ob::ship_name(0x0001_0000 + n);
+                let Ok(connection) = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), addr, "zod").unwrap().await else { return false };
+                hello(&connection, &name).await
+            }));
+        }
+        let mut welcomed = 0;
+        for caller in callers {
+            welcomed += caller.await.unwrap() as usize;
+        }
+        welcomed
+    });
+    assert_eq!(welcomed, 0);
+    let (asked, most) = (urbit.asked.load(Ordering::SeqCst), 32 + (started.elapsed().as_secs_f64() * 32.0) as usize + 1);
+    assert!(asked >= 8 && asked <= most, "asked {asked} times in {:?}", started.elapsed());
+    assert!(asked < 200);
+}
+
+#[test]
+fn a_ship_that_shows_another_key_has_its_key_read_again() {
+    let (a, b, c) = (TempDir::new("id-doubt-a"), TempDir::new("id-doubt-b"), TempDir::new("id-doubt-c"));
+    let urbit = Arc::new(Listings::default());
+    // Keys are good for minutes here: nothing is read again just because time has passed.
+    let slow = |dir: &TempDir, ship: &str| {
+        let directory = Directory::reading_with(urbit.clone(), Duration::from_secs(120), Duration::from_secs(600));
+        let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
+        rt.create_ship(ship, &kernel(&rt)).unwrap();
+        let net = Network::start(rt.clone(), directory.clone(), impatient()).unwrap();
+        (rt, net, directory)
+    };
+    let (zod, zod_net, zod_dir) = slow(&a, "~zod");
+    let (nec, nec_net, nec_dir) = slow(&b, "~nec");
+    let (other, other_net, other_dir) = slow(&c, "~nec");
+    zod_dir.place("~nec", nec_net.addr()).unwrap();
+    nec_dir.place("~zod", zod_net.addr()).unwrap();
+    other_dir.place("~zod", zod_net.addr()).unwrap();
+    urbit.list("~zod", zod.public_key("~zod").unwrap());
+    urbit.list("~nec", nec.public_key("~nec").unwrap());
+    let read_at = Instant::now();
+    zod_net.ping("~zod", "~nec").unwrap();
+    nec_net.ping("~nec", "~zod").unwrap();
+
+    // ~nec is given a new key in Urbit ID, the one another runtime holds. ~zod read the old
+    // one a moment ago and would not look again for minutes. But a ship calling as ~nec
+    // with a key ~zod does not have for it is a reason to look, once a few seconds have
+    // passed since the last look, and it is believed on the spot.
+    let other_key = other.public_key("~nec").unwrap();
+    urbit.list("~nec", other_key);
+    let asked = urbit.asked.load(Ordering::SeqCst);
+    let called = other_net.ping("~nec", "~zod");
+    // (Only if this test has got here within those few seconds, which it may not have on
+    // a machine with a great deal else to do.)
+    if read_at.elapsed() < Duration::from_secs(4) {
+        assert!(called.is_err(), "looked again within moments of the last look");
+        assert_eq!(urbit.asked.load(Ordering::SeqCst), asked + 1, "the caller looks ~zod up, and ~zod does not look again so soon");
+    }
+    std::thread::sleep(Duration::from_millis(5200));
+    assert_eq!(other_net.ping("~nec", "~zod").unwrap().seen_as, "nec");
+    assert_eq!(zod_dir.key_of("~nec"), Some(other_key));
+
+    // And the other way about: ~zod calls ~bus and the ship that answers shows a key
+    // other than the one ~zod holds. That too is a reason to look again.
+    let (d, e) = (TempDir::new("id-doubt-d"), TempDir::new("id-doubt-e"));
+    let (bus, bus_net, bus_dir) = slow(&d, "~bud");
+    let (later, later_net, later_dir) = slow(&e, "~bud");
+    bus_dir.place("~zod", zod_net.addr()).unwrap();
+    later_dir.place("~zod", zod_net.addr()).unwrap();
+    urbit.list("~bud", bus.public_key("~bud").unwrap());
+    zod_dir.place("~bud", bus_net.addr()).unwrap();
+    zod_net.ping("~zod", "~bud").unwrap();
+    urbit.list("~bud", later.public_key("~bud").unwrap());
+    zod_dir.place("~bud", later_net.addr()).unwrap();
+    assert!(zod_net.ping("~zod", "~bud").is_err());
+    std::thread::sleep(Duration::from_millis(5200));
+    eventually("~zod reads ~bud's new key", || zod_net.ping("~zod", "~bud").is_ok());
+    assert_eq!(zod_dir.key_of("~bud"), Some(later.public_key("~bud").unwrap()));
+}
+
+#[test]
+fn an_answer_from_somewhere_behind_does_not_put_an_old_key_back() {
+    let (a, b, c) = (TempDir::new("id-back-a"), TempDir::new("id-back-b"), TempDir::new("id-back-c"));
+    let urbit = Arc::new(Listings::default());
+    let (zod, zod_net, zod_dir) = on_urbit_id(&a, "~zod", &urbit);
+    let (old, old_net, old_dir) = on_urbit_id(&b, "~nec", &urbit);
+    let (new, new_net, new_dir) = on_urbit_id(&c, "~nec", &urbit);
+    let (old_key, new_key) = (old.public_key("~nec").unwrap(), new.public_key("~nec").unwrap());
+    old_dir.place("~zod", zod_net.addr()).unwrap();
+    new_dir.place("~zod", zod_net.addr()).unwrap();
+    urbit.list("~zod", zod.public_key("~zod").unwrap());
+    urbit.list_as("~nec", old_key, 4);
+    zod_dir.place("~nec", old_net.addr()).unwrap();
+    zod_net.ping("~zod", "~nec").unwrap();
+    // ~nec is given new keys: revision five.
+    urbit.list_as("~nec", new_key, 5);
+    zod_dir.place("~nec", new_net.addr()).unwrap();
+    eventually("~zod reads the new key", || {
+        let _ = zod_net.ping("~zod", "~nec");
+        zod_dir.key_of("~nec") == Some(new_key)
+    });
+    eventually("and reaches the ship that holds it", || zod_net.ping("~zod", "~nec").is_ok());
+
+    // Now whatever ~zod asks is answered from somewhere that has not caught up, and still
+    // says revision four. A ship's keys are counted upwards: an earlier count than the one
+    // held is not news, and the old key does not come back, calling or called.
+    urbit.list_as("~nec", old_key, 4);
+    let asked = urbit.asked.load(Ordering::SeqCst);
+    eventually("~zod asks again", || {
+        let _ = zod_net.ping("~zod", "~nec");
+        urbit.asked.load(Ordering::SeqCst) >= asked + 3 && zod_dir.trouble().is_some_and(|why| why.contains("earlier revision"))
+    });
+    assert_eq!(zod_dir.key_of("~nec"), Some(new_key));
+    assert_eq!(zod_net.ping("~zod", "~nec").unwrap().ship, "nec");
+    assert!(old_net.ping("~nec", "~zod").is_err());
+    assert_eq!(new_net.ping("~nec", "~zod").unwrap().seen_as, "nec");
+    assert_eq!(zod_dir.key_of("~nec"), Some(new_key));
+    // The same revision again, and a later one, are taken as they come.
+    urbit.list_as("~nec", new_key, 5);
+    std::thread::sleep(FRESH + Duration::from_millis(200));
+    zod_net.ping("~zod", "~nec").unwrap();
+    urbit.list_as("~nec", old_key, 6);
+    eventually("~zod reads revision six", || {
+        let _ = zod_net.ping("~zod", "~nec");
+        zod_dir.key_of("~nec") == Some(old_key)
+    });
+}
+
+#[test]
+fn a_ship_is_asked_about_once_however_many_want_to_know() {
+    let a = TempDir::new("id-once");
+    let urbit = Arc::new(Listings::default());
+    let (_zod, zod_net, zod_dir) = on_urbit_id(&a, "~zod", &urbit);
+    let seed = [0x21u8; 32];
+    urbit.list("~nec", public_of(seed));
+    // Urbit ID is slow to answer. Meanwhile a dozen connections arrive, all from ~nec,
+    // which ~zod has never heard of. It is asked about once, and they all wait for that.
+    urbit.slow.store(600, Ordering::SeqCst);
+    let addr = zod_net.addr();
+    let tokio = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let welcomed: usize = tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut callers = Vec::new();
+        for _ in 0..12 {
+            let endpoint = endpoint.clone();
+            callers.push(tokio::spawn(async move {
+                let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), addr, "zod").unwrap().await.unwrap();
+                hello(&connection, "nec").await
+            }));
+        }
+        let mut welcomed = 0;
+        for caller in callers {
+            welcomed += caller.await.unwrap() as usize;
+        }
+        welcomed
+    });
+    assert_eq!(welcomed, 12);
+    assert_eq!(urbit.asked.load(Ordering::SeqCst), 1);
+    assert_eq!(zod_dir.key_of("~nec"), Some(public_of(seed)));
+
+    // Those who wait for an answer about one ship hold up nobody else. Questions about
+    // ~bud take two seconds; a dozen callers wait on one. A caller from ~wes, which is
+    // quick to look up, is welcomed meanwhile, long before ~bud's answer is in.
+    let (slow, quick) = ([0x22u8; 32], [0x23u8; 32]);
+    urbit.list("~bud", public_of(slow));
+    urbit.list("~wes", public_of(quick));
+    *urbit.slow_about.lock().unwrap() = Some(runtime::urbit_id::ob::ship_number("~bud").unwrap());
+    urbit.slow.store(2000, Ordering::SeqCst);
+    let took = tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut waiting = Vec::new();
+        for _ in 0..12 {
+            let endpoint = endpoint.clone();
+            waiting.push(tokio::spawn(async move {
+                let connection = endpoint.connect_with(stranger_client(Some((slow, slow)), b"ship/1"), addr, "zod").unwrap().await.unwrap();
+                hello(&connection, "bud").await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        let connection = endpoint.connect_with(stranger_client(Some((quick, quick)), b"ship/1"), addr, "zod").unwrap().await.unwrap();
+        assert!(hello(&connection, "wes").await);
+        let took = started.elapsed();
+        for caller in waiting {
+            let _ = caller.await;
+        }
+        took
+    });
+    assert!(took < Duration::from_millis(1000), "{took:?}");
+}
+
+#[test]
+fn only_so_many_callers_are_remembered_once_they_have_gone() {
+    let dir = TempDir::new("net-remembered");
+    let directory = Directory::new();
+    // Two connections at a time, so twenty callers are remembered at most.
+    let (_nec, nec_net) = networked_with(&dir, "~nec", &directory, NetConfig { max_connections: 2, ..impatient() });
+    let name = |n: u32| runtime::urbit_id::ob::ship_name(0x0001_0000 + n);
+    let seed = |n: u32| [n as u8 + 1; 32];
+    for n in 0..60 {
+        directory.set(&name(n), public_of(seed(n)), "127.0.0.1:9".parse().unwrap()).unwrap();
+    }
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = nec_net.addr();
+        let call = |n: u32| {
+            let endpoint = endpoint.clone();
+            async move {
+                let connection = endpoint.connect_with(stranger_client(Some((seed(n), seed(n))), b"ship/1"), addr, "nec").unwrap().await.unwrap();
+                let answered = hello(&connection, &name(n)).await && exchange(&connection, &ping_bytes()).await.is_some_and(|reply| reply.body.is_some());
+                connection.close(0u32.into(), b"done");
+                // Give the ship a moment to see the connection go.
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                answered
+            }
+        };
+        // Sixty ships call, one after another, and go.
+        for n in 0..60 {
+            assert!(call(n).await, "caller {n}");
+            assert!(nec_net.callers_remembered() <= 2 * 2 + 16, "{} remembered after {n}", nec_net.callers_remembered());
+        }
+        assert!(nec_net.callers_remembered() < 60);
+        // A ship that was forgotten, and one that is remembered, are both answered when
+        // they call again.
+        assert!(call(0).await);
+        assert!(call(59).await);
+    });
+}
+
+#[test]
+fn a_moon_shown_again_under_a_later_revision_is_not_set_back() {
+    let dirs: Vec<TempDir> = (0..5).map(|n| TempDir::new(&format!("moon-rev-{n}"))).collect();
+    let directory = Directory::new();
+    let (planet, _planet_net) = networked_with(&dirs[0], PLANET, &directory, impatient());
+    let (_nec, nec_net) = networked_with(&dirs[1], "~nec", &directory, impatient());
+    // The moon at revision one, with a key call it A. ~nec meets it.
+    let (first, first_net) = moon_on(&dirs[2], &planet.moon_keyfile(PLANET, MOON, 1).unwrap(), &directory);
+    let a = first.public_key(MOON).unwrap();
+    directory.place(MOON, first_net.addr()).unwrap();
+    nec_net.ping("~nec", MOON).unwrap();
+    assert_eq!(directory.key_of(MOON), Some(a));
+    // The planet gives it key B at revision two, which ~nec never sees, and then puts it
+    // back on key A, at revision three.
+    let apart = Directory::new();
+    let (second, second_net) = moon_on(&dirs[3], &planet.moon_keyfile(PLANET, MOON, 2).unwrap(), &apart);
+    apart.set("~nec", directory.lookup("~nec").unwrap().key, nec_net.addr()).unwrap();
+    let b = second.public_key(MOON).unwrap();
+    let number = runtime::urbit_id::ob::moon_number(MOON).unwrap();
+    let planet_seed = ed25519_dalek::SigningKey::from_bytes(&seed_of(&dirs[0].0, "sampel-palnet"));
+    let signed = runtime::moon::vouch(&planet_seed, number, 3, &a).signed;
+    let keys = runtime::urbit_id::NetworkKeys { auth: seed_of(&dirs[2].0, "doznec-sampel-palnet"), crypt: [0; 32] };
+    let third_keyfile = runtime::urbit_id::Keyfile { ship: number, revision: 3, keys, signed: Some(signed) }.write();
+    let (third, third_net) = moon_on(&dirs[4], &third_keyfile, &directory);
+    assert_eq!(third.public_key(MOON).unwrap(), a);
+
+    // ~nec calls the moon where it now is. The key is the one ~nec already has, and the
+    // word shown with it is for revision three: that is taken in all the same.
+    directory.place(MOON, third_net.addr()).unwrap();
+    assert_eq!(nec_net.ping("~nec", MOON).unwrap().ship, "doznec-sampel-palnet");
+    // So whoever still holds key B and the word for revision two is not the moon to ~nec,
+    // called or calling.
+    directory.place(MOON, second_net.addr()).unwrap();
+    match nec_net.ping("~nec", MOON) {
+        Err(NetError::Unreachable(why)) => assert!(why.contains("a later key"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(directory.key_of(MOON), Some(a));
+    assert_ne!(a, b);
+    assert!(second_net.ping(MOON, "~nec").is_err());
+    directory.place(MOON, third_net.addr()).unwrap();
+    assert!(nec_net.ping("~nec", MOON).is_ok());
+}
+
+#[test]
+fn an_answer_from_before_a_ships_keys_were_taken_away_does_not_bring_them_back() {
+    let (a, b, c) = (TempDir::new("id-clear-a"), TempDir::new("id-clear-b"), TempDir::new("id-clear-c"));
+    let urbit = Arc::new(Listings::default());
+    // What is held is believed for an hour here, which is longer than this takes.
+    let hour = Duration::from_secs(3600);
+    let (zod, zod_net, zod_dir) = on_urbit_id_for(&a, "~zod", &urbit, hour);
+    let (old, old_net, old_dir) = on_urbit_id_for(&b, "~nec", &urbit, hour);
+    let (new, new_net, new_dir) = on_urbit_id_for(&c, "~nec", &urbit, hour);
+    let (old_key, new_key) = (old.public_key("~nec").unwrap(), new.public_key("~nec").unwrap());
+    old_dir.place("~zod", zod_net.addr()).unwrap();
+    new_dir.place("~zod", zod_net.addr()).unwrap();
+    urbit.list("~zod", zod.public_key("~zod").unwrap());
+    // ~nec's history in Urbit ID: a key at revision four; its keys taken away, which is
+    // revision five; a new key at revision six. ~zod has read as far as six.
+    urbit.list_as("~nec", new_key, 6);
+    zod_dir.place("~nec", new_net.addr()).unwrap();
+    zod_net.ping("~zod", "~nec").unwrap();
+    // Wait for ~zod to have asked again, several times over, with whatever Urbit ID now
+    // says, and then for it to hold for ~nec what it is expected to. If it holds anything
+    // else by then, it goes on holding it, and this gives up.
+    let after_asking = |what: &str, expected: Option<[u8; 32]>| {
+        let asked = urbit.asked.load(Ordering::SeqCst);
+        let ask = || {
+            let _ = zod_net.ping("~zod", "~nec");
+            let _ = new_net.ping("~nec", "~zod");
+        };
+        eventually(what, || {
+            ask();
+            urbit.asked.load(Ordering::SeqCst) >= asked + 4
+        });
+        eventually(what, || {
+            ask();
+            zod_dir.key_of("~nec") == expected
+        });
+        zod_dir.key_of("~nec")
+    };
+    let none = [0u8; 32];
+
+    // Answers from somewhere that is behind, in the order that would do the damage: first
+    // "no keys" as of revision five, which would have the new key dropped, and then the
+    // old key at revision four, which would then look like news. Neither is taken.
+    urbit.list_as("~nec", none, 5);
+    assert_eq!(after_asking("~zod asks and hears revision five", Some(new_key)), Some(new_key));
+    assert!(zod_dir.trouble().is_some_and(|why| why.contains("earlier revision")));
+    urbit.list_as("~nec", old_key, 4);
+    assert_eq!(after_asking("~zod asks and hears revision four", Some(new_key)), Some(new_key));
+    urbit.unlist("~nec");
+    assert_eq!(after_asking("~zod asks and hears there is no such ship", Some(new_key)), Some(new_key));
+    assert_eq!(new_net.ping("~nec", "~zod").unwrap().seen_as, "nec");
+    assert!(old_net.ping("~nec", "~zod").is_err());
+
+    // The keys really are taken away: revision seven. That is taken, and ~nec is nobody.
+    urbit.list_as("~nec", none, 7);
+    assert_eq!(after_asking("~zod asks and hears revision seven", None), None);
+    assert!(matches!(zod_net.ping("~zod", "~nec"), Err(NetError::Unlisted(_))));
+    assert!(new_net.ping("~nec", "~zod").is_err());
+    // And now an answer from before that, with the key that was taken away, is not news
+    // either. Nor is the one before it, nor "no such ship".
+    urbit.list_as("~nec", new_key, 6);
+    assert_eq!(after_asking("~zod asks and hears revision six", None), None);
+    assert!(new_net.ping("~nec", "~zod").is_err());
+    urbit.list_as("~nec", old_key, 4);
+    assert_eq!(after_asking("~zod asks and hears revision four again", None), None);
+    urbit.unlist("~nec");
+    assert_eq!(after_asking("~zod asks and hears there is no such ship again", None), None);
+    urbit.list_as("~nec", old_key, 4);
+    assert_eq!(after_asking("~zod asks and hears revision four once more", None), None);
+    assert!(old_net.ping("~nec", "~zod").is_err());
+    // A key set after that, at revision eight, is.
+    urbit.list_as("~nec", old_key, 8);
+    assert_eq!(after_asking("~zod asks and hears revision eight", Some(old_key)), Some(old_key));
+    zod_dir.place("~nec", old_net.addr()).unwrap();
+    eventually("~zod reaches ~nec on its newest key", || zod_net.ping("~zod", "~nec").is_ok());
+}
+
+#[test]
+fn a_connection_older_than_one_that_was_forgotten_is_turned_away() {
+    let dir = TempDir::new("net-forgotten");
+    let directory = Directory::new();
+    // Two connections at a time, so twenty callers are remembered at most. Callers here
+    // are given a good while to say who they are.
+    let (_nec, nec_net) = networked_with(&dir, "~nec", &directory, NetConfig { max_connections: 2, ..NetConfig::default() });
+    let name = |n: u32| runtime::urbit_id::ob::ship_name(0x0001_0000 + n);
+    let seed = |n: u32| [n as u8 + 1; 32];
+    for n in 0..40 {
+        directory.set(&name(n), public_of(seed(n)), "127.0.0.1:9".parse().unwrap()).unwrap();
+    }
+    let addr = nec_net.addr();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connect = |n: u32| endpoint.connect_with(stranger_client(Some((seed(n), seed(n))), b"ship/1"), addr, "nec").unwrap();
+        // Ship 0 connects, and is slow to say who it is.
+        let old = connect(0).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Meanwhile it connects again, says who it is, is answered, and goes.
+        let newer = connect(0).await.unwrap();
+        assert!(hello(&newer, &name(0)).await);
+        assert!(exchange(&newer, &ping_bytes()).await.is_some_and(|reply| reply.body.is_some()));
+        newer.close(0u32.into(), b"done");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Enough other ships call and go that the ship forgets ship 0 ever called.
+        for n in 1..40 {
+            let connection = connect(n).await.unwrap();
+            assert!(hello(&connection, &name(n)).await, "caller {n}");
+            connection.close(0u32.into(), b"done");
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert!(nec_net.callers_remembered() < 39);
+        // Now the first connection says who it is. It arrived before one that has come and
+        // gone, and the ship no longer has the record that would say so in particular. It
+        // is turned away all the same: nothing it asks is answered.
+        let _ = hello(&old, &name(0)).await;
+        assert!(exchange(&old, &ping_bytes()).await.is_none_or(|reply| reply.body.is_none()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(old.close_reason().is_some(), "the older connection was left open");
+        // A connection made now is newer than anything forgotten, and is answered.
+        let fresh = connect(0).await.unwrap();
+        assert!(hello(&fresh, &name(0)).await);
+        assert!(exchange(&fresh, &ping_bytes()).await.is_some_and(|reply| reply.body.is_some()));
+    });
+}
+
+/// So many callers arrive at a ship at once, each holding a key that is nobody's and saying
+/// it is a different planet, numbered from `first`.
+fn say_names(addr: std::net::SocketAddr, first: u32, count: u32) {
+    let tokio = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut callers = Vec::new();
+        for n in 0..count {
+            let endpoint = endpoint.clone();
+            callers.push(tokio::spawn(async move {
+                let seed = [(n % 250) as u8 + 1; 32];
+                let name = runtime::urbit_id::ob::ship_name(first + n);
+                let Ok(connection) = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), addr, "zod").unwrap().await else { return };
+                let _ = hello(&connection, &name).await;
+            }));
+        }
+        for caller in callers {
+            let _ = caller.await;
+        }
+    });
+}
+
+#[test]
+fn only_so_many_ships_wait_to_be_asked_about_at_the_say_so_of_callers() {
+    let (a, b) = (TempDir::new("id-queue-a"), TempDir::new("id-queue-b"));
+    let urbit = Arc::new(Listings::default());
+    let (zod, zod_net, zod_dir) = on_urbit_id(&a, "~zod", &urbit);
+    let (wes, wes_net, wes_dir) = on_urbit_id(&b, "~wes", &urbit);
+    urbit.list("~zod", zod_net_key_of(&zod));
+    urbit.list("~wes", wes.public_key("~wes").unwrap());
+    wes_dir.place("~zod", zod_net.addr()).unwrap();
+    zod_dir.place("~wes", wes_net.addr()).unwrap();
+    // Urbit ID takes two seconds over every answer about a planet. Forty callers arrive
+    // at ~zod at once, each saying a different planet's name. Thirty-two are let wait to
+    // be asked about: that is half the places there are, and as many callers as are
+    // looked up in a second.
+    urbit.slow_planets.store(true, Ordering::SeqCst);
+    urbit.slow.store(2000, Ordering::SeqCst);
+    let addr = zod_net.addr();
+    let first = std::thread::spawn(move || say_names(addr, 0x0002_0000, 40));
+    // A second later ~zod would look up thirty-two more. Forty more arrive, with new
+    // names. The first thirty-two are all still waiting, eight of them being asked about.
+    // So none of these is let wait at all.
+    std::thread::sleep(Duration::from_millis(1200));
+    let second = std::thread::spawn(move || say_names(addr, 0x0003_0000, 40));
+    // The other half of the places are for the ships ~zod's own ships want to call. ~zod
+    // has never heard of ~wes. There is a place for it, though it waits its turn behind
+    // the callers' questions, and it is reached.
+    eventually("~zod reaches ~wes", || zod_net.ping("~zod", "~wes").is_ok());
+    first.join().unwrap();
+    second.join().unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    // The first thirty-two, ~wes, and ~zod as looked up by ~wes.
+    let asked = urbit.asked.load(Ordering::SeqCst);
+    assert!((30..=34).contains(&asked), "asked {asked} times");
+}
+
+#[test]
+fn names_already_held_are_read_again_for_callers_only_so_many_at_once() {
+    let a = TempDir::new("id-requeue");
+    let urbit = Arc::new(Listings::default());
+    let (_zod, zod_net, zod_dir) = on_urbit_id(&a, "~zod", &urbit);
+    // Forty planets with keys. ~zod comes to hold a key for each, because callers said
+    // their names (and were not believed, holding other keys).
+    for n in 0..40u32 {
+        urbit.list(&runtime::urbit_id::ob::ship_name(0x0004_0000 + n), [n as u8 + 100; 32]);
+    }
+    let addr = zod_net.addr();
+    say_names(addr, 0x0004_0000, 20);
+    std::thread::sleep(Duration::from_millis(1100));
+    say_names(addr, 0x0004_0014, 20);
+    let held = || (0..40u32).filter(|n| zod_dir.key_of(&runtime::urbit_id::ob::ship_name(0x0004_0000 + n)).is_some()).count();
+    assert_eq!(held(), 40);
+    // The keys are old enough to be read again, and Urbit ID has become slow. The same
+    // callers say the same names. Each name would be a question waiting its turn. These
+    // too are let wait only thirty-two at a time, though nothing here is new to ~zod.
+    std::thread::sleep(FRESH + Duration::from_millis(200));
+    urbit.slow.store(1500, Ordering::SeqCst);
+    let asked = urbit.asked.load(Ordering::SeqCst);
+    say_names(addr, 0x0004_0000, 40);
+    std::thread::sleep(Duration::from_millis(7000));
+    let more = urbit.asked.load(Ordering::SeqCst) - asked;
+    assert!((8..=32).contains(&more), "asked {more} times more");
+}
+
+#[test]
+fn a_connection_made_earlier_does_not_stand_in_for_room_among_the_ships_that_are_kept() {
+    let (a, b, c) = (TempDir::new("id-reuse-a"), TempDir::new("id-reuse-b"), TempDir::new("id-reuse-c"));
+    let urbit = Arc::new(Listings::default());
+    // ~zod's runtime keeps one ship that has proved its key, and believes a key for a
+    // second without reading it again.
+    let bounds = runtime::net::Bounds { proved: 1, unproved: 8, moons: 4, moons_each: 2 };
+    let zod_dir = Directory::reading_within(urbit.clone(), Duration::from_millis(200), Duration::from_millis(1000), bounds);
+    let zod = Arc::new(Runtime::open(&a.0, fast()).unwrap());
+    zod.create_ship("~zod", &kernel(&zod)).unwrap();
+    let zod_net = Network::start(zod.clone(), zod_dir.clone(), impatient()).unwrap();
+    let (nec, nec_net, nec_dir) = on_urbit_id_for(&b, "~nec", &urbit, Duration::from_secs(3600));
+    let (bud, bud_net, bud_dir) = on_urbit_id_for(&c, "~bud", &urbit, Duration::from_secs(3600));
+    for (name, rt) in [("~zod", &zod), ("~nec", &nec), ("~bud", &bud)] {
+        urbit.list(name, rt.public_key(name).unwrap());
+    }
+    zod_dir.place("~nec", nec_net.addr()).unwrap();
+    zod_dir.place("~bud", bud_net.addr()).unwrap();
+    nec_dir.place("~zod", zod_net.addr()).unwrap();
+    bud_dir.place("~zod", zod_net.addr()).unwrap();
+
+    // ~zod calls ~nec, which proves its key and has the one place. ~bud's key can be
+    // read, but there is no place to keep ~bud, so it cannot be called.
+    zod_net.ping("~zod", "~nec").unwrap();
+    match zod_net.ping("~zod", "~bud") {
+        Err(NetError::Unreachable(why)) => assert!(why.contains("no room"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(zod_dir.trouble().is_some_and(|why| why.contains("no room")));
+    zod_net.ping("~zod", "~nec").unwrap();
+    // Nothing passes between ~zod and ~nec for a while, and what ~zod held for ~nec is
+    // no longer believed. The connection between them is still open. Now ~bud can have
+    // the place, and takes it.
+    std::thread::sleep(Duration::from_millis(1300));
+    eventually("~zod reaches ~bud", || zod_net.ping("~zod", "~bud").is_ok());
+    // ~zod calls ~nec again. It reads ~nec's key afresh, and it is the key the open
+    // connection was made on. That connection is not a way round the bound: ~nec would
+    // have to be kept, and the place is ~bud's.
+    match zod_net.ping("~zod", "~nec") {
+        Err(NetError::Unreachable(why)) => assert!(why.contains("no room"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(zod_net.ping("~zod", "~bud").unwrap().ship, "bud");
+}
+
+/// The key of the one ship a runtime in these tests holds, ~zod.
+fn zod_net_key_of(rt: &Runtime) -> [u8; 32] {
+    rt.public_key("~zod").unwrap()
+}
+
+#[test]
+fn a_connection_that_can_no_longer_be_used_does_not_hold_a_place_among_the_calls() {
+    let (a, b, c) = (TempDir::new("id-slot-a"), TempDir::new("id-slot-b"), TempDir::new("id-slot-c"));
+    let urbit = Arc::new(Listings::default());
+    // ~zod's runtime keeps one ship that has proved its key, and calls one ship at a time.
+    let bounds = runtime::net::Bounds { proved: 1, unproved: 8, moons: 4, moons_each: 2 };
+    let zod_dir = Directory::reading_within(urbit.clone(), Duration::from_millis(200), Duration::from_millis(1000), bounds);
+    let zod = Arc::new(Runtime::open(&a.0, fast()).unwrap());
+    zod.create_ship("~zod", &kernel(&zod)).unwrap();
+    let zod_net = Network::start(zod.clone(), zod_dir.clone(), NetConfig { max_calls: 1, ..impatient() }).unwrap();
+    let (nec, nec_net, nec_dir) = on_urbit_id_for(&b, "~nec", &urbit, Duration::from_secs(3600));
+    let (bud, bud_net, bud_dir) = on_urbit_id_for(&c, "~bud", &urbit, Duration::from_secs(3600));
+    for (name, rt) in [("~zod", &zod), ("~nec", &nec), ("~bud", &bud)] {
+        urbit.list(name, rt.public_key(name).unwrap());
+    }
+    zod_dir.place("~nec", nec_net.addr()).unwrap();
+    zod_dir.place("~bud", bud_net.addr()).unwrap();
+    nec_dir.place("~zod", zod_net.addr()).unwrap();
+    bud_dir.place("~zod", zod_net.addr()).unwrap();
+
+    // ~zod calls ~nec, and keeps the connection. Then what it holds for ~nec lapses.
+    zod_net.ping("~zod", "~nec").unwrap();
+    std::thread::sleep(Duration::from_millis(1300));
+    // ~bud calls ~zod, proves its key, and has the one place among the ships that are
+    // kept, which ~nec's lapsed key gives up.
+    assert_eq!(bud_net.ping("~bud", "~zod").unwrap().seen_as, "bud");
+    assert_eq!(zod_dir.key_of("~nec"), None);
+    // Someone says ~nec's name to ~zod, holding some other key. ~zod reads ~nec's key
+    // again: the same key the open connection was made on, though ~nec is no longer a
+    // ship that is kept, and cannot be while ~bud is.
+    say_names(zod_net.addr(), runtime::urbit_id::ob::ship_number("~nec").unwrap(), 1);
+    assert_eq!(zod_dir.key_of("~nec"), Some(nec.public_key("~nec").unwrap()));
+    // ~zod calls ~bud. It may call one ship at a time, and the connection to ~nec is
+    // still open. It is no use to anyone, and gives up its place.
+    assert_eq!(zod_net.ping("~zod", "~bud").unwrap().ship, "bud");
 }

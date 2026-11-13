@@ -4,6 +4,10 @@
 
 mod host;
 pub mod net;
+pub mod azimuth;
+pub mod chain;
+pub mod replica;
+pub mod moon;
 pub mod seal;
 pub mod server;
 mod ship;
@@ -29,6 +33,8 @@ use wasmtime::{Engine, InstancePre, Linker, Module};
 
 pub use ship_proto::{Device, EntryBody, Manifest, Provide, SignedCheckpoint, SignedEntry, Use};
 pub use seal::StorageKey;
+pub use urbit_id;
+use urbit_id::{Keyfile, NetworkKeys, Wallet};
 pub use store::RemoteFollow;
 
 use host::Ctx;
@@ -239,6 +245,8 @@ pub enum Error {
     BadStorageKey(String),
     /// The ship has not been given a recovery key, so there is nothing to seal a copy of it to.
     NoRecoveryKey(String),
+    /// A master ticket or a keyfile that is not one, or is not this ship's.
+    BadKeys(String),
     /// The kernel would not install the agent.
     InstallRefused(String),
     /// Another runtime already has this data directory open.
@@ -278,6 +286,7 @@ impl fmt::Display for Error {
             Error::BadShipFile(why) => write!(f, "bad ship file: {why}"),
             Error::BadStorageKey(why) => write!(f, "bad storage key: {why}"),
             Error::NoRecoveryKey(name) => write!(f, "{name} has no recovery key to seal a copy to"),
+            Error::BadKeys(why) => write!(f, "bad keys: {why}"),
             Error::InstallRefused(why) => write!(f, "install refused: {why}"),
             Error::DataDirInUse => write!(f, "another runtime is using this data directory"),
             Error::LogTrimmed(base) => write!(f, "the log no longer holds entries up to {base}; fetch its checkpoint"),
@@ -356,7 +365,7 @@ pub(crate) struct Inner {
     /// started. The network asks on every connection and every request, from places that must
     /// not wait on a disk. A ship's key does not change while the runtime runs: nothing here
     /// replaces one, and the files of a running runtime must not be swapped underneath it.
-    identities: std::sync::RwLock<Option<HashMap<String, Arc<SigningKey>>>>,
+    identities: std::sync::RwLock<Option<HashMap<String, Held>>>,
     awake_changed: Condvar,
     /// For each ship, how many events have added to its logs since the runtime started. A
     /// reader waiting for new entries sleeps on `logs_changed` until this moves. Nothing else
@@ -490,6 +499,13 @@ fn add_bulk_checks(wasm: &[u8]) -> Result<Vec<u8>, wasmparser::BinaryReaderError
         }
     }
     Ok(out.finish())
+}
+
+/// What is held in memory for a ship, for the network: its key, and for a moon its
+/// parent's word for that key.
+struct Held {
+    key: Arc<SigningKey>,
+    proof: Option<moon::Proof>,
 }
 
 fn canonical_ship(name: &str) -> Result<String, Error> {
@@ -744,6 +760,14 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     sync_dir(dir)
 }
 
+/// What a master ticket gives for the ship of this name.
+fn wallet_of(ticket: &str, name: &str) -> Result<Wallet, Error> {
+    if urbit_id::ob::ticket_bytes(ticket).is_none() {
+        return Err(Error::BadKeys("not a master ticket".into()));
+    }
+    Wallet::from_ticket(ticket, name).ok_or_else(|| Error::BadKeys(format!("{name} is not the name of a galaxy, star or planet")))
+}
+
 /// The storage key kept in a data directory for a runtime that was given none. Sixty-four
 /// hexadecimal digits, so it can be moved to wherever the operator keeps secrets and handed
 /// back through `Config::storage_key`.
@@ -903,21 +927,109 @@ impl Runtime {
         Ok(hash)
     }
 
-    /// Create a ship whose policy is the kernel module with the given hash.
+    /// Create a ship whose policy is the kernel module with the given hash, with a key made
+    /// up for it. This is for trying things out: the ship is nobody's planet. A real one is
+    /// made from its master ticket or its keyfile.
     pub fn create_ship(&self, name: &str, kernel_hash: &str) -> Result<(), Error> {
+        self.create_ship_keyed(name, kernel_hash, &random_bytes::<32>()?, None, None)
+    }
+
+    /// Create the ship of a planet, star or galaxy from its master ticket, as Urbit's wallet
+    /// derives it: the ship runs with the networking keys the ticket gives for `revision`
+    /// (nought until the keys have been replaced), and copies of it are sealed so that the
+    /// ticket opens them.
+    ///
+    /// The ticket is used here and not kept. Working the keys out of it takes half a
+    /// gigabyte of memory and a good part of a second, by design: that is what makes a
+    /// ticket short enough to write down hard to guess.
+    pub fn create_ship_from_ticket(&self, name: &str, kernel_hash: &str, ticket: &str, revision: u32) -> Result<(), Error> {
+        let name = canonical_ship(name)?;
+        if self.inner.ship_path(&name).exists() {
+            return Err(Error::ShipExists(name));
+        }
+        let wallet = wallet_of(ticket, &name)?;
+        let recovery = seal::recovery_public(&wallet.backup_code());
+        self.create_ship_keyed(&name, kernel_hash, &wallet.network_keys(revision).auth, Some(recovery), None)
+    }
+
+    /// Create a ship from its keyfile, which names the ship and holds its networking keys
+    /// and nothing else. This is how a ship is started by someone who is not given its
+    /// master ticket. Returns the ship's name.
+    ///
+    /// Copies of a ship made this way cannot be sealed until it is given a recovery key
+    /// (`set_recovery_key`), since that comes from the ticket and is not in a keyfile.
+    ///
+    /// A moon is started the same way, from the keyfile its parent made for it
+    /// (`moon_keyfile`), which carries the parent's word for the moon's key.
+    pub fn create_ship_from_keyfile(&self, kernel_hash: &str, keyfile: &str) -> Result<String, Error> {
+        let keyfile = Keyfile::parse(keyfile).ok_or_else(|| Error::BadKeys("not a keyfile".into()))?;
+        let name = canonical_ship(&urbit_id::ob::any_name(keyfile.ship))?;
+        let seed = keyfile.keys.auth;
+        let proof = match (keyfile.ship >= urbit_id::ob::FIRST_MOON, keyfile.signed) {
+            (true, Some(signed)) => Some(moon::Proof { revision: keyfile.revision, signed }),
+            (true, None) => return Err(Error::BadKeys(format!("{name} is a moon, and its keyfile does not carry its parent's word for its key"))),
+            (false, Some(_)) => return Err(Error::BadKeys(format!("{name} is not a moon, and its keyfile is signed as one"))),
+            (false, None) => None,
+        };
+        self.create_ship_keyed(&name, kernel_hash, &seed, None, proof)?;
+        Ok(name)
+    }
+
+    /// Make a moon of one of this runtime's ships: new keys for it, and the parent's word
+    /// that they are the moon's, together as a keyfile. The moon is started from that
+    /// keyfile, on this runtime or any other (`create_ship_from_keyfile`), and needs
+    /// nothing more from its parent.
+    ///
+    /// `revision` counts the keys this moon has been given, from one. To replace a moon's
+    /// keys, make it a keyfile with a higher revision: ships that have seen the later one
+    /// refuse the earlier. The parent keeps no list of its moons, so the count is the
+    /// caller's to keep.
+    pub fn moon_keyfile(&self, parent: &str, moon: &str, revision: u32) -> Result<String, Error> {
+        let parent = canonical_ship(parent)?;
+        let moon = canonical_ship(moon)?;
+        let number = urbit_id::ob::moon_number(&moon).ok_or_else(|| Error::BadKeys(format!("{moon} is not the name of a moon")))?;
+        let owner = urbit_id::ob::ship_name(urbit_id::ob::moon_parent(number));
+        if owner.trim_start_matches('~') != parent {
+            return Err(Error::BadKeys(format!("{moon} is a moon of {owner}, not of {parent}")));
+        }
+        if revision == 0 {
+            return Err(Error::BadKeys("a moon's keys are counted from one".into()));
+        }
+        if !self.inner.ship_path(&parent).exists() {
+            return Err(Error::UnknownShip(parent));
+        }
+        let signer = self.inner.load_key(&parent)?;
+        let keys = NetworkKeys { auth: random_bytes::<32>()?, crypt: random_bytes::<32>()? };
+        let proof = moon::vouch(&signer, number, revision, &keys.auth_public());
+        Ok(Keyfile { ship: number, revision, keys, signed: Some(proof.signed) }.write())
+    }
+
+    /// The keyfile for a ship's networking keys, for starting it somewhere that is not given
+    /// its master ticket.
+    pub fn keyfile(name: &str, revision: u32, keys: &NetworkKeys) -> Result<String, Error> {
+        let name = canonical_ship(name)?;
+        let ship = urbit_id::ob::ship_number(&name).ok_or_else(|| Error::BadKeys(format!("{name} is not the name of a galaxy, star or planet")))?;
+        Ok(Keyfile { ship: ship.into(), revision, keys: keys.clone(), signed: None }.write())
+    }
+
+    /// Create a ship that proves who it is with the key pair `seed` gives, the key Urbit ID
+    /// calls its authentication key. Urbit ID also lists an encryption key for each ship.
+    /// It is not used here and not kept: traffic between ships is encrypted under keys made
+    /// afresh for each connection.
+    fn create_ship_keyed(&self, name: &str, kernel_hash: &str, seed: &[u8; 32], recovery: Option<[u8; 32]>, proof: Option<moon::Proof>) -> Result<(), Error> {
         let name = canonical_ship(name)?;
         self.inner.kernel(kernel_hash)?;
         if self.inner.ship_path(&name).exists() {
             return Err(Error::ShipExists(name));
         }
-        // The ship's signing key, a stand-in for its Urbit ID networking key. It lives beside the
-        // ship file, not in it.
-        let seed = random_bytes::<32>()?;
+        // The key lives beside the ship file, not in it.
         // Built under a private name and then published, so a failure part way through cannot
         // leave a broken file sitting on the ship's name for ever.
         let fresh = Scratch::new(&self.inner.tmp_dir);
-        store::create(&fresh.0, &name, kernel_hash, self.inner.cfg.max_ship_bytes, &random_bytes::<16>()?, &self.inner.file_key(&name))?;
-        self.inner.publish(&name, &fresh.0, &SigningKey::from_bytes(&seed))
+        let (file_key, incarnation) = (self.inner.file_key(&name), random_bytes::<16>()?);
+        let kept = proof.map(|proof| proof.to_bytes());
+        store::create(&fresh.0, &name, kernel_hash, self.inner.cfg.max_ship_bytes, &incarnation, &file_key, recovery.as_ref(), kept.as_ref())?;
+        self.inner.publish(&name, &fresh.0, &SigningKey::from_bytes(seed), proof)
     }
 
     /// Install an agent, or replace it. The manifest says which interfaces it offers and which
@@ -1093,7 +1205,15 @@ impl Runtime {
         // Memory only. This is called from inside connections being made, where waiting on a
         // disk or on another thread's lock would hold up the whole network.
         let identities = self.inner.identities.read().unwrap_or_else(PoisonError::into_inner);
-        identities.as_ref().and_then(|held| held.get(&name).cloned()).ok_or(Error::UnknownShip(name))
+        identities.as_ref().and_then(|held| held.get(&name).map(|held| held.key.clone())).ok_or(Error::UnknownShip(name))
+    }
+
+    /// For a moon this runtime holds: its parent's word for its key, to show other ships.
+    /// From memory, like the key.
+    pub(crate) fn moon_proof(&self, ship: &str) -> Option<moon::Proof> {
+        let name = canonical_ship(ship).ok()?;
+        let identities = self.inner.identities.read().unwrap_or_else(PoisonError::into_inner);
+        identities.as_ref()?.get(&name)?.proof
     }
 
     /// Read every ship's signing key into memory, if that has not been done. The network calls
@@ -1114,7 +1234,9 @@ impl Runtime {
                 continue;
             };
             if let Ok(key) = self.inner.load_key(&ship) {
-                held.insert(ship, Arc::new(key));
+                // Only a moon has a proof, and only a moon's file is opened to look for one.
+                let proof = urbit_id::ob::moon_number(&ship).and_then(|_| self.inner.stored_proof(&self.inner.ship_path(&ship), &ship));
+                held.insert(ship, Held { key: Arc::new(key), proof });
             }
         }
         *identities = Some(held);
@@ -1572,13 +1694,11 @@ impl Runtime {
         self.inner.with_ship(ship, |ship| Ok(store::recovery_set(&lock(&ship.conn), &public)?))
     }
 
-    /// Make a new recovery code for a ship, give the ship its public half, and return the
-    /// code. The runtime keeps no copy of it. This is the simple way; it does show the code
-    /// to the machine the ship runs on, once.
-    pub fn new_recovery_code(&self, ship: &str) -> Result<String, Error> {
-        let code = seal::recovery_code(&random_bytes::<20>()?);
-        self.set_recovery_key(ship, seal::recovery_public(&code))?;
-        Ok(code)
+    /// The public half of the recovery key a master ticket gives for a ship, to hand to
+    /// `set_recovery_key`. For a ship that was started from a keyfile: whoever holds the
+    /// ticket works this out and hands it over, and the ticket itself stays with them.
+    pub fn recovery_key_of_ticket(ship: &str, ticket: &str) -> Result<[u8; 32], Error> {
+        Ok(seal::recovery_public(&wallet_of(ticket, &canonical_ship(ship)?)?.backup_code()))
     }
 
     /// Whether a ship has been given a recovery key, and so can be exported.
@@ -1651,6 +1771,17 @@ impl Runtime {
     /// moment, and what it holds is written to disk only into the new ship's own encrypted
     /// file. The code is used here and not kept. The ship goes on with the recovery key of
     /// that code.
+    /// Bring in a ship exported by `export_ship`, with the ship's master ticket. The ticket
+    /// opens the copy if the copy was sealed to it, which it was if the ship was made from
+    /// the ticket or was given `recovery_key_of_ticket`.
+    pub fn import_ship_with_ticket(&self, src: impl AsRef<Path>, ship: &str, ticket: &str) -> Result<(), Error> {
+        let name = canonical_ship(ship)?;
+        if self.inner.ship_path(&name).exists() {
+            return Err(Error::ShipExists(name));
+        }
+        self.import_ship(src, &name, &wallet_of(ticket, &name)?.backup_code())
+    }
+
     pub fn import_ship(&self, src: impl AsRef<Path>, ship: &str, code: &str) -> Result<(), Error> {
         let name = canonical_ship(ship)?;
         let src = src.as_ref();
@@ -1725,7 +1856,8 @@ impl Runtime {
         if Instant::now() > deadline {
             return Err(Error::BadShipFile(format!("{name}: import took too long")));
         }
-        self.inner.publish(&name, &fresh.0, &key)?;
+        let proof = self.inner.stored_proof(&fresh.0, &name);
+        self.inner.publish(&name, &fresh.0, &key, proof)?;
         // The ship may have arrived with messages waiting to go to other ships, and with
         // events queued.
         self.inner.work_ready(&name);
@@ -1792,7 +1924,13 @@ impl Inner {
     /// name cannot leave one's file with the other's key. The key goes in first: a key with no
     /// ship is harmless and is replaced next time, while a ship with no key could not be woken.
     /// The hard link never replaces an existing ship.
-    fn publish(&self, name: &str, staged: &Path, key: &SigningKey) -> Result<(), Error> {
+    /// A moon's proof, as its file has it.
+    fn stored_proof(&self, file: &Path, name: &str) -> Option<moon::Proof> {
+        let conn = store::open_read_only(file, &self.file_key(name)).ok()?;
+        moon::Proof::from_bytes(&store::moon_proof(&conn).ok()??)
+    }
+
+    fn publish(&self, name: &str, staged: &Path, key: &SigningKey, proof: Option<moon::Proof>) -> Result<(), Error> {
         let _together = lock(&self.lifecycle);
         let dest_file = self.ship_path(name);
         if dest_file.exists() {
@@ -1805,7 +1943,7 @@ impl Inner {
                 // ship is in place from this moment, so this comes before anything that can
                 // still fail: a ship that exists is never unknown to the network.
                 if let Some(held) = self.identities.write().unwrap_or_else(PoisonError::into_inner).as_mut() {
-                    held.insert(name.to_string(), Arc::new(key.clone()));
+                    held.insert(name.to_string(), Held { key: Arc::new(key.clone()), proof });
                 }
                 Ok(sync_dir(&self.ships_dir)?)
             }

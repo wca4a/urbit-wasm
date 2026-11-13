@@ -1,0 +1,21 @@
+[package]
+name = "urbit-id"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# BLAKE2b, which Argon2 is built on.
+blake2 = "0.10"
+# The word list and the stretching that turn a seed into a phrase and back (BIP39).
+bip39 = "2"
+ed25519-dalek = "2"
+sha2 = "0.10"
+# Keccak-256, the hash Ethereum uses, and secp256k1, the curve its signatures are made on:
+# for checking who signed a layer 2 transaction (`naive.rs`).
+sha3 = "0.10"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+[dev-dependencies]
+# A standard Argon2, to check this crate's own against before trusting its Urbit variant.
+argon2 = "0.5"

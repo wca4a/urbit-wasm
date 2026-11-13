@@ -16,12 +16,19 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 sha2 = "0.10"
 stacker = "0.1"
 ship-proto = { path = "../proto" }
+urbit-id = { path = "../urbit-id" }
 wasm-encoder = "0.226"
 wasmparser = "0.226"
 wasmtime = { version = "31", default-features = false, features = ["cranelift", "runtime", "std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time", "sync"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+serde_json = "1"
+# Reading a node's answers into the shapes expected, skipping what is not asked for.
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 wat = "1"
+# To sign layer 2 transactions in the tests of the copy of Azimuth.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }

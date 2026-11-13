@@ -14,6 +14,7 @@ use rusqlite::{params, Connection, DatabaseName, OpenFlags, OptionalExtension, R
 
 use ship_proto::{CheckpointBody, Device, Kind, LogNews, Message, PeerMessage, Receipt, Verdict};
 
+use crate::moon::PROOF_BYTES;
 use crate::{signed_bytes, AuditEntry, ChainCheck, Config, Durability, Effect, Error, CHECKPOINT_DOMAIN};
 
 const SCHEMA_VERSION: i64 = 9;
@@ -250,7 +251,16 @@ pub const MAX_LABEL_BYTES: usize = 64;
 
 /// Create a ship file at `path`, which must not exist. The caller creates it under a private
 /// name and publishes it afterwards, so a failure here never leaves a half-made ship behind.
-pub fn create(path: &Path, name: &str, kernel: &str, max_bytes: u64, incarnation: &[u8; 16], file_key: &[u8; 32]) -> Result<(), Error> {
+pub fn create(
+    path: &Path,
+    name: &str,
+    kernel: &str,
+    max_bytes: u64,
+    incarnation: &[u8; 16],
+    file_key: &[u8; 32],
+    recovery: Option<&[u8; 32]>,
+    moon_proof: Option<&[u8; PROOF_BYTES]>,
+) -> Result<(), Error> {
     // create_new makes "does this ship already exist" atomic.
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(_) => {}
@@ -272,8 +282,24 @@ pub fn create(path: &Path, name: &str, kernel: &str, max_bytes: u64, incarnation
         "INSERT INTO meta VALUES ('schema', ?1), ('name', ?2), ('kernel', ?3), ('incarnation', ?4)",
         params![SCHEMA_VERSION, name, kernel, &incarnation[..]],
     )?;
+    // With everything else, so that a ship that is to have a recovery key never exists
+    // without it.
+    if let Some(public) = recovery {
+        recovery_set(&conn, public)?;
+    }
+    // Likewise a moon and its parent's word for its key.
+    if let Some(proof) = moon_proof {
+        conn.execute("INSERT INTO meta VALUES ('moon', ?1)", [&proof[..]])?;
+    }
     conn.execute_batch("COMMIT")?;
     Ok(())
+}
+
+/// For a moon: its parent's word for its key, which it shows to other ships. It is not a
+/// secret. `None` for a ship that has none, or whose file holds something else there.
+pub fn moon_proof(conn: &Connection) -> rusqlite::Result<Option<[u8; PROOF_BYTES]>> {
+    let stored: Option<Vec<u8>> = conn.query_row("SELECT value FROM meta WHERE key = 'moon'", [], |r| r.get(0)).optional()?;
+    Ok(stored.and_then(|proof| <[u8; PROOF_BYTES]>::try_from(proof).ok()))
 }
 
 /// The mark this copy of the ship was given when it was made or brought in. Every ship file
@@ -2227,12 +2253,14 @@ pub fn import(
     // The copy is given a mark of its own, whatever mark the source had: it may be an old
     // copy of the ship, brought back, and other ships tell by the mark that it may have
     // forgotten what it once knew of them.
-    create(dest, name, &kernel_hash, cfg.max_ship_bytes, incarnation, file_key)?;
-    let to = open(dest, Durability::Full, cfg.max_ship_bytes, file_key)?;
     // The ship keeps the recovery key of the code that opened this copy, whatever the copy
     // itself says its key is. So the code that brought a ship back is the code that opens
     // the copies made of it from here on.
-    recovery_set(&to, recovery)?;
+    // A moon keeps its parent's word for its key. Whether that word is good is for the
+    // ships it meets to say: a bad one only stops the moon being believed.
+    let proof = moon_proof(&from).map_err(|_| bad_row("not a ship file"))?;
+    create(dest, name, &kernel_hash, cfg.max_ship_bytes, incarnation, file_key, Some(recovery), proof.as_ref())?;
+    let to = open(dest, Durability::Full, cfg.max_ship_bytes, file_key)?;
     // Leave WAL mode so that a commit means the data is in the main file, which is the only
     // file that gets published. The switch itself fails if earlier writes cannot be folded in.
     let mode: String = to.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
