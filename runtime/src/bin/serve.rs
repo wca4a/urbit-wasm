@@ -8,14 +8,17 @@
 //! `--ethereum`. `--lookup` prints what Urbit ID lists for a ship, and stops.
 //!
 //! With `--azimuth-copy` those keys come from a copy of Azimuth kept in a file and worked
-//! out from Ethereum alone, in place of asking the roller about ships on layer 2.
+//! out from Ethereum alone, in place of asking the roller about ships on layer 2. The copy
+//! can be started from a snapshot (`--azimuth-snapshot`), and a snapshot written of it
+//! (`--azimuth-write-snapshot`), if need be at a given block (`--azimuth-until`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use runtime::azimuth::{Azimuth, AzimuthConfig, Keys};
-use runtime::replica::{Replica, ReplicaConfig, TroubleWatch};
+use runtime::replica::snapshot::{self, Summary};
+use runtime::replica::{Replica, ReplicaConfig, Restored, TroubleWatch};
 use runtime::net::{Directory, NetConfig, Network};
 use runtime::server::{Server, ServerConfig};
 use runtime::urbit_id::ob;
@@ -25,6 +28,8 @@ const USAGE: &str = "usage: serve --dir <data directory> [--addr 127.0.0.1:8080]
              [--storage-key-file <file>] [--secure-cookies] [--access-code <ship>] [--signin-link <ship>]
              [--demo [--kernel <kernel.wasm>] [--counter <counter.wasm>]]
              [--ethereum <url> [--roller <url> | --azimuth-copy <file>]] [--net <address>]
+             [--azimuth-snapshot <file> [--azimuth-snapshot-sha256 <hex>]]
+             [--azimuth-until <block>] [--azimuth-write-snapshot <file>]
              [--peer <ship>=<address>]...
              [--keyfile <file>] [--lookup <ship>]...
 
@@ -42,6 +47,21 @@ const USAGE: &str = "usage: serve --dir <data directory> [--addr 127.0.0.1:8080]
                          to Ethereum, and read keys from it instead of asking the roller. The
                          first time, reading all of Azimuth's history takes a while; the node
                          must answer eth_getLogs for old blocks
+  --azimuth-snapshot <file>
+                         if there is no copy yet, make it from this snapshot, then read on from
+                         the snapshot's block. A copy that is there is never replaced, and the
+                         snapshot is then not used. macOS and Linux only
+  --azimuth-snapshot-sha256 <hex>
+                         the fingerprint the snapshot must have, as 64 hexadecimal digits. Take
+                         it from somewhere other than where the snapshot came from
+  --azimuth-until <block>
+                         read the copy to this block and no further, then stop (with
+                         --azimuth-write-snapshot, write a snapshot there first). Needs
+                         --ethereum. A copy stopped short answers no lookups
+  --azimuth-write-snapshot <file>
+                         write a snapshot of the copy to this new file, and its fingerprint and
+                         block to the same name with .txt added, then stop. The node is not asked
+                         anything unless --azimuth-until is given. macOS and Linux only
   --net <address>        talk to ships on other runtimes, listening here (UDP), each ship
                          known by the key Urbit ID lists for it. Needs --ethereum
   --peer <ship>=<addr>   where another ship is to be found. Its key comes from Urbit ID
@@ -99,6 +119,32 @@ fn wait_for(replica: &Replica) {
     }
 }
 
+/// Wait until the copy of Azimuth has read to `until`, where it was told to stop, and this run
+/// has found the file's block hash to be the node's: a copy that was already there when it was
+/// opened is not taken as there until the node has agreed with it.
+fn wait_until(replica: &Replica, until: u64) {
+    let started = std::time::Instant::now();
+    let mut said = std::time::Instant::now();
+    loop {
+        let status = replica.status();
+        if replica.reached_until() {
+            eprintln!("The copy of Azimuth has read every block up to {until}, where it was told to stop, in {} seconds.", started.elapsed().as_secs());
+            return;
+        }
+        if said.elapsed() >= Duration::from_secs(10) {
+            said = std::time::Instant::now();
+            let trouble = status.trouble.map_or(String::new(), |why| format!(" Last trouble: {why}."));
+            eprintln!("Reading Azimuth: block {} of {until}, {} logs and {} batches so far.{trouble}", status.read_to, status.counts.logs, status.counts.batches);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Say what snapshot was written, in the same lines as are written beside it.
+fn print_written(out: &std::path::Path, summary: &Summary) {
+    println!("Wrote {}, and the same lines to {}.txt:\n{}", out.display(), out.display(), summary.lines());
+}
+
 fn main() {
     let (mut dir, mut addr, mut host_suffix) = (None, "127.0.0.1:8080".to_string(), None);
     let (mut secure_cookies, mut demo) = (false, false);
@@ -106,6 +152,7 @@ fn main() {
     let (mut access_codes, mut signin_links) = (Vec::new(), Vec::new());
     let (mut ethereum, mut roller, mut net, mut peers, mut keyfile, mut lookups) = (None, None, None, Vec::new(), None, Vec::new());
     let mut azimuth_copy = None;
+    let (mut azimuth_snapshot, mut snapshot_sha256, mut azimuth_until, mut write_snapshot) = (None, None, None, None);
     let mut kernel = PathBuf::from("target/wasm/wasm32-unknown-unknown/release/kernel.wasm");
     let mut counter = PathBuf::from("target/wasm/wasm32-unknown-unknown/release/counter.wasm");
 
@@ -126,6 +173,16 @@ fn main() {
             "--ethereum" => ethereum = Some(value()),
             "--roller" => roller = Some(value()),
             "--azimuth-copy" => azimuth_copy = Some(PathBuf::from(value())),
+            "--azimuth-snapshot" => azimuth_snapshot = Some(PathBuf::from(value())),
+            "--azimuth-snapshot-sha256" => {
+                let written = value();
+                snapshot_sha256 = Some(snapshot::fingerprint(&written).unwrap_or_else(|| fail(&format!("--azimuth-snapshot-sha256 {written}: not 64 hexadecimal digits"))));
+            }
+            "--azimuth-until" => {
+                let written = value();
+                azimuth_until = Some(written.parse::<u64>().unwrap_or_else(|_| fail(&format!("--azimuth-until {written}: not a block number"))));
+            }
+            "--azimuth-write-snapshot" => write_snapshot = Some(PathBuf::from(value())),
             "--net" => net = Some(value()),
             "--peer" => peers.push(value()),
             "--keyfile" => keyfile = Some(PathBuf::from(value())),
@@ -135,6 +192,31 @@ fn main() {
     }
     if azimuth_copy.is_some() && roller.is_some() {
         fail("--azimuth-copy needs no roller");
+    }
+    if azimuth_copy.is_none() && (azimuth_snapshot.is_some() || azimuth_until.is_some() || write_snapshot.is_some()) {
+        fail("--azimuth-snapshot, --azimuth-until and --azimuth-write-snapshot need --azimuth-copy");
+    }
+    if snapshot_sha256.is_some() && azimuth_snapshot.is_none() {
+        fail("--azimuth-snapshot-sha256 needs --azimuth-snapshot");
+    }
+    // Where snapshots are neither written nor restored, either flag is refused here, before
+    // the copy is opened or anything is made: a copy read to a block only to be refused a
+    // snapshot of would be work for nothing.
+    if azimuth_snapshot.is_some() || write_snapshot.is_some() {
+        snapshot::supported().unwrap_or_else(|why| fail(&why));
+    }
+    if azimuth_until.is_some() && (!lookups.is_empty() || net.is_some()) {
+        fail("--azimuth-until stops the copy short of the end of the chain, so it answers no lookups: it cannot go with --lookup or --net");
+    }
+    // A snapshot of the copy as it is: no node is asked anything.
+    if let (Some(out), Some(file), None) = (&write_snapshot, &azimuth_copy, azimuth_until) {
+        if azimuth_snapshot.is_some() {
+            fail("--azimuth-snapshot with --azimuth-write-snapshot needs --azimuth-until: a copy only just made from a snapshot would be written back as the same snapshot");
+        }
+        let cfg = ReplicaConfig::mainnet(ethereum.as_deref().unwrap_or_default());
+        let summary = snapshot::write(file, &cfg, out).unwrap_or_else(|e| fail(&format!("cannot write a snapshot of {} to {}: {e}", file.display(), out.display())));
+        print_written(out, &summary);
+        return;
     }
     let azimuth: Option<Arc<dyn Keys>> = match (ethereum, azimuth_copy) {
         (None, Some(_)) => fail("--azimuth-copy needs --ethereum"),
@@ -147,7 +229,38 @@ fn main() {
             Some(Arc::new(Azimuth::new(cfg)))
         }
         (Some(ethereum), Some(file)) => {
-            let replica = Replica::open(&file, ReplicaConfig::mainnet(&ethereum)).unwrap_or_else(|e| fail(&format!("cannot open {}: {e}", file.display())));
+            let cfg = ReplicaConfig { until: azimuth_until, ..ReplicaConfig::mainnet(&ethereum) };
+            let opened = match &azimuth_snapshot {
+                None => Replica::open(&file, cfg.clone()),
+                Some(from) => Replica::open_from_snapshot(&file, cfg.clone(), from, snapshot_sha256).map(|(replica, restored)| {
+                    match restored {
+                        Restored::Made(summary) => eprintln!(
+                            "Made the copy of Azimuth {} from the snapshot {}: block {}, {} points, fingerprint (sha256) {}. It reads on from there.",
+                            file.display(),
+                            from.display(),
+                            summary.block,
+                            summary.points,
+                            snapshot::plain_hex(&summary.sha256)
+                        ),
+                        Restored::Ignored => eprintln!("There is a copy of Azimuth at {} already, so the snapshot {} is not used: a copy is never replaced.", file.display(), from.display()),
+                    }
+                    replica
+                }),
+            };
+            let replica = opened.unwrap_or_else(|e| fail(&format!("cannot open {}: {e}", file.display())));
+            if let Some(until) = azimuth_until {
+                let read_to = replica.status().read_to;
+                if read_to > until {
+                    fail(&format!("{} has read to block {read_to} already, past block {until}; a copy cannot go back", file.display()));
+                }
+                replica.keep_up();
+                wait_until(&replica, until);
+                if let Some(out) = &write_snapshot {
+                    let summary = snapshot::write(&file, &cfg, out).unwrap_or_else(|e| fail(&format!("cannot write a snapshot of {} to {}: {e}", file.display(), out.display())));
+                    print_written(out, &summary);
+                }
+                return;
+            }
             replica.keep_up();
             let replica = Arc::new(replica);
             if !lookups.is_empty() {

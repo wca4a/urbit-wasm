@@ -32,16 +32,31 @@
 //! order as a list), text as text, a list as a list, a yes or no as one, and `null` nowhere
 //! but where this list says so. Numbers and hashes are text, written as Ethereum writes them.
 //!
-//! Of the final block (`eth_getBlockByNumber("finalized")`): `number`, a quantity, never
-//! behind the final block heard of before or behind what the file has read (replica). Not
-//! read: its hash, its parent, its transactions, and the rest.
+//! Of a block (`eth_getBlockByNumber`), the final one or one asked for by its number:
+//! - `number`: a quantity; for one asked for by number, that number; for the final one, never
+//!   behind the final block of the last poll that succeeded, and waited for while it is behind
+//!   what the file has read (replica).
+//! - `hash`: 32 bytes. Only ever asked of a block at or before the final one heard of in the
+//!   same poll. Of the last block of a range, the hash the file keeps beside the number of the
+//!   block it has read to, written in the same step (replica). Of the block the file has read
+//!   to, asked once at the start of every run before anything is applied or answered: the same
+//!   as the one the file keeps, or nothing is read, written or answered (replica).
+//! Not read: its parent, its transactions, and the rest.
+//!
+//! One block, one hash (replica): in a poll, every block number and hash the node gives is one
+//! chain, whichever answer gave it: the final block, the final block of the last poll that
+//! succeeded, the block the file had read to at the start of the run, the last block of each
+//! range, and the `blockNumber` and `blockHash` of every log of that range (and so of every
+//! batch's transaction, which must be in its log's block). One number never has two hashes,
+//! and one hash is never of two numbers. What is held for this is the poll's block answers and
+//! one range's logs at a time; only a poll that succeeded is remembered for the next.
 //!
 //! Of a log (`eth_getLogs`):
 //! - `address`: the contract asked about.
 //! - `removed`: absent or false (not `null`).
 //! - `blockNumber`: a quantity, within the blocks asked about; with `logIndex`, strictly
-//!   increasing through an answer; in a range, one hash for each number and one number for
-//!   each hash, both contracts' logs together (replica).
+//!   increasing through an answer; with `blockHash`, one block with the range's other logs
+//!   (both contracts') and the poll's block answers (replica, as above).
 //! - `blockHash`: 32 bytes; as above (replica); the same as the block hash of a batch's
 //!   transaction.
 //! - `logIndex`: a quantity; with `blockNumber`, strictly increasing through an answer, and
@@ -107,6 +122,13 @@ pub struct Log {
     pub transaction_index: u64,
     pub topics: Vec<[u8; 32]>,
     pub data: Vec<u8>,
+}
+
+/// A block: its number, and its hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Block {
+    pub number: u64,
+    pub hash: [u8; 32],
 }
 
 /// Why a question got no answer.
@@ -324,10 +346,18 @@ impl Ethereum {
 
     /// The newest block the chain has finalised: Ethereum's word that it will never be
     /// replaced (unless a third of all that is staked is destroyed).
-    pub fn finalized(&self) -> Result<u64, Trouble> {
-        self.ask("eth_getBlockByNumber", json!(["finalized", false]), PhantomData::<Object<RawBlock>>, MOST_BLOCK_ANSWER_BYTES, self.timeout, |block| {
-            quantity(&block.0.number).ok_or_else(|| Trouble::Failed("the finalised block has no number".into()))
-        })
+    pub fn finalized(&self) -> Result<Block, Trouble> {
+        self.block_at(json!("finalized"), None)
+    }
+
+    /// The block with this number: asked only of blocks the chain has already finalised, whose
+    /// hash can no longer change.
+    pub fn block(&self, number: u64) -> Result<Block, Trouble> {
+        self.block_at(json!(format!("{number:#x}")), Some(number))
+    }
+
+    fn block_at(&self, which: Value, asked: Option<u64>) -> Result<Block, Trouble> {
+        self.ask("eth_getBlockByNumber", json!([which, false]), PhantomData::<Object<RawBlock>>, MOST_BLOCK_ANSWER_BYTES, self.timeout, move |block| block_of(block.0, asked))
     }
 
     /// Every log `contract` wrote in blocks `from` to `to`, both included, in order, whose
@@ -763,11 +793,23 @@ fn four_at_most<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String
     deserializer.deserialize_seq(Topics)
 }
 
-/// A block as a node writes it: only its number. The hashes of its transactions are passed
-/// over.
+/// A block as a node writes it: only its number and hash. The hashes of its transactions are
+/// passed over.
 #[derive(Deserialize)]
 struct RawBlock {
     number: String,
+    hash: String,
+}
+
+/// A block's number and hash, checked: the number is the one asked for, when one was.
+fn block_of(block: RawBlock, asked: Option<u64>) -> Result<Block, Trouble> {
+    let what = asked.map_or("the finalised block".to_string(), |asked| format!("block {asked}"));
+    let number = quantity(&block.number).ok_or_else(|| Trouble::Failed(format!("{what} has no number")))?;
+    if asked.is_some_and(|asked| asked != number) {
+        return Err(Trouble::Failed(format!("the node answered with block {number} when asked for {what}")));
+    }
+    let hash = word(&block.hash).ok_or_else(|| Trouble::Failed(format!("{what} has no hash")))?;
+    Ok(Block { number, hash })
 }
 
 /// A transaction as a node writes it: only the fields read here.
@@ -981,7 +1023,7 @@ mod tests {
         assert!(logs(r#"{"jsonrpc":"2.0","id":"1","result":null}"#, 10).unwrap_err().why().contains("nothing in it"));
         // A block's transactions are passed over.
         let hashes: Vec<String> = (0..3000).map(|at| format!("\"0x{at:064x}\"")).collect();
-        let block = answer(&format!(r#"{{"number":"0x2a","transactions":[{}]}}"#, hashes.join(",")));
+        let block = answer(&format!(r#"{{"number":"0x2a","hash":"0x{}","transactions":[{}]}}"#, "33".repeat(32), hashes.join(",")));
         let read = parse("eth_getBlockByNumber", block.as_bytes(), AnswerSeed(PhantomData::<Object<RawBlock>>)).and_then(|answer| take("eth_getBlockByNumber", answer, "1"));
         assert_eq!(read.unwrap().0.number, "0x2a");
         // Several answers where fewer questions were asked.
@@ -1129,10 +1171,27 @@ mod tests {
 
         // The final block as a list, its number as a number.
         let block = |text: &str| parse("eth_getBlockByNumber", text.as_bytes(), AnswerSeed(PhantomData::<Object<RawBlock>>)).and_then(|answer| take("eth_getBlockByNumber", answer, "1"));
-        assert!(block(&answer(r#"{"number":"0x29"}"#)).is_ok());
-        for not in [r#"["0x29"]"#, r#"{"number":41}"#, r#"{"number":null}"#, r#""0x29""#] {
-            assert!(block(&answer(not)).is_err(), "{not}");
+        let hash_of = format!("0x{}", "33".repeat(32));
+        let whole_block = format!(r#"{{"number":"0x29","hash":"{hash_of}"}}"#);
+        assert!(block(&answer(&whole_block)).is_ok());
+        for not in [
+            format!(r#"["0x29","{hash_of}"]"#),
+            whole_block.replace(r#""number":"0x29""#, r#""number":41"#),
+            whole_block.replace(r#""number":"0x29""#, r#""number":null"#),
+            whole_block.replace(r#""hash":"#, r#""parentHash":"#),
+            whole_block.replace(&format!(r#""{hash_of}""#), "null"),
+            whole_block.replace(&format!(r#""{hash_of}""#), "7"),
+            r#""0x29""#.to_string(),
+        ] {
+            assert!(block(&answer(&not)).is_err(), "{not}");
         }
+        // A block is the one asked for, with a hash of 32 bytes.
+        let raw = |number: &str, hash: &str| RawBlock { number: number.into(), hash: hash.into() };
+        assert_eq!(block_of(raw("0x29", &hash_of), Some(41)).unwrap(), Block { number: 41, hash: [0x33; 32] });
+        assert_eq!(block_of(raw("0x29", &hash_of), None).unwrap().number, 41);
+        assert!(block_of(raw("0x2a", &hash_of), Some(41)).unwrap_err().why().contains("block 42 when asked for block 41"));
+        assert!(block_of(raw("0x29", &hash_of[..64]), Some(41)).unwrap_err().why().contains("no hash"));
+        assert!(block_of(raw("0x029", &hash_of), None).unwrap_err().why().contains("no number"));
         // A transaction as a list, its place as a number, not yet in a block.
         let hash = format!("0x{}", "22".repeat(32));
         let transaction = |text: &str| parse("eth_getTransactionByHash", text.as_bytes(), AnswerSeed(PhantomData::<Object<RawTransaction>>)).and_then(|answer| take("eth_getTransactionByHash", answer, "1"));
@@ -1245,13 +1304,13 @@ mod tests {
                 }
                 let mut body = vec![0; length];
                 let _ = reader.read_exact(&mut body);
-                let answer = r#"{"jsonrpc":"2.0","id":"1","result":{"number":"0x2a"}}"#;
+                let answer = format!(r#"{{"jsonrpc":"2.0","id":"1","result":{{"number":"0x2a","hash":"0x{}"}}}}"#, "44".repeat(32));
                 let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}", answer.len());
             }
         });
         let found: Arc<LookUp> = Arc::new(move |_: &str| Ok(vec![address]));
         let ethereum = Ethereum::resolving("http://node.invalid:8545", Duration::from_secs(2), Duration::ZERO, Arc::new(Stop::default()), found);
-        assert_eq!(ethereum.finalized().unwrap(), 42);
+        assert_eq!(ethereum.finalized().unwrap(), Block { number: 42, hash: [0x44; 32] });
     }
 
     /// A resolver that never answers holds one thread, however many questions are asked.

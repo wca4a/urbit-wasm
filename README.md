@@ -154,6 +154,25 @@ cargo run -p runtime --release --bin serve -- --ethereum https://gateway.tenderl
   --azimuth-copy /tmp/azimuth.sqlite --lookup '~zod'
 ```
 
+Start the copy from a snapshot instead, and read on from its block (see
+Starting the copy from a snapshot; nothing is published yet, so the snapshot
+here is one you wrote yourself or were handed):
+
+```sh
+cargo run -p runtime --release --bin serve -- --ethereum https://gateway.tenderly.co/public/mainnet \
+  --azimuth-copy /tmp/azimuth.sqlite --azimuth-snapshot azimuth.snapshot \
+  --azimuth-snapshot-sha256 <64 hexadecimal digits> --lookup '~zod'
+```
+
+Write a snapshot of a copy (no node needed), or rebuild one at a given block
+to check someone else's fingerprint:
+
+```sh
+cargo run -p runtime --release --bin serve -- --azimuth-copy /tmp/azimuth.sqlite --azimuth-write-snapshot azimuth.snapshot
+cargo run -p runtime --release --bin serve -- --ethereum https://gateway.tenderly.co/public/mainnet \
+  --azimuth-copy /tmp/check.sqlite --azimuth-until 26407242 --azimuth-write-snapshot check.snapshot
+```
+
 Run a real ship on the network, from its keyfile, with other ships' keys read
 from Urbit ID. `--peer` says where another ship is to be found (add
 `--azimuth-copy <file>` to read keys from a copy instead of the roller):
@@ -621,10 +640,10 @@ says in its comments which part of `naive.hoon` each piece follows:
   as Ethereum does, and `v` with or without 27 added.
 
 The file is plain SQLite (public data, not encrypted): a `points` table, one
-row per ship, and a `meta` table with the last block read, counts of what was
-read, and which chain and contracts the file is a copy of (a file is never
-opened as a copy of another). Each step forward, a range of blocks applied and
-the new last block, is one transaction: a crash or a failed question leaves
+row per ship, and a `meta` table with the last block read and its hash, counts
+of what was read, and which chain and contracts the file is a copy of (a file
+is never opened as a copy of another). Each step forward, a range of blocks
+applied and the new last block with its hash, is one transaction: a crash or a failed question leaves
 the file where it was, and the next poll carries on from there. Only one copy
 may have the file open at a time: it holds an exclusive lock on
 `<file>.lock` for as long as it is open, and a second opener, in the same
@@ -633,7 +652,26 @@ uses), is refused at once with a message saying so. Links are followed first,
 so the file is locked under one name however it is reached; a file with a
 second name of its own (a hard link) is refused; and SQLite opens the file
 without following a link, so a link put in its place after its name was
-worked out is refused too.
+worked out is refused too. A file that is not there is not made while a file
+SQLite would take as part of it is there (the same name with `-wal`, `-shm` or
+`-journal` added, left by an earlier copy whose file was removed): SQLite would
+play its old pages over the new file. The copy refuses, names them, and leaves
+them for the operator to remove. A file that is there is handed to SQLite only
+if it is a plain file, and only if each of those three that is beside it is a
+plain file with one name, SQLite's own: SQLite writes to them even when it only
+reads the database, so through a link, a second name of some other file, or
+something that is not a plain file, it would write to something else. Anything
+else is refused and left alone, when the copy is opened and when a snapshot is
+written of it.
+
+Every number in `meta` (the last block read and the six counts) is a whole
+number from 0 to 2^63 - 1, kept as an SQLite integer. A count that reaches
+2^63 - 1 stays there, so copies that read the same history keep the same
+counts however often they are reopened. Anything else under one of those names
+(a number below zero, text, bytes, a fraction) is a damaged file, and the copy
+is not opened; nothing is clamped or taken to be zero. A count that is missing
+is damage too, except in a file that has read nothing yet: copies made before
+the counts were written from the start kept none until their first step.
 
 A lookup decides that the copy may answer and reads its answer in one step,
 holding the copy's status throughout, so it never reads a file part way
@@ -658,8 +696,11 @@ would hand out keys that have since changed. (So for the second or so after
 each new final block is heard of, while it is read, lookups are refused and
 the directory goes on with what it had.) After that, if the node goes away,
 lookups go on being answered from what the copy has. A node whose final block
-goes back, behind one it gave before or behind what the file has read, is not
-followed. A ship has a listing if it is in the table; its key follows the same
+goes back, behind one it gave in a poll that succeeded, is not followed (one
+given only in a poll that then failed may have been the wrong answer, and is
+not held against later ones); one whose final block
+is behind what the file has read (a node not yet caught up, or a copy made
+from a newer snapshot) is waited for. A ship has a listing if it is in the table; its key follows the same
 rules as above.
 
 Ethereum nodes differ, and the code copes:
@@ -725,10 +766,12 @@ an error; any field not listed is not read. A range is the blocks read in one st
 | Every answer | `id` | the number of the question asked, as text; a refusal may carry another number, however written, or `null`, and among answers to questions asked at once a refusal is taken first |
 | Every answer | `result` | the shape asked for; `null` is an answer with nothing in it, an error |
 | Every answer | `error` | when there, an object, never `null`; its `message` text or `null`, only reported; never beside a result that is not `null` |
-| Final block | `number` | never behind a final block heard of before, or behind the file |
+| Block, the final one or one asked for by number | `number` | the number asked for; for the final one, never behind the final block of the last poll that succeeded, and waited for while behind the file |
+| Block | `hash` | 32 bytes; asked only of a block at or before the final one heard of in the same poll. Of a range's last block, kept with the file's last block in the same step; of the file's last block, asked at the start of each run, the same as the one kept |
+| Block and log | number with hash | in a poll, one chain: the final block, the final block of the last poll that succeeded, the file's last block asked at the start of a run, a range's last block, and the block of every log in that range (so of every batch's transaction) never give one number two hashes or one hash two numbers |
 | Log | `address` | the contract asked about |
 | Log | `removed` | absent or false (not `null`) |
-| Log | `blockNumber` | within the blocks asked; with `logIndex`, strictly increasing; one hash per number and one number per hash in a range |
+| Log | `blockNumber` | within the blocks asked; with `logIndex`, strictly increasing; with `blockHash`, one chain with the range's other logs and the poll's block answers (row above) |
 | Log | `blockHash` | as above; the same as a batch's transaction's |
 | Log | `logIndex` | with `blockNumber`, strictly increasing; never the same as another log's in a range |
 | Log | `transactionHash` | in one block in a range; its logs together in its block; for a batch, the transaction asked for |
@@ -739,7 +782,7 @@ an error; any field not listed is not read. A range is the blocks read in one st
 | Transaction | `blockNumber`, `blockHash`, `transactionIndex` | those of its batch's log |
 | Transaction | `input` | at most the limit for one input; the same in every answer for one transaction at one place |
 
-Not read: a final block's hash, parent and transactions; a log's `blockTimestamp`; a
+Not read: a block's parent and transactions; a log's `blockTimestamp`; a
 transaction's `from`, `to`, `value`, `gas`, `nonce` and signature (a batch may be sent
 through another contract, and its input is taken as Urbit's own software takes it). Not
 compared across ranges: that a transaction or block hash read in one range does not come
@@ -769,7 +812,7 @@ could ever put in one, which only a broken node can claim. All are settings
 | Batches applied, each logged batch counted | 64 MiB | none: one block is applied whatever its work, and a stop is noticed between events and between transactions | One transaction can log its input many times over |
 | Data of one log | 16 KiB | same | Only applied kinds are asked for; the longest has 128 bytes |
 | Topics of one log | 4 | same | Ethereum's own maximum |
-| The answer about the final block | 16 MiB | | Every transaction's hash, 69 bytes each, at 21,000 gas a transaction: blocks of over five billion gas |
+| The answer about a block | 16 MiB | | Every transaction's hash, 69 bytes each, at 21,000 gas a transaction: blocks of over five billion gas |
 | Several transactions asked for in one request | 20, and 8 MiB of answer | | Past either, they are asked for one at a time |
 | Time for one question | 30 s | ten times that, for one block's logs or one transaction | Longer answers |
 
@@ -779,6 +822,170 @@ takes 100,000 blocks to a question and several questions to a request, and
 answers HTTP 429 when asked too often; flashbots takes 2,000 blocks,
 Cloudflare 800; drpc's free plan refuses. A full read of the main network
 through Tenderly is described under Tests.
+
+### Starting the copy from a snapshot
+
+A copy read from nothing reads all of Azimuth's history, which needs a node
+that answers questions about wide ranges of old blocks: Tenderly's public node
+takes 100,000 blocks to a question, but many free plans take ten, which would
+mean millions of questions. A copy can instead start from a snapshot, a flat
+file of the table at some block, and read only what came after it, which any
+node can answer. The idea is taken from latter-bolden/azimuth-resolver, whose
+bundled snapshot matched this copy's table on every point not changed since
+its block; none of its code is used.
+
+**The block's hash.** Beside the number of the block it has read to, the copy
+keeps that block's hash, written in the same step as the number. The hash is
+the node's answer for a block it has said is final: the final block itself
+when a step ends there, or the block asked for by number otherwise (one more
+question for each step). Within a poll, every block number and hash the node
+gives (the final block, the final block of the last poll that succeeded, the
+block asked for at the start of the run, each range's last block, and the
+block of every log in the range) must be one chain: no number with two hashes,
+no hash of two numbers. Only a poll that succeeded is remembered for the next,
+so a wrong answer in one that failed never holds back a right one. At the start
+of every run, before anything is applied and before any lookup is answered, the
+copy asks the node for the hash of the block it has read to. If it differs from the one kept, the node follows
+another chain or the file is wrong: nothing is read, written or answered, the
+trouble says so (and says that a copy made from a snapshot can be removed,
+with any file of the same name with `-wal`, `-shm` or `-journal` added, to try
+another), and every later poll asks again, so the copy carries on once the
+node answers as before. A node that cannot answer is ordinary trouble, tried
+again. A file made before the hash was kept has none; it is used as before,
+learns the hash the next time it moves forward, and is checked from the next
+run on. A copy made from a snapshot always has one.
+
+**Writing a snapshot.** `serve --azimuth-copy <file> --azimuth-write-snapshot
+<out>` writes a snapshot of the copy as it is and stops; no node is asked
+anything. Snapshots are written and restored only on macOS and Linux (see
+Known limits); elsewhere `serve` refuses either snapshot flag before the copy
+is opened or anything is made. Everything is read in one read transaction, so
+the points, the block, its hash and the counts belong together, even while a running server
+moves the copy on. A copy with no hash kept is refused: a snapshot nobody can
+place on the chain is not made, as is one with a change a crash left unfinished
+beside it (a hot `-journal`), which the writer, reading only, cannot undo: it
+says to open the copy once first, which undoes that change unless the file is
+damaged as well. The copy, and each file beside it, must be a plain file with
+one name, as when a copy is opened. A write-ahead log not yet written back is
+read as part of the copy. The file is described at the top of
+`runtime/src/replica/snapshot.rs`: a 176-byte header (a magic, the format, the
+version of the rules, the chain and both contracts with their first blocks,
+the block and its hash, the six counts, the number of points), then one
+211-byte record per point in ascending order of ship, every number written
+most significant byte first, a yes or no as 0 or 1, and a field with nothing
+in it as zeros. There is one way to write a given table, so the same table at
+the same block, by the same rules, gives the same bytes however it was
+reached; about 30 MB for the main network today. Its fingerprint is the
+SHA-256 of the whole file. The writer prints the block, its hash, the number
+of points, the size and the fingerprint, and writes the same lines to
+`<out>.txt`. It never replaces a file and never follows a link at either name:
+each is written under a name of its own beside it, put on disk, and given its
+name only if that name is still free.
+
+The version of the rules (`RULES` in `snapshot.rs`) is raised whenever
+`naive.rs` or the way the copy reads and applies the history changes what a
+given history gives, so that a snapshot worked out by other rules is never
+taken.
+
+**Starting from one.** `serve --azimuth-copy <file> --azimuth-snapshot
+<snapshot> [--azimuth-snapshot-sha256 <hex>]` makes the copy from the snapshot
+if there is no copy yet, then reads on as usual. What is at the copy's name
+decides what happens, and is looked at before anything is written:
+
+- Nothing: the copy is made from the snapshot, as below, unless something
+  SQLite would take as part of a new copy (the same name with `-wal`, `-shm`
+  or `-journal` added) is there, which is refused and left for the operator
+  to remove.
+- A copy: it is opened as it is, the snapshot is not read, and a line says so.
+- Something that is not a copy (an empty file, a file whose first start was
+  cut short, another database, a file that is not a database): refused, with a
+  message saying to remove it, and any `-wal`, `-shm` or `-journal` beside it,
+  for the snapshot to be used, and, where an ordinary start could make a copy
+  of it, that starting once without `--azimuth-snapshot` finishes it as a copy
+  read from the beginning. Without a snapshot asked for, an empty file or one
+  whose first start was cut short is set up that way, as before.
+- Something that cannot be read to tell: refused with SQLite's own error, never
+  taken for "not a copy". The message says that an ordinary start will finish
+  it if the trouble is a change a crash left unfinished, and that otherwise the
+  file is damaged and must be removed, with what is beside it.
+- Something that is not a plain file with one name (once a symbolic link to it
+  has been followed, which is done on purpose), or a file beside it that is a
+  link, a second name or not a plain file: refused, as when any copy is opened.
+
+What is there is left as it is, with one exception: a database with a change a
+crash left unfinished beside it (a hot `-journal`) cannot be read by a
+connection that may only read, so a file that begins as every SQLite database
+does is then opened once to write, without the right to make a file, so that
+SQLite undoes that change as any opening would, and is looked at again. If it
+then turns out not to be a copy, or still cannot be read, the message says so,
+and says that SQLite undid that change and nothing else was changed. If the
+change could not be undone (the file may not be written to, say), the message
+says that, with the error, and that nothing was changed; it claims neither that
+the change was undone nor that the file is damaged. A file that is not an
+SQLite database is never handed to a connection that may write.
+
+The snapshot is read as hostile: its length must be exactly what its header's
+count of points says before any point is believed; it is read through a buffer
+of fixed size, so memory does not depend on what it claims; every point must be
+in the one form allowed (ships strictly ascending, each yes or no 0 or 1, an
+absent escape all zeros, a place one of the three), which also keeps to every
+check of the `points` table; and it must have been made for the same chain and
+contracts, by the same version of the rules, with the fingerprint given, if one
+is. Anything else refuses it, and no copy is made.
+
+The copy is made by the same code as any copy (the same schema, the same lock,
+the same refusal of links), with every point, the block, its hash and the
+counts in one transaction, under a name of its own beside the copy's, with
+nothing of SQLite's beside that name. It is then put in the copy's usual
+journal (write-ahead) and closed; nothing of SQLite's may be left beside it; it
+is put on disk; and only then is it given the copy's name, only if that name is
+still free. So once named it is whole on its own, and opening it changes
+nothing. What a crash at each point leaves is listed at the top of
+`snapshot.rs`: at every point the next start finds no copy and makes it again,
+or finds a whole one, never a part of one, and never an empty copy that would
+quietly read from the beginning. (A crash part way can leave the file under its
+own name, ending in `.part`, beside the copy; it is never taken for the copy.)
+
+Once named, the copy is opened without the right to make a file, and read back
+before anything is written to it: its tables, its journal, what it is a copy
+of, its block, the block's hash, its counts and its number of points must be
+what was made, or it is not used; an error reading it back is said as an error.
+Then the copy reads on, starting with the check of the block's hash. Lookups
+stay refused until that check has passed and the copy has reached the final
+block heard of in this run. A snapshot newer than what the node has finalised
+waits. If the node disagrees about the snapshot's block, the copy stays refused
+and says to remove the file, and any `-wal`, `-shm` or `-journal` beside it, to
+try another snapshot; it does not remove them itself.
+
+**Stopping at a block.** `--azimuth-until <block>` reads the copy to that block
+and no further (once it is final; until then it reads as far as is final and
+waits), then stops, writing a snapshot there first with
+`--azimuth-write-snapshot`. A copy that is already at that block when it is
+opened is taken as there only once this run's check of its block hash has
+passed. That is how a second party rebuilds a publisher's snapshot to compare
+fingerprints. A copy told to stop never counts as caught
+up and answers no lookups, so it cannot go with `--lookup` or `--net`.
+
+What a snapshot does and does not prove:
+
+- The fingerprint shows the file is the one somebody named. It does not show
+  that it is right.
+- The check of the block's hash shows that the snapshot's block is on the
+  chain the node follows.
+- Whether the table is what Azimuth's history gives is the publisher's word,
+  until a second party reads to the same block (`--azimuth-until`) and gets the
+  same fingerprint. Then it is two parties' word, and anyone with a node that
+  answers wide ranges can make it their own.
+- A wrong snapshot could list a wrong key for a ship that does not change
+  afterwards. Reading on does not repair that. This is the risk taken by
+  whoever starts from someone else's snapshot, and why the fingerprint should
+  come from somewhere other than the place the file came from.
+
+Not in this increment: fetching a snapshot from an address; compression (the
+fingerprint is of the plain bytes, so a snapshot can be compressed to carry
+it and nothing else changes); keeping the raw events and batch inputs beside
+the table so that it can be rebuilt without a node; checking a sample of the
+table against the layer 1 contract; and publishing a snapshot anywhere.
 
 ### Moons
 
@@ -1250,6 +1457,7 @@ twice over, and any time limit that is zero or over a day.
 | `most_block_batch_bytes` | 128 MiB | The same for one block, which cannot be split |
 | `most_work_bytes` | 64 MiB | Most work for a range of blocks, each logged batch counted; one block is applied whatever its work |
 | `tries` | 8 | Questions in a row that may go unanswered before a poll gives up |
+| `until` | none | The last block to read, to stop short of the end of the chain (to make a snapshot at that block); a copy told to stop answers no lookups |
 
 ### `ServerConfig` (HTTP)
 
@@ -1308,6 +1516,56 @@ twice over, and any time limit that is zero or over a day.
   of it in the file when opened again), batches too big to hold at once, a
   node that takes one question per request, and dropping the copy while it
   is reading.
+- Unit tests of snapshots, in `replica.rs` and `replica/snapshot.rs`, against
+  the same stand-in node, some with hooks that step into a restore or a write
+  part way:
+  - The same bytes: a snapshot made into a copy and written again; copies read
+    to one block a block at a time and all at once; a copy made from a snapshot
+    part way and read on, against one read straight there; copies from the same
+    snapshot with a count at 2^63 - 1, reopened at different times.
+  - Snapshots refused, making no copy and leaving nothing behind: one byte too
+    many or too few, shorter than a header, a count of points that does not
+    match, a byte changed with the fingerprint given, each form not allowed,
+    ships out of order or twice, another chain, contract or first block, other
+    rules, another format, numbers too big to write down, a snapshot that grows
+    while it is read.
+  - What is at the copy's name: a file that is there, or a link, is never
+    replaced or followed, by a restore or by the writer; no copy is made beside
+    a `-wal`, `-shm` or `-journal` left there; a file beside a copy that is a
+    link, a second name or a directory, or a copy that is a pipe, is refused by
+    opening, by restoring and by writing a snapshot, with the other file left as
+    it was; something that is not a copy (empty, another database, not a
+    database) is refused when a snapshot is asked for and left as it was, and a
+    first start cut short is finished by an ordinary open and refused with a
+    true message when a snapshot is asked for; a copy with a change a crash left
+    unfinished is recovered and used by the same start again, while a file that
+    is not a database with such a journal beside it is left exactly as it was,
+    and another database with one is refused saying what SQLite undid; a file
+    that cannot be read is refused with SQLite's own error, promising an
+    ordinary start only for a change a crash left unfinished; and one whose
+    unfinished change cannot be undone (it may not be written to) says so,
+    claiming neither that the change was undone nor that it is damaged.
+  - Making a copy: a restore that crashes part way leaves no copy and is made
+    again whole; a restored copy is in its usual journal with nothing beside it
+    when named, and opening it changes no byte of it; a restore that would leave
+    anything beside the file it makes makes no copy; a copy just made is read
+    back, so one swapped for another, emptied or changed in any one thing is
+    refused, one that cannot be read back says so, and one taken away is not
+    made anew; nothing is written through a link put where a new file is first
+    made.
+  - Writing a snapshot: of the copy as it was when it began, while something
+    else adds to it; refused for a copy with no hash, for another Azimuth's,
+    and for one with a change a crash left unfinished, saying to open it once.
+  - The node: one that disagrees about the file's block (a copy read from the
+    start, and one made from a snapshot) stops it, writes nothing and answers
+    nothing, until it answers as before; every block number and hash it gives
+    in a poll is one chain; a wrong final block in a poll that failed does not
+    hold back a right one; a snapshot newer than its final block waits.
+  - The file and stopping: a file kept before the hash learns one and is then
+    checked; a damaged hash, or a number in `meta` that is not a whole number in
+    range, is damage; a copy told to stop stops exactly there and answers
+    nothing, and one already at its block has not reached it until the node
+    agrees with its hash; snapshots are supported on this system.
 - Unit tests in `urbit-id`, against the test vectors of Urbit's key-generation
   library (wallets, networking keys, keyfiles, ship names) and against a
   standard Argon2 library. Moon names are checked against the example in
@@ -1367,6 +1625,28 @@ asking by kind, reached block 26,407,753 in 512 seconds: every row of the
 earlier fresh read the same, and one planet more, which again matches the
 contract.
 
+Snapshots were checked against the main network's history by hand the same
+day. From the recording above, replayed through a local stand-in that also
+answers blocks by number (with the recorded hash for the last block and for
+every block with logs, and a made-up one for the rest): a copy read from
+nothing to block 26,407,242 took 520 seconds (one more question for each step
+than before) and wrote snapshot A, 30,490,309 bytes for 144,503 points, with
+the fingerprint `48945e929b859f7321998b54dd2045f375239bbd4800dd662258ae2826b2375f`.
+A copy read only to block 20,000,000 wrote a snapshot of 137,853 points; a
+copy made from it, with its fingerprint, read on to 26,407,242 in 178 seconds
+and wrote snapshot B, the same bytes as A. Both tables were the same as the
+earlier read's, row for row. Against Tenderly's public node, a copy made from
+a snapshot at block 25,400,470 (one whose real hash the recording holds) read
+on about a million blocks to block 26,409,414: 40 seconds from start to its
+first answer and 74 requests (14 for blocks, 26 for logs, 34 for transactions
+asked several at a time; 9 were answered "too many requests" and asked again).
+A copy made from snapshot A got there in under 3 seconds with 4 requests. The
+two wrote the same snapshot, byte for byte, and `~zod`, `~marzod` and `~pocwet`
+looked up from them were the same as looked up through the roller. The
+snapshot at block 20,000,000, whose hash the stand-in had made up, was refused
+by the real chain: the copy read nothing, answered nothing, and its file was
+left as it was made.
+
 The integration tests are grouped roughly in this order: transactions and
 rollback; fuel, time, memory, table, and stack limits, including bulk memory
 tricks; isolation and permissions; export and import, including tampered,
@@ -1405,6 +1685,25 @@ These are stated in the source.
   free public node, and needs one that answers `eth_getLogs` for old blocks. It
   then asks the node once a minute how far the chain is final, and more only
   when that has moved.
+- The directory that holds the copy of Azimuth is taken to be the operator's
+  own. What is found there when the copy is opened is checked (no file SQLite
+  would take as part of a new copy, nothing that is not a plain file with one
+  name at the copy's name once a symbolic link to it has been followed, and no
+  link, second name or other thing that is not a plain file beside it);
+  another program writing in the directory while the copy runs is not
+  defended against: it could replace the copy at any time, and nothing stops it
+  changing the files a restore makes there while the restore works.
+- Snapshots are written and restored only on macOS (`renamex_np` with
+  `RENAME_EXCL`) and Linux (`renameat2` with `RENAME_NOREPLACE`): putting a
+  file in place without the risk of replacing one needs such a call. The Linux
+  path has not been compiled or run. On other systems `serve` refuses either
+  snapshot flag before the copy is opened or anything is made, and the copy
+  can still be made by reading Azimuth from the start.
+- A copy started from a snapshot takes the snapshot's word for every point
+  that has not changed since its block, until someone reads to that block
+  themselves and gets the same fingerprint (see Starting the copy from a
+  snapshot). Keeping the hash of each step's last block costs one more question
+  to the node for each step.
 - A hard link to the copy's file made by someone else at the moment it is
   opened, after its name has been checked, is not caught. It takes someone
   who can already write to the directory.

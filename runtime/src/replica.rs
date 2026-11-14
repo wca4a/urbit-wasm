@@ -6,7 +6,8 @@
 //! layer 2 contract, in the order Ethereum has them, and works out the state of every ship
 //! from them under Urbit's own rules (`urbit_id::naive`). Only the Ethereum node is trusted.
 //!
-//! The state is kept in one SQLite file: a table of points, and how far the file has read.
+//! The state is kept in one SQLite file: a table of points, and how far the file has read, the
+//! hash of that block, what the file is a copy of, and counts of what was read.
 //! It holds only public data and is not encrypted. Only blocks Ethereum has finalised are
 //! read, so nothing in the file ever has to be undone, and lookups are answered from the
 //! file alone. The newest blocks are not read: they can still be replaced, and a copy that
@@ -20,13 +21,35 @@
 //! Lookups are refused until the file has reached the newest finalised block this run has
 //! heard of. A file part way through its history is history: answering from it would hand
 //! out keys that have since changed.
+//!
+//! Beside the number of the block it has read to, the file keeps that block's hash, as the
+//! node gave it for a block it had said was final, written in the same step. At the start of
+//! every run, before anything is applied or answered, the node is asked for that block's hash
+//! again: if they differ, the node follows another chain, or the file (or the snapshot it was
+//! made from) is wrong, and nothing is read, written or answered until they agree. A file made
+//! before the hash was kept learns it the next time it moves forward, and until then is used
+//! as before.
+//!
+//! What the node says in a poll is held against what it says later only once that poll has
+//! succeeded, so a wrong answer in a poll that failed never holds back a right one.
+//!
+//! A copy can also be started from a snapshot (`snapshot`) instead of from the beginning of
+//! Azimuth's history, and then catches up from the snapshot's block as usual. When a snapshot
+//! is asked for, something at the copy's name that is not a copy is refused, not set up as one.
+//!
+//! A file that is not there is made only when nothing SQLite would take as part of it (the
+//! same name with `-wal`, `-shm` or `-journal` added) is there either; a file that is there is
+//! handed to SQLite only if it, and each of those beside it, is a plain file with one name.
+//! The numbers in `meta` (the block read to and the six counts) are whole numbers from 0 to
+//! 2^63 - 1; a count stops there; anything else is a damaged file.
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -35,7 +58,9 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use urbit_id::naive::{self, Dominion, Holder, NetKeys, Outcome, Point, Points};
 
 use crate::azimuth::{listed, Keys, Listing};
-use crate::chain::{hex, Ethereum, Limits, Log, Placed, Stop, Trouble};
+use crate::chain::{hex, Block, Ethereum, Limits, Log, Placed, Stop, Trouble};
+
+pub mod snapshot;
 
 /// Where Azimuth is, how to read it, and how often.
 #[derive(Clone, Debug)]
@@ -76,6 +101,11 @@ pub struct ReplicaConfig {
     pub most_work_bytes: usize,
     /// How many questions in a row may go unanswered before a poll gives up until the next.
     pub tries: u32,
+    /// The last block to read, for a copy that is to stop short of the end of the chain: to
+    /// make a snapshot at exactly that block, such as to check one someone else made. It must
+    /// be final to be read; until it is, the copy reads as far as is final and waits. A copy
+    /// told to stop never counts as caught up, and answers no lookups.
+    pub until: Option<u64>,
 }
 
 impl ReplicaConfig {
@@ -98,6 +128,7 @@ impl ReplicaConfig {
             most_block_batch_bytes: 128 << 20,
             most_work_bytes: 64 << 20,
             tries: 8,
+            until: None,
         }
     }
 }
@@ -159,6 +190,31 @@ impl Event {
     }
 }
 
+/// Blocks as the node has given them, each a number and a hash: one number never has two
+/// hashes, and one hash is never of two numbers, wherever the node gave them. Every pair the
+/// node gives in a poll goes through one of these: the final block, the block the file had read
+/// to when the run began, the last block of each range, and the block of every log in that
+/// range (and so of every batch's transaction, which must be in its log's block). It holds the
+/// poll's block answers and, for one range at a time, the blocks of that range, so it is never
+/// bigger than a range's answers.
+#[derive(Clone, Default)]
+struct Blocks {
+    hashes: HashMap<u64, [u8; 32]>,
+    numbers: HashMap<[u8; 32], u64>,
+}
+
+impl Blocks {
+    fn see(&mut self, number: u64, hash: [u8; 32]) -> Result<(), Trouble> {
+        if self.hashes.insert(number, hash).is_some_and(|before| before != hash) {
+            return Err(Trouble::Wrong(format!("block {number} is said to have two hashes")));
+        }
+        if self.numbers.insert(hash, number).is_some_and(|before| before != number) {
+            return Err(Trouble::Wrong(format!("block hash {} is said to be of two blocks", hex(&hash))));
+        }
+        Ok(())
+    }
+}
+
 struct Inner {
     cfg: ReplicaConfig,
     ethereum: Ethereum,
@@ -173,6 +229,14 @@ struct Inner {
     /// the block (number and hash) each was had for, so that a range tried again does not
     /// ask for them again, and an input had for one block is never used for another.
     fetched: Mutex<Fetched>,
+    /// Whether the hash of the block the file had read to when it was opened has been found to
+    /// be the node's, in this run. Nothing is applied or answered before.
+    checked: AtomicBool,
+    /// The final block as the node gave it in the last poll that succeeded: the next poll's
+    /// final block must not be behind it, and its blocks must be one chain with it. Only a
+    /// poll that succeeded is remembered, so a wrong answer in one that failed never holds a
+    /// later right one back.
+    last_final: Mutex<Option<Block>>,
     stop: Arc<Stop>,
     /// Held for as long as the copy is open: no other copy may use the file meanwhile.
     _owned: fs::File,
@@ -287,9 +351,73 @@ fn true_name(path: &Path) -> Result<PathBuf, String> {
 /// its name was worked out is refused, not followed to some other file. A hard link made by
 /// someone else in that same moment is not caught, and is left out of what this guards
 /// against: it takes someone who can already write to the directory.
-fn connect(path: &Path, read_only: bool) -> Result<Connection, String> {
-    let how = if read_only { OpenFlags::SQLITE_OPEN_READ_ONLY } else { OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE };
-    Connection::open_with_flags(path, how | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW).map_err(sql)
+fn connect(path: &Path, access: Access) -> Result<Connection, String> {
+    open_with(path, access).map_err(sql)
+}
+
+/// The same, keeping SQLite's own error, for a caller that tells one kind from another.
+fn open_with(path: &Path, access: Access) -> rusqlite::Result<Connection> {
+    let how = match access {
+        Access::Read => OpenFlags::SQLITE_OPEN_READ_ONLY,
+        Access::Make => OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        Access::Write => OpenFlags::SQLITE_OPEN_READ_WRITE,
+    };
+    Connection::open_with_flags(path, how | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+}
+
+/// SQLite's answer to a database opened only to read that has a change left unfinished by a
+/// crash beside it (a hot rollback journal): undoing that change is a write, which only a
+/// connection that may write can make.
+const SQLITE_READONLY_ROLLBACK: i32 = 776;
+
+/// The extended code of an SQLite error, if it is one.
+fn sqlite_code(error: &rusqlite::Error) -> Option<i32> {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => Some(failure.extended_code),
+        _ => None,
+    }
+}
+
+/// The first sixteen bytes of every SQLite database.
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// How a file is opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Access {
+    /// To read it only.
+    Read,
+    /// To read and write it, making it if it is not there.
+    Make,
+    /// To read and write it, and it must be there already.
+    Write,
+}
+
+/// The ends of the names of the files SQLite keeps beside a database while it is used: its
+/// write-ahead log, the memory that log is shared through, and its rollback journal. SQLite
+/// takes whatever it finds under those names as part of the database of that name, and plays
+/// a log or journal it finds there over the database when it opens it.
+const BESIDE: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// The same name with `suffix` added.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Before a database is made where there is none: refuse while any file SQLite would take as
+/// part of it is there (one left by an earlier copy whose file was removed, say), since its old
+/// pages would be played over the new file. None of them is touched.
+fn none_beside(path: &Path) -> Result<(), String> {
+    let found: Vec<String> = BESIDE.iter().map(|end| beside(path, end)).filter(|name| fs::symlink_metadata(name).is_ok()).map(|name| name.display().to_string()).collect();
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} is not there, but {} is, left perhaps by an earlier copy, and SQLite would take it as part of a new file of that name. Remove it, then try again",
+        path.display(),
+        found.join(" and ")
+    ))
 }
 
 /// Take the file for this copy alone, for as long as the returned file is held. Two copies
@@ -310,13 +438,248 @@ fn own(path: &Path) -> Result<fs::File, String> {
     Ok(file)
 }
 
+/// What became of a snapshot a copy was asked to start from.
+#[derive(Debug)]
+pub enum Restored {
+    /// There was no copy, and it was made from the snapshot.
+    Made(snapshot::Summary),
+    /// There was a copy already, so the snapshot was not used. A copy is never replaced.
+    Ignored,
+}
+
+/// What a file is a copy of: the chain and the two contracts, each from the block it was made
+/// in. A file made for one is never read as another's, and a snapshot made for one is never
+/// restored as another's.
+fn made_for(cfg: &ReplicaConfig) -> String {
+    format!("chain {}, azimuth {} from block {}, naive {} from block {}", cfg.chain, hex(&cfg.azimuth), cfg.azimuth_from, hex(&cfg.naive), cfg.naive_from)
+}
+
+/// Before a database that is there is handed to SQLite: each file SQLite keeps beside it that
+/// is there must be a plain file with one name, SQLite's own. SQLite opens those and writes to
+/// them, even for a database opened only to read, so through a link, a second name of another
+/// file, or something that is not a plain file, it would write to something else. None is
+/// touched. This covers what is in place when the copy is opened; another program writing in
+/// the directory meanwhile is not defended against.
+fn plain_beside(path: &Path) -> Result<(), String> {
+    for end in BESIDE {
+        let name = beside(path, end);
+        let found = match fs::symlink_metadata(&name) {
+            Ok(found) => found,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot look at {}: {e}", name.display())),
+        };
+        let what = if found.file_type().is_symlink() {
+            "a link"
+        } else if !found.file_type().is_file() {
+            "not a plain file"
+        } else if found.nlink() > 1 {
+            "a file with more than one name (a hard link)"
+        } else {
+            continue;
+        };
+        return Err(format!(
+            "{} is {what}, and SQLite would write through it as part of {}, to whatever it is. Remove it, then try again",
+            name.display(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// What is at a copy's name, as far as can be told, and whether SQLite undid a change a crash
+/// had left unfinished in it while it was looked at (see `found_at`).
+enum Found {
+    /// A copy of Azimuth: it keeps a record of what it is a copy of.
+    Copy,
+    /// Certainly not one, and why: empty, not an SQLite database, or one that reads cleanly
+    /// and keeps no such record.
+    NotCopy { what: &'static str, recovered: bool },
+    /// It could not be read to tell, with SQLite's own error.
+    Unreadable { why: String, recovered: bool },
+    /// It has a change a crash left unfinished, and could not be opened to undo it, with the
+    /// error that stopped that. Nothing was undone and nothing was changed.
+    Unfinished(String),
+}
+
+/// Whether a database keeps a copy's record of what it is a copy of. Only a table or a row
+/// that is not there is taken for absence; any error reading is an error.
+fn keeps_record(connection: &Connection) -> rusqlite::Result<bool> {
+    let tables: i64 = connection.query_row("select count(*) from sqlite_master where type = 'table' and name = 'meta'", [], |row| row.get(0))?;
+    if tables == 0 {
+        return Ok(false);
+    }
+    let records: i64 = connection.query_row("select count(*) from meta where name = 'made for'", [], |row| row.get(0))?;
+    Ok(records > 0)
+}
+
+/// Look at what is at the copy's name, writing nothing to it, but for one thing: a database
+/// with a change a crash left unfinished (a hot journal beside it) cannot be read by a
+/// connection that may only read, and is opened once to write, without the right to make a
+/// file, so that SQLite undoes that change as any opening would, and then looked at again.
+/// That is done only for a file that begins as every SQLite database does: a file that is not
+/// one is never handed to a connection that may write.
+fn found_at(path: &Path) -> Result<Found, String> {
+    let mut start = [0; 16];
+    let mut file = fs::File::open(path).map_err(|e| format!("cannot look at {}: {e}", path.display()))?;
+    let mut read = 0;
+    while read < start.len() {
+        match file.read(&mut start[read..]).map_err(|e| format!("cannot read {}: {e}", path.display()))? {
+            0 => break,
+            more => read += more,
+        }
+    }
+    drop(file);
+    if read == 0 {
+        return Ok(Found::NotCopy { what: "is empty", recovered: false });
+    }
+    if read < start.len() || start != *SQLITE_HEADER {
+        return Ok(Found::NotCopy { what: "is not an SQLite database", recovered: false });
+    }
+    let look = |access| open_with(path, access).and_then(|opened| keeps_record(&opened));
+    let (looked, recovered) = match look(Access::Read) {
+        Err(e) if sqlite_code(&e) == Some(SQLITE_READONLY_ROLLBACK) => {
+            // SQLite opens a file it may not write to for reading only, without saying so: a
+            // connection that came back that way, or a look that still finds it may only read,
+            // undid nothing.
+            let opened = match open_with(path, Access::Write) {
+                Ok(opened) => opened,
+                Err(e) => return Ok(Found::Unfinished(e.to_string())),
+            };
+            if opened.is_readonly(rusqlite::DatabaseName::Main).unwrap_or(true) {
+                return Ok(Found::Unfinished("it could not be opened to write".to_string()));
+            }
+            match keeps_record(&opened) {
+                Err(e) if matches!(&e, rusqlite::Error::SqliteFailure(failure, _) if failure.code == rusqlite::ErrorCode::ReadOnly) => return Ok(Found::Unfinished(e.to_string())),
+                looked => (looked, true),
+            }
+        }
+        looked => (looked, false),
+    };
+    Ok(match looked {
+        Ok(true) => Found::Copy,
+        Ok(false) => Found::NotCopy { what: "keeps no record of what it is a copy of", recovered },
+        Err(e) => Found::Unreadable { why: e.to_string(), recovered },
+    })
+}
+
+/// Whether the file that is there is a copy of Azimuth. When a snapshot is asked for, anything
+/// else at the copy's name (an empty file, a file whose first start was cut short, some other
+/// database) is not taken for a copy, set up afresh and read from the beginning: it is refused,
+/// and left as it is. One that cannot be read to tell is refused too, with SQLite's own error,
+/// and how to go on.
+fn is_a_copy(given: &Path, path: &Path) -> Result<(), String> {
+    let remove = "remove it, and any file of the same name with -wal, -shm or -journal added";
+    // What was done to it while it was looked at: nothing, or only what any opening of it does.
+    let done = |recovered: bool| {
+        if recovered {
+            "SQLite undid a change a crash had left unfinished in it, as any opening of it would have done; nothing else was changed"
+        } else {
+            "It has been left as it is"
+        }
+    };
+    match found_at(path)? {
+        Found::Copy => Ok(()),
+        Found::NotCopy { what, recovered } => {
+            // Only a file an ordinary start can make a copy of is pointed there.
+            let first_start = if what == "is not an SQLite database" {
+                ""
+            } else {
+                " (If it is a copy whose first start was cut short, which keeps no record yet, starting once without --azimuth-snapshot finishes it as a copy read from the beginning.)"
+            };
+            Err(format!("{} is there, but {what}, so it is not a copy of Azimuth. {}: {remove}, for the snapshot to be used.{first_start}", given.display(), done(recovered)))
+        }
+        Found::Unfinished(why) => Err(format!(
+            "{} is there, with a change a crash left unfinished (a -journal beside it), which could not be undone: {why}. Nothing was changed. If it is a copy, an ordinary start (without --azimuth-snapshot) undoes that change once the file can be written to; or {remove}, for the snapshot to be used",
+            given.display()
+        )),
+        Found::Unreadable { why, recovered } => {
+            let way_on = if recovered {
+                // The change a crash left unfinished has been undone already, and it still
+                // cannot be read: an ordinary start would meet the same.
+                format!("The file is damaged: {remove}, to start again from the snapshot or from the beginning")
+            } else {
+                format!("If the trouble is a change a crash left unfinished, an ordinary start (without --azimuth-snapshot) will finish it; otherwise the file is damaged: {remove}, to start again from the snapshot or from the beginning")
+            };
+            Err(format!("{} is there, but could not be read to tell whether it is a copy of Azimuth: {why}. {}. {way_on}", given.display(), done(recovered)))
+        }
+    }
+}
+
+/// How a copy is being opened.
+enum Opening<'a> {
+    /// There is no file: it is made, as a copy that has read nothing.
+    New,
+    /// There is a file: it is opened as it is, and must still be there.
+    There,
+    /// The file was just made from the snapshot this describes: it must still be there, and
+    /// must be what was made.
+    Restored(&'a snapshot::Summary),
+}
+
+/// Whether there is a file at `path`, its true name. A file being there is never replaced; a
+/// file not being there is made only when nothing SQLite would take as part of it is there.
+fn is_there(given: &Path, path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(found) => {
+            // Something there that is not a plain file (a directory, a pipe) is not a copy, and
+            // SQLite could wait for ever on some of them.
+            if !found.file_type().is_file() {
+                return Err(format!("{} is there, but is not a plain file, so it is not a copy of Azimuth; it has been left as it is", given.display()));
+            }
+            plain_beside(path)?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            none_beside(path)?;
+            Ok(false)
+        }
+        Err(e) => Err(format!("cannot find {}: {e}", given.display())),
+    }
+}
+
 impl Replica {
     /// Open the copy kept in `path`, or start one there. Nothing is asked of Ethereum yet.
     pub fn open(path: &Path, cfg: ReplicaConfig) -> Result<Replica, String> {
         let given = path;
         let path = &true_name(given)?;
         let owned = own(path)?;
-        let writer = connect(path, false)?;
+        let opening = if is_there(given, path)? { Opening::There } else { Opening::New };
+        Replica::open_owned(given, path, owned, cfg, opening)
+    }
+
+    /// Open the copy kept in `path`; if there is none, first make it from the snapshot in
+    /// `from`, which must have the fingerprint `sha256` if one is given. A copy that is there
+    /// already is opened as it is, and the snapshot is not read.
+    ///
+    /// The copy is made under the same lock as any copy is opened under, so no other copy can
+    /// be made or opened there meanwhile, and it is made whole under a name of its own and then
+    /// given its name, so that whatever happens part way, the next start finds either no copy
+    /// (and makes it again) or a whole one.
+    pub fn open_from_snapshot(path: &Path, cfg: ReplicaConfig, from: &Path, sha256: Option<[u8; 32]>) -> Result<(Replica, Restored), String> {
+        // Where snapshots cannot be restored, nothing is made or opened, not even the lock.
+        snapshot::supported()?;
+        let given = path;
+        let path = &true_name(given)?;
+        let owned = own(path)?;
+        if is_there(given, path)? {
+            is_a_copy(given, path)?;
+            return Ok((Replica::open_owned(given, path, owned, cfg, Opening::There)?, Restored::Ignored));
+        }
+        let made = snapshot::restore(path, &cfg, from, sha256)?;
+        snapshot::step_in(from, "placed", path);
+        plain_beside(path)?;
+        let replica = Replica::open_owned(given, path, owned, cfg, Opening::Restored(&made))?;
+        Ok((replica, Restored::Made(made)))
+    }
+
+    /// Open the copy at `path`, its true name, with the file already taken for this copy alone.
+    fn open_owned(given: &Path, path: &Path, owned: fs::File, cfg: ReplicaConfig, opening: Opening) -> Result<Replica, String> {
+        let writer = connect(path, if matches!(opening, Opening::New) { Access::Make } else { Access::Write })?;
+        // A copy just made from a snapshot is read back before anything is written to it: the
+        // file at its name must be the one that was made.
+        if let Opening::Restored(made) = opening {
+            check_made(&writer, &cfg, given, made)?;
+        }
         // Readers do not wait for the writer, and the writer does not wait for the disk on
         // every step: a step lost to a power cut is read again.
         writer.pragma_update(None, "journal_mode", "wal").map_err(sql)?;
@@ -324,23 +687,24 @@ impl Replica {
         writer.busy_timeout(Duration::from_secs(10)).map_err(sql)?;
         writer.execute_batch(SCHEMA).map_err(sql)?;
         // A file made for one chain and pair of contracts is never read as another's.
-        let made_for = format!("chain {}, azimuth {} from block {}, naive {} from block {}", cfg.chain, hex(&cfg.azimuth), cfg.azimuth_from, hex(&cfg.naive), cfg.naive_from);
+        let made_for = made_for(&cfg);
         let found: Option<String> = writer.query_row("select value from meta where name = 'made for'", [], |row| row.get(0)).optional().map_err(sql)?;
         match found {
             Some(found) if found != made_for => return Err(format!("{} is a copy of another Azimuth ({found})", given.display())),
             Some(_) => {}
             None => {
-                let start = i64::try_from(cfg.azimuth_from.min(cfg.naive_from).saturating_sub(1)).map_err(|_| "the contracts start at a block too far on to write down".to_string())?;
-                writer.execute("insert into meta (name, value) values ('made for', ?1), ('read to', ?2)", params![made_for, start]).map_err(sql)?;
+                let starting = writer.unchecked_transaction().map_err(sql)?;
+                starting.execute("insert into meta (name, value) values ('made for', ?1)", [&made_for]).map_err(sql)?;
+                keep_number(&starting, "read to", start(&cfg))?;
+                for name in COUNTS {
+                    keep_number(&starting, name, 0)?;
+                }
+                starting.commit().map_err(sql)?;
             }
         }
         let read_to = read_to(&writer)?;
-        let mut counts = Counts::default();
-        for (name, count) in COUNTS.iter().zip(counts_mut(&mut counts)) {
-            let found: Option<i64> = writer.query_row("select value from meta where name = ?1", [name], |row| row.get(0)).optional().map_err(sql)?;
-            *count = found.unwrap_or(0).max(0) as u64;
-        }
-        let reader = connect(path, true)?;
+        let counts = read_counts(&writer, &cfg)?;
+        let reader = connect(path, Access::Read)?;
         reader.busy_timeout(Duration::from_secs(10)).map_err(sql)?;
         let stop = Arc::new(Stop::default());
         let ethereum = Ethereum::new(&cfg.ethereum, cfg.timeout, cfg.pause, stop.clone()).with_limits(cfg.limits);
@@ -354,6 +718,8 @@ impl Replica {
             status: Mutex::new(status),
             span,
             fetched: Mutex::default(),
+            checked: AtomicBool::new(false),
+            last_final: Mutex::new(None),
             stop,
             _owned: owned,
             #[cfg(test)]
@@ -387,10 +753,20 @@ impl Replica {
         lock(&self.inner.status).clone()
     }
 
-    /// Whether lookups are answered: the file has reached the newest finalised block heard
-    /// of in this run.
+    /// Whether a copy told to stop at a block has read to it, with this run's check of the
+    /// file's block hash passed and that block final. A copy that is already at the block when
+    /// it is opened has not got there in this run until the node has agreed with it. Never,
+    /// for a copy not told to stop.
+    pub fn reached_until(&self) -> bool {
+        let status = lock(&self.inner.status);
+        self.inner.cfg.until.is_some_and(|until| status.read_to >= until && status.finalized.is_some_and(|finalized| finalized >= until))
+    }
+
+    /// Whether lookups are answered: the file's block hash has been found to be the node's,
+    /// and the file has reached the newest finalised block heard of in this run. Never, for a
+    /// copy told to stop at a block.
     pub fn caught_up(&self) -> bool {
-        behind(&lock(&self.inner.status)).is_none()
+        behind(&lock(&self.inner.status), self.inner.cfg.until).is_none()
     }
 }
 
@@ -418,7 +794,7 @@ impl Keys for Replica {
     /// it asks the node anything, so a lookup does not wait on the network.
     fn listing(&self, ship: u32) -> Result<Option<Listing>, String> {
         let status = lock(&self.inner.status);
-        if let Some(why) = behind(&status) {
+        if let Some(why) = behind(&status, self.inner.cfg.until) {
             return Err(why);
         }
         #[cfg(test)]
@@ -522,8 +898,17 @@ impl TroubleWatch {
     }
 }
 
-/// Why lookups are not answered yet, if they are not.
-fn behind(status: &Status) -> Option<String> {
+/// Why lookups are not answered yet, if they are not. The newest finalised block is only
+/// taken into the status once the file's block hash has been found to be the node's, so a
+/// copy whose hash is not yet checked, or is wrong, has heard of no finalised block, and
+/// answers nothing.
+fn behind(status: &Status, until: Option<u64>) -> Option<String> {
+    if let Some(until) = until {
+        return Some(format!(
+            "the copy of Azimuth was told to stop at block {until}, short of the end of the chain, so it answers no lookups; it has read to block {}",
+            status.read_to
+        ));
+    }
     match status.finalized {
         None => {
             let trouble = status.trouble.as_ref().map_or(String::new(), |why| format!(", and is held up: {why}"));
@@ -572,17 +957,53 @@ impl Inner {
 
     fn poll_with(&self, writer: &mut Connection) -> Result<(), String> {
         let finalized = self.asking(|| self.ethereum.finalized())?;
-        {
-            // A node whose finalised block goes back, behind one it gave before or behind
-            // what the file has read, does not know its own chain, and is not followed.
-            let mut status = lock(&self.status);
-            let before = status.finalized.unwrap_or(0).max(status.read_to);
-            if finalized < before {
-                return Err(format!("Ethereum says the chain is final to block {finalized}, behind block {before}, which it said or the file has read before"));
-            }
-            status.finalized = Some(finalized);
+        let read_to = self.read_to();
+        // A node whose finalised block goes back, behind one it gave in a poll that succeeded,
+        // does not know its own chain, and is not followed. (Behind one it gave only in a poll
+        // that then failed is not held against it: that one may have been the wrong answer.)
+        let before = *lock(&self.last_final);
+        if let Some(before) = before.filter(|before| finalized.number < before.number) {
+            return Err(format!("Ethereum says the chain is final to block {}, behind block {}, which it said before", finalized.number, before.number));
         }
-        self.catch_up(writer, finalized)
+        // One behind what the file has read is waited for: a node not yet caught up with the
+        // chain, or a copy made from a snapshot newer than what the node has finalised.
+        if finalized.number < read_to {
+            return Err(format!("Ethereum says the chain is final to block {}, behind block {read_to}, which the file has read; this waits until it is final there", finalized.number));
+        }
+        if let Some(until) = self.cfg.until.filter(|until| read_to > *until) {
+            return Err(format!("the file has read to block {read_to} already, past block {until}, where it was told to stop; it cannot go back"));
+        }
+        // The final block given in the last poll that succeeded, and this one, are one chain
+        // with everything else given in this poll.
+        let mut answers = Blocks::default();
+        if let Some(before) = before {
+            answers.see(before.number, before.hash).map_err(|trouble| trouble.why().to_string())?;
+        }
+        answers.see(finalized.number, finalized.hash).map_err(|trouble| trouble.why().to_string())?;
+        // Once each run, before anything is applied or answered: the block the file has read
+        // to must be the node's. Nothing is written either way, and a later poll asks again.
+        // Passing is remembered for the run, since it is the file's own hash that was matched.
+        if !self.checked.load(Ordering::SeqCst) {
+            if let Some(kept) = read_to_hash(writer)? {
+                let said = if read_to == finalized.number { finalized.hash } else { self.asking(|| self.ethereum.block(read_to))?.hash };
+                answers.see(read_to, said).map_err(|trouble| trouble.why().to_string())?;
+                if said != kept {
+                    return Err(format!(
+                        "Ethereum says block {read_to}, which the file has read to, has the hash {}, but the file has {}: the node follows another chain, or the file is wrong. Nothing is read or answered until they agree. If the file was made from a snapshot, remove it, and any file of the same name with -wal, -shm or -journal added, to try another",
+                        hex(&said),
+                        hex(&kept)
+                    ));
+                }
+            }
+            self.checked.store(true, Ordering::SeqCst);
+        }
+        // Taken into the status at once, so that lookups wait while the file catches up to it;
+        // remembered for the next poll only once this one has succeeded.
+        lock(&self.status).finalized = Some(finalized.number);
+        let target = self.cfg.until.map_or(finalized.number, |until| until.min(finalized.number));
+        self.catch_up(writer, target, &finalized, &answers)?;
+        *lock(&self.last_final) = Some(finalized);
+        Ok(())
     }
 
     /// Ask until answered, waiting longer each time, up to the number of tries allowed.
@@ -616,8 +1037,10 @@ impl Inner {
         lock(&self.status).read_to
     }
 
-    /// Read forward to `target`, one step at a time, each step one transaction.
-    fn catch_up(&self, writer: &mut Connection, target: u64) -> Result<(), String> {
+    /// Read forward to `target`, one step at a time, each step one transaction. `finalized` is
+    /// the finalised block heard of in this poll, at or past `target`, and `answers` the blocks
+    /// the node has given in this poll so far.
+    fn catch_up(&self, writer: &mut Connection, target: u64, finalized: &Block, answers: &Blocks) -> Result<(), String> {
         let mut tries = 0;
         loop {
             if self.stop.stopped() {
@@ -629,10 +1052,10 @@ impl Inner {
             }
             let span = self.span.load(Ordering::Relaxed).max(1);
             let to = target.min(from.saturating_add(span - 1));
-            match self.events(from, to) {
-                Ok(events) => {
+            match self.step(from, to, finalized, answers) {
+                Ok((events, hash)) => {
                     self.grow_if_small(&events);
-                    self.commit(writer, from, to, &events)?;
+                    self.commit(writer, from, to, &hash, &events)?;
                     tries = 0;
                 }
                 Err(trouble) => self.after_range(&trouble, &mut tries, to - from + 1)?,
@@ -661,28 +1084,34 @@ impl Inner {
         self.after(trouble, tries)
     }
 
-    /// Everything to apply from blocks `from` to `to`, in order.
-    fn events(&self, from: u64, to: u64) -> Result<Vec<Event>, Trouble> {
+    /// Everything to apply from blocks `from` to `to`, in order, and the hash of block `to`,
+    /// which the file keeps once they are applied: the node's word for a block at or before
+    /// the finalised one (`finalized`). Every block the range's logs name, block `to` as the
+    /// node gives it, and the blocks it has given in this poll before (`answers`) are one
+    /// chain: no number with two hashes, no hash of two numbers.
+    fn step(&self, from: u64, to: u64, finalized: &Block, answers: &Blocks) -> Result<(Vec<Event>, [u8; 32]), Trouble> {
+        let mut blocks = answers.clone();
+        let events = self.events(from, to, &mut blocks)?;
+        let hash = if to == finalized.number { finalized.hash } else { self.ethereum.block(to)?.hash };
+        blocks.see(to, hash)?;
+        Ok((events, hash))
+    }
+
+    /// Everything to apply from blocks `from` to `to`, in order. The block of every log is
+    /// seen in `blocks`.
+    fn events(&self, from: u64, to: u64, blocks: &mut Blocks) -> Result<Vec<Event>, Trouble> {
         let cfg = &self.cfg;
         let mut events = Vec::new();
-        // Which block each transaction is in, and each block's hash, as the logs of both
-        // contracts say. One transaction in two blocks, or one block number with two hashes,
-        // is a node contradicting itself. (Several logs from one transaction, in its block,
-        // are as they should be.)
+        // Which block each transaction is in, as the logs of both contracts say, and each
+        // log's block, with the blocks given before. One transaction in two blocks, or one
+        // block number with two hashes, is a node contradicting itself. (Several logs from one
+        // transaction, in its block, are as they should be.)
         let mut placed: HashMap<[u8; 32], u64> = HashMap::new();
-        let mut hashes: HashMap<u64, [u8; 32]> = HashMap::new();
-        let mut heights: HashMap<[u8; 32], u64> = HashMap::new();
         let mut place = |log: &Log| {
             if let Some(before) = placed.insert(log.transaction, log.block).filter(|before| *before != log.block) {
                 return Err(Trouble::Wrong(format!("transaction {} is said to be in block {before} and in block {}", hex(&log.transaction), log.block)));
             }
-            if hashes.insert(log.block, log.block_hash).is_some_and(|before| before != log.block_hash) {
-                return Err(Trouble::Wrong(format!("block {} is said to have two hashes", log.block)));
-            }
-            if heights.insert(log.block_hash, log.block).is_some_and(|before| before != log.block) {
-                return Err(Trouble::Wrong(format!("block hash {} is said to be of two blocks", hex(&log.block_hash))));
-            }
-            Ok(())
+            blocks.see(log.block, log.block_hash)
         };
         if to >= cfg.azimuth_from {
             let wanted: Vec<[u8; 32]> = kinds().iter().map(|kind| kind.name).collect();
@@ -825,10 +1254,9 @@ impl Inner {
         found.collect::<Option<Vec<_>>>().ok_or_else(|| Trouble::Failed("a transaction's input was not kept".into()))
     }
 
-    /// Apply one step's events to the file and move its high-water mark, all in one
-    /// transaction.
-    fn commit(&self, writer: &mut Connection, from: u64, to: u64, events: &[Event]) -> Result<(), String> {
-        let to_written = i64::try_from(to).map_err(|_| "a block too far on to write down".to_string())?;
+    /// Apply one step's events to the file and move its high-water mark, with the hash of the
+    /// block it now reaches, all in one transaction.
+    fn commit(&self, writer: &mut Connection, from: u64, to: u64, hash: &[u8; 32], events: &[Event]) -> Result<(), String> {
         // Begun for writing at once, so that anything else writing the same file waits, and
         // then finds the file has moved on and that this step would be a repeat.
         let transaction = writer.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
@@ -838,9 +1266,10 @@ impl Inner {
         let mut counts = lock(&self.status).counts;
         // Closing gives up part way, and the step, never committed, leaves nothing behind.
         apply(&mut Stoppable { points: Stored(&transaction), stop: &self.stop }, &self.stop, self.cfg.chain, events, &mut counts)?;
-        transaction.execute("update meta set value = ?1 where name = 'read to'", [to_written]).map_err(sql)?;
+        keep_number(&transaction, "read to", to)?;
+        transaction.execute("insert or replace into meta (name, value) values ('read to hash', ?1)", [&hash[..]]).map_err(sql)?;
         for (name, count) in COUNTS.iter().zip(counts_mut(&mut counts)) {
-            transaction.execute("insert or replace into meta (name, value) values (?1, ?2)", params![name, *count as i64]).map_err(sql)?;
+            keep_number(&transaction, name, *count)?;
         }
         if self.stop.stopped() {
             return Err(CLOSING.into());
@@ -868,19 +1297,19 @@ fn apply(points: &mut impl Points, stop: &Stop, chain: u64, events: &[Event], co
         match event {
             Event::Log(log) => {
                 naive::receive_log(points, &log.topics, &log.data).map_err(|why| format!("the log at block {}, place {}: {why}", log.block, log.index))?;
-                counts.logs += 1;
+                count_one(&mut counts.logs);
             }
             Event::Batch { input, .. } => {
                 let received = naive::receive_batch(points, chain, input)?;
-                counts.batches += 1;
+                count_one(&mut counts.batches);
                 match received.outcomes {
-                    None => counts.unreadable += 1,
+                    None => count_one(&mut counts.unreadable),
                     Some(outcomes) => {
                         for outcome in outcomes {
                             match outcome {
-                                Outcome::Applied => counts.applied += 1,
-                                Outcome::Failed => counts.failed += 1,
-                                Outcome::Unsigned => counts.unsigned += 1,
+                                Outcome::Applied => count_one(&mut counts.applied),
+                                Outcome::Failed => count_one(&mut counts.failed),
+                                Outcome::Unsigned => count_one(&mut counts.unsigned),
                             }
                         }
                     }
@@ -895,9 +1324,129 @@ fn counts_mut(counts: &mut Counts) -> [&mut u64; 6] {
     [&mut counts.logs, &mut counts.batches, &mut counts.unreadable, &mut counts.applied, &mut counts.failed, &mut counts.unsigned]
 }
 
+/// The largest number kept in `meta`: SQLite keeps whole numbers up to 2^63 - 1.
+const MOST_KEPT: u64 = i64::MAX as u64;
+
+const DAMAGED: &str = "the copy of Azimuth is damaged";
+
+/// A number kept in `meta`, the block read to or one of the six counts: a whole number from 0
+/// to 2^63 - 1, kept as an SQLite integer. Anything else under its name (a number below zero,
+/// text, bytes) is a damaged file, never taken for something else. `None` if nothing is kept
+/// under the name.
+fn kept_number(connection: &Connection, name: &str) -> Result<Option<u64>, String> {
+    let found: Option<Option<u64>> = connection
+        .query_row("select value from meta where name = ?1", [name], |row| {
+            Ok(match row.get_ref(0)? {
+                rusqlite::types::ValueRef::Integer(number) => u64::try_from(number).ok(),
+                _ => None,
+            })
+        })
+        .optional()
+        .map_err(sql)?;
+    match found {
+        None => Ok(None),
+        Some(Some(number)) => Ok(Some(number)),
+        Some(None) => Err(DAMAGED.to_string()),
+    }
+}
+
+/// Keep a number in `meta` under `name`, the only way such a number is written. One past
+/// 2^63 - 1 cannot be written down.
+fn keep_number(connection: &Connection, name: &str, value: u64) -> Result<(), String> {
+    let written = i64::try_from(value).map_err(|_| format!("{value}, for the copy of Azimuth's {name}, is too big to write down"))?;
+    connection.execute("insert or replace into meta (name, value) values (?1, ?2)", params![name, written]).map_err(sql)?;
+    Ok(())
+}
+
+/// Add one to a count, stopping at the largest number that can be kept. A count that has got
+/// there stays there, so that every copy that reads the same history keeps the same count,
+/// however often it is closed and opened again on the way.
+fn count_one(count: &mut u64) {
+    *count = count.saturating_add(1).min(MOST_KEPT);
+}
+
+/// The block before either contract was made: where a copy that has read nothing stands.
+fn start(cfg: &ReplicaConfig) -> u64 {
+    cfg.azimuth_from.min(cfg.naive_from).saturating_sub(1)
+}
+
 fn read_to(connection: &Connection) -> Result<u64, String> {
-    let read_to: i64 = connection.query_row("select value from meta where name = 'read to'", [], |row| row.get(0)).map_err(sql)?;
-    u64::try_from(read_to).map_err(|_| "the copy of Azimuth is damaged".to_string())
+    kept_number(connection, "read to")?.ok_or_else(|| DAMAGED.to_string())
+}
+
+/// The six counts, as the file keeps them. A file made by this code keeps all six from the
+/// moment it is made. One made before that kept none until its first step forward, and then
+/// all six; so a file that has read nothing yet may keep none of them, which is nothing
+/// counted. Any other count missing is a damaged file.
+fn read_counts(connection: &Connection, cfg: &ReplicaConfig) -> Result<Counts, String> {
+    let read_to = read_to(connection)?;
+    let mut counts = Counts::default();
+    let mut missing = 0;
+    for (name, count) in COUNTS.iter().zip(counts_mut(&mut counts)) {
+        match kept_number(connection, name)? {
+            Some(kept) => *count = kept,
+            None => missing += 1,
+        }
+    }
+    match missing {
+        0 => Ok(counts),
+        6 if read_to == start(cfg) => Ok(counts),
+        _ => Err(DAMAGED.to_string()),
+    }
+}
+
+/// Read back a copy just made from a snapshot, before anything is written to it: what it is a
+/// copy of, the block it has read to and that block's hash, its counts and how many points it
+/// holds must all be what the snapshot's header says. Anything else is not the file that was
+/// made.
+fn check_made(connection: &Connection, cfg: &ReplicaConfig, given: &Path, made: &snapshot::Summary) -> Result<(), String> {
+    let not_made = |what: &str| format!("the copy at {} is not the one just made from the snapshot ({what} is not what was made), so it is not used", given.display());
+    // An error reading it back is not taken for a difference: it is said as it is.
+    let unreadable = |why: String| format!("the copy at {} could not be read back after it was made ({why}), so it is not used", given.display());
+    let tables: i64 = connection
+        .query_row("select count(*) from sqlite_master where type = 'table' and name in ('meta', 'points')", [], |row| row.get(0))
+        .map_err(|e| unreadable(e.to_string()))?;
+    if tables != 2 {
+        return Err(not_made("its tables"));
+    }
+    // Made in its usual journal before it was given its name, so that opening it changes
+    // nothing to make it a good copy.
+    let journal: String = connection.query_row("pragma journal_mode", [], |row| row.get(0)).map_err(|e| unreadable(e.to_string()))?;
+    if journal != "wal" {
+        return Err(not_made("its journal"));
+    }
+    let found: Option<String> = connection.query_row("select value from meta where name = 'made for'", [], |row| row.get(0)).optional().map_err(|e| unreadable(e.to_string()))?;
+    if found.as_deref() != Some(made_for(cfg).as_str()) {
+        return Err(not_made("what it is a copy of"));
+    }
+    if read_to(connection).map_err(unreadable)? != made.block {
+        return Err(not_made("the block it has read to"));
+    }
+    if read_to_hash(connection).map_err(unreadable)? != Some(made.hash) {
+        return Err(not_made("that block's hash"));
+    }
+    if read_counts(connection, cfg).map_err(unreadable)? != made.counts {
+        return Err(not_made("its counts"));
+    }
+    let points: i64 = connection.query_row("select count(*) from points", [], |row| row.get(0)).map_err(|e| unreadable(e.to_string()))?;
+    if u64::try_from(points).ok() != Some(made.points) {
+        return Err(not_made("how many points it holds"));
+    }
+    Ok(())
+}
+
+/// The hash of the block the file has read to, if it keeps one: 32 bytes, nothing else. A file
+/// made before the hash was kept has none.
+fn read_to_hash(connection: &Connection) -> Result<Option<[u8; 32]>, String> {
+    let found: Option<Option<[u8; 32]>> = connection
+        .query_row("select value from meta where name = 'read to hash'", [], |row| Ok(row.get_ref(0)?.as_blob().ok().and_then(|blob| <[u8; 32]>::try_from(blob).ok())))
+        .optional()
+        .map_err(sql)?;
+    match found {
+        None => Ok(None),
+        Some(Some(hash)) => Ok(Some(hash)),
+        Some(None) => Err(DAMAGED.to_string()),
+    }
 }
 
 /// The table of points in the file.
@@ -971,7 +1520,11 @@ fn point_of_row(row: &rusqlite::Row) -> Result<Point, String> {
         transfer_proxy: holder(10)?,
         continuity: number(12)?,
         keys: NetKeys { revision: number(13)?, suite: number(14)?, authentication: key(15)?, encryption: key(16)? },
-        has_sponsor: number(17)? == 1,
+        has_sponsor: match number(17)? {
+            0 => false,
+            1 => true,
+            _ => return Err(damaged()),
+        },
         sponsor: number(18)?,
         escape,
     })
@@ -1049,6 +1602,8 @@ mod tests {
         block_transactions: usize,
         /// Several questions asked at once are each refused, as some nodes do past a few.
         refuse_together: bool,
+        /// Blocks given another hash than their logs have, when asked for as blocks.
+        lying: HashMap<u64, [u8; 32]>,
         made: u64,
     }
 
@@ -1108,8 +1663,18 @@ mod tests {
             let refuse = |why: &str| json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": why } });
             let result = match method.as_str() {
                 "eth_getBlockByNumber" => {
-                    let transactions: Vec<String> = (0..self.block_transactions as u64).map(|at| hex(&keccak(&at.to_be_bytes()))).collect();
-                    json!({ "number": format!("{:#x}", self.finalized), "hash": hex(&block_hash(self.finalized)), "transactions": transactions })
+                    let number = match params[0].as_str() {
+                        Some("finalized") => self.finalized,
+                        _ => quantity(&params[0]),
+                    };
+                    // Only blocks the chain has made are answered.
+                    if number > self.finalized.saturating_add(100) {
+                        Value::Null
+                    } else {
+                        let transactions: Vec<String> = (0..self.block_transactions as u64).map(|at| hex(&keccak(&at.to_be_bytes()))).collect();
+                        let hash = self.lying.get(&number).copied().unwrap_or(block_hash(number));
+                        json!({ "number": format!("{number:#x}"), "hash": hex(&hash), "transactions": transactions })
+                    }
                 }
                 "eth_getLogs" => {
                     let filter = &params[0];
@@ -1262,6 +1827,7 @@ mod tests {
                 most_block_batch_bytes: 2 << 20,
                 most_work_bytes: 1 << 20,
                 tries: 5,
+                until: None,
             }
         }
     }
@@ -1665,23 +2231,28 @@ mod tests {
         let replica = Replica::open(&path, ReplicaConfig { tries: 2, ..node.config() }).unwrap();
         replica.poll().unwrap();
         node.with(|chain| chain.finalized = 39);
-        assert!(replica.poll().unwrap_err().contains("behind block 40"));
+        assert!(replica.poll().unwrap_err().contains("behind block 40, which it said before"));
         assert_eq!(replica.status().finalized, Some(40));
         // Final to block 50, heard of while the blocks after 40 cannot be had, so that the
-        // file stays at 40. Then the node says 45: behind what it said before, though ahead
-        // of the file. It is not followed, and 50 is kept.
+        // poll fails and the file stays at 40; lookups wait for 50 meanwhile. Then the node
+        // says 45: behind 50, but 50 came in a poll that failed, and may have been the wrong
+        // answer, so it is not held against the node, and the copy reads to 45.
         node.with(|chain| {
             chain.finalized = 50;
             chain.refused_from = Some(41);
         });
         assert!(replica.poll().is_err());
         assert_eq!((replica.status().read_to, replica.status().finalized), (40, Some(50)));
+        assert!(replica.listing(PLANET).is_err());
         node.with(|chain| {
             chain.finalized = 45;
             chain.refused_from = None;
         });
-        assert!(replica.poll().unwrap_err().contains("behind block 50"));
-        assert_eq!((replica.status().read_to, replica.status().finalized), (40, Some(50)));
+        replica.poll().unwrap();
+        assert_eq!((replica.status().read_to, replica.status().finalized), (45, Some(45)));
+        // Behind one given in a poll that succeeded is still not followed.
+        node.with(|chain| chain.finalized = 44);
+        assert!(replica.poll().unwrap_err().contains("behind block 45, which it said before"));
         node.with(|chain| chain.finalized = 50);
         replica.poll().unwrap();
         assert_eq!(replica.status().read_to, 50);
@@ -1695,6 +2266,19 @@ mod tests {
         node.with(|chain| chain.finalized = 50);
         replica.poll().unwrap();
         assert!(replica.listing(PLANET).is_ok());
+        // A copy told to stop short of the final block is still not led back by it: the file
+        // is at 30, the node said 50 in a poll that succeeded, and now says 40.
+        drop(replica);
+        let stopped = scratch.0.join("stopped.sqlite");
+        let short = Replica::open(&stopped, ReplicaConfig { until: Some(30), tries: 2, ..node.config() }).unwrap();
+        short.poll().unwrap();
+        assert_eq!(short.status().read_to, 30);
+        node.with(|chain| chain.finalized = 40);
+        assert!(short.poll().unwrap_err().contains("behind block 50, which it said before"));
+        drop(short);
+        node.with(|chain| chain.finalized = 50);
+        let replica = Replica::open(&path, ReplicaConfig { tries: 2, ..node.config() }).unwrap();
+        replica.poll().unwrap();
         // A final block too big to write down is not a block number. (Taken as one, it
         // would have the copy read for ever: the poll runs on a thread of its own here, so
         // that the test fails rather than waits if it does.)
@@ -2489,10 +3073,15 @@ mod tests {
         let directory = std::fs::canonicalize(&scratch.0).unwrap();
         let late = directory.join("late.sqlite");
         std::os::unix::fs::symlink(directory.join("azimuth.sqlite"), &late).unwrap();
-        assert!(connect(&late, false).unwrap_err().contains("could not be read or written"));
-        assert!(connect(&late, true).is_err());
-        assert!(connect(&directory.join("azimuth.sqlite"), false).is_ok());
-        assert!(connect(&directory.join("azimuth.sqlite"), true).is_ok());
+        assert!(connect(&late, Access::Make).unwrap_err().contains("could not be read or written"));
+        assert!(connect(&late, Access::Write).is_err());
+        assert!(connect(&late, Access::Read).is_err());
+        for access in [Access::Make, Access::Write, Access::Read] {
+            assert!(connect(&directory.join("azimuth.sqlite"), access).is_ok());
+        }
+        // Opened to write a file that must be there, a file that is not is not made.
+        assert!(connect(&directory.join("absent.sqlite"), Access::Write).is_err());
+        assert!(!directory.join("absent.sqlite").exists());
         // A link to nothing yet is refused, rather than making the file under another name.
         let dangling = scratch.0.join("dangling.sqlite");
         std::os::unix::fs::symlink(scratch.0.join("not-yet.sqlite"), &dangling).unwrap();
@@ -2641,5 +3230,1126 @@ mod tests {
         assert_eq!(file_revision(&path, STAR), Some(1));
         let replica = Replica::open(&path, node.config()).unwrap();
         assert_eq!((replica.status().read_to, replica.status().counts), (40, counts));
+    }
+
+    /// The snapshot of a copy, written to `out`, and its bytes.
+    fn snapshot_bytes(path: &Path, cfg: &ReplicaConfig, out: &Path) -> (snapshot::Summary, Vec<u8>) {
+        let summary = snapshot::write(path, cfg, out).unwrap();
+        (summary, fs::read(out).unwrap())
+    }
+
+    /// A copy read to `until`, or to the end of the stand-in's chain, in steps of at most
+    /// `widest` blocks.
+    fn read_to_block(path: &Path, node: &Node, widest: u64, until: Option<u64>) {
+        let replica = Replica::open(path, ReplicaConfig { widest, until, ..node.config() }).unwrap();
+        replica.poll().unwrap();
+        if let Some(until) = until {
+            assert_eq!(replica.status().read_to, until);
+        }
+    }
+
+    /// The names in a directory, but for the lock files copies leave.
+    fn names_in(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).filter(|name| !name.ends_with(".lock")).collect();
+        names.sort();
+        names
+    }
+
+    fn kept_hash(path: &Path) -> Option<[u8; 32]> {
+        read_to_hash(&Connection::open(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_snapshot_restored_and_written_again_is_the_same_bytes() {
+        let scratch = Scratch::new("snapshot-again");
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        let first = scratch.0.join("first.sqlite");
+        read_to_block(&first, &node, 1000, None);
+        let (summary, written) = snapshot_bytes(&first, &node.config(), &scratch.0.join("a.snapshot"));
+        assert_eq!((summary.block, summary.hash, summary.bytes), (40, block_hash(40), written.len() as u64));
+        assert_eq!(written.len() as u64, 176 + 211 * summary.points);
+        let notes = fs::read_to_string(scratch.0.join("a.snapshot.txt")).unwrap();
+        assert_eq!(notes, summary.lines());
+        assert!(notes.contains("block: 40\n") && notes.contains(&format!("sha256: {}", summary.sha256.iter().map(|byte| format!("{byte:02x}")).collect::<String>())));
+
+        // Made again from it, with its fingerprint: the same bytes, before and after reading on.
+        let second = scratch.0.join("second.sqlite");
+        let (replica, restored) = Replica::open_from_snapshot(&second, node.config(), &scratch.0.join("a.snapshot"), Some(summary.sha256)).unwrap();
+        assert!(matches!(&restored, Restored::Made(made) if *made == summary), "{restored:?}");
+        assert!(replica.listing(PLANET).unwrap_err().contains("not yet heard"), "nothing is answered before the node is asked");
+        let (_, again) = snapshot_bytes(&second, &node.config(), &scratch.0.join("b.snapshot"));
+        assert!(again == written);
+        replica.poll().unwrap();
+        assert_eq!(replica.status().counts, Replica::open(&first, node.config()).map(|first| first.status().counts).unwrap());
+        assert_eq!(replica.listing(PLANET).unwrap().unwrap(), Listing { key: key(0x71), revision: 1, continuity: 0, sponsor: Some(STAR) });
+        drop(replica);
+        let (_, after) = snapshot_bytes(&second, &node.config(), &scratch.0.join("c.snapshot"));
+        assert!(after == written);
+    }
+
+    #[test]
+    fn copies_read_to_one_block_in_steps_of_any_size_write_the_same_snapshot() {
+        let scratch = Scratch::new("snapshot-steps");
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        let (one, wide) = (scratch.0.join("one.sqlite"), scratch.0.join("wide.sqlite"));
+        read_to_block(&one, &node, 1, None);
+        read_to_block(&wide, &node, 1000, None);
+        let (_, by_ones) = snapshot_bytes(&one, &node.config(), &scratch.0.join("one.snapshot"));
+        let (_, at_once) = snapshot_bytes(&wide, &node.config(), &scratch.0.join("wide.snapshot"));
+        assert!(by_ones == at_once);
+        // Each step asked for the hash of its last block, but the last, which the final block's
+        // answer gave.
+        let asked: Vec<u64> = node.with(|chain| chain.methods("eth_getBlockByNumber").iter().filter_map(|params| params[0].as_str().filter(|which| *which != "finalized").map(|which| u64::from_str_radix(&which[2..], 16).unwrap())).collect());
+        assert!(asked.contains(&10) && asked.contains(&39) && !asked.contains(&40), "{asked:?}");
+    }
+
+    #[test]
+    fn a_snapshot_read_on_from_is_the_same_as_reading_straight_there() {
+        let scratch = Scratch::new("snapshot-on");
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        // Stopped part way, between the two batches.
+        let early = scratch.0.join("early.sqlite");
+        read_to_block(&early, &node, 1000, Some(23));
+        assert_eq!(kept_hash(&early), Some(block_hash(23)), "the hash kept is the node's for the block asked for");
+        let (at_23, _) = snapshot_bytes(&early, &node.config(), &scratch.0.join("23.snapshot"));
+        assert_eq!(at_23.block, 23);
+        let restored = scratch.0.join("restored.sqlite");
+        let (replica, _) = Replica::open_from_snapshot(&restored, node.config(), &scratch.0.join("23.snapshot"), Some(at_23.sha256)).unwrap();
+        replica.poll().unwrap();
+        assert_eq!(replica.status().read_to, 40);
+        drop(replica);
+        let straight = scratch.0.join("straight.sqlite");
+        read_to_block(&straight, &node, 1000, None);
+        let (_, from_snapshot) = snapshot_bytes(&restored, &node.config(), &scratch.0.join("restored.snapshot"));
+        let (_, from_start) = snapshot_bytes(&straight, &node.config(), &scratch.0.join("straight.snapshot"));
+        assert!(from_snapshot == from_start);
+    }
+
+    #[test]
+    fn a_snapshot_not_in_the_one_form_allowed_makes_nothing() {
+        let scratch = Scratch::new("snapshot-refused");
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        let source = scratch.0.join("source.sqlite");
+        read_to_block(&source, &node, 1000, None);
+        let good_path = scratch.0.join("good.snapshot");
+        let (summary, good) = snapshot_bytes(&source, &node.config(), &good_path);
+        assert!(summary.points >= 3);
+        let record = |at: usize| 176 + 211 * at;
+        let changed = |at: usize, bytes: &[u8]| {
+            let mut other = good.clone();
+            other[at..at + bytes.len()].copy_from_slice(bytes);
+            other
+        };
+        let mut swapped = good.clone();
+        swapped[record(0)..record(2)].rotate_left(211);
+        let mut repeated = good.clone();
+        repeated.copy_within(record(0)..record(1), record(1));
+        let refused: Vec<(&str, Vec<u8>, Option<[u8; 32]>, &str)> = vec![
+            ("one byte too many", [good.clone(), vec![0]].concat(), None, "bytes long"),
+            ("one byte too few", good[..good.len() - 1].to_vec(), None, "bytes long"),
+            ("shorter than a header", good[..100].to_vec(), None, "shorter"),
+            ("one point more said than there is", changed(168, &(summary.points + 1).to_be_bytes()), None, "bytes long"),
+            ("one byte of a key changed, with the fingerprint", changed(record(1) + 140, &[0xee]), Some(summary.sha256), "fingerprint"),
+            ("a place that is none of the three", changed(record(0) + 4, &[3]), None, "none of the three"),
+            ("a sponsor that is neither yes nor no", changed(record(0) + 201, &[2]), None, "one form"),
+            ("an escape that is neither yes nor no", changed(record(0) + 206, &[2]), None, "one form"),
+            ("an escape not asked for, not zero", changed(record(0) + 207, &[0, 0, 0, 9]), None, "one form"),
+            ("ships out of order", swapped, None, "not after"),
+            ("a ship twice", repeated, None, "not after"),
+            ("another chain", changed(16, &5u64.to_be_bytes()), None, "made for chain 5"),
+            ("another Azimuth contract", changed(24, &[0xcc]), None, "made for"),
+            ("another first block", changed(72, &21u64.to_be_bytes()), None, "made for"),
+            ("other rules", changed(12, &2u32.to_be_bytes()), None, "version 2 of the rules"),
+            ("another format", changed(8, &2u32.to_be_bytes()), None, "format 2"),
+            ("not a snapshot", changed(0, b"SQLite f"), None, "not a snapshot"),
+            ("a count that does not fit", changed(120, &u64::MAX.to_be_bytes()), None, "too big"),
+            ("a block that does not fit", changed(80, &u64::MAX.to_be_bytes()), None, "too big"),
+        ];
+        let before = names_in(&scratch.0);
+        for (what, bytes, sha256, why) in refused {
+            let offered = scratch.0.join("offered.snapshot");
+            fs::write(&offered, &bytes).unwrap();
+            let copy = scratch.0.join("copy.sqlite");
+            let refusal = Replica::open_from_snapshot(&copy, node.config(), &offered, sha256).err().unwrap_or_else(|| panic!("{what}: taken"));
+            assert!(refusal.contains(why) && refusal.contains("no copy is made"), "{what}: {refusal}");
+            fs::remove_file(&offered).unwrap();
+            assert_eq!(names_in(&scratch.0), before, "{what}: no copy, and nothing left behind");
+        }
+        // Without its fingerprint, a byte changed where any byte is allowed is not caught: it
+        // is the fingerprint that shows a snapshot is the one somebody named.
+        let offered = scratch.0.join("offered.snapshot");
+        fs::write(&offered, changed(record(1) + 140, &[0xee])).unwrap();
+        assert!(Replica::open_from_snapshot(&scratch.0.join("copy.sqlite"), node.config(), &offered, None).is_ok());
+        // A copy that would be made for another Azimuth is not made from this one.
+        let other = ReplicaConfig { naive_from: 21, ..node.config() };
+        assert!(Replica::open_from_snapshot(&scratch.0.join("other.sqlite"), other, &good_path, None).unwrap_err().contains("made for"));
+        assert!(!scratch.0.join("other.sqlite").exists());
+    }
+
+    #[test]
+    fn a_file_that_is_there_is_never_replaced_and_links_are_not_followed() {
+        let scratch = Scratch::new("snapshot-there");
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        let copy = scratch.0.join("copy.sqlite");
+        read_to_block(&copy, &node, 1000, Some(30));
+        let snapshot_path = scratch.0.join("at-30.snapshot");
+        let (_, written) = snapshot_bytes(&copy, &node.config(), &snapshot_path);
+        // A copy that is there is opened as it is: the snapshot is not even read.
+        let (replica, restored) = Replica::open_from_snapshot(&copy, node.config(), &scratch.0.join("no such snapshot"), None).unwrap();
+        assert!(matches!(restored, Restored::Ignored));
+        assert_eq!(replica.status().read_to, 30);
+        drop(replica);
+        // The writer replaces neither the snapshot nor its notes, and follows no link.
+        let refusal = snapshot::write(&copy, &node.config(), &snapshot_path).unwrap_err();
+        assert!(refusal.contains("never replaces"), "{refusal}");
+        assert!(fs::read(&snapshot_path).unwrap() == written);
+        let notes_only = scratch.0.join("notes-only.snapshot");
+        fs::write(scratch.0.join("notes-only.snapshot.txt"), "mine").unwrap();
+        assert!(snapshot::write(&copy, &node.config(), &notes_only).unwrap_err().contains("never replaces"));
+        assert!(!notes_only.exists());
+        assert_eq!(fs::read_to_string(scratch.0.join("notes-only.snapshot.txt")).unwrap(), "mine");
+        let target = scratch.0.join("target");
+        let link = scratch.0.join("link.snapshot");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(snapshot::write(&copy, &node.config(), &link).unwrap_err().contains("never replaces"));
+        assert!(!target.exists());
+        // A copy is not made through a link to where there is none.
+        let made_through = scratch.0.join("made-through.sqlite");
+        std::os::unix::fs::symlink(&target, &made_through).unwrap();
+        assert!(Replica::open_from_snapshot(&made_through, node.config(), &snapshot_path, None).unwrap_err().contains("link"));
+        assert!(!target.exists());
+        // Nor a snapshot written of a copy that is not there.
+        assert!(snapshot::write(&scratch.0.join("absent.sqlite"), &node.config(), &scratch.0.join("absent.snapshot")).unwrap_err().contains("no copy"));
+        assert!(!scratch.0.join("absent.sqlite").exists());
+    }
+
+    #[test]
+    fn a_node_that_disagrees_about_the_files_block_stops_it_and_writes_nothing() {
+        let scratch = Scratch::new("snapshot-disagrees");
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        let replayed = scratch.0.join("replayed.sqlite");
+        read_to_block(&replayed, &node, 1000, None);
+        let (summary, _) = snapshot_bytes(&replayed, &node.config(), &scratch.0.join("40.snapshot"));
+        let restored = scratch.0.join("restored.sqlite");
+        drop(Replica::open_from_snapshot(&restored, node.config(), &scratch.0.join("40.snapshot"), Some(summary.sha256)).unwrap());
+        for (path, made_from_snapshot) in [(&replayed, false), (&restored, true)] {
+            // The node now says block 40 has another hash: as the final block, and then as a
+            // block asked for by number once the chain is final further on.
+            node.with(|chain| {
+                chain.finalized = 40;
+                chain.lying.insert(40, [0xdd; 32]);
+            });
+            let before = fs::read(path).unwrap();
+            let replica = Replica::open(path, node.config()).unwrap();
+            let refusal = replica.poll().unwrap_err();
+            assert!(refusal.contains("another chain") && refusal.contains(&hex(&[0xdd; 32])), "{refusal}");
+            assert!(refusal.contains("remove it, and any file of the same name with -wal, -shm or -journal added, to try another"), "{refusal}");
+            assert!(replica.listing(PLANET).unwrap_err().contains("another chain"), "{made_from_snapshot}");
+            assert!(!replica.caught_up());
+            node.with(|chain| chain.finalized = 50);
+            assert!(replica.poll().unwrap_err().contains("another chain"));
+            assert_eq!(replica.status().read_to, 40);
+            assert!(replica.listing(PLANET).is_err());
+            assert!(fs::read(path).unwrap() == before, "nothing was written");
+            // An honest answer later lets it go on.
+            node.with(|chain| chain.lying.clear());
+            replica.poll().unwrap();
+            assert_eq!(replica.status().read_to, 50);
+            assert_eq!(kept_hash(path), Some(block_hash(50)));
+            assert!(replica.listing(PLANET).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn a_file_kept_before_the_hash_learns_one_and_is_then_checked() {
+        let scratch = Scratch::new("snapshot-old-file");
+        let path = scratch.file();
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        read_to_block(&path, &node, 1000, None);
+        Connection::open(&path).unwrap().execute("delete from meta where name = 'read to hash'", []).unwrap();
+        assert!(snapshot::write(&path, &node.config(), &scratch.0.join("none.snapshot")).unwrap_err().contains("does not keep the hash"));
+        assert!(!scratch.0.join("none.snapshot").exists());
+        // With nothing to check, it is used as before, even by a node that would disagree.
+        node.with(|chain| {
+            chain.lying.insert(40, [0xdd; 32]);
+        });
+        let replica = Replica::open(&path, node.config()).unwrap();
+        replica.poll().unwrap();
+        assert!(replica.listing(PLANET).unwrap().is_some());
+        assert_eq!(kept_hash(&path), None);
+        node.with(|chain| {
+            chain.lying.clear();
+            chain.finalized = 45;
+        });
+        replica.poll().unwrap();
+        assert_eq!(kept_hash(&path), Some(block_hash(45)));
+        drop(replica);
+        // From then on it is checked.
+        node.with(|chain| {
+            chain.lying.insert(45, [0xdd; 32]);
+        });
+        let replica = Replica::open(&path, node.config()).unwrap();
+        assert!(replica.poll().unwrap_err().contains("another chain"));
+        assert!(replica.listing(PLANET).is_err());
+    }
+
+    #[test]
+    fn a_copy_told_to_stop_stops_there_and_answers_nothing() {
+        let scratch = Scratch::new("snapshot-until");
+        let path = scratch.file();
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        let replica = Replica::open(&path, ReplicaConfig { until: Some(30), ..node.config() }).unwrap();
+        replica.poll().unwrap();
+        assert_eq!(replica.status().read_to, 30);
+        assert!(!replica.caught_up());
+        assert!(replica.listing(PLANET).unwrap_err().contains("told to stop at block 30"));
+        replica.poll().unwrap();
+        assert_eq!(replica.status().read_to, 30);
+        drop(replica);
+        // Past what is final, it reads as far as is final, and waits.
+        let replica = Replica::open(&path, ReplicaConfig { until: Some(50), ..node.config() }).unwrap();
+        replica.poll().unwrap();
+        assert_eq!(replica.status().read_to, 40);
+        node.with(|chain| chain.finalized = 60);
+        replica.poll().unwrap();
+        assert_eq!(replica.status().read_to, 50);
+        assert_eq!(kept_hash(&path), Some(block_hash(50)));
+        assert!(!replica.caught_up());
+        drop(replica);
+        // It cannot be told to stop behind where it is.
+        let replica = Replica::open(&path, ReplicaConfig { until: Some(45), ..node.config() }).unwrap();
+        assert!(replica.poll().unwrap_err().contains("cannot go back"));
+        assert_eq!(replica.status().read_to, 50);
+    }
+
+    #[test]
+    fn a_block_whose_hash_is_not_its_logs_hash_stops_the_step() {
+        let scratch = Scratch::new("snapshot-logs-hash");
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+            // Block 24 holds a batch, and the node gives the block another hash than its log.
+            chain.lying.insert(24, [0xdd; 32]);
+        });
+        for (name, until, tries) in [("asked.sqlite", Some(24), 5), ("final.sqlite", None, 5)] {
+            if until.is_none() {
+                node.with(|chain| chain.finalized = 24);
+            }
+            let path = scratch.0.join(name);
+            let replica = Replica::open(&path, ReplicaConfig { until, tries, ..node.config() }).unwrap();
+            let refusal = replica.poll().unwrap_err();
+            assert!(refusal.contains("block 24 is said to have two hashes"), "{name}: {refusal}");
+            assert_eq!(replica.status().read_to, 9, "{name}: nothing was applied");
+            assert_eq!(kept_hash(&path), None);
+        }
+    }
+
+    #[test]
+    fn a_snapshot_newer_than_the_nodes_final_block_waits() {
+        let scratch = Scratch::new("snapshot-ahead");
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        let source = scratch.0.join("source.sqlite");
+        read_to_block(&source, &node, 1000, None);
+        let (summary, _) = snapshot_bytes(&source, &node.config(), &scratch.0.join("40.snapshot"));
+        // A node that has finalised less than the snapshot has.
+        node.with(|chain| chain.finalized = 30);
+        let restored = scratch.0.join("restored.sqlite");
+        let (replica, _) = Replica::open_from_snapshot(&restored, node.config(), &scratch.0.join("40.snapshot"), Some(summary.sha256)).unwrap();
+        let waiting = replica.poll().unwrap_err();
+        assert!(waiting.contains("waits until it is final there"), "{waiting}");
+        assert!(replica.listing(PLANET).is_err());
+        assert_eq!(replica.status().read_to, 40);
+        assert!(node.with(|chain| chain.methods("eth_getBlockByNumber").iter().all(|params| params[0] == "finalized")), "no block past the final one is asked about");
+        node.with(|chain| chain.finalized = 41);
+        replica.poll().unwrap();
+        assert_eq!(replica.status().read_to, 41);
+        assert!(replica.listing(PLANET).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_damaged_hash_in_the_file_is_not_taken_for_none() {
+        let scratch = Scratch::new("snapshot-damaged-hash");
+        let path = scratch.file();
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        read_to_block(&path, &node, 1000, None);
+        for damaged in [rusqlite::types::Value::Blob(vec![1; 31]), rusqlite::types::Value::Text(hex(&block_hash(40)))] {
+            Connection::open(&path).unwrap().execute("update meta set value = ?1 where name = 'read to hash'", [damaged]).unwrap();
+            let replica = Replica::open(&path, node.config()).unwrap();
+            assert!(replica.poll().unwrap_err().contains("damaged"));
+            assert!(replica.listing(PLANET).is_err());
+            assert!(snapshot::write(&path, &node.config(), &scratch.0.join("damaged.snapshot")).unwrap_err().contains("damaged"));
+        }
+    }
+
+    #[test]
+    fn a_snapshot_is_written_only_of_a_copy_of_the_azimuth_asked_for() {
+        let scratch = Scratch::new("snapshot-made-for");
+        let path = scratch.file();
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        read_to_block(&path, &node, 1000, None);
+        let other = ReplicaConfig { chain: 5, ..node.config() };
+        assert!(snapshot::write(&path, &other, &scratch.0.join("other.snapshot")).unwrap_err().contains("not a copy of the Azimuth"));
+        assert!(!scratch.0.join("other.snapshot").exists());
+    }
+
+    /// Have a test step in at a place in the snapshot code, for one file.
+    fn step_in_at(file: &Path, at: &'static str, hook: impl FnMut(&Path) + Send + 'static) {
+        snapshot::HOOKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((file.to_path_buf(), at, Box::new(hook)));
+    }
+
+    fn step_out(file: &Path) {
+        snapshot::HOOKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|(for_file, ..)| for_file != file);
+    }
+
+    /// A copy read to block 40 of the usual history, and a snapshot of it.
+    fn source_and_snapshot(scratch: &Scratch, node: &Node) -> (PathBuf, PathBuf, snapshot::Summary) {
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        let source = scratch.0.join("source.sqlite");
+        read_to_block(&source, node, 1000, None);
+        let from = scratch.0.join("40.snapshot");
+        let (summary, _) = snapshot_bytes(&source, &node.config(), &from);
+        (source, from, summary)
+    }
+
+    #[test]
+    fn a_restore_that_crashes_part_way_leaves_no_copy_and_is_made_again() {
+        let scratch = Scratch::new("snapshot-crash");
+        let node = Node::start();
+        let (_, from, summary) = source_and_snapshot(&scratch, &node);
+        step_in_at(&from, "restoring", |_| panic!("a crash part way through making a copy"));
+        let copy = scratch.0.join("copy.sqlite");
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Replica::open_from_snapshot(&copy, node.config(), &from, None)));
+        step_out(&from);
+        assert!(crashed.is_err());
+        // No copy, so the next start makes it again, whole; the half-made file is left under
+        // its own name, never the copy's.
+        assert!(!copy.exists());
+        assert!(names_in(&scratch.0).iter().any(|name| name.starts_with(".copy.sqlite.") && name.ends_with(".part")), "{:?}", names_in(&scratch.0));
+        let (replica, restored) = Replica::open_from_snapshot(&copy, node.config(), &from, Some(summary.sha256)).unwrap();
+        assert!(matches!(restored, Restored::Made(_)));
+        assert_eq!(replica.status().read_to, 40);
+        replica.poll().unwrap();
+        assert!(replica.listing(PLANET).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_snapshot_that_grows_while_it_is_read_is_refused() {
+        let scratch = Scratch::new("snapshot-grows");
+        let node = Node::start();
+        let (_, from, _) = source_and_snapshot(&scratch, &node);
+        let growing = from.clone();
+        step_in_at(&from, "restored", move |_| {
+            fs::OpenOptions::new().append(true).open(&growing).unwrap().write_all(&[0]).unwrap();
+        });
+        let copy = scratch.0.join("copy.sqlite");
+        let refusal = Replica::open_from_snapshot(&copy, node.config(), &from, None).unwrap_err();
+        step_out(&from);
+        assert!(refusal.contains("changed while it was being read"), "{refusal}");
+        assert!(!copy.exists());
+    }
+
+    #[test]
+    fn a_snapshot_is_of_one_moment_while_the_copy_moves_on() {
+        let scratch = Scratch::new("snapshot-moment");
+        let node = Node::start();
+        let (source, before, counted) = source_and_snapshot(&scratch, &node);
+        // Something else adds a point to the copy after the snapshot has counted its points.
+        let during = scratch.0.join("during.snapshot");
+        let writing = source.clone();
+        step_in_at(&during, "counted", move |_| {
+            Connection::open(&writing)
+                .unwrap()
+                .execute(
+                    "insert into points select 77777, dominion, owner, owner_nonce, spawn_proxy, spawn_nonce, management_proxy, management_nonce, voting_proxy, voting_nonce, transfer_proxy, transfer_nonce, continuity, revision, suite, authentication, encryption, has_sponsor, sponsor, escape_to from points where ship = 0",
+                    [],
+                )
+                .unwrap();
+        });
+        let written = snapshot::write(&source, &node.config(), &during);
+        step_out(&during);
+        written.unwrap();
+        assert!(fs::read(&during).unwrap() == fs::read(&before).unwrap(), "the snapshot is of the copy as it was when it began");
+        let (after, _) = snapshot_bytes(&source, &node.config(), &scratch.0.join("after.snapshot"));
+        assert_eq!(after.points, counted.points + 1, "the point was added, and is in a snapshot begun after it");
+    }
+
+    #[test]
+    fn a_copy_is_not_made_beside_files_an_earlier_copy_left() {
+        let scratch = Scratch::new("snapshot-beside");
+        let node = Node::start();
+        let (_, from, summary) = source_and_snapshot(&scratch, &node);
+        for end in ["-wal", "-shm", "-journal"] {
+            let copy = scratch.0.join(format!("copy{end}.sqlite"));
+            let left = beside(&copy, end);
+            fs::write(&left, b"left by an earlier copy").unwrap();
+            // Neither made from a snapshot nor made new, and what was left is not touched.
+            let refusal = Replica::open_from_snapshot(&copy, node.config(), &from, Some(summary.sha256)).unwrap_err();
+            assert!(refusal.contains(&left.display().to_string()) && refusal.contains("Remove it"), "{end}: {refusal}");
+            let refusal = Replica::open(&copy, node.config()).unwrap_err();
+            assert!(refusal.contains(&left.display().to_string()), "{end}: {refusal}");
+            assert!(!copy.exists(), "{end}");
+            assert_eq!(fs::read(&left).unwrap(), b"left by an earlier copy", "{end}");
+            // Once it is removed, the copy is made.
+            fs::remove_file(&left).unwrap();
+            let (replica, restored) = Replica::open_from_snapshot(&copy, node.config(), &from, Some(summary.sha256)).unwrap();
+            assert!(matches!(restored, Restored::Made(_)));
+            assert_eq!(replica.status().read_to, 40);
+        }
+        // Nor beside the file it is first made under, under its own name: a journal put there
+        // refuses the restore, and is left as it was.
+        // (A restore makes the copy under its true name, links followed.)
+        let copy = fs::canonicalize(&scratch.0).unwrap().join("planted.sqlite");
+        let planted = Arc::new(Mutex::new(None));
+        let noting = planted.clone();
+        step_in_at(&copy, "making", move |making| {
+            let journal = beside(making, "-journal");
+            fs::write(&journal, b"planted").unwrap();
+            *noting.lock().unwrap() = Some(journal);
+        });
+        let refusal = Replica::open_from_snapshot(&copy, node.config(), &from, None).unwrap_err();
+        step_out(&copy);
+        assert!(refusal.contains("-journal"), "{refusal}");
+        assert!(!copy.exists());
+        let journal = planted.lock().unwrap().clone().unwrap();
+        assert_eq!(fs::read(&journal).unwrap(), b"planted");
+    }
+
+    #[test]
+    fn every_block_the_node_gives_in_a_poll_is_one_chain() {
+        let scratch = Scratch::new("snapshot-one-chain");
+        let node = Node::start();
+        let (galaxy, star) = (wallet(1).1, wallet(2).1);
+        let setup = |chain: &mut Chain| {
+            *chain = Chain { widest: 1000, together: true, ..Chain::default() };
+            history(chain);
+        };
+        let refused = |name: &str, until: Option<u64>| {
+            let path = scratch.0.join(name);
+            let replica = Replica::open(&path, ReplicaConfig { until, ..node.config() }).unwrap();
+            let refusal = replica.poll().unwrap_err();
+            assert_eq!(replica.status().read_to, 9, "{name}: nothing applied");
+            assert_eq!(kept_hash(&path), None, "{name}");
+            refusal
+        };
+        // A log in block 41 with the final block's hash, and no log in block 42.
+        node.with(|chain| {
+            setup(chain);
+            chain.azimuth(41, b"OwnerChanged(uint32,address)", 0, Some(word(&galaxy)), vec![]);
+            chain.logs.iter_mut().filter(|log| log.block == 41).for_each(|log| log.block_hash = block_hash(42));
+            chain.finalized = 42;
+        });
+        assert!(refused("final.sqlite", None).contains("is said to be of two blocks"));
+        // A log in block 25 with the hash the node gives for block 30, the range's last.
+        node.with(|chain| {
+            setup(chain);
+            chain.azimuth(25, b"OwnerChanged(uint32,address)", STAR, Some(word(&star)), vec![]);
+            chain.logs.iter_mut().filter(|log| log.block == 25).for_each(|log| log.block_hash = block_hash(30));
+            chain.finalized = 40;
+        });
+        assert!(refused("last.sqlite", Some(30)).contains("is said to be of two blocks"));
+        // The range's last block given the final block's hash.
+        node.with(|chain| {
+            setup(chain);
+            chain.finalized = 40;
+            chain.lying.insert(30, block_hash(40));
+        });
+        assert!(refused("last-and-final.sqlite", Some(30)).contains("is said to be of two blocks"));
+        // The block the file had read to, given the hash the final block is given.
+        node.with(|chain| {
+            setup(chain);
+            chain.finalized = 40;
+        });
+        let path = scratch.0.join("start.sqlite");
+        read_to_block(&path, &node, 1000, Some(30));
+        node.with(|chain| {
+            chain.lying.insert(40, block_hash(30));
+        });
+        let before = fs::read(&path).unwrap();
+        let replica = Replica::open(&path, node.config()).unwrap();
+        assert!(replica.poll().unwrap_err().contains("is said to be of two blocks"));
+        assert!(replica.listing(PLANET).is_err());
+        drop(replica);
+        assert!(fs::read(&path).unwrap() == before);
+        // The final block given another hash in a later poll of the same run, though nothing
+        // after it is read.
+        node.with(|chain| chain.lying.clear());
+        let replica = Replica::open(&path, node.config()).unwrap();
+        replica.poll().unwrap();
+        node.with(|chain| {
+            chain.lying.insert(40, [0xdd; 32]);
+        });
+        assert!(replica.poll().unwrap_err().contains("block 40 is said to have two hashes"));
+    }
+
+    #[test]
+    fn a_count_stops_at_the_most_that_can_be_kept_whenever_the_copy_is_reopened() {
+        let scratch = Scratch::new("snapshot-most");
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        // A snapshot at block 23 whose count of batches is the most that can be kept. The
+        // batch at block 24 comes after it.
+        let early = scratch.0.join("early.sqlite");
+        read_to_block(&early, &node, 1000, Some(23));
+        let (_, mut written) = snapshot_bytes(&early, &node.config(), &scratch.0.join("23.snapshot"));
+        written[128..136].copy_from_slice(&(i64::MAX as u64).to_be_bytes());
+        let most = scratch.0.join("most.snapshot");
+        fs::write(&most, &written).unwrap();
+        // One copy reads on in one go; the other stops at 24 and is opened again.
+        let (straight, again) = (scratch.0.join("straight.sqlite"), scratch.0.join("again.sqlite"));
+        drop(Replica::open_from_snapshot(&straight, node.config(), &most, None).unwrap());
+        drop(Replica::open_from_snapshot(&again, node.config(), &most, None).unwrap());
+        read_to_block(&straight, &node, 1000, None);
+        read_to_block(&again, &node, 1000, Some(24));
+        read_to_block(&again, &node, 1000, None);
+        for path in [&straight, &again] {
+            let replica = Replica::open(path, node.config()).unwrap();
+            assert_eq!(replica.status().counts.batches, i64::MAX as u64);
+            assert_eq!(replica.status().read_to, 40);
+        }
+        let (_, one_go) = snapshot_bytes(&straight, &node.config(), &scratch.0.join("straight.snapshot"));
+        let (_, reopened) = snapshot_bytes(&again, &node.config(), &scratch.0.join("again.snapshot"));
+        assert!(one_go == reopened);
+    }
+
+    #[test]
+    fn a_number_kept_in_meta_is_a_whole_number_in_range_or_the_file_is_damaged() {
+        use rusqlite::types::Value as Kept;
+        let scratch = Scratch::new("snapshot-meta-numbers");
+        let path = scratch.file();
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        read_to_block(&path, &node, 1000, None);
+        let set = |name: &str, value: Kept| Connection::open(&path).unwrap().execute("update meta set value = ?1 where name = ?2", params![value, name]).unwrap();
+        for (name, bad) in [
+            ("read to", Kept::Text("40".into())),
+            ("read to", Kept::Integer(-1)),
+            ("read to", Kept::Real(40.0)),
+            ("logs", Kept::Integer(-1)),
+            ("logs", Kept::Text("5".into())),
+            ("batches", Kept::Real(2.0)),
+            ("applied", Kept::Blob(vec![1])),
+        ] {
+            let good: Kept = Connection::open(&path).unwrap().query_row("select value from meta where name = ?1", [name], |row| row.get(0)).unwrap();
+            set(name, bad.clone());
+            assert!(Replica::open(&path, node.config()).unwrap_err().contains("damaged"), "{name}: {bad:?}");
+            assert!(snapshot::write(&path, &node.config(), &scratch.0.join("damaged.snapshot")).unwrap_err().contains("damaged"), "{name}: {bad:?}");
+            set(name, good);
+        }
+        // A count missing from a file that has read on is damage too.
+        Connection::open(&path).unwrap().execute("delete from meta where name = 'failed'", []).unwrap();
+        assert!(Replica::open(&path, node.config()).unwrap_err().contains("damaged"));
+        // A file that has read nothing, made before the counts were kept from the start, has
+        // none of them, and they are nothing counted. A file made now keeps all six at once.
+        let fresh = scratch.0.join("fresh.sqlite");
+        drop(Replica::open(&fresh, node.config()).unwrap());
+        let kept: i64 = Connection::open(&fresh).unwrap().query_row("select count(*) from meta where name in ('logs', 'batches', 'unreadable', 'applied', 'failed', 'unsigned') and value = 0", [], |row| row.get(0)).unwrap();
+        assert_eq!(kept, 6);
+        Connection::open(&fresh).unwrap().execute("delete from meta where name in ('logs', 'batches', 'unreadable', 'applied', 'failed', 'unsigned')", []).unwrap();
+        assert_eq!(Replica::open(&fresh, node.config()).unwrap().status().counts, Counts::default());
+        // Every one of them can be kept up to 2^63 - 1, and no further.
+        assert!(keep_number(&Connection::open(&fresh).unwrap(), "logs", i64::MAX as u64).is_ok());
+        assert!(keep_number(&Connection::open(&fresh).unwrap(), "logs", i64::MAX as u64 + 1).unwrap_err().contains("too big"));
+        let mut count = i64::MAX as u64 - 1;
+        count_one(&mut count);
+        count_one(&mut count);
+        assert_eq!(count, i64::MAX as u64);
+    }
+
+    #[test]
+    fn a_copy_already_at_its_stopping_block_has_not_reached_it_until_the_node_agrees() {
+        let scratch = Scratch::new("snapshot-until-agreed");
+        let path = scratch.file();
+        let node = Node::start();
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        let until = ReplicaConfig { until: Some(30), ..node.config() };
+        let replica = Replica::open(&path, until.clone()).unwrap();
+        assert!(!replica.reached_until());
+        replica.poll().unwrap();
+        assert!(replica.reached_until());
+        drop(replica);
+        // Opened again, already at the block, with a node that disagrees about its hash.
+        node.with(|chain| {
+            chain.lying.insert(30, [0xdd; 32]);
+        });
+        let replica = Replica::open(&path, until.clone()).unwrap();
+        assert_eq!(replica.status().read_to, 30);
+        assert!(!replica.reached_until());
+        assert!(replica.poll().unwrap_err().contains("another chain"));
+        assert!(!replica.reached_until());
+        node.with(|chain| chain.lying.clear());
+        replica.poll().unwrap();
+        assert!(replica.reached_until());
+        // Nor while the node has not finalised the block.
+        drop(replica);
+        node.with(|chain| chain.finalized = 29);
+        let replica = Replica::open(&path, until).unwrap();
+        assert!(replica.poll().is_err());
+        assert!(!replica.reached_until());
+        assert!(!Replica::open(&scratch.0.join("other.sqlite"), node.config()).unwrap().reached_until(), "never, for a copy not told to stop");
+    }
+
+    #[test]
+    fn a_restored_copy_is_read_back_and_never_made_anew_by_opening_it() {
+        let scratch = Scratch::new("snapshot-read-back");
+        let node = Node::start();
+        let (_, from, summary) = source_and_snapshot(&scratch, &node);
+        // Another good copy, of another block, to put in the copy's place.
+        let other = scratch.0.join("other.sqlite");
+        read_to_block(&other, &node, 1000, Some(23));
+        let substituted = |name: &str, change: Box<dyn FnMut(&Path) + Send>| {
+            let copy = scratch.0.join(name);
+            step_in_at(&from, "placed", change);
+            let opened = Replica::open_from_snapshot(&copy, node.config(), &from, Some(summary.sha256));
+            step_out(&from);
+            (copy, opened.err().unwrap_or_default())
+        };
+        let other_file = other.clone();
+        let (copy, refusal) = substituted("swapped.sqlite", Box::new(move |placed: &Path| {
+            fs::copy(&other_file, placed).unwrap();
+        }));
+        assert!(refusal.contains("is not the one just made") && refusal.contains("the block it has read to"), "{refusal}");
+        assert_eq!(Replica::open(&copy, node.config()).unwrap().status().read_to, 23, "it is left as it was found");
+        let (copy, refusal) = substituted("emptied.sqlite", Box::new(|placed: &Path| fs::write(placed, b"").unwrap()));
+        assert!(refusal.contains("is not the one just made"), "{refusal}");
+        assert_eq!(fs::metadata(&copy).unwrap().len(), 0, "nothing is written to it");
+        // Each thing read back, changed alone.
+        for (name, change, what) in [
+            ("block", "update meta set value = 39 where name = 'read to'", "the block it has read to"),
+            ("hash", "update meta set value = zeroblob(32) where name = 'read to hash'", "that block's hash"),
+            ("count", "update meta set value = 99 where name = 'logs'", "its counts"),
+            ("point", "delete from points where ship = 0", "how many points it holds"),
+            ("made-for", "update meta set value = 'another' where name = 'made for'", "what it is a copy of"),
+            ("journal", "pragma journal_mode = delete", "its journal"),
+        ] {
+            let (_, refusal) = substituted(&format!("{name}.sqlite"), Box::new(move |placed: &Path| {
+                Connection::open(placed).unwrap().execute_batch(change).unwrap();
+            }));
+            assert!(refusal.contains("is not the one just made") && refusal.contains(what), "{name}: {refusal}");
+        }
+        // One that cannot be read back is not taken for one that differs: the error is said.
+        let (_, refusal) = substituted("unreadable.sqlite", Box::new(|placed: &Path| {
+            Connection::open(placed).unwrap().execute("update meta set value = 'forty' where name = 'read to'", []).unwrap();
+        }));
+        assert!(refusal.contains("could not be read back") && refusal.contains("damaged"), "{refusal}");
+        let (copy, refusal) = substituted("gone.sqlite", Box::new(|placed: &Path| fs::remove_file(placed).unwrap()));
+        assert!(!refusal.is_empty());
+        assert!(!copy.exists(), "opening a copy just made never makes one");
+        // Left alone, the copy made is the one opened.
+        let (replica, _) = Replica::open_from_snapshot(&scratch.0.join("left.sqlite"), node.config(), &from, Some(summary.sha256)).unwrap();
+        assert_eq!(replica.status().read_to, 40);
+    }
+
+    #[test]
+    fn a_wrong_answer_in_a_poll_that_failed_does_not_hold_back_a_right_one() {
+        let scratch = Scratch::new("snapshot-failed-poll");
+        let path = scratch.file();
+        let node = Node::start();
+        let galaxy = wallet(1).1;
+        node.with(|chain| {
+            history(chain);
+            chain.finalized = 40;
+        });
+        let replica = Replica::open(&path, ReplicaConfig { tries: 2, ..node.config() }).unwrap();
+        replica.poll().unwrap();
+        // The node confirms the file's block, but gives the final block, 42, a wrong hash
+        // once; a right log from block 42 then disagrees with it, and nothing is committed.
+        node.with(|chain| {
+            chain.azimuth(42, b"OwnerChanged(uint32,address)", 0, Some(word(&galaxy)), vec![]);
+            chain.finalized = 42;
+            chain.lying.insert(42, [0xdd; 32]);
+        });
+        assert!(replica.poll().unwrap_err().contains("block 42 is said to have two hashes"));
+        assert_eq!(replica.status().read_to, 40);
+        // Then it answers rightly, at the same final block: the copy goes on, without being
+        // opened again.
+        node.with(|chain| chain.lying.clear());
+        replica.poll().unwrap();
+        assert_eq!(replica.status().read_to, 42);
+        assert_eq!(kept_hash(&path), Some(block_hash(42)));
+        assert!(replica.listing(PLANET).unwrap().is_some());
+        // The same for a final block far ahead of the chain, given once in a poll that then
+        // fails: a right, lower one afterwards is not taken for the chain going back.
+        node.with(|chain| {
+            chain.finalized = 1_000_000;
+            chain.failing.insert("eth_getLogs".into(), 100);
+        });
+        assert!(replica.poll().is_err());
+        assert!(replica.listing(PLANET).is_err(), "lookups wait meanwhile");
+        node.with(|chain| {
+            chain.finalized = 45;
+            chain.failing.clear();
+        });
+        replica.poll().unwrap();
+        assert_eq!(replica.status().read_to, 45);
+        assert!(replica.listing(PLANET).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_file_at_the_copys_name_that_is_not_a_copy_is_not_taken_for_one_when_a_snapshot_is_asked_for() {
+        let scratch = Scratch::new("snapshot-not-a-copy");
+        let node = Node::start();
+        let (_, from, summary) = source_and_snapshot(&scratch, &node);
+        // An empty file, and a database that is not a copy.
+        let empty = scratch.0.join("empty.sqlite");
+        fs::write(&empty, b"").unwrap();
+        let other = scratch.0.join("other.sqlite");
+        Connection::open(&other).unwrap().execute_batch("create table notes (text text); insert into notes values ('mine');").unwrap();
+        for (path, why) in [(&empty, "is empty"), (&other, "keeps no record of what it is a copy of")] {
+            let before = fs::read(path).unwrap();
+            let refusal = Replica::open_from_snapshot(path, node.config(), &from, Some(summary.sha256)).unwrap_err();
+            assert!(refusal.contains(why) && refusal.contains("remove it"), "{refusal}");
+            assert!(fs::read(path).unwrap() == before, "nothing is written to it");
+            for end in BESIDE {
+                assert!(!beside(path, end).exists(), "{end}");
+            }
+        }
+        // Opened without a snapshot, an empty file is set up as a copy that has read nothing,
+        // as before.
+        let replica = Replica::open(&empty, node.config()).unwrap();
+        assert_eq!(replica.status().read_to, 9);
+        drop(replica);
+        // A copy that is there is used as it is, and the snapshot is not.
+        let (_, restored) = Replica::open_from_snapshot(&empty, node.config(), &from, None).unwrap();
+        assert!(matches!(restored, Restored::Ignored));
+        // A copy just made and found emptied is refused, and on the next start it is not
+        // quietly read from the beginning either.
+        let emptied = scratch.0.join("emptied.sqlite");
+        step_in_at(&from, "placed", |placed: &Path| fs::write(placed, b"").unwrap());
+        assert!(Replica::open_from_snapshot(&emptied, node.config(), &from, None).unwrap_err().contains("is not the one just made"));
+        step_out(&from);
+        assert!(Replica::open_from_snapshot(&emptied, node.config(), &from, None).unwrap_err().contains("is empty"));
+        assert_eq!(fs::metadata(&emptied).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn files_beside_a_copy_that_are_not_plain_files_of_its_own_are_refused_and_left_alone() {
+        let scratch = Scratch::new("snapshot-plain-beside");
+        let node = Node::start();
+        let (source, from, _) = source_and_snapshot(&scratch, &node);
+        let elsewhere = scratch.0.join("elsewhere.txt");
+        fs::write(&elsewhere, b"someone else's").unwrap();
+        for end in BESIDE {
+            for (kind, said) in [("link", "is a link"), ("second name", "is a file with more than one name"), ("directory", "is not a plain file")] {
+                // (Writing the snapshot read the copy, which leaves SQLite's own plain files
+                // beside it; they are taken away first, to put something else there.)
+                for left in BESIDE {
+                    let _ = fs::remove_file(beside(&source, left));
+                }
+                let name = beside(&source, end);
+                match kind {
+                    "link" => std::os::unix::fs::symlink(&elsewhere, &name).unwrap(),
+                    "second name" => fs::hard_link(&elsewhere, &name).unwrap(),
+                    _ => fs::create_dir(&name).unwrap(),
+                }
+                let named = name.display().to_string();
+                for refusal in [
+                    Replica::open(&source, node.config()).err(),
+                    Replica::open_from_snapshot(&source, node.config(), &from, None).err(),
+                    snapshot::write(&source, &node.config(), &scratch.0.join("out.snapshot")).err(),
+                ] {
+                    let refusal = refusal.unwrap_or_else(|| panic!("{end} as {kind}: taken"));
+                    assert!(refusal.contains(&format!("{named} {said}")) && refusal.contains("Remove it"), "{end} as {kind}: {refusal}");
+                }
+                assert_eq!(fs::read(&elsewhere).unwrap(), b"someone else's", "{end} as {kind}");
+                assert!(!scratch.0.join("out.snapshot").exists());
+                match kind {
+                    "directory" => fs::remove_dir(&name).unwrap(),
+                    _ => fs::remove_file(&name).unwrap(),
+                }
+            }
+        }
+        // Nor is anything at the copy's own name that is not a plain file, such as a pipe,
+        // which SQLite could wait on for ever.
+        // (Each is tried on a thread of its own, so that the test fails rather than waits if
+        // one does wait.)
+        let pipe = scratch.0.join("pipe.sqlite");
+        let named = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(named.as_ptr(), 0o600) }, 0);
+        let within = |try_it: Box<dyn FnOnce() -> Option<String> + Send>| {
+            let (done, answer) = std::sync::mpsc::channel();
+            std::thread::spawn(move || done.send(try_it()));
+            answer.recv_timeout(Duration::from_secs(10)).ok().flatten().unwrap_or_default()
+        };
+        let (cfg, piped, out) = (node.config(), pipe.clone(), scratch.0.join("pipe.snapshot"));
+        assert!(within(Box::new(move || Replica::open(&piped, cfg).err())).contains("not a plain file"));
+        let (cfg, piped, offered) = (node.config(), pipe.clone(), from.clone());
+        assert!(within(Box::new(move || Replica::open_from_snapshot(&piped, cfg, &offered, None).err())).contains("not a plain file"));
+        let (cfg, piped) = (node.config(), pipe.clone());
+        assert!(within(Box::new(move || snapshot::write(&piped, &cfg, &out).err())).contains("not a plain file"));
+        // Nor a link put beside a copy a restore has just made, before it is opened.
+        let made = fs::canonicalize(&scratch.0).unwrap().join("made.sqlite");
+        let pointing = elsewhere.clone();
+        step_in_at(&from, "placed", move |placed: &Path| std::os::unix::fs::symlink(&pointing, beside(placed, "-shm")).unwrap());
+        let refusal = Replica::open_from_snapshot(&made, node.config(), &from, None).unwrap_err();
+        step_out(&from);
+        assert!(refusal.contains("-shm is a link"), "{refusal}");
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"someone else's");
+        // Plain files of its own beside it are SQLite's, and left to it.
+        let replica = Replica::open(&source, node.config()).unwrap();
+        assert!(beside(&source, "-wal").exists() && beside(&source, "-shm").exists());
+        assert!(snapshot::write(&source, &node.config(), &scratch.0.join("beside.snapshot")).is_ok());
+        drop(replica);
+    }
+
+    /// Leave at `to` the copy in `of` as a crash part way through a change would leave it: in a
+    /// rollback journal, its file part changed and the change beside it in a hot journal, to be
+    /// undone. (`of` is left in that journal, with the change undone.)
+    fn crashed_part_way(of: &Path, to: &Path) {
+        let changing = Connection::open(of).unwrap();
+        changing.execute_batch("pragma journal_mode = delete").unwrap();
+        changing.execute_batch("pragma cache_size = 2; begin; create table spill (x blob);").unwrap();
+        for _ in 0..200 {
+            changing.execute("insert into spill values (randomblob(4000))", []).unwrap();
+        }
+        fs::copy(of, to).unwrap();
+        fs::copy(beside(of, "-journal"), beside(to, "-journal")).unwrap();
+        changing.execute_batch("rollback").unwrap();
+    }
+
+    #[test]
+    fn a_copy_with_a_change_a_crash_left_unfinished_is_recovered_not_refused() {
+        let scratch = Scratch::new("snapshot-hot-journal");
+        let node = Node::start();
+        let (_, from, summary) = source_and_snapshot(&scratch, &node);
+        let directory = fs::canonicalize(&scratch.0).unwrap();
+        // A restore leaves nothing of the kind: when the copy is given its name it is already
+        // in its usual journal, with nothing beside it, and opening it changes nothing.
+        let restored = directory.join("restored.sqlite");
+        let seen = Arc::new(Mutex::new(None));
+        let seeing = seen.clone();
+        step_in_at(&from, "placed", move |placed: &Path| {
+            let header = fs::read(placed).unwrap();
+            let beside_it: Vec<bool> = BESIDE.iter().map(|end| beside(placed, end).exists()).collect();
+            *seeing.lock().unwrap() = Some(((header[18], header[19]), beside_it, header));
+        });
+        let (replica, _) = Replica::open_from_snapshot(&restored, node.config(), &from, Some(summary.sha256)).unwrap();
+        step_out(&from);
+        drop(replica);
+        let (journal, beside_it, placed_bytes) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(journal, (2, 2), "in its write-ahead journal when named");
+        assert_eq!(beside_it, [false; 3], "nothing beside it when named");
+        assert!(fs::read(&restored).unwrap() == placed_bytes, "opened and closed, it is as it was named");
+        // A restored copy as a crash in a change of journal would leave it (the way copies were
+        // made before), and the same start again: it is recovered and used, not refused.
+        let crashed = directory.join("crashed.sqlite");
+        crashed_part_way(&restored, &crashed);
+        assert!(beside(&crashed, "-journal").exists());
+        assert!(connect(&crashed, Access::Read).unwrap().query_row("select count(*) from meta", [], |row| row.get::<_, i64>(0)).is_err(), "it cannot be read without being recovered");
+        let (replica, restored_again) = Replica::open_from_snapshot(&crashed, node.config(), &from, Some(summary.sha256)).unwrap();
+        assert!(matches!(restored_again, Restored::Ignored));
+        assert_eq!(replica.status().read_to, 40);
+        assert!(!beside(&crashed, "-journal").exists(), "the unfinished change was undone");
+        replica.poll().unwrap();
+        assert!(replica.listing(PLANET).unwrap().is_some());
+        drop(replica);
+        let (_, written) = snapshot_bytes(&crashed, &node.config(), &directory.join("crashed.snapshot"));
+        assert!(written == fs::read(&from).unwrap(), "the copy recovered is the copy made");
+        // A file that is not a database, with such a journal beside it, is left exactly as found.
+        let junk = directory.join("junk.sqlite");
+        fs::write(&junk, vec![0x5a; 8192]).unwrap();
+        let again = directory.join("again.sqlite");
+        crashed_part_way(&restored, &again);
+        fs::copy(beside(&again, "-journal"), beside(&junk, "-journal")).unwrap();
+        let journal_bytes = fs::read(beside(&junk, "-journal")).unwrap();
+        let refusal = Replica::open_from_snapshot(&junk, node.config(), &from, None).unwrap_err();
+        assert!(refusal.contains("is not an SQLite database") && refusal.contains("It has been left as it is"), "{refusal}");
+        assert!(!refusal.contains("first start"), "an ordinary start cannot make a copy of what is not a database: {refusal}");
+        // Another SQLite database, not a copy, with such a change left unfinished: SQLite undoes
+        // it on the way, as any opening would, and the refusal says so, not that it was left.
+        let theirs = directory.join("theirs.sqlite");
+        Connection::open(&theirs).unwrap().execute_batch("create table notes (text text); insert into notes values ('mine');").unwrap();
+        let unfinished = directory.join("unfinished.sqlite");
+        crashed_part_way(&theirs, &unfinished);
+        let refusal = Replica::open_from_snapshot(&unfinished, node.config(), &from, None).unwrap_err();
+        assert!(refusal.contains("keeps no record") && refusal.contains("SQLite undid a change a crash had left unfinished in it"), "{refusal}");
+        assert!(!refusal.contains("left as it is"), "{refusal}");
+        assert!(!beside(&unfinished, "-journal").exists());
+        let notes: String = Connection::open(&unfinished).unwrap().query_row("select text from notes", [], |row| row.get(0)).unwrap();
+        assert_eq!(notes, "mine", "nothing else was changed");
+        assert_eq!(fs::read(&junk).unwrap(), vec![0x5a; 8192]);
+        assert!(fs::read(beside(&junk, "-journal")).unwrap() == journal_bytes);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_refused_with_sqlites_own_error_and_left_as_it_is() {
+        let scratch = Scratch::new("snapshot-unreadable");
+        let node = Node::start();
+        let (source, from, _) = source_and_snapshot(&scratch, &node);
+        // An SQLite database's beginning, and damage after it.
+        let damaged = scratch.0.join("damaged.sqlite");
+        let mut bytes = fs::read(&source).unwrap()[..100].to_vec();
+        bytes.extend(vec![0xa5; 8092]);
+        fs::write(&damaged, &bytes).unwrap();
+        let refusal = Replica::open_from_snapshot(&damaged, node.config(), &from, None).unwrap_err();
+        // It says what was done to it (nothing), and promises a recovery only for a change a
+        // crash left unfinished, which an ordinary start can finish; otherwise it is damaged.
+        assert!(refusal.contains("could not be read to tell whether it is a copy") && refusal.contains("It has been left as it is"), "{refusal}");
+        assert!(refusal.contains("If the trouble is a change a crash left unfinished, an ordinary start") && refusal.contains("otherwise the file is damaged"), "{refusal}");
+        assert!(refusal.contains("malformed") || refusal.contains("not a database"), "SQLite's own error: {refusal}");
+        assert!(fs::read(&damaged).unwrap() == bytes);
+        // A change a crash left unfinished, undone, and the file still damaged (its record's
+        // page, which the change did not touch, overwritten): no ordinary start is promised to
+        // mend it, and it says what was done.
+        let crashed = scratch.0.join("crashed.sqlite");
+        crashed_part_way(&source, &crashed);
+        // (Both the table's page and its key's, since the record is found through the key.)
+        let (page_size, meta_pages): (u64, Vec<u64>) = {
+            let reading = Connection::open(&source).unwrap();
+            let pages = reading.prepare("select rootpage from sqlite_master where tbl_name = 'meta'").unwrap().query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+            (reading.query_row("pragma page_size", [], |row| row.get(0)).unwrap(), pages)
+        };
+        let mut file = fs::OpenOptions::new().write(true).open(&crashed).unwrap();
+        for page in meta_pages {
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start((page - 1) * page_size)).unwrap();
+            file.write_all(&vec![0xa5; page_size as usize]).unwrap();
+        }
+        drop(file);
+        let refusal = Replica::open_from_snapshot(&crashed, node.config(), &from, None).unwrap_err();
+        assert!(refusal.contains("SQLite undid a change a crash had left unfinished in it") && refusal.contains("The file is damaged"), "{refusal}");
+        assert!(!refusal.contains("an ordinary start (without --azimuth-snapshot) will finish it") && !refusal.contains("left as it is"), "{refusal}");
+    }
+
+    #[test]
+    fn a_snapshot_is_not_written_of_a_copy_with_a_change_left_unfinished_and_says_why() {
+        let scratch = Scratch::new("snapshot-writer-hot");
+        let node = Node::start();
+        let (source, before, _) = source_and_snapshot(&scratch, &node);
+        let crashed = scratch.0.join("crashed.sqlite");
+        crashed_part_way(&source, &crashed);
+        let out = scratch.0.join("out.snapshot");
+        let refusal = snapshot::write(&crashed, &node.config(), &out).unwrap_err();
+        assert!(refusal.contains("a crash left unfinished") && refusal.contains("open it once"), "{refusal}");
+        assert!(!out.exists());
+        // Opened once, it is recovered, and the snapshot is the copy's.
+        drop(Replica::open(&crashed, node.config()).unwrap());
+        assert!(snapshot::write(&crashed, &node.config(), &out).is_ok());
+        assert!(fs::read(&out).unwrap() == fs::read(&before).unwrap());
+    }
+
+    #[test]
+    fn a_first_start_cut_short_is_finished_by_an_ordinary_open_and_not_taken_for_a_copy_with_a_snapshot() {
+        let scratch = Scratch::new("snapshot-first-start");
+        let node = Node::start();
+        let (_, from, _) = source_and_snapshot(&scratch, &node);
+        let directory = fs::canonicalize(&scratch.0).unwrap();
+        // The points at which a first start writes: the file made, put in its journal, its
+        // tables made, its record of what it is a copy of written. (Empty is tested elsewhere.)
+        for (name, steps) in [("journal.sqlite", "pragma journal_mode = wal;"), ("tables.sqlite", "pragma journal_mode = wal;")] {
+            let path = directory.join(name);
+            let making = connect(&path, Access::Make).unwrap();
+            making.execute_batch(steps).unwrap();
+            if name == "tables.sqlite" {
+                making.execute_batch(SCHEMA).unwrap();
+            }
+            drop(making);
+            let before = fs::read(&path).unwrap();
+            let refusal = Replica::open_from_snapshot(&path, node.config(), &from, None).unwrap_err();
+            assert!(refusal.contains("keeps no record of what it is a copy of") && refusal.contains("starting once without --azimuth-snapshot finishes it"), "{name}: {refusal}");
+            assert!(fs::read(&path).unwrap() == before, "{name}: left as it is");
+            let replica = Replica::open(&path, node.config()).unwrap();
+            assert_eq!(replica.status().read_to, 9, "{name}: finished as a copy that has read nothing");
+            drop(replica);
+            let (_, restored) = Replica::open_from_snapshot(&path, node.config(), &from, None).unwrap();
+            assert!(matches!(restored, Restored::Ignored), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_restore_that_leaves_anything_beside_the_file_it_makes_makes_no_copy() {
+        let scratch = Scratch::new("snapshot-left-beside");
+        let node = Node::start();
+        let (_, from, _) = source_and_snapshot(&scratch, &node);
+        let copy = fs::canonicalize(&scratch.0).unwrap().join("copy.sqlite");
+        step_in_at(&from, "closed", |made: &Path| fs::write(beside(made, "-wal"), b"left").unwrap());
+        let refusal = Replica::open_from_snapshot(&copy, node.config(), &from, None).unwrap_err();
+        step_out(&from);
+        assert!(refusal.contains("was not whole on its own") && refusal.contains("-wal"), "{refusal}");
+        assert!(!copy.exists());
+        assert!(!names_in(&scratch.0).iter().any(|name| name.ends_with(".part") || name.ends_with(".part-wal")), "{:?}", names_in(&scratch.0));
+    }
+
+    #[test]
+    fn a_change_left_unfinished_that_cannot_be_undone_is_said_so_without_claiming_more() {
+        use std::os::unix::fs::PermissionsExt;
+        // Whoever may write any file would undo it; the case is one of a file that may not be.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let scratch = Scratch::new("snapshot-cannot-undo");
+        let node = Node::start();
+        let (source, from, _) = source_and_snapshot(&scratch, &node);
+        let crashed = scratch.0.join("crashed.sqlite");
+        crashed_part_way(&source, &crashed);
+        // The copy may not be written to; the directory it is in still may.
+        fs::set_permissions(&crashed, fs::Permissions::from_mode(0o444)).unwrap();
+        let before = (fs::read(&crashed).unwrap(), fs::read(beside(&crashed, "-journal")).unwrap());
+        let refusal = Replica::open_from_snapshot(&crashed, node.config(), &from, None).err();
+        let after = (fs::read(&crashed).unwrap(), fs::read(beside(&crashed, "-journal")).unwrap());
+        fs::set_permissions(&crashed, fs::Permissions::from_mode(0o644)).unwrap();
+        let refusal = refusal.expect("refused");
+        assert!(refusal.contains("a change a crash left unfinished") && refusal.contains("could not be undone") && refusal.contains("Nothing was changed"), "{refusal}");
+        assert!(!refusal.contains("SQLite undid") && !refusal.contains("damaged"), "{refusal}");
+        assert!(before == after, "nothing was changed");
+        // Once it may be written to, the same start undoes the change and uses the copy.
+        let (replica, restored) = Replica::open_from_snapshot(&crashed, node.config(), &from, None).unwrap();
+        assert!(matches!(restored, Restored::Ignored));
+        assert_eq!(replica.status().read_to, 40);
     }
 }
