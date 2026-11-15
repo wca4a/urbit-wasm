@@ -51,6 +51,16 @@
 //! already under way stops at its next check that sees the address, best effort, and may
 //! begin one more attempt or question after it. A ship's own key does not change while its
 //! runtime runs.
+//!
+//! The runtime owns its UDP socket and hands it to QUIC, keeping the means to send a bare
+//! packet from the same port. It does so for one thing only: a ship behind a home router, told
+//! by its lookup point that a caller wants it, sends three small packets from that port to the
+//! caller's addresses, which opens its router to that caller (see `crate::lookup`). The packet
+//! (`PUNCH`) is four bytes that any QUIC endpoint drops without a word, and nothing is done on
+//! receiving one. A caller about to try a record that asks for this asks the ship's point to
+//! introduce it first, and gives the attempt the time a lost first packet takes to be sent
+//! again; a connection made that way sends a packet every `keep_alive`, so that the routers
+//! keep the way open while it is idle.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -61,7 +71,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use quinn::crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig};
-use quinn::{Connection, Endpoint, IdleTimeout, Incoming, RecvStream, SendStream, TransportConfig, VarInt};
+use quinn::udp::Transmit;
+use quinn::{AsyncUdpSocket, Connection, Endpoint, EndpointConfig, IdleTimeout, Incoming, RecvStream, Runtime as _, SendStream, TokioRuntime, TransportConfig, VarInt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::AlwaysResolvesClientRawPublicKeys;
 use rustls::crypto::{verify_tls13_signature_with_raw_key, CryptoProvider, WebPkiSupportedAlgorithms};
@@ -71,16 +82,17 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use ship_proto::{
-    peer_reply, peer_request, Deliver, Delivered, Fetch, Heard, Hello, Message, MoonProof, News, PeerReply, PeerRequest, Ping, Pong, Resync,
-    Resynced, Standing, Welcome,
+    peer_reply, peer_request, Deliver, Delivered, Fetch, Heard, Hello, Introduction, Message, MoonProof, News, PeerReply, PeerRequest, Ping, Pong,
+    Resync, Resynced, Standing, Welcome,
 };
 use tokio::sync::Semaphore;
 
 use urbit_id::ob;
 
 use crate::azimuth::{Keys, Listing};
-use crate::lookup::{self, Finder, Lookup, Point, PointStatus};
+use crate::lookup::{self, Bucket, Finder, Lead, Lookup, Point, PointStatus};
 use crate::moon;
+use crate::whereabouts;
 use crate::ship::Taken;
 use crate::store::{PeerWork, Stand, MAX_BATCH_MESSAGES, MAX_FETCH_ENTRIES, MAX_NEWS_LOGS};
 use crate::{canonical_ship, lock, Acked, Error, Runtime};
@@ -112,6 +124,58 @@ const MOST_READING: usize = 8;
 
 /// Room in a request for what goes round a command: names, numbers, and framing.
 const MESSAGE_ENVELOPE_BYTES: usize = 4096;
+
+/// The packet a ship behind a home router sends toward a caller it has been introduced to, to
+/// open its router: four bytes that are no QUIC packet. Its first byte says a short header
+/// follows, and four bytes are too few for one, so a QUIC endpoint drops it as malformed; and
+/// it is far too small to be answered by the only things QUIC sends to strangers, a version
+/// negotiation (only for a long header of at least 1,200 bytes) or a stateless reset (only
+/// for a packet larger than the reset, which is at least 21 bytes, and by the standard never
+/// three times the size of what it answers).
+pub const PUNCH: &[u8] = &[0, 0, 0, 0];
+
+/// How many times a ship sends the packet to each of a caller's addresses, and how long it
+/// waits between. Three, a quarter of a second apart, so that one or two lost on the way, or
+/// arriving at the caller's router before the caller has sent anything through it, still
+/// leave one to open the way; the caller's own attempt is what gets in.
+const PUNCH_ROUNDS: usize = 3;
+const PUNCH_GAP: Duration = Duration::from_millis(250);
+
+
+/// How many introductions a runtime holds at once, handed on by points and not yet weighed.
+/// Past this they are dropped.
+pub const MOST_INTRODUCTIONS_IN_HAND: usize = 8;
+
+/// How many introductions are weighed, all together: as many as this at a stroke, then this
+/// many a second, earned back as time passes. Each may cost a question to Urbit ID and a
+/// signature to check.
+pub const INTRODUCTIONS_WEIGHED: u32 = 32;
+
+/// How many introductions are acted on for any one caller ship, and in all: as many as this
+/// at a stroke, then this many a second, earned back as time passes. The allowance is per
+/// full ship name, so each moon has its own. An introduction is acted on only once it holds
+/// one of the `MOST_PUNCHING` places, taken before either allowance is charged and held until
+/// its last packet; it sends `PUNCH_ROUNDS` packets to each of the caller's addresses, at most
+/// four, so at most twelve.
+///
+/// So the packets in any span of T seconds come from jobs holding a place when the span
+/// begins (at most 16, twelve packets each) or from introductions charged within the span (at
+/// most 2 + 2T for one caller ship, 16 + 16T in all), however the threads are scheduled. In
+/// any span of T seconds: at most 12 x (16 + 2 + 2T) = 216 + 24T packets attributable to one
+/// caller ship, and 12 x (16 + 16 + 16T) = 384 + 192T in all; and, four addresses a job, at
+/// most 72 + 8T distinct addresses for one caller ship and 128 + 64T in all. Kept up, 24 and
+/// 192 packets a second, 8 and 64 addresses a second. Several ships may name the same
+/// addresses, so what any one address can receive is bounded only by the figures in all.
+pub const PUNCHES_EACH: u32 = 2;
+pub const PUNCHES: u32 = 16;
+
+/// How many introductions may be being acted on at once (their packets still being sent), and
+/// how many callers are counted against `PUNCHES_EACH`.
+const MOST_PUNCHING: usize = 16;
+const MOST_PUNCHED_FOR: usize = 1024;
+
+/// The longest one introduction is worked on, a question to Urbit ID included.
+const INTRODUCTION_LIMIT: Duration = Duration::from_secs(5);
 
 /// The smallest a ship's file may be allowed to grow to, for a runtime that goes on the
 /// network. A ship refuses outright any command larger than a quarter of its file, and takes
@@ -602,22 +666,22 @@ impl Directory {
         self.word(name, key, proof, false, Some(still_good))
     }
 
-    /// Take a moon's word, as `vouched` and `recorded_word` describe. `proves` says the moon
-    /// has proved, on a connection, that it holds the key. `still_good`, for a word from a
-    /// record, is asked once the directory is held.
-    fn word(&self, name: &str, key: [u8; 32], proof: &moon::Proof, proves: bool, still_good: Option<&dyn Fn() -> bool>) -> Result<(), &'static str> {
+    /// Whether a moon's word for `key` stands by what is held here, read from `listed`: the
+    /// parent's word signed with the key held for the parent; a key set here by hand never
+    /// changed by a word from elsewhere (only the same key stands, and then there is nothing
+    /// to take); under the same key of the parent's, only forwards, and one key to a
+    /// revision. The parent's key if the word is to be taken, `None` if the key set by hand is
+    /// this one. The one statement of this rule, for taking a word and for weighing one
+    /// without taking it.
+    fn weigh_word(&self, listed: &Listed, name: &str, key: [u8; 32], proof: &moon::Proof) -> Result<Option<[u8; 32]>, &'static str> {
         let (Some(number), Some(parent)) = (ob::moon_number(name), parent_of(name)) else { return Err("not a moon") };
-        let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
-        if still_good.is_some_and(|good| !good()) {
-            return Err("the record the moon's word came in is no longer good by this clock");
-        }
-        let by = self.held(&listed, &parent).ok_or("the moon's parent is not listed")?;
+        let by = self.held(listed, &parent).ok_or("the moon's parent is not listed")?;
         if !moon::holds(&by, number, &key, proof) {
             return Err("not the word of the moon's parent for the key shown");
         }
         match listed.keys.get(name) {
             // Set by whoever runs this runtime, which no word from elsewhere changes.
-            Some(Entry { key: set, from: From::Set, .. }) => return if *set == key { Ok(()) } else { Err("another key is set for the moon here") },
+            Some(Entry { key: set, from: From::Set, .. }) => return if *set == key { Ok(None) } else { Err("another key is set for the moon here") },
             // Under the same key of the parent's: only forwards, and one key to a revision.
             Some(Entry { key: seen, from: From::Vouched { revision, by: then }, .. }) if *then == by => {
                 if proof.revision < *revision || (proof.revision == *revision && *seen != key) {
@@ -626,6 +690,29 @@ impl Directory {
             }
             _ => {}
         }
+        Ok(Some(by))
+    }
+
+    /// Whether a moon's word, as it came in a record, would be taken here, by the very rule
+    /// taking it uses (`weigh_word`), read with the directory held and nothing changed: no
+    /// word kept, nothing marked proved, no room taken. For weighing a record this runtime
+    /// acts on but keeps nothing of (an introduction).
+    pub(crate) fn moon_word_stands(&self, name: &str, key: [u8; 32], proof: &moon::Proof) -> Result<(), &'static str> {
+        let listed = self.listed.read().unwrap_or_else(|e| e.into_inner());
+        self.weigh_word(&listed, name, key, proof).map(drop)
+    }
+
+    /// Take a moon's word, as `vouched` and `recorded_word` describe. `proves` says the moon
+    /// has proved, on a connection, that it holds the key. `still_good`, for a word from a
+    /// record, is asked once the directory is held.
+    fn word(&self, name: &str, key: [u8; 32], proof: &moon::Proof, proves: bool, still_good: Option<&dyn Fn() -> bool>) -> Result<(), &'static str> {
+        let (Some(_), Some(parent)) = (ob::moon_number(name), parent_of(name)) else { return Err("not a moon") };
+        let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
+        if still_good.is_some_and(|good| !good()) {
+            return Err("the record the moon's word came in is no longer good by this clock");
+        }
+        // A key set by hand, and the same: nothing to change.
+        let Some(by) = self.weigh_word(&listed, name, key, proof)? else { return Ok(()) };
         // The parent first: its key now has something standing on it, and it is kept.
         if listed.keys.get(&parent).is_some_and(|parent| !parent.proved) {
             if !self.room_for_proved(&mut listed) {
@@ -917,7 +1004,72 @@ struct Shared {
     finder: Option<Arc<Finder>>,
     /// This runtime's role as a lookup point, if it has one.
     point: Option<Arc<Point>>,
+    /// The UDP socket QUIC runs on, kept to send the packets an introduction calls for.
+    socket: Arc<dyn AsyncUdpSocket>,
+    /// What introductions this runtime's ships have been given, and what came of them.
+    punching: Punching,
 }
+
+/// How a runtime acts on introductions its lookup points pass to its ships.
+struct Punching {
+    /// Introductions that may still be weighed just now.
+    weighing: Mutex<Bucket>,
+    /// Introductions that may still be acted on just now, for each caller, and in all.
+    each: Mutex<HashMap<String, Bucket>>,
+    all: Mutex<Bucket>,
+    /// Places among the introductions being acted on.
+    under_way: Arc<Semaphore>,
+    /// Introductions heard, those let past the weighing allowance, those acted on, and packets
+    /// sent because of them.
+    heard: AtomicU64,
+    weighed: AtomicU64,
+    acted: AtomicU64,
+    sent: Arc<AtomicU64>,
+}
+
+impl Punching {
+    fn new() -> Punching {
+        Punching {
+            weighing: Mutex::new(Bucket::new(INTRODUCTIONS_WEIGHED)),
+            each: Mutex::default(),
+            all: Mutex::new(Bucket::new(PUNCHES)),
+            under_way: Arc::new(Semaphore::new(MOST_PUNCHING)),
+            heard: AtomicU64::new(0),
+            weighed: AtomicU64::new(0),
+            acted: AtomicU64::new(0),
+            sent: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Count one introduction against a caller's allowance, if it has one left. Only so many
+    /// callers are counted; past that, those whose allowance is whole are forgotten.
+    fn for_caller(&self, caller: &str) -> bool {
+        let mut each = lock(&self.each);
+        if !each.contains_key(caller) && each.len() >= MOST_PUNCHED_FOR {
+            each.retain(|_, bucket| !bucket.whole());
+            if each.len() >= MOST_PUNCHED_FOR {
+                return false;
+            }
+        }
+        each.entry(caller.to_string()).or_insert_with(|| Bucket::new(PUNCHES_EACH)).take()
+    }
+}
+
+/// What introductions a runtime's ships have been given by their lookup points.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Introductions {
+    /// Introductions heard and taken to be weighed, those let past the allowance for weighing,
+    /// and those acted on (packets sent for them).
+    pub heard: u64,
+    pub weighed: u64,
+    pub acted: u64,
+    /// Packets sent toward callers because of them.
+    pub sent: u64,
+}
+
+/// A stand-in for the UDP socket a network makes for itself, for tests to put something
+/// between a runtime and everything else. Made inside the network's own threads.
+pub(crate) type MakeSocket = Box<dyn FnOnce() -> io::Result<Arc<dyn AsyncUdpSocket>> + Send>;
 
 /// What the network knows about commands waiting to go to other ships.
 #[derive(Default)]
@@ -991,6 +1143,12 @@ enum Carried {
 
 impl Network {
     pub fn start(runtime: Arc<Runtime>, directory: Arc<Directory>, cfg: NetConfig) -> io::Result<Network> {
+        Network::start_on(runtime, directory, cfg, None)
+    }
+
+    /// The same, with the UDP socket made by `socket` rather than bound at `cfg.addr`: for
+    /// tests only.
+    pub(crate) fn start_on(runtime: Arc<Runtime>, directory: Arc<Directory>, cfg: NetConfig, socket: Option<MakeSocket>) -> io::Result<Network> {
         let addr: SocketAddr = cfg.addr.parse().map_err(|_| io::Error::other("not an address to listen on"))?;
         if cfg.max_message_bytes == 0 || cfg.max_message_bytes > u32::MAX as usize || cfg.max_reading_bytes < cfg.max_message_bytes {
             return Err(io::Error::other("max_reading_bytes must have room for at least one message"));
@@ -1035,6 +1193,11 @@ impl Network {
             return Err(io::Error::other("request_timeout and idle_timeout must be more than nothing and at most a day"));
         }
         cfg.lookup.sound().map_err(io::Error::other)?;
+        // A packet every `keep_alive` keeps a connection open only if it comes before the
+        // connection is taken to be idle.
+        if cfg.lookup.finds() && cfg.lookup.keep_alive >= cfg.idle_timeout {
+            return Err(io::Error::other("keep_alive must be less than idle_timeout"));
+        }
         // The ships' keys are read into memory now, and never from inside a connection being
         // made. If they cannot be read, there is no network.
         runtime.load_identities().map_err(io::Error::other)?;
@@ -1067,9 +1230,15 @@ impl Network {
         // Connections waiting for this runtime to decide whether to take them.
         server.max_incoming(256);
 
-        let endpoint = {
+        // The socket is this runtime's own, handed to QUIC, so that the packets an introduction
+        // calls for go out from the very port the ships are reached at.
+        let (endpoint, socket) = {
             let _entered = tokio.enter();
-            Endpoint::server(server, addr)?
+            let socket = match socket {
+                Some(make) => make()?,
+                None => TokioRuntime.wrap_udp_socket(std::net::UdpSocket::bind(addr)?)?,
+            };
+            (Endpoint::new_with_abstract_socket(EndpointConfig::default(), Some(server), socket.clone(), Arc::new(TokioRuntime))?, socket)
         };
         let bound = endpoint.local_addr()?;
         let reading = Arc::new(Semaphore::new(cfg.max_reading_bytes));
@@ -1077,8 +1246,16 @@ impl Network {
         let working = Arc::new(Semaphore::new(cfg.max_working));
         let carrying = Arc::new(Semaphore::new(cfg.max_carrying));
         let carrier = Arc::new(Carrier::default());
+        // Introductions points pass to this runtime's ships wait here to be weighed, only so many.
+        let (pushed, introductions) = match cfg.lookup.finds() {
+            true => {
+                let (pushed, introductions) = tokio::sync::mpsc::channel(MOST_INTRODUCTIONS_IN_HAND);
+                (Some(pushed), Some(introductions))
+            }
+            false => (None, None),
+        };
         let finder = match cfg.lookup.finds() {
-            true => Some(Arc::new(Finder::new(cfg.lookup.clone(), &cfg, endpoint.clone(), &provider)?)),
+            true => Some(Arc::new(Finder::new(cfg.lookup.clone(), &cfg, endpoint.clone(), &provider, bound, pushed)?)),
             false => None,
         };
         // Taken last of the things that can fail, so that a start that fails gives it back.
@@ -1104,24 +1281,19 @@ impl Network {
             meeting: Mutex::new((MOST_MEETINGS, Instant::now())),
             finder,
             point,
+            socket,
+            punching: Punching::new(),
         });
         tokio.spawn(answer_calls(shared.clone()));
         tokio.spawn(carry(shared.clone()));
         // This runtime's ships are announced to the lookup points for their galaxies, at the
-        // addresses given, or else at the one listened on if that is one others could use.
+        // addresses given, or else at the one each point sees this runtime's connection come
+        // from; and introductions those points pass on are weighed.
         if let Some(finder) = &shared.finder {
-            let addresses = match &shared.cfg.lookup.announce {
-                given if !given.is_empty() => given.clone(),
-                _ if bound.ip().is_unspecified() => Vec::new(),
-                _ => vec![bound],
-            };
-            if addresses.is_empty() {
-                finder.worried(format!(
-                    "not announcing this runtime's ships: it listens on {bound}, which says where it listens and not where it is reached from; give the addresses to announce"
-                ));
-            } else {
-                tokio.spawn(finder.clone().announce(shared.runtime.clone(), addresses));
-            }
+            tokio.spawn(finder.clone().announce(shared.runtime.clone(), shared.cfg.lookup.announce.clone()));
+        }
+        if let Some(introductions) = introductions {
+            tokio.spawn(weigh_introductions(shared.clone(), introductions));
         }
         // From now on the runtime says when a ship has queued commands for other ships.
         let told = carrier.clone();
@@ -1171,6 +1343,25 @@ impl Network {
     /// How this runtime is doing as a lookup point, if it is one.
     pub fn point_status(&self) -> Option<PointStatus> {
         self.shared.point.as_ref().map(|point| point.status())
+    }
+
+    /// What introductions this runtime's ships have been given, and the packets sent because of
+    /// them.
+    pub fn introductions(&self) -> Introductions {
+        let punching = &self.shared.punching;
+        Introductions {
+            heard: punching.heard.load(Ordering::SeqCst),
+            weighed: punching.weighed.load(Ordering::SeqCst),
+            acted: punching.acted.load(Ordering::SeqCst),
+            sent: punching.sent.load(Ordering::SeqCst),
+        }
+    }
+
+    /// What one of this runtime's ships was last announced as, if a point took its record:
+    /// its addresses, and whether callers were asked to be introduced.
+    pub fn announced_as(&self, ship: &str) -> Option<(Vec<SocketAddr>, bool)> {
+        let ship = canonical_ship(ship).ok()?;
+        self.shared.finder.as_ref()?.shown_as(&ship)
     }
 
     /// The last thing that went wrong in finding ships through lookup points or announcing
@@ -1690,6 +1881,14 @@ impl Shared {
     /// being tried to its end (its few addresses are each time-limited, and whatever answers
     /// must prove the key); the newer record is used by the next round of this call, if there
     /// is one, or by the next call. Only the record that was tried is marked failed.
+    ///
+    /// A record that asks callers to be introduced: before its addresses are tried, the
+    /// directory is read again as before a question, and the ship's point is asked to
+    /// introduce this ship, waiting at most `INTRODUCE_WAIT` (or a quarter of the time left)
+    /// for it to say so; whatever it says, or if it says nothing, the addresses are then tried
+    /// as for any record, each for longer (`TRY_INTRODUCED`, or three quarters of the time
+    /// left), on a connection that keeps itself alive. A ship that announces no record of its
+    /// own cannot be introduced, and tries the addresses without.
     async fn dial_found(
         self: &Arc<Self>,
         client: &quinn::ClientConfig,
@@ -1710,14 +1909,33 @@ impl Shared {
             }
             // The record the addresses come from, by the number it was kept under, so that
             // only that one is marked failed.
-            let (kept_as, addresses) = if asking { finder.ask(&self.directory, to, deadline).await? } else { finder.cached(to).unwrap_or_default() };
-            for &addr in &addresses {
+            let lead: Lead = if asking { finder.ask(&self.directory, to, deadline).await? } else { finder.cached(to).unwrap_or_default() };
+            if lead.introduce && !lead.addresses.is_empty() {
+                // Read again before the point is asked, as before a question.
+                if !matches!(self.route(to), Some(Route::Found(key)) if moon || key == held) {
+                    return Err(changed());
+                }
+                if let Ok(Err(failed)) = tokio::time::timeout(lookup::introduce_wait(deadline), finder.introduce(&self.runtime, from, to, deadline)).await {
+                    finder.worried(format!("~{to}: {failed}"));
+                }
+            }
+            // A connection made on such a record keeps itself alive, so that the routers on the
+            // way keep it open while it is idle.
+            let kept_alive;
+            let client = if lead.introduce {
+                kept_alive = self.kept_alive(client)?;
+                &kept_alive
+            } else {
+                client
+            };
+            for &addr in &lead.addresses {
                 // The last thing read before an attempt: nothing waits after it.
                 let now_held = match self.route(to) {
                     Some(Route::Found(key)) if moon || key == held => key,
                     _ => return Err(changed()),
                 };
-                match tokio::time::timeout(lookup::try_limit(deadline), self.dial(client, from, to, now_held, addr, true)).await {
+                let limit = if lead.introduce { lookup::introduced_limit(deadline) } else { lookup::try_limit(deadline) };
+                match tokio::time::timeout(limit, self.dial(client, from, to, now_held, addr, true)).await {
                     Ok(Ok((connection, proved))) => {
                         // Connecting took time. If an address has been set by hand meanwhile,
                         // or the ship's key has changed, what was just proved is out of date.
@@ -1731,11 +1949,104 @@ impl Shared {
                     Err(_) => why = NetError::Unreachable(format!("nothing answered as ~{to} at {addr} in time")),
                 }
             }
-            if !addresses.is_empty() {
-                finder.failed(to, kept_as);
+            if !lead.addresses.is_empty() {
+                finder.failed(to, lead.kept_as);
+                if lead.introduce {
+                    why = NetError::Unreachable(format!(
+                        "~{to} could not be reached directly: it asks to be introduced first, and nothing answered as it after that (its router, or this runtime's, lets nothing in this way; reaching it would need a relay, which is not built). Last: {why}"
+                    ));
+                }
             }
         }
         Err(why)
+    }
+
+    /// The same way of calling, with a packet sent every `keep_alive`: for a connection made
+    /// on a record that asks for introductions, so that the routers it passes through keep it
+    /// open while it is idle. Nothing else about it changes.
+    fn kept_alive(&self, client: &quinn::ClientConfig) -> Result<quinn::ClientConfig, NetError> {
+        let mut transport = transport(&self.cfg, 0).map_err(|e| NetError::Unreachable(e.to_string()))?;
+        transport.keep_alive_interval(Some(self.cfg.lookup.keep_alive));
+        let mut client = client.clone();
+        client.transport_config(Arc::new(transport));
+        Ok(client)
+    }
+
+    /// A lookup point has passed on a caller's record for one of this runtime's ships. If that
+    /// ship was last announced asking callers to be introduced, the record is believed by this
+    /// runtime's own checks, and the allowances let it, `PUNCH` is sent from this runtime's
+    /// port to each address the record names, `PUNCH_ROUNDS` times, and nothing else.
+    ///
+    /// Nothing the point says is taken on its word, the record is weighed against what this
+    /// runtime already believes of the caller as an ordinary lookup would weigh it, and nothing
+    /// of the introduction is kept:
+    /// not the record, not a moon's word in it, not a route. The caller's key is read from
+    /// Urbit ID into the directory as for any ship that says its name, under the same limits.
+    async fn introduced(self: &Arc<Self>, introduction: &[u8]) -> Result<(), &'static str> {
+        let finder = self.finder.as_ref().ok_or("this runtime finds no ships through lookup points")?;
+        let Introduction { callee, record } = Introduction::decode(introduction).map_err(|_| "not an introduction")?;
+        let callee = whereabouts::name_of(callee).ok_or("the introduction names no ship")?;
+        // Only for a ship held here, and last announced asking for introductions.
+        if self.runtime.signing_key(&callee).is_err() || !finder.introduces(&callee) {
+            return Err("the introduction is for no ship here that asks for introductions");
+        }
+        if !lock(&self.punching.weighing).take() {
+            return Err("too many introductions just now");
+        }
+        self.punching.weighed.fetch_add(1, Ordering::SeqCst);
+        let caller = whereabouts::ship_of(&record).and_then(whereabouts::name_of).ok_or("the introduction carries no record")?;
+        if self.runtime.signing_key(&caller).is_ok() {
+            return Err("the introduction is of a ship of this runtime's own");
+        }
+        // The caller's key is found as any caller's is, and under the same limits.
+        let subject = parent_of(&caller).unwrap_or_else(|| caller.clone());
+        if self.directory.due(&subject) == Due::Now && !self.may_meet() {
+            return Err("too many ships nothing is known of just now");
+        }
+        self.know(&caller, MOST_LOOKUPS / 2).await;
+        // Believed by this runtime's own checks: keys from its own directory, fresh by its own
+        // clock, and weighed against what this runtime already believes of the caller (the
+        // newest record held for it, and for a moon the latest of its parent's word), as an
+        // ordinary lookup would weigh it. Nothing of it is kept: neither is advanced.
+        let (known, now) = finder.known(&caller, &self.directory);
+        let believed = whereabouts::check(&record, &|name: &str| self.directory.key_of(name), known, now)?;
+        // For a moon, its parent's word is weighed by the directory's own rule, as an ordinary
+        // lookup weighs it (a key set by hand for the moon included), without taking it.
+        if let (Some((_, key)), Some(proof)) = (believed.moon, believed.proof) {
+            self.directory.moon_word_stands(&caller, key, &proof)?;
+        }
+        // Finding the caller's key may have waited: whether the ship still asks to be
+        // introduced is read again before anything is sent.
+        if !finder.introduces(&callee) {
+            return Err("the ship no longer asks for introductions");
+        }
+        // A place among those under way first, then the allowances; a refusal after the place is
+        // taken gives it back at once. Introductions are weighed one at a time, so no other can
+        // want a place while a refused one briefly holds it.
+        let turn = self.punching.under_way.clone().try_acquire_owned().map_err(|_| "too many introductions being acted on")?;
+        if !self.punching.for_caller(&caller) {
+            return Err("too many introductions of that caller just now");
+        }
+        if !lock(&self.punching.all).take() {
+            return Err("too many introductions acted on just now");
+        }
+        self.punching.acted.fetch_add(1, Ordering::SeqCst);
+        let (socket, sent) = (self.socket.clone(), self.punching.sent.clone());
+        tokio::spawn(async move {
+            for round in 0..PUNCH_ROUNDS {
+                if round > 0 {
+                    tokio::time::sleep(PUNCH_GAP).await;
+                }
+                for &destination in &believed.addresses {
+                    let packet = Transmit { destination, ecn: None, contents: PUNCH, segment_size: None, src_ip: None };
+                    if socket.try_send(&packet).is_ok() {
+                        sent.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            drop(turn);
+        });
+        Ok(())
     }
 
     /// The first thing said on a connection this runtime has made: which ship is calling,
@@ -1904,6 +2215,15 @@ impl Place {
 impl Drop for Place {
     fn drop(&mut self) {
         self.0.taken.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Weigh the introductions lookup points pass to this runtime's ships, one at a time, each
+/// within `INTRODUCTION_LIMIT`, for as long as the network runs.
+async fn weigh_introductions(shared: Arc<Shared>, mut introductions: tokio::sync::mpsc::Receiver<Vec<u8>>) {
+    while let Some(introduction) = introductions.recv().await {
+        shared.punching.heard.fetch_add(1, Ordering::SeqCst);
+        let _ = tokio::time::timeout(INTRODUCTION_LIMIT, shared.introduced(&introduction)).await;
     }
 }
 
@@ -2809,6 +3129,12 @@ async fn carry_messages(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried
     Carried::All
 }
 
+/// Ships behind pretend home routers, which need the crate's own way of giving a network a
+/// socket.
+#[cfg(test)]
+#[path = "router_tests.rs"]
+mod router_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3273,6 +3599,23 @@ mod tests {
     fn deliver(count: usize) -> Vec<u8> {
         let messages = (0..count).map(|_| ship_proto::PeerMessage::default()).collect();
         PeerRequest { body: Some(peer_request::Body::Deliver(Deliver { messages })) }.encode_to_vec()
+    }
+
+    #[test]
+    fn only_so_many_callers_are_counted_for_introductions() {
+        let punching = Punching::new();
+        for n in 0..MOST_PUNCHED_FOR {
+            assert!(punching.for_caller(&format!("caller-{n}")));
+        }
+        // Each has spent half its allowance, so none is forgotten: a new caller is turned away.
+        assert!(!punching.for_caller("another"));
+        // One already counted has its allowance still.
+        assert!(punching.for_caller("caller-0"));
+        assert!(!punching.for_caller("caller-0"));
+        // Once allowances are whole again, the callers are forgotten and a new one is counted.
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(punching.for_caller("another"));
+        assert!(lock(&punching.each).len() < 3);
     }
 
     #[test]

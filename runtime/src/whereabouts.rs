@@ -29,6 +29,21 @@
 //!
 //! `check` weighs a record by the clock it is given. Whoever keeps a record weighs its time
 //! again with the clock read where it is kept, under the lock that guards what is kept.
+//!
+//! A record carries one more thing its ship says, under the same signature: whether callers
+//! should ask the ship's lookup point to introduce them before they call. A ship behind a home
+//! router sets it, since its router lets nothing in from an address it has not sent to first.
+//! A point cannot set it or clear it.
+//!
+//! Presence. A record says where a ship is, and anyone can read one from a point and hand it
+//! on. So when a ship gives its record to a point, it also signs, with the same key, a short
+//! statement that names the ship, the record's time, and a value that both ends of that one
+//! connection work out from its handshake and nobody else can (`presence`, `present`). The
+//! point keeps a record only with that, so a record cannot be announced by anyone but its
+//! ship, and the point knows which connection the ship itself is on. The value is TLS's
+//! exporter for the connection: it comes from the secrets of that one handshake, which both
+//! ends make afresh for every connection (nothing is resumed), so it is never the same on two
+//! connections, and someone in the middle of two handshakes cannot make them agree on it.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -41,6 +56,17 @@ use crate::moon;
 /// What goes in front of what is signed, so that a signature on a record can never be taken
 /// for a signature on anything else a ship signs.
 const LABEL: &[u8] = b"ship.v1.where\n";
+
+/// What goes in front of a ship's presence on a connection, so that it can never be taken for
+/// anything else the ship signs.
+const PRESENCE_LABEL: &[u8] = b"ship.v1.here\n";
+
+/// What the value both ends of a connection work out from its handshake is asked for under.
+pub(crate) const BINDING_LABEL: &[u8] = b"ship.v1.here";
+
+/// The value both ends of one connection work out from its handshake, and nobody else can:
+/// TLS's exporter for the connection, asked for under `ship.v1.here` with no context.
+pub type Binding = [u8; 32];
 
 /// The most addresses one record may name. A caller tries each, so this bounds how many
 /// places a record can have callers send to.
@@ -64,9 +90,9 @@ pub const MOST_RECORD_BYTES: usize = 512;
 /// zeros), and the port.
 const SLOT_BYTES: usize = 1 + 16 + 2;
 
-/// The length of what is signed: the label, the ship, when it was made, how many addresses,
-/// and a slot for each of the most there may be.
-const STATEMENT_BYTES: usize = LABEL.len() + 8 + 8 + 1 + MOST_ADDRESSES * SLOT_BYTES;
+/// The length of what is signed: the label, the ship, when it was made, whether callers should
+/// be introduced, how many addresses, and a slot for each of the most there may be.
+const STATEMENT_BYTES: usize = LABEL.len() + 8 + 8 + 1 + 1 + MOST_ADDRESSES * SLOT_BYTES;
 
 /// What a record says, once it is believed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +107,11 @@ pub struct Believed {
     pub moon: Option<(u32, [u8; 32])>,
     /// For a moon: its parent's word itself, for whoever keeps the moon's keys to take in.
     pub proof: Option<moon::Proof>,
+    /// The ship's word that callers should ask to be introduced before they call.
+    pub introduce: bool,
+    /// The key that signed it: the ship's own, or for a moon the key its parent vouched for.
+    /// Its presence on a connection is checked against this.
+    pub signer: [u8; 32],
 }
 
 /// What is already known of a ship, against which a new record of it is weighed.
@@ -115,7 +146,7 @@ pub fn galaxy_of(number: u64) -> u8 {
 }
 
 /// The name of a ship, without the `~`, if the number is one Urbit ID has a place for.
-fn name_of(number: u64) -> Option<String> {
+pub(crate) fn name_of(number: u64) -> Option<String> {
     let name = match u32::try_from(number) {
         Ok(ship) => ob::ship_name(ship),
         Err(_) => ob::moon_name(number)?,
@@ -150,7 +181,7 @@ pub fn fits(addresses: &[SocketAddr]) -> Result<(), &'static str> {
 }
 
 /// An address as it travels in a record.
-fn address_bytes(addr: &SocketAddr) -> Vec<u8> {
+pub(crate) fn address_bytes(addr: &SocketAddr) -> Vec<u8> {
     let mut bytes = match addr.ip() {
         IpAddr::V4(ip) => ip.octets().to_vec(),
         IpAddr::V6(ip) => ip.octets().to_vec(),
@@ -160,7 +191,7 @@ fn address_bytes(addr: &SocketAddr) -> Vec<u8> {
 }
 
 /// An address as it travelled, if it is one.
-fn address_read(bytes: &[u8]) -> Option<SocketAddr> {
+pub(crate) fn address_read(bytes: &[u8]) -> Option<SocketAddr> {
     let port = |at: usize| u16::from_be_bytes([bytes[at], bytes[at + 1]]);
     match bytes.len() {
         6 => Some(SocketAddr::new(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).into(), port(4))),
@@ -169,9 +200,10 @@ fn address_read(bytes: &[u8]) -> Option<SocketAddr> {
     }
 }
 
-/// What a ship signs: the label, then its number, when it made the record, how many
-/// addresses, and each address in a slot of its own, with empty slots after.
-fn statement(ship: u64, issued: u64, addresses: &[SocketAddr]) -> [u8; STATEMENT_BYTES] {
+/// What a ship signs: the label, then its number, when it made the record, whether callers
+/// should ask to be introduced (one byte, one or nought), how many addresses, and each address
+/// in a slot of its own, with empty slots after.
+fn statement(ship: u64, issued: u64, introduce: bool, addresses: &[SocketAddr]) -> [u8; STATEMENT_BYTES] {
     let mut out = [0u8; STATEMENT_BYTES];
     let mut at = 0;
     let mut put = |bytes: &[u8]| {
@@ -181,6 +213,7 @@ fn statement(ship: u64, issued: u64, addresses: &[SocketAddr]) -> [u8; STATEMENT
     put(LABEL);
     put(&ship.to_be_bytes());
     put(&issued.to_be_bytes());
+    put(&[u8::from(introduce)]);
     put(&[addresses.len().min(MOST_ADDRESSES) as u8]);
     for slot in 0..MOST_ADDRESSES {
         let mut written = [0u8; SLOT_BYTES];
@@ -204,8 +237,13 @@ fn statement(ship: u64, issued: u64, addresses: &[SocketAddr]) -> [u8; STATEMENT
 
 /// A ship's record of where it is, signed with its networking key, as it travels. For a
 /// moon, `proof` is its parent's word for the key, and is required; for any other ship it
-/// must be absent.
+/// must be absent. Callers are not asked to be introduced first (see `sign_flagged`).
 pub fn sign(ship: &str, addresses: &[SocketAddr], issued: u64, key: &SigningKey, proof: Option<moon::Proof>) -> Result<Vec<u8>, String> {
+    sign_flagged(ship, addresses, issued, false, key, proof)
+}
+
+/// The same, saying whether callers should ask the ship's lookup point to introduce them first.
+pub fn sign_flagged(ship: &str, addresses: &[SocketAddr], issued: u64, introduce: bool, key: &SigningKey, proof: Option<moon::Proof>) -> Result<Vec<u8>, String> {
     let number = ob::any_number(ship).ok_or_else(|| format!("{ship} is not the name of a ship"))?;
     // Only the address and port go in a record: whatever else an IPv6 address carries is
     // left behind, so that what is signed is what is sent.
@@ -217,9 +255,31 @@ pub fn sign(ship: &str, addresses: &[SocketAddr], issued: u64, key: &SigningKey,
         (true, None) => return Err(format!("{ship} is a moon, and its record needs its parent's word for its key")),
         (false, Some(_)) => return Err(format!("{ship} is not a moon, and has no parent's word to show")),
     };
-    let signature = key.sign(&statement(number, issued, &addresses)).to_bytes().to_vec();
-    let record = Whereabouts { ship: number, addresses: addresses.iter().map(address_bytes).collect(), issued, moon_key, proof, signature };
+    let signature = key.sign(&statement(number, issued, introduce, &addresses)).to_bytes().to_vec();
+    let record = Whereabouts { ship: number, addresses: addresses.iter().map(address_bytes).collect(), issued, moon_key, proof, signature, introduce };
     Ok(record.encode_to_vec())
+}
+
+/// What a ship signs to say it is on a connection: the label, then its number, the time of the
+/// record it gives over that connection, and the value both ends work out from the
+/// connection's handshake.
+fn presence_statement(ship: u64, issued: u64, binding: &Binding) -> Vec<u8> {
+    [PRESENCE_LABEL, &ship.to_be_bytes()[..], &issued.to_be_bytes()[..], &binding[..]].concat()
+}
+
+/// A ship's presence on a connection, for the record it made at `issued`, signed with the key
+/// that signed the record.
+pub fn presence(ship: u64, issued: u64, binding: &Binding, key: &SigningKey) -> Vec<u8> {
+    key.sign(&presence_statement(ship, issued, binding)).to_bytes().to_vec()
+}
+
+/// Whether `signature` is the presence, on the connection `binding` stands for, of the ship
+/// whose believed record this is: signed by the key that signed the record, over the record's
+/// ship and time and this connection's value.
+pub(crate) fn present(believed: &Believed, binding: &Binding, signature: &[u8]) -> Result<(), &'static str> {
+    let signature = Signature::from_slice(signature).map_err(|_| "the record came without the ship's presence on this connection")?;
+    let signer = VerifyingKey::from_bytes(&believed.signer).map_err(|_| "the key that signed is not a key")?;
+    signer.verify_strict(&presence_statement(believed.number, believed.issued, binding), &signature).map_err(|_| "the ship's presence is not for this connection")
 }
 
 /// The ship a record is for, by number, if it is a record at all. Nothing is checked: this
@@ -294,9 +354,19 @@ pub fn check(bytes: &[u8], key_of: &dyn Fn(&str) -> Option<[u8; 32]>, known: Kno
         }
         (key_of(&name).ok_or("no key is listed for the ship")?, None)
     };
+    let signed_by = signer;
     let signer = VerifyingKey::from_bytes(&signer).map_err(|_| "the key that signed is not a key")?;
-    signer.verify_strict(&statement(record.ship, record.issued, &addresses), &signature).map_err(|_| "the record is not signed by the ship's key")?;
-    Ok(Believed { ship: name, number: record.ship, addresses, issued: record.issued, moon: moon.map(|(revision, key, _)| (revision, key)), proof: moon.map(|(_, _, proof)| proof) })
+    signer.verify_strict(&statement(record.ship, record.issued, record.introduce, &addresses), &signature).map_err(|_| "the record is not signed by the ship's key")?;
+    Ok(Believed {
+        ship: name,
+        number: record.ship,
+        addresses,
+        issued: record.issued,
+        moon: moon.map(|(revision, key, _)| (revision, key)),
+        proof: moon.map(|(_, _, proof)| proof),
+        introduce: record.introduce,
+        signer: signed_by,
+    })
 }
 
 #[cfg(test)]
@@ -327,8 +397,8 @@ mod tests {
     /// Sign the fixed layout for any fields at all, even ones `sign` would refuse, and wrap
     /// them as a record.
     fn forged(ship: u64, addresses: &[Vec<u8>], issued: u64, signer: &SigningKey, read_as: &[SocketAddr]) -> Whereabouts {
-        let signature = signer.sign(&statement(ship, issued, read_as)).to_bytes().to_vec();
-        Whereabouts { ship, addresses: addresses.to_vec(), issued, moon_key: Vec::new(), proof: None, signature }
+        let signature = signer.sign(&statement(ship, issued, false, read_as)).to_bytes().to_vec();
+        Whereabouts { ship, addresses: addresses.to_vec(), issued, moon_key: Vec::new(), proof: None, signature, introduce: false }
     }
 
     #[test]
@@ -337,15 +407,16 @@ mod tests {
         let addresses = [at("203.0.113.7:4433"), at("[2001:db8::1]:4433")];
         let record = sign(&name, &addresses, NOW, &key(1), None).unwrap();
         let believed = check(&record, &listing(&name, &key(1)), Known::default(), NOW).unwrap();
-        assert_eq!(believed, Believed { ship: name.clone(), number, addresses: addresses.to_vec(), issued: NOW, moon: None, proof: None });
+        let signer = key(1).verifying_key().to_bytes();
+        assert_eq!(believed, Believed { ship: name.clone(), number, addresses: addresses.to_vec(), issued: NOW, moon: None, proof: None, introduce: false, signer });
         assert_eq!(ship_of(&record), Some(number));
         assert!(record.len() < 300);
         // By another key, or with no key listed for the ship, it is not.
         assert_eq!(check(&record, &listing(&name, &key(2)), Known::default(), NOW), Err("the record is not signed by the ship's key"));
         assert_eq!(check(&record, &|_: &str| None, Known::default(), NOW), Err("no key is listed for the ship"));
         // What is signed has the label in front and is the same length whatever is in it.
-        assert_eq!(&statement(number, NOW, &addresses)[..LABEL.len()], LABEL);
-        assert_eq!(statement(number, NOW, &addresses[..1]).len(), STATEMENT_BYTES);
+        assert_eq!(&statement(number, NOW, false, &addresses)[..LABEL.len()], LABEL);
+        assert_eq!(statement(number, NOW, false, &addresses[..1]).len(), STATEMENT_BYTES);
     }
 
     #[test]
@@ -371,6 +442,8 @@ mod tests {
             Box::new(|record| drop(record.addresses.pop())),
             Box::new(|record| record.addresses.push(address_bytes(&at("198.51.100.1:1")))),
             Box::new(|record| record.signature[5] ^= 1),
+            // Whether callers should be introduced is under the signature too.
+            Box::new(|record| record.introduce = !record.introduce),
         ];
         for (n, change) in changes.iter().enumerate() {
             let mut record = good.clone();
@@ -378,16 +451,74 @@ mod tests {
             assert!(checked(&record).is_err(), "change {n} went unnoticed");
         }
         // The same fields signed without the label, or under another label, are not a record.
-        let bare = key(1).sign(&statement(number, NOW, &addresses)[LABEL.len()..]).to_bytes().to_vec();
+        let bare = key(1).sign(&statement(number, NOW, false, &addresses)[LABEL.len()..]).to_bytes().to_vec();
         assert!(checked(&Whereabouts { signature: bare, ..good.clone() }).is_err());
-        let mut moon_label = statement(number, NOW, &addresses);
+        let mut moon_label = statement(number, NOW, false, &addresses);
         moon_label[..LABEL.len()].copy_from_slice(b"ship.v1.moon\n\n");
         assert!(checked(&Whereabouts { signature: key(1).sign(&moon_label).to_bytes().to_vec(), ..good.clone() }).is_err());
         // Each slot is written at its place: an address moved to another slot is another
         // statement.
         let one = [at("203.0.113.7:4433")];
-        assert_ne!(statement(number, NOW, &one), statement(number, NOW, &[at("203.0.113.7:4434")]));
-        assert_ne!(statement(number, NOW, &addresses), statement(number, NOW, &[addresses[1], addresses[0]]));
+        assert_ne!(statement(number, NOW, false, &one), statement(number, NOW, false, &[at("203.0.113.7:4434")]));
+        assert_ne!(statement(number, NOW, false, &addresses), statement(number, NOW, false, &[addresses[1], addresses[0]]));
+        assert_ne!(statement(number, NOW, false, &one), statement(number, NOW, true, &one));
+    }
+
+    #[test]
+    fn whether_callers_are_to_be_introduced_is_the_ships_own_word() {
+        let (number, name) = planet();
+        let keys = listing(&name, &key(1));
+        let addresses = [at("203.0.113.7:4433")];
+        // Signed with the flag, a record says so, and without, it does not.
+        let flagged = sign_flagged(&name, &addresses, NOW, true, &key(1), None).unwrap();
+        assert!(check(&flagged, &keys, Known::default(), NOW).unwrap().introduce);
+        assert!(!check(&sign(&name, &addresses, NOW, &key(1), None).unwrap(), &keys, Known::default(), NOW).unwrap().introduce);
+        // Whoever passes the record on cannot clear it, or set it on a record without it.
+        let mut cleared = Whereabouts::decode(&*flagged).unwrap();
+        cleared.introduce = false;
+        assert_eq!(check(&cleared.encode_to_vec(), &keys, Known::default(), NOW), Err("the record is not signed by the ship's key"));
+        let mut set = Whereabouts::decode(&*sign(&name, &addresses, NOW, &key(1), None).unwrap()).unwrap();
+        set.introduce = true;
+        assert_eq!(check(&set.encode_to_vec(), &keys, Known::default(), NOW), Err("the record is not signed by the ship's key"));
+        // The flag is written one way only: as one, when set.
+        let mut twice = flagged.clone();
+        let at = twice.len() - 1;
+        assert_eq!(&twice[at - 1..], &[0x38, 0x01]);
+        twice[at] = 0x02;
+        assert!(Whereabouts::decode(&*twice).unwrap().introduce);
+        assert!(check(&twice, &keys, Known::default(), NOW).is_err());
+        let _ = number;
+    }
+
+    #[test]
+    fn a_ships_presence_is_for_one_ship_one_record_one_connection_and_one_key() {
+        let (number, name) = planet();
+        let keys = listing(&name, &key(1));
+        let record = sign(&name, &[at("203.0.113.7:4433")], NOW, &key(1), None).unwrap();
+        let believed = check(&record, &keys, Known::default(), NOW).unwrap();
+        let (here, there) = ([7u8; 32], [8u8; 32]);
+        assert_eq!(present(&believed, &here, &presence(number, NOW, &here, &key(1))), Ok(()));
+        // Made for another connection, another ship, another time, by another key; nothing.
+        let not = Err("the ship's presence is not for this connection");
+        assert_eq!(present(&believed, &here, &presence(number, NOW, &there, &key(1))), not);
+        assert_eq!(present(&believed, &here, &presence(number + 1, NOW, &here, &key(1))), not);
+        assert_eq!(present(&believed, &here, &presence(number, NOW + 1, &here, &key(1))), not);
+        assert_eq!(present(&believed, &here, &presence(number, NOW, &here, &key(2))), not);
+        assert_eq!(present(&believed, &here, &[]), Err("the record came without the ship's presence on this connection"));
+        // A record's own signature is not a presence, nor the other way round.
+        let signature = Whereabouts::decode(&*record).unwrap().signature;
+        assert_eq!(present(&believed, &here, &signature), not);
+        // A moon's presence is by the key its record carries, which its parent vouched for.
+        let moon = 7u64 << 32 | number;
+        let moon_key = key(5);
+        let word = moon::vouch(&key(1), moon, 1, &moon_key.verifying_key().to_bytes());
+        let moons = check(&sign(&name_of(moon).unwrap(), &[at("203.0.113.7:4433")], NOW, &moon_key, Some(word)).unwrap(), &keys, Known::default(), NOW).unwrap();
+        assert_eq!(moons.signer, moon_key.verifying_key().to_bytes());
+        assert_eq!(present(&moons, &here, &presence(moon, NOW, &here, &moon_key)), Ok(()));
+        assert_eq!(present(&moons, &here, &presence(moon, NOW, &here, &key(1))), not);
+        // What is signed has its own label in front, and nothing else a ship signs has it.
+        assert_eq!(&presence_statement(number, NOW, &here)[..PRESENCE_LABEL.len()], PRESENCE_LABEL);
+        assert_ne!(PRESENCE_LABEL, LABEL);
     }
 
     #[test]

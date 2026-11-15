@@ -554,6 +554,10 @@ message Whereabouts {
   MoonProof proof = 5;
   // The ship's signature, with its networking key, over the fixed layout.
   bytes signature = 6;
+  // The ship's own word that callers should ask its lookup point to introduce them before
+  // they call: it is behind a router that lets nothing in that it has not sent to first.
+  // Under the signature, so a point can neither set it nor clear it.
+  bool introduce = 7;
 }
 
 // To a lookup point, over a connection of its own protocol (`ship-where/1`). One request and
@@ -562,12 +566,32 @@ message WhereRequest {
   oneof body {
     Announce announce = 1;
     Where ask = 2;
+    Seen seen = 3;
+    Introduce introduce = 4;
   }
 }
 
 // A runtime gives the point the records of some of its ships, each an encoded Whereabouts.
+// With each, in the same order, the ship's presence: its signature, by the key that signed
+// the record, over a fixed layout that names the ship, the record's time, and a value both
+// ends derive from this one connection (see `runtime/src/whereabouts.rs`). So a record is
+// kept only from the connection the ship itself is on.
 message Announce {
   repeated bytes records = 1;
+  repeated bytes presence = 2;
+}
+
+// What address does this connection come from, as the point sees it?
+message Seen {
+}
+
+// A caller asks the point of the ship it wants to call to pass its record to that ship, so
+// that the ship sends a few packets toward the caller and opens its router. The caller's own
+// record, signed now, and its presence for this connection, as in an announcement.
+message Introduce {
+  uint64 callee = 1;
+  bytes record = 2;
+  bytes presence = 3;
 }
 
 // Anyone asks the point where a ship is, by number.
@@ -579,6 +603,8 @@ message WhereReply {
   oneof body {
     Announced announced = 1;
     Found found = 2;
+    Saw saw = 3;
+    Introduced introduced = 4;
   }
   // Set, with no body, when the request was not one the point would answer.
   string refused = 15;
@@ -593,4 +619,23 @@ message Announced {
 // good. Whoever asked checks it as if it came from anyone.
 message Found {
   bytes record = 1;
+}
+
+// The address the point sees the connection coming from: an IPv4 address and port (six
+// bytes) or an IPv6 address and port (eighteen), as in a record.
+message Saw {
+  bytes address = 1;
+}
+
+// The caller's record has been passed on to the ship it wants. The point does not wait for
+// that ship, and says nothing of what it did.
+message Introduced {
+}
+
+// From a lookup point to a ship, on a stream the point opens on the connection the ship
+// proved it is on: a caller's record, for the ship named, to send a few packets toward.
+// Nothing in it is taken on the point's word: the record is checked as any record is.
+message Introduction {
+  uint64 callee = 1;
+  bytes record = 2;
 }

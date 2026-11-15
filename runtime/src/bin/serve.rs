@@ -10,7 +10,9 @@
 //! With `--lookup-at` or `--lookup-domain` the ships are also found by name alone: each of
 //! this runtime's ships is announced, with a record of where it is that it signs, to the
 //! lookup point for its galaxy, and a ship with no `--peer` address is looked for there.
-//! `--lookup-point` makes this runtime a lookup point itself.
+//! Unless `--announce` says where the runtime is reached, it announces the address the point
+//! sees it at, which works behind a home router too. `--lookup-point` makes this runtime a
+//! lookup point itself.
 //!
 //! With `--azimuth-copy` those keys come from a copy of Azimuth kept in a file and worked
 //! out from Ethereum alone, in place of asking the roller about ships on layer 2. The copy
@@ -38,7 +40,7 @@ const USAGE: &str = "usage: serve --dir <data directory> [--addr 127.0.0.1:8080]
              [--azimuth-until <block>] [--azimuth-write-snapshot <file>]
              [--peer <ship>=<address>]...
              [--lookup-at [<galaxy>=]<address>]... [--lookup-domain <domain>:<port>]
-             [--announce <address>]... [--lookup-point <all | galaxy,galaxy,...>]
+             [--announce <address>]... [--behind-router] [--lookup-point <all | galaxy,galaxy,...>]
              [--keyfile <file>] [--lookup <ship>]...
 
   --storage-key-file <file>
@@ -82,9 +84,13 @@ const USAGE: &str = "usage: serve --dir <data directory> [--addr 127.0.0.1:8080]
                          find the lookup point for each galaxy by name, as <galaxy>.<domain>
                          (the point for ~zod is zod.<domain>), through this machine's resolver
   --announce <address>   the address other ships reach this runtime at, to announce its ships
-                         at; up to four. Without it, the address given to --net, unless that is
-                         0.0.0.0 or ::, which says nothing of where the runtime is reached, and
-                         then nothing is announced. Needs --lookup-at or --lookup-domain
+                         at; up to four. Without it, the address the lookup point of each ship's
+                         galaxy sees this runtime at, and if that is not the address given to
+                         --net, callers are asked to be introduced first, so that a home router
+                         lets them in. Needs --lookup-at or --lookup-domain
+  --behind-router        ask callers to be introduced first even with --announce: for a runtime
+                         whose outside address is known but whose router lets nothing in that
+                         it has not sent to first. Needs --lookup-at or --lookup-domain
   --lookup-point <all | galaxy,galaxy,...>
                          also be the lookup point for the ships of these galaxies (all, or a
                          list such as ~zod,~nec): keep the signed records of where they are
@@ -177,7 +183,7 @@ fn galaxy(written: &str) -> Option<u8> {
 
 /// The settings for finding ships through lookup points, announcing to them, and being one,
 /// from what was given on the command line.
-fn lookup_settings(at: &[String], domain: Option<&str>, announce: &[String], point: Option<&str>, keys: &Arc<dyn Keys>) -> Lookup {
+fn lookup_settings(at: &[String], domain: Option<&str>, announce: &[String], behind_router: bool, point: Option<&str>, keys: &Arc<dyn Keys>) -> Lookup {
     let at = at
         .iter()
         .map(|given| {
@@ -202,7 +208,7 @@ fn lookup_settings(at: &[String], domain: Option<&str>, announce: &[String], poi
         };
         PointConfig { keys: keys.clone(), galaxies, bounds: PointBounds::default() }
     });
-    Lookup { serve, at, domain, announce, ..Lookup::default() }
+    Lookup { serve, at, domain, announce, behind_router, ..Lookup::default() }
 }
 
 fn main() {
@@ -213,6 +219,7 @@ fn main() {
     let (mut ethereum, mut roller, mut net, mut peers, mut keyfile, mut lookups) = (None, None, None, Vec::new(), None, Vec::new());
     let mut azimuth_copy = None;
     let (mut lookup_at, mut lookup_domain, mut announce, mut lookup_point) = (Vec::new(), None, Vec::new(), None);
+    let mut behind_router = false;
     let (mut azimuth_snapshot, mut snapshot_sha256, mut azimuth_until, mut write_snapshot) = (None, None, None, None);
     let mut kernel = PathBuf::from("target/wasm/wasm32-unknown-unknown/release/kernel.wasm");
     let mut counter = PathBuf::from("target/wasm/wasm32-unknown-unknown/release/counter.wasm");
@@ -249,6 +256,7 @@ fn main() {
             "--lookup-at" => lookup_at.push(value()),
             "--lookup-domain" => lookup_domain = Some(value()),
             "--announce" => announce.push(value()),
+            "--behind-router" => behind_router = true,
             "--lookup-point" => lookup_point = Some(value()),
             "--keyfile" => keyfile = Some(PathBuf::from(value())),
             "--lookup" => lookups.push(value()),
@@ -256,11 +264,11 @@ fn main() {
         }
     }
     let finds = !lookup_at.is_empty() || lookup_domain.is_some();
-    if net.is_none() && (finds || lookup_point.is_some() || !announce.is_empty()) {
-        fail("--lookup-at, --lookup-domain, --announce and --lookup-point need --net");
+    if net.is_none() && (finds || lookup_point.is_some() || !announce.is_empty() || behind_router) {
+        fail("--lookup-at, --lookup-domain, --announce, --behind-router and --lookup-point need --net");
     }
-    if !announce.is_empty() && !finds {
-        fail("--announce needs somewhere to announce: --lookup-at or --lookup-domain");
+    if (!announce.is_empty() || behind_router) && !finds {
+        fail("--announce and --behind-router need somewhere to announce: --lookup-at or --lookup-domain");
     }
     // A lookup point checks every record it is given against Urbit ID. Asking an Ethereum
     // node or the roller for each would let anyone who announces have this runtime ask them
@@ -412,7 +420,7 @@ fn main() {
             let Some((ship, addr)) = placed else { fail(&format!("--peer {peer}: not <ship>=<address>")) };
             directory.place(ship, addr).unwrap_or_else(|e| fail(&format!("--peer {peer}: {e}")));
         }
-        let lookup = lookup_settings(&lookup_at, lookup_domain.as_deref(), &announce, lookup_point.as_deref(), &azimuth);
+        let lookup = lookup_settings(&lookup_at, lookup_domain.as_deref(), &announce, behind_router, lookup_point.as_deref(), &azimuth);
         let network = Network::start(runtime.clone(), directory, NetConfig { addr, lookup, ..NetConfig::default() }).unwrap_or_else(|e| fail(&format!("cannot start the network: {e}")));
         println!("Talking to other ships at {} (UDP), with keys from Urbit ID.", network.addr());
         if let Some(galaxies) = &lookup_point {

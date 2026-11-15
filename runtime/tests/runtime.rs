@@ -9265,10 +9265,13 @@ fn only_so_many_ships_wait_to_be_asked_about_at_the_say_so_of_callers() {
     urbit.slow_planets.store(true, Ordering::SeqCst);
     urbit.slow.store(2000, Ordering::SeqCst);
     let addr = zod_net.addr();
+    let before = urbit.asked.load(Ordering::SeqCst);
     let first = std::thread::spawn(move || say_names(addr, 0x0002_0000, 40));
     // A second later ~zod would look up thirty-two more. Forty more arrive, with new
     // names. The first thirty-two are all still waiting, eight of them being asked about.
-    // So none of these is let wait at all.
+    // So none of these is let wait at all. (The test first sees the eight questions begin,
+    // so that the first callers have surely arrived, and then waits the second.)
+    eventually("the first eight questions begin", || urbit.asked.load(Ordering::SeqCst) >= before + 8);
     std::thread::sleep(Duration::from_millis(1200));
     let second = std::thread::spawn(move || say_names(addr, 0x0003_0000, 40));
     // The other half of the places are for the ships ~zod's own ships want to call. ~zod

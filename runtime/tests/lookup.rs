@@ -400,13 +400,45 @@ enum Lie {
     Late(Duration, Vec<u8>),
 }
 
+/// What a lying point answers when asked where it sees a connection come from.
+#[derive(Clone)]
+enum SeenLie {
+    /// The address it does see.
+    Truth,
+    /// These bytes, as the address.
+    Address(Vec<u8>),
+    /// It will not say.
+    Refuse,
+    /// It never answers.
+    Silent,
+}
+
 /// A stand-in for a lookup point that speaks the protocol and answers questions as the test
-/// says. Announcements it takes and throws away.
+/// says. Announcements it takes, keeps the records of, and does not check; it can pass anything
+/// at all, as an introduction, over the connection of whoever announced last.
 struct Liar {
     addr: SocketAddr,
     lie: Arc<Mutex<Lie>>,
     asked: Arc<AtomicUsize>,
-    _tokio: tokio::runtime::Runtime,
+    seen: Arc<Mutex<SeenLie>>,
+    /// Questions about where a connection is seen from, the records announced to it, and the
+    /// introductions asked of it.
+    seens: Arc<AtomicUsize>,
+    announced: Arc<Mutex<Vec<Vec<u8>>>>,
+    introductions: Arc<AtomicUsize>,
+    /// How long it takes to answer a request for an introduction.
+    introduce_after: Arc<Mutex<Duration>>,
+    announcers: Arc<Mutex<Vec<quinn::Connection>>>,
+    /// Ships, by number, whose records it refuses in every announcement.
+    refuse: Arc<Mutex<Vec<u64>>>,
+    /// While set, every question about a ship waits.
+    hold: Arc<AtomicBool>,
+    /// While set, an announcement of fewer than sixteen records (the last chunk of a round) is
+    /// answered with rubbish.
+    garble_short: Arc<AtomicBool>,
+    /// Introductions it has begun to pass on.
+    pushes: AtomicUsize,
+    tokio: tokio::runtime::Runtime,
 }
 
 /// A raw public key, with the means to sign with it, as either end of a connection shows one.
@@ -489,24 +521,62 @@ fn liar() -> Liar {
     let addr = endpoint.local_addr().unwrap();
     let lie = Arc::new(Mutex::new(Lie::Rubbish(vec![])));
     let asked = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(SeenLie::Truth));
+    let (seens, announced, introductions) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicUsize::new(0)));
+    let introduce_after = Arc::new(Mutex::new(Duration::ZERO));
+    let announcers = Arc::new(Mutex::new(Vec::new()));
+    let (refuse, hold, garble_short) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
     let (lying, counting) = (lie.clone(), asked.clone());
+    let doubles = (seen.clone(), seens.clone(), announced.clone(), introductions.clone(), introduce_after.clone(), announcers.clone(), refuse.clone(), hold.clone(), garble_short.clone());
     tokio.spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            let (lying, counting) = (lying.clone(), counting.clone());
+            let (lying, counting, doubles) = (lying.clone(), counting.clone(), doubles.clone());
             tokio::spawn(async move {
                 let Ok(connection) = incoming.await else { return };
+                let from = connection.remote_address();
                 while let Ok((mut send, mut receive)) = connection.accept_bi().await {
-                    let (lying, counting) = (lying.clone(), counting.clone());
+                    let (lying, counting, doubles, connection) = (lying.clone(), counting.clone(), doubles.clone(), connection.clone());
                     tokio::spawn(async move {
+                        let (seen, seens, announced, introductions, introduce_after, announcers, refuse, hold, garble_short) = doubles;
                         let Ok(bytes) = receive.read_to_end(1 << 16).await else { return };
                         let Ok(request) = ship_proto::WhereRequest::decode(&*bytes) else { return };
                         let answer = match request.body {
+                            // Where a caller is seen from: as the test says. It does not count
+                            // among the questions.
+                            Some(ship_proto::where_request::Body::Seen(_)) => {
+                                seens.fetch_add(1, Ordering::SeqCst);
+                                let saw = |address: Vec<u8>| ship_proto::WhereReply { body: Some(ship_proto::where_reply::Body::Saw(ship_proto::Saw { address })), refused: String::new() }.encode_to_vec();
+                                let said = seen.lock().unwrap().clone();
+                                match said {
+                                    SeenLie::Truth => saw(address_bytes(from)),
+                                    SeenLie::Address(bytes) => saw(bytes),
+                                    SeenLie::Refuse => ship_proto::WhereReply { body: None, refused: "not telling".into() }.encode_to_vec(),
+                                    SeenLie::Silent => {
+                                        tokio::time::sleep(Duration::from_secs(60)).await;
+                                        return;
+                                    }
+                                }
+                            }
+                            Some(ship_proto::where_request::Body::Introduce(_)) => {
+                                introductions.fetch_add(1, Ordering::SeqCst);
+                                let after = *introduce_after.lock().unwrap();
+                                tokio::time::sleep(after).await;
+                                ship_proto::WhereReply { body: Some(ship_proto::where_reply::Body::Introduced(ship_proto::Introduced {})), refused: String::new() }.encode_to_vec()
+                            }
+                            Some(ship_proto::where_request::Body::Announce(announce)) if garble_short.load(Ordering::SeqCst) && announce.records.len() < 16 => vec![0xff; 10],
                             Some(ship_proto::where_request::Body::Announce(announce)) => {
-                                let outcomes = vec![String::new(); announce.records.len()];
+                                let refused = refuse.lock().unwrap().clone();
+                                let taken = |record: &Vec<u8>| !refused.contains(&ship_proto::Whereabouts::decode(&**record).map_or(0, |record| record.ship));
+                                announced.lock().unwrap().extend(announce.records.iter().filter(|record| taken(record)).cloned());
+                                announcers.lock().unwrap().push(connection.clone());
+                                let outcomes = announce.records.iter().map(|record| if taken(record) { String::new() } else { "refused by the test".to_string() }).collect();
                                 ship_proto::WhereReply { body: Some(ship_proto::where_reply::Body::Announced(ship_proto::Announced { outcomes })), refused: String::new() }.encode_to_vec()
                             }
                             _ => {
                                 counting.fetch_add(1, Ordering::SeqCst);
+                                while hold.load(Ordering::SeqCst) {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
                                 let lie = lying.lock().unwrap().clone();
                                 match lie {
                                     Lie::Record(record) => ship_proto::WhereReply { body: Some(ship_proto::where_reply::Body::Found(ship_proto::Found { record })), refused: String::new() }.encode_to_vec(),
@@ -535,12 +605,73 @@ fn liar() -> Liar {
             });
         }
     });
-    Liar { addr, lie, asked, _tokio: tokio }
+    Liar { addr, lie, asked, seen, seens, announced, introductions, introduce_after, announcers, refuse, hold, garble_short, pushes: AtomicUsize::new(0), tokio }
+}
+
+/// An address as it travels in a record: four or sixteen bytes, then the port.
+fn address_bytes(addr: SocketAddr) -> Vec<u8> {
+    let mut bytes = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+        std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+    };
+    bytes.extend_from_slice(&addr.port().to_be_bytes());
+    bytes
 }
 
 impl Liar {
     fn say(&self, lie: Lie) {
         *self.lie.lock().unwrap() = lie;
+    }
+
+    fn see(&self, seen: SeenLie) {
+        *self.seen.lock().unwrap() = seen;
+    }
+
+    /// The records announced to it so far, as they were sent.
+    fn records(&self) -> Vec<ship_proto::Whereabouts> {
+        self.announced.lock().unwrap().iter().map(|record| ship_proto::Whereabouts::decode(&**record).unwrap()).collect()
+    }
+
+    /// Whether a stream of its own can be opened, within a moment, over the connection of
+    /// whoever announced to it last. One that opens is held open, unfinished, for `held`, and
+    /// then given up.
+    fn opens(&self, held: Duration) -> bool {
+        let connection = self.announcers.lock().unwrap().last().cloned().expect("nobody has announced");
+        self.tokio.block_on(async {
+            match tokio::time::timeout(Duration::from_millis(300), connection.open_uni()).await {
+                Ok(Ok(mut stream)) => {
+                    let _ = stream.write_all(&[0x08]).await;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(held).await;
+                        let _ = stream.reset(0u32.into());
+                    });
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// Pass these bytes, on a stream of their own, over the connection of whoever announced
+    /// to it last: finished, or (if `endless`) never finished, a byte now and then.
+    fn push(&self, bytes: Vec<u8>, endless: bool) {
+        self.pushes.fetch_add(1, Ordering::SeqCst);
+        let connection = self.announcers.lock().unwrap().last().cloned().expect("nobody has announced");
+        // Within a time limit, so that a ship that takes nothing fails the test, not hangs it.
+        let pushed = self.tokio.block_on(async move { tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = connection.open_uni().await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            if endless {
+                tokio::spawn(async move {
+                    while stream.write_all(&[0]).await.is_ok() {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                });
+            } else {
+                stream.finish().unwrap();
+            }
+        }).await });
+        assert!(pushed.is_ok(), "the ship took no introduction in five seconds");
     }
 }
 
@@ -630,9 +761,10 @@ fn a_record_that_has_run_out_is_not_used_even_where_it_would_still_do() {
     let at = nec_net.addr();
     let here = NetConfig { addr: at.to_string(), ..eager() };
     let (_zod, zod_net, _) = ship_on(&a, "~zod", &urbit, with(Lookup { ask_again: Duration::from_millis(100), ..finding(liar.addr) }));
-    // A record with three seconds left to run.
+    // A record with eight seconds left to run: room for the first call, even on a busy
+    // machine.
     let key = SigningKey::from_bytes(&seed);
-    let issued = now_ms() - whereabouts::LIFETIME_MS + 3000;
+    let issued = now_ms() - whereabouts::LIFETIME_MS + 8000;
     liar.say(Lie::Record(whereabouts::sign("~nec", &[at], issued, &key, None).unwrap()));
     assert!(reaches(&zod_net, "~zod", "~nec"));
     // ~nec starts again at the same address: the connection is lost, though the address
@@ -640,7 +772,11 @@ fn a_record_that_has_run_out_is_not_used_even_where_it_would_still_do() {
     liar.say(Lie::Rubbish(vec![0xff; 10]));
     drop(nec_net);
     let nec_net = Network::start(nec.clone(), Directory::reading(urbit.clone()), here).unwrap();
-    std::thread::sleep(Duration::from_millis(3200));
+    let waiting = Instant::now();
+    while now_ms() < issued + whereabouts::LIFETIME_MS + 200 {
+        assert!(waiting.elapsed() < Duration::from_secs(30), "the wall clock went back while waiting");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert!(zod_net.ping("~zod", "~nec").is_err(), "a record that had run out was used");
     // A record still good, and ~nec is reached there.
     liar.say(Lie::Record(whereabouts::sign("~nec", &[at], now_ms(), &key, None).unwrap()));
@@ -714,8 +850,31 @@ async fn ask_point(connection: &quinn::Connection, request: &[u8]) -> Option<shi
     tokio::time::timeout(Duration::from_secs(3), attempt).await.ok().flatten()
 }
 
+/// An announcement of records whose presence does not matter to the test: each comes with an
+/// empty one, so none of them could be kept.
 fn announce(records: Vec<Vec<u8>>) -> Vec<u8> {
-    ship_proto::WhereRequest { body: Some(ship_proto::where_request::Body::Announce(ship_proto::Announce { records })) }.encode_to_vec()
+    let presence = vec![Vec::new(); records.len()];
+    ship_proto::WhereRequest { body: Some(ship_proto::where_request::Body::Announce(ship_proto::Announce { records, presence })) }.encode_to_vec()
+}
+
+/// The value both ends of a connection work out from its handshake, as the protocol names it.
+fn binding_of(connection: &quinn::Connection) -> [u8; 32] {
+    let mut binding = [0u8; 32];
+    connection.export_keying_material(&mut binding, b"ship.v1.here", b"").unwrap();
+    binding
+}
+
+/// A ship's presence on a connection, for a record of its signed with `key`.
+fn presence_on(connection: &quinn::Connection, record: &[u8], key: &SigningKey) -> Vec<u8> {
+    let read = ship_proto::Whereabouts::decode(record).unwrap();
+    whereabouts::presence(read.ship, read.issued, &binding_of(connection), key)
+}
+
+/// An announcement over `connection` of records each with its ship's presence on it.
+fn announce_on(connection: &quinn::Connection, records: &[(Vec<u8>, SigningKey)]) -> Vec<u8> {
+    let presence = records.iter().map(|(record, key)| presence_on(connection, record, key)).collect();
+    let records = records.iter().map(|(record, _)| record.clone()).collect();
+    ship_proto::WhereRequest { body: Some(ship_proto::where_request::Body::Announce(ship_proto::Announce { records, presence })) }.encode_to_vec()
 }
 
 fn question(ship: &str) -> Vec<u8> {
@@ -756,13 +915,15 @@ fn a_point_holds_its_bounds_against_anyone_and_keeps_what_it_has() {
         let connect = || async { endpoint.connect_with(where_client(), point.addr(), "lookup").unwrap().await.unwrap() };
         let first = connect().await;
         // Three records a second on one connection: the fourth is refused, and says why.
-        let said = outcomes(ask_point(&first, &announce(records[..4].to_vec())).await);
+        let keyed: Vec<(Vec<u8>, SigningKey)> = records.iter().cloned().zip(keys.iter().cloned()).collect();
+        let said = outcomes(ask_point(&first, &announce_on(&first, &keyed[..4])).await);
         assert_eq!(said[..3], [String::new(), String::new(), String::new()]);
         assert_eq!(said[3], "too many records on this connection just now; try again later");
         assert_eq!(found(ask_point(&first, &question(&ships[0])).await), Some(records[0].clone()));
         // More records than one announcement may carry, and more bytes than a request may
         // be, are refused whole, unread.
-        let crowd = announce(vec![records[4].clone(); 17]);
+        // (With no presences at all, so that only the count of records refuses it.)
+        let crowd = announce_with(vec![records[4].clone(); 17], Vec::new());
         let refused = ask_point(&first, &crowd).await.unwrap();
         assert!(refused.body.is_none() && refused.refused.contains("too many records"), "{refused:?}");
         // A question that would be answered, but for twenty kilobytes of a field nobody
@@ -884,11 +1045,11 @@ fn a_name_is_looked_up_again_once_its_answer_is_old() {
     names.say("nec.points.test", vec![point.addr()]);
     let (_nec, _nec_net, _) = ship_on(&b, "~nec", &urbit, with(finding(point.addr())));
     eventually("~nec is announced", || point.point_status().unwrap().records == 1);
-    // ~zod listens on an address that says nothing of where it is, so it announces nothing
-    // and looks names up only to ask about others. Answers are kept for a second.
+    // ~zod's own galaxy's point cannot be found by name, so it announces nothing and looks
+    // names up only to ask about others. Answers are kept for a second.
     let lookup = Lookup { resolved_for: Duration::from_secs(1), ..by_name(&names) };
     let (_zod, zod_net, _) = ship_on(&a, "~zod", &urbit, NetConfig { addr: "0.0.0.0:0".into(), ..with(lookup) });
-    assert!(zod_net.lookup_trouble().is_some_and(|why| why.contains("not announcing")), "{:?}", zod_net.lookup_trouble());
+    eventually("~zod finds it has nowhere to announce", || zod_net.lookup_trouble().is_some_and(|why| why.contains("zod.points.test")));
     // Two more ships of ~nec's galaxy, in Urbit ID and never announced.
     let (one, two) = (ob::ship_name(0x1234_0101), ob::ship_name(0x1235_0101));
     for ship in [&one, &two] {
@@ -993,6 +1154,8 @@ fn a_record_is_signed_over_exactly_what_it_says() {
     let mut statement = b"ship.v1.where\n".to_vec();
     statement.extend_from_slice(&number.to_be_bytes());
     statement.extend_from_slice(&1_800_000_000_000u64.to_be_bytes());
+    // Callers are not asked to be introduced.
+    statement.push(0);
     statement.push(1);
     statement.push(4);
     statement.extend_from_slice(&[203, 0, 113, 7]);
@@ -1001,6 +1164,19 @@ fn a_record_is_signed_over_exactly_what_it_says() {
     statement.extend_from_slice(&[0; 19 * 3]);
     assert_eq!(record.signature, key.sign(&statement).to_bytes().to_vec());
     assert_eq!(record.addresses, vec![vec![203, 0, 113, 7, 0x11, 0x51]]);
+    // With callers asked to be introduced, that byte is one, and the record says so.
+    let flagged = ship_proto::Whereabouts::decode(&*whereabouts::sign_flagged(ship, &[at], 1_800_000_000_000, true, &key, None).unwrap()).unwrap();
+    statement[b"ship.v1.where\n".len() + 16] = 1;
+    assert_eq!(flagged.signature, key.sign(&statement).to_bytes().to_vec());
+    assert!(flagged.introduce);
+    // And a ship's presence on a connection is signed over its own label, the ship, the
+    // record's time, and the connection's value.
+    let binding = [5u8; 32];
+    let mut here = b"ship.v1.here\n".to_vec();
+    here.extend_from_slice(&number.to_be_bytes());
+    here.extend_from_slice(&1_800_000_000_000u64.to_be_bytes());
+    here.extend_from_slice(&binding);
+    assert_eq!(whereabouts::presence(number, 1_800_000_000_000, &binding, &key), key.sign(&here).to_bytes().to_vec());
 }
 
 // What this round of review asked for.
@@ -1148,7 +1324,7 @@ fn a_point_holds_only_so_many_requests_and_lets_go_of_what_a_closed_connection_l
         let connection = endpoint.connect_with(where_client(), point.addr(), "lookup").unwrap().await.unwrap();
         let started = Instant::now();
         loop {
-            let said = outcomes(ask_point(&connection, &announce(vec![record(0)])).await);
+            let said = outcomes(ask_point(&connection, &announce_on(&connection, &[(record(0), keys[0].clone())])).await);
             if said == [String::new()] {
                 break;
             }
@@ -1306,12 +1482,17 @@ fn patient_point(dir: &TempDir, urbit: &Arc<Listings>, bounds: PointBounds) -> (
 /// `count` planets listed in `urbit`, each with a key of its own, and a record of each at
 /// an address nobody uses.
 fn planets(urbit: &Listings, first: u32, count: u32) -> Vec<Vec<u8>> {
+    planets_keyed(urbit, first, count).into_iter().map(|(record, _)| record).collect()
+}
+
+/// The same, each with the key it was signed with.
+fn planets_keyed(urbit: &Listings, first: u32, count: u32) -> Vec<(Vec<u8>, SigningKey)> {
     let at: SocketAddr = "203.0.113.7:4433".parse().unwrap();
     (0..count)
         .map(|n| {
             let (ship, key) = (ob::ship_name(first + (n << 16)), SigningKey::from_bytes(&[(n as u8).wrapping_add(120); 32]));
             urbit.list(&ship, key.verifying_key().to_bytes());
-            whereabouts::sign(&ship, &[at], now_ms(), &key, None).unwrap()
+            (whereabouts::sign(&ship, &[at], now_ms(), &key, None).unwrap(), key)
         })
         .collect()
 }
@@ -1353,9 +1534,9 @@ fn a_closed_connections_announcement_asks_no_more_and_keeps_nothing() {
         urbit.1.store(false, Ordering::SeqCst);
         // An honest announcement on a new connection goes through, which takes a checking
         // place, so the eight held are free again by then.
-        let honest = planets(&urbit, 0x2234_0100, 1);
+        let honest = planets_keyed(&urbit, 0x2234_0100, 1);
         let connection = endpoint.connect_with(where_client(), point.addr(), "lookup").unwrap().await.unwrap();
-        assert_eq!(outcomes(ask_point(&connection, &announce(honest)).await), [String::new()]);
+        assert_eq!(outcomes(ask_point(&connection, &announce_on(&connection, &honest)).await), [String::new()]);
         // No question was asked for the rest of the closed connections' records, and nothing
         // of theirs was kept: only the honest one.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1629,4 +1810,1142 @@ fn an_address_set_by_hand_while_a_records_attempt_fails_stops_the_next_question(
         assert!(call.join().unwrap().is_err());
     });
     assert_eq!(liar.asked.load(Ordering::SeqCst), asked, "the point was asked after an address was set by hand");
+}
+
+// Routing, phase 2: presence, the outside address, introductions.
+
+/// An announcement of records, each with the presence given.
+fn announce_with(records: Vec<Vec<u8>>, presence: Vec<Vec<u8>>) -> Vec<u8> {
+    ship_proto::WhereRequest { body: Some(ship_proto::where_request::Body::Announce(ship_proto::Announce { records, presence })) }.encode_to_vec()
+}
+
+/// A request over `connection` to introduce `caller` (with `key`, at `at`, its record made at
+/// `issued`) to `callee`, with the caller's presence on that connection.
+fn introduce_on(connection: &quinn::Connection, callee: &str, caller: &str, key: &SigningKey, issued: u64, at: SocketAddr) -> Vec<u8> {
+    let record = whereabouts::sign(caller, &[at], issued, key, None).unwrap();
+    let presence = presence_on(connection, &record, key);
+    introduce_with(callee, record, presence)
+}
+
+fn introduce_with(callee: &str, record: Vec<u8>, presence: Vec<u8>) -> Vec<u8> {
+    let callee = ob::any_number(callee).unwrap();
+    ship_proto::WhereRequest { body: Some(ship_proto::where_request::Body::Introduce(ship_proto::Introduce { callee, record, presence })) }.encode_to_vec()
+}
+
+/// Why a request was refused, or nothing if it was not.
+fn refusal(reply: Option<ship_proto::WhereReply>) -> String {
+    match reply {
+        Some(ship_proto::WhereReply { body: None, refused }) => refused,
+        Some(_) => String::new(),
+        None => "no answer".into(),
+    }
+}
+
+/// The next introduction the point passes over `connection`, if one comes within a second.
+async fn passed(connection: &quinn::Connection) -> Option<ship_proto::Introduction> {
+    let mut stream = tokio::time::timeout(Duration::from_secs(1), connection.accept_uni()).await.ok()?.ok()?;
+    ship_proto::Introduction::decode(&*stream.read_to_end(4096).await.ok()?).ok()
+}
+
+/// A caller that offers the lookup protocol and lets the point open no streams of its own: a
+/// ship that never takes the introductions passed to it.
+fn deaf_client() -> quinn::ClientConfig {
+    let mut client = where_client();
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_uni_streams(0u32.into());
+    client.transport_config(Arc::new(transport));
+    client
+}
+
+#[test]
+fn a_record_is_kept_only_with_its_ships_presence_on_the_connection_it_came_on() {
+    let p = TempDir::new("presence-p");
+    let urbit = Arc::new(Listings::default());
+    let (_pr, point) = point_on(&p, &urbit, None, PointBounds::default(), "127.0.0.1:0");
+    let (ship, key, other) = (ob::ship_name(0x1234_0100), SigningKey::from_bytes(&[130; 32]), SigningKey::from_bytes(&[131; 32]));
+    urbit.list(&ship, key.verifying_key().to_bytes());
+    let at: SocketAddr = "203.0.113.7:4433".parse().unwrap();
+    let record = whereabouts::sign(&ship, &[at], now_ms(), &key, None).unwrap();
+    let read = ship_proto::Whereabouts::decode(&*record).unwrap();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let first = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        let second = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        let said = |presence: Vec<u8>| {
+            let (first, record) = (first.clone(), record.clone());
+            async move { outcomes(ask_point(&first, &announce_with(vec![record], vec![presence])).await).remove(0) }
+        };
+        let not_here = "the ship's presence is not for this connection";
+        // None at all; one for another connection; for another ship; for the record at another
+        // time; by another key. None of these is kept.
+        assert_eq!(said(Vec::new()).await, "the record came without the ship's presence on this connection");
+        assert_eq!(said(presence_on(&second, &record, &key)).await, not_here);
+        assert_eq!(said(whereabouts::presence(read.ship + (1 << 16), read.issued, &binding_of(&first), &key)).await, not_here);
+        assert_eq!(said(whereabouts::presence(read.ship, read.issued + 1, &binding_of(&first), &key)).await, not_here);
+        assert_eq!(said(presence_on(&first, &record, &other)).await, not_here);
+        // Records and presences must pair off.
+        let unpaired = ask_point(&first, &announce_with(vec![record.clone()], Vec::new())).await;
+        assert!(refusal(unpaired).contains("presence"));
+        assert_eq!(point.point_status().unwrap().records, 0);
+        // The ship's own presence on this connection: kept, and the ship attends here.
+        assert_eq!(said(presence_on(&first, &record, &key)).await, "");
+        assert_eq!(point.point_status().unwrap().attending, 1);
+        // It stops attending when the connection closes, and the record is still handed out.
+        first.close(0u32.into(), b"gone");
+        let started = Instant::now();
+        while point.point_status().unwrap().attending > 0 {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(found(ask_point(&second, &question(&ship)).await), Some(record.clone()));
+
+        // A moon's presence is by the key its record carries, which its parent vouched for.
+        let moon = ob::any_name(7u64 << 32 | 0x1234_0100);
+        let moon_key = SigningKey::from_bytes(&[132; 32]);
+        let word = runtime::moon::vouch(&key, ob::any_number(&moon).unwrap(), 1, &moon_key.verifying_key().to_bytes());
+        let moons = whereabouts::sign(&moon, &[at], now_ms(), &moon_key, Some(word)).unwrap();
+        let by_parent = presence_on(&second, &moons, &key);
+        assert_eq!(outcomes(ask_point(&second, &announce_with(vec![moons.clone()], vec![by_parent])).await), [not_here.to_string()]);
+        let by_moon = presence_on(&second, &moons, &moon_key);
+        assert_eq!(outcomes(ask_point(&second, &announce_with(vec![moons], vec![by_moon])).await), [String::new()]);
+        assert_eq!(point.point_status().unwrap().attending, 1);
+    });
+}
+
+/// Waiting for a connection that is expected to be made.
+trait Connected {
+    async fn await_connected(self) -> quinn::Connection;
+}
+
+impl Connected for Result<quinn::Connecting, quinn::ConnectError> {
+    async fn await_connected(self) -> quinn::Connection {
+        self.unwrap().await.unwrap()
+    }
+}
+
+#[test]
+fn a_record_read_from_a_point_cannot_be_announced_by_anyone_else_nor_move_where_the_ship_attends() {
+    let (p, q) = (TempDir::new("borrowed-p"), TempDir::new("borrowed-q"));
+    let urbit = Arc::new(Listings::default());
+    let (_pr, point) = point_on(&p, &urbit, None, PointBounds::default(), "127.0.0.1:0");
+    let (_qr, elsewhere) = point_on(&q, &urbit, None, PointBounds::default(), "127.0.0.1:0");
+    let (ship, key) = (ob::ship_name(0x1234_0100), SigningKey::from_bytes(&[133; 32]));
+    let (caller, caller_key) = (ob::ship_name(0x1235_0100), SigningKey::from_bytes(&[134; 32]));
+    let thief = SigningKey::from_bytes(&[135; 32]);
+    urbit.list(&ship, key.verifying_key().to_bytes());
+    urbit.list(&caller, caller_key.verifying_key().to_bytes());
+    let at: SocketAddr = "203.0.113.7:4433".parse().unwrap();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connect = |to: SocketAddr| endpoint.connect_with(where_client(), to, "lookup").await_connected();
+        // The ship announces itself to one point, on its own connection.
+        let own = connect(point.addr()).await;
+        let first = whereabouts::sign(&ship, &[at], now_ms(), &key, None).unwrap();
+        assert_eq!(outcomes(ask_point(&own, &announce_with(vec![first.clone()], vec![presence_on(&own, &first, &key)])).await), [String::new()]);
+        // And a newer record of itself to another point, where anyone can read it.
+        let there = connect(elsewhere.addr()).await;
+        let newer = whereabouts::sign(&ship, &[at], now_ms() + 5, &key, None).unwrap();
+        assert_eq!(outcomes(ask_point(&there, &announce_with(vec![newer.clone()], vec![presence_on(&there, &newer, &key)])).await), [String::new()]);
+        // Someone reads it there, and announces it to the first point: with no presence, with
+        // the ship's presence on the other connection, with one of its own making. None is
+        // taken, so the ship still attends where it was.
+        let thief_connection = connect(point.addr()).await;
+        let read = found(ask_point(&thief_connection, &question(&ship)).await).expect("the first point has the ship");
+        assert_eq!(read, first);
+        let stolen = found(ask_point(&connect(elsewhere.addr()).await, &question(&ship)).await).expect("the other point has the newer");
+        for presence in [Vec::new(), presence_on(&there, &newer, &key), presence_on(&thief_connection, &stolen, &thief)] {
+            let said = outcomes(ask_point(&thief_connection, &announce_with(vec![stolen.clone()], vec![presence])).await);
+            assert!(said.len() == 1 && said[0].contains("presence"), "{said:?}");
+        }
+        assert_eq!(found(ask_point(&thief_connection, &question(&ship)).await), Some(first.clone()));
+        // An introduction to the ship goes over the ship's own connection, and nowhere else.
+        let caller_connection = connect(point.addr()).await;
+        let asked = introduce_on(&caller_connection, &ship, &caller, &caller_key, now_ms(), "198.51.100.4:4433".parse().unwrap());
+        assert_eq!(refusal(ask_point(&caller_connection, &asked).await), "");
+        let introduction = passed(&own).await.expect("the introduction did not reach the ship's own connection");
+        assert_eq!(introduction.callee, ob::any_number(&ship).unwrap());
+        assert_eq!(whereabouts::ship_of(&introduction.record), ob::any_number(&caller));
+        assert!(passed(&thief_connection).await.is_none(), "an introduction went to someone who only read the record");
+        assert_eq!(point.point_status().unwrap().pushed, 1);
+    });
+}
+
+#[test]
+fn introductions_at_a_point_are_checked_bounded_and_refused_saying_which_limit() {
+    let p = TempDir::new("introlimits-p");
+    let urbit = Arc::new(Listings::default());
+    // Seven introductions in all and two for any one caller, counted by the hour, so nothing is
+    // earned back while the test runs.
+    let bounds = PointBounds { introductions: 7, introductions_each: 2, rate_period: Duration::from_secs(3600), ..PointBounds::default() };
+    let (_pr, point) = point_on(&p, &urbit, None, bounds, "127.0.0.1:0");
+    let keys: Vec<SigningKey> = (0..5u8).map(|n| SigningKey::from_bytes(&[140 + n; 32])).collect();
+    let ships: Vec<String> = (0..5u32).map(|n| ob::ship_name(0x1234_0100 + (n << 16))).collect();
+    for (ship, key) in ships.iter().zip(&keys) {
+        urbit.list(ship, key.verifying_key().to_bytes());
+    }
+    let (callee, callee_key) = (&ships[0], &keys[0]);
+    let at: SocketAddr = "198.51.100.4:4433".parse().unwrap();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connect = || endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected();
+        let (own, asker, other) = (connect().await, connect().await, connect().await);
+        // Not attending: nobody has announced the callee.
+        let ask = |connection: quinn::Connection, request: Vec<u8>| async move { refusal(ask_point(&connection, &request).await) };
+        assert_eq!(ask(asker.clone(), introduce_on(&asker, callee, &ships[1], &keys[1], now_ms(), at)).await, "that ship is not attending this lookup point");
+        // The callee announces itself, and attends.
+        let record = whereabouts::sign(callee, &[at], now_ms(), callee_key, None).unwrap();
+        assert_eq!(outcomes(ask_point(&own, &announce_with(vec![record.clone()], vec![presence_on(&own, &record, callee_key)])).await), [String::new()]);
+        // A caller's record forged, run out, or shown with a presence for another connection.
+        let forged = introduce_on(&asker, callee, &ships[1], &keys[2], now_ms(), at);
+        assert_eq!(ask(asker.clone(), forged).await, "the record is not signed by the ship's key");
+        let stale = introduce_on(&asker, callee, &ships[1], &keys[1], now_ms() - whereabouts::LIFETIME_MS - 1000, at);
+        assert_eq!(ask(asker.clone(), stale).await, "the record has run out");
+        let replayed = introduce_on(&other, callee, &ships[1], &keys[1], now_ms(), at);
+        assert_eq!(ask(asker.clone(), replayed).await, "the ship's presence is not for this connection");
+        assert!(passed(&own).await.is_none(), "an introduction not believed was passed on");
+        // A genuine one is passed to the callee, over its own connection.
+        assert_eq!(ask(asker.clone(), introduce_on(&asker, callee, &ships[1], &keys[1], now_ms(), at)).await, "");
+        let introduction = passed(&own).await.expect("passed on");
+        assert_eq!(whereabouts::ship_of(&introduction.record), ob::any_number(&ships[1]));
+        // Two for one caller, and the third is refused for that reason.
+        assert_eq!(ask(asker.clone(), introduce_on(&asker, callee, &ships[1], &keys[1], now_ms(), at)).await, "");
+        assert_eq!(ask(asker.clone(), introduce_on(&asker, callee, &ships[1], &keys[1], now_ms(), at)).await, "too many introductions from that ship just now; try again later");
+        // Seven in all, the refused ones counted: one more is let in, and then none.
+        assert_eq!(ask(other.clone(), introduce_on(&other, callee, &ships[2], &keys[2], now_ms(), at)).await, "");
+        assert_eq!(ask(other.clone(), introduce_on(&other, callee, &ships[3], &keys[3], now_ms(), at)).await, "too many introductions at this point just now; try again later");
+        // None of that stops ordinary questions.
+        assert_eq!(found(ask_point(&other, &question(callee)).await), Some(record.clone()));
+        // The callee's connection closes; a moment later, it is not attending, whatever else.
+        own.close(0u32.into(), b"gone");
+        let started = Instant::now();
+        while point.point_status().unwrap().attending > 0 {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(ask(other.clone(), introduce_on(&other, callee, &ships[4], &keys[4], now_ms(), at)).await, "that ship is not attending this lookup point");
+        assert_eq!(found(ask_point(&other, &question(callee)).await), Some(record));
+    });
+}
+
+#[test]
+fn a_point_holds_only_so_many_introductions_waiting_for_a_ship_that_does_not_take_them() {
+    let p = TempDir::new("introwait-p");
+    let urbit = Arc::new(Listings::default());
+    let bounds = PointBounds { introductions_each: 100, ..PointBounds::default() };
+    let (_pr, point) = point_on(&p, &urbit, None, bounds, "127.0.0.1:0");
+    let (callee, callee_key) = (ob::ship_name(0x1234_0100), SigningKey::from_bytes(&[150; 32]));
+    let (caller, caller_key) = (ob::ship_name(0x1235_0100), SigningKey::from_bytes(&[151; 32]));
+    urbit.list(&callee, callee_key.verifying_key().to_bytes());
+    urbit.list(&caller, caller_key.verifying_key().to_bytes());
+    let at: SocketAddr = "198.51.100.4:4433".parse().unwrap();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let point_net = tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        // The callee lets the point open no streams: nothing passed to it is ever taken.
+        let own = endpoint.connect_with(deaf_client(), point.addr(), "lookup").await_connected().await;
+        let record = whereabouts::sign(&callee, &[at], now_ms(), &callee_key, None).unwrap();
+        assert_eq!(outcomes(ask_point(&own, &announce_with(vec![record.clone()], vec![presence_on(&own, &record, &callee_key)])).await), [String::new()]);
+        let asker = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        let mut said = Vec::new();
+        for _ in 0..(runtime::lookup::MOST_WAITING_EACH + 2) {
+            said.push(refusal(ask_point(&asker, &introduce_on(&asker, &callee, &caller, &caller_key, now_ms(), at)).await));
+        }
+        // One may be on its way (waiting for the callee to take it), and four more wait. Past
+        // that, each is refused for that reason.
+        let taken = said.iter().filter(|why| why.is_empty()).count();
+        assert!(taken == runtime::lookup::MOST_WAITING_EACH || taken == runtime::lookup::MOST_WAITING_EACH + 1, "{said:?}");
+        assert!(said.last().unwrap().contains("as many introductions waiting"), "{said:?}");
+        // What waits too long is dropped, and there is room again. (This waits on the clock.)
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        assert_eq!(refusal(ask_point(&asker, &introduce_on(&asker, &callee, &caller, &caller_key, now_ms(), at)).await), "");
+        assert_eq!(point.point_status().unwrap().pushed, 0);
+        (own, asker)
+    });
+    // And the point stops promptly, with introductions in hand for a ship that takes none.
+    let started = Instant::now();
+    drop(point);
+    assert!(started.elapsed() < Duration::from_secs(2), "stopping took {:?}", started.elapsed());
+    drop(point_net);
+}
+
+/// The packets that arrive at `socket` within `wait` of the last, and where each came from.
+fn packets(socket: &std::net::UdpSocket, wait: Duration) -> Vec<(Vec<u8>, SocketAddr)> {
+    socket.set_read_timeout(Some(wait)).unwrap();
+    let mut got = Vec::new();
+    let mut packet = [0u8; 2048];
+    while let Ok((read, from)) = socket.recv_from(&mut packet) {
+        got.push((packet[..read].to_vec(), from));
+    }
+    got
+}
+
+/// An introduction of `caller`'s record to `callee`, as a point passes it on.
+fn introduction(callee: &str, record: Vec<u8>) -> Vec<u8> {
+    ship_proto::Introduction { callee: ob::any_number(callee).unwrap(), record }.encode_to_vec()
+}
+
+#[test]
+fn a_ship_sends_its_packets_only_for_introductions_it_believes_and_only_so_many() {
+    let a = TempDir::new("punch-a");
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    // The point says ~nec is seen somewhere it does not listen, so ~nec asks to be introduced.
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    let (nec, nec_net, _) = ship_on(&a, "~nec", &urbit, with(finding(liar.addr)));
+    eventually("~nec is announced, asking to be introduced", || liar.records().last().is_some_and(|record| record.introduce));
+    let watch = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let here = watch.local_addr().unwrap();
+    let bus = SigningKey::from_bytes(&[160; 32]);
+    urbit.list("~bus", bus.verifying_key().to_bytes());
+    let heard = |count: u64| eventually("the introductions are heard", || nec_net.introductions().heard >= count);
+    let now = now_ms();
+    // A forged record, one run out, ~nec's own, rubbish, one for a ship not here, one that never
+    // ends: none is believed, and nothing is sent.
+    liar.push(introduction("~nec", whereabouts::sign("~bus", &[here], now, &SigningKey::from_bytes(&[161; 32]), None).unwrap()), false);
+    liar.push(introduction("~nec", whereabouts::sign("~bus", &[here], now - whereabouts::LIFETIME_MS - 1, &bus, None).unwrap()), false);
+    liar.push(introduction("~nec", whereabouts::sign("~bus", &[here], now, &bus, None).unwrap()[..20].to_vec()), false);
+    liar.push(vec![0xff; 64], false);
+    liar.push(introduction("~bud", whereabouts::sign("~bus", &[here], now, &bus, None).unwrap()), false);
+    liar.push(introduction("~nec", whereabouts::sign("~bus", &[here], now, &bus, None).unwrap()), true);
+    heard(5);
+    // ~nec's own record, signed as ~nec signs: the network has it; the test reads it back.
+    let own = liar.records().last().unwrap().encode_to_vec();
+    liar.push(introduction("~nec", own), false);
+    heard(6);
+    // Then a genuine one: exactly three packets, each the one that opens a router, from the
+    // port ~nec is reached at. (Weighed in order, so the ones before were weighed first.)
+    liar.push(introduction("~nec", whereabouts::sign("~bus", &[here], now, &bus, None).unwrap()), false);
+    let got = packets(&watch, Duration::from_millis(800));
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert!(got.iter().all(|(packet, from)| packet == runtime::net::PUNCH && *from == nec_net.addr()), "{got:?}");
+    assert_eq!(nec_net.introductions().sent, 3);
+    // An introduction of a ship nothing is known of waits on Urbit ID. Meanwhile ~nec stops
+    // asking to be introduced (the point now says it sees ~nec where it listens). When the
+    // caller's key comes, nothing is sent: that is weighed again after the wait.
+    let wes = SigningKey::from_bytes(&[163; 32]);
+    urbit.list("~wes", wes.verifying_key().to_bytes());
+    urbit.1.store(true, Ordering::SeqCst);
+    let asked = urbit.2.load(Ordering::SeqCst);
+    let heard_before = nec_net.introductions().heard;
+    liar.push(introduction("~nec", whereabouts::sign("~wes", &[here], now_ms(), &wes, None).unwrap()), false);
+    eventually("it waits on Urbit ID", || urbit.2.load(Ordering::SeqCst) > asked);
+    liar.see(SeenLie::Truth);
+    eventually("~nec is announced asking for no introduction", || liar.records().last().is_some_and(|record| !record.introduce));
+    std::thread::sleep(Duration::from_millis(200));
+    urbit.1.store(false, Ordering::SeqCst);
+    // And an introduction of a caller already known, now: nothing either.
+    liar.push(introduction("~nec", whereabouts::sign("~bus", &[here], now_ms(), &bus, None).unwrap()), false);
+    eventually("both are heard", || nec_net.introductions().heard >= heard_before + 2);
+    assert!(packets(&watch, Duration::from_millis(800)).is_empty());
+    assert_eq!(nec_net.introductions().sent, 3);
+    let _ = nec;
+}
+
+/// Push introductions from each caller in turn, `rounds` times, and count the packets that
+/// come of them at each caller's socket. Each count is held to the allowances by the time the
+/// weighing ended: whole at the start, earned back at their rate after.
+fn flood(liar: &Liar, net: &Network, urbit: &Listings, first: u32, callers: u32, rounds: usize) -> (Vec<usize>, f64, f64) {
+    let callers: Vec<(String, SigningKey, std::net::UdpSocket)> = (0..callers)
+        .map(|n| {
+            let (ship, key) = (ob::ship_name(first + (n << 16)), SigningKey::from_bytes(&[(first >> 16) as u8 ^ n as u8; 32]));
+            urbit.list(&ship, key.verifying_key().to_bytes());
+            (ship, key, std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        })
+        .collect();
+    let heard = net.introductions().heard;
+    let started = Instant::now();
+    for _ in 0..rounds {
+        for (ship, key, socket) in &callers {
+            liar.push(introduction("~nec", whereabouts::sign(ship, &[socket.local_addr().unwrap()], now_ms(), key, None).unwrap()), false);
+        }
+    }
+    // Weighing has ended once nothing more is heard for a while; the time taken to see that is
+    // more than the weighing took, so the bound it gives is loose the right way.
+    let mut last = (net.introductions().heard, Instant::now());
+    while last.1.elapsed() < Duration::from_millis(300) {
+        std::thread::sleep(Duration::from_millis(20));
+        let now = net.introductions().heard;
+        if now != last.0 {
+            last = (now, Instant::now());
+        }
+    }
+    assert!(last.0 > heard);
+    let took = (last.1 - started).as_secs_f64();
+    std::thread::sleep(Duration::from_millis(700));
+    let counted = callers.iter().map(|(_, _, socket)| packets(socket, Duration::from_millis(50)).len()).collect();
+    (counted, took, started.elapsed().as_secs_f64())
+}
+
+#[test]
+fn a_ship_flooded_with_introductions_still_answers_its_ordinary_callers() {
+    let (a, b) = (TempDir::new("flood-a"), TempDir::new("flood-b"));
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    let (_nec, nec_net, _) = ship_on(&a, "~nec", &urbit, with(finding(liar.addr)));
+    let (_zod, zod_net, zod_dir) = ship_on(&b, "~zod", &urbit, eager());
+    zod_dir.place("~nec", nec_net.addr()).unwrap();
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    eventually("~nec is announced, asking to be introduced", || liar.records().last().is_some_and(|record| record.introduce));
+    // An introduction in hand: Urbit ID is held, and an introduction of a ship ~nec knows
+    // nothing of waits on its key. While it does, an ordinary call to ~nec completes.
+    let wes = SigningKey::from_bytes(&[171; 32]);
+    urbit.list("~wes", wes.verifying_key().to_bytes());
+    urbit.1.store(true, Ordering::SeqCst);
+    let asked = urbit.2.load(Ordering::SeqCst);
+    liar.push(introduction("~nec", whereabouts::sign("~wes", &["127.0.0.1:9".parse().unwrap()], now_ms(), &wes, None).unwrap()), false);
+    eventually("the introduction waits on Urbit ID", || urbit.2.load(Ordering::SeqCst) > asked);
+    let acted = nec_net.introductions().acted;
+    let calling = Instant::now();
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert!(calling.elapsed() < Duration::from_secs(3), "{:?}", calling.elapsed());
+    // The introduction was still in hand when the call completed: not acted on.
+    assert_eq!(nec_net.introductions().acted, acted);
+    urbit.1.store(false, Ordering::SeqCst);
+    // Then floods of introductions, while ~zod calls ~nec over and over: every call goes
+    // through, within a time a loaded machine meets. (This shows calls succeed throughout a
+    // period in which introductions are pushed and weighed, not that each overlaps one. The
+    // limits on what introductions send are shown on their own by the unit tests in
+    // `router_tests.rs`: a caller's allowance, the places under way, the overall allowance,
+    // and their order.)
+    let flooding = AtomicBool::new(true);
+    /// Tells the calling thread to stop however the floods end, a failed check included.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let calls = std::thread::scope(|scope| {
+        let stop = Stop(&flooding);
+        let caller = scope.spawn(|| {
+            let mut calls = Vec::new();
+            while flooding.load(Ordering::SeqCst) {
+                let started = Instant::now();
+                calls.push((reaches(&zod_net, "~zod", "~nec"), started.elapsed()));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            calls
+        });
+        // Three callers, each introduced twenty times; then forty callers, each once. Some of
+        // each are acted on.
+        let (each, _, _) = flood(&liar, &nec_net, &urbit, 0x2234_0100, 3, 20);
+        assert!(each.iter().all(|&got| got >= 3), "{each:?}");
+        std::thread::sleep(Duration::from_millis(1100));
+        let (each, _, _) = flood(&liar, &nec_net, &urbit, 0x3334_0100, 40, 1);
+        assert!(each.iter().sum::<usize>() >= 3, "{each:?}");
+        drop(stop);
+        caller.join().unwrap()
+    });
+    assert!(!calls.is_empty());
+    assert!(calls.iter().all(|(reached, took)| *reached && *took < Duration::from_secs(3)), "{calls:?}");
+}
+
+#[test]
+fn a_ship_lets_go_of_the_connection_to_a_point_it_no_longer_announces_to() {
+    let dirs: Vec<TempDir> = (0..4).map(|n| TempDir::new(&format!("walk-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let points: Vec<(Arc<Runtime>, Network)> = dirs[..3].iter().map(|dir| point_on(dir, &urbit, None, PointBounds::default(), "127.0.0.1:0")).collect();
+    let names = Arc::new(Names::default());
+    names.say("zod.points.test", vec![points[0].1.addr()]);
+    let lookup = Lookup { resolved_for: Duration::from_millis(200), ..by_name(&names) };
+    let (_zod, _zod_net, _) = ship_on(&dirs[3], "~zod", &urbit, with(lookup));
+    eventually("~zod attends at the first point", || points[0].1.point_status().unwrap().attending == 1);
+    // The name moves on to each of the other points in turn. ~zod announces there, and lets
+    // go of the connection to the point before, which nothing else announces over.
+    for n in 1..3 {
+        names.say("zod.points.test", vec![points[n].1.addr()]);
+        eventually("~zod attends at the next point", || points[n].1.point_status().unwrap().attending == 1);
+        eventually("the point before sees its connection closed", || points[n - 1].1.point_status().unwrap().connections == 0);
+    }
+}
+
+#[test]
+fn a_ship_holds_only_so_many_introductions_and_stops_promptly_with_one_in_hand() {
+    let (a, b) = (TempDir::new("inhandintro-a"), TempDir::new("inhandintro-b"));
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    let (_nec, nec_net, _) = ship_on(&a, "~nec", &urbit, with(finding(liar.addr)));
+    let (_zod, zod_net, zod_dir) = ship_on(&b, "~zod", &urbit, eager());
+    zod_dir.place("~nec", nec_net.addr()).unwrap();
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    eventually("~nec is announced, asking to be introduced", || liar.records().last().is_some_and(|record| record.introduce));
+    // Urbit ID stops answering. Each introduction is of a ship ~nec knows nothing of, so the
+    // first waits on its key, and the rest wait behind it, as many as may.
+    let watch = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let callers: Vec<(String, SigningKey)> = (0..40u32).map(|n| (ob::ship_name(0x3234_0100 + (n << 16)), SigningKey::from_bytes(&[200 + (n % 50) as u8; 32]))).collect();
+    for (ship, key) in &callers {
+        urbit.list(ship, key.verifying_key().to_bytes());
+    }
+    urbit.1.store(true, Ordering::SeqCst);
+    let asked = urbit.2.load(Ordering::SeqCst);
+    for (ship, key) in &callers {
+        liar.push(introduction("~nec", whereabouts::sign(ship, &[watch.local_addr().unwrap()], now_ms(), key, None).unwrap()), false);
+    }
+    eventually("the first waits on Urbit ID", || urbit.2.load(Ordering::SeqCst) > asked);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(nec_net.introductions().heard, 1, "{:?}", nec_net.introductions());
+    // A ship already known calls ~nec meanwhile, and is answered at once.
+    let calling = Instant::now();
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert!(calling.elapsed() < Duration::from_secs(1), "{:?}", calling.elapsed());
+    // The one being weighed is given up on in its time (five seconds), and the next is taken,
+    // though Urbit ID still says nothing. (This waits on the clock.)
+    eventually("the next introduction is taken", || nec_net.introductions().heard >= 2);
+    // Urbit ID answers again. The introductions that waited are weighed: one, and eight more
+    // that waited behind it. The rest were dropped as they came.
+    urbit.1.store(false, Ordering::SeqCst);
+    eventually("those that waited are weighed", || nec_net.introductions().heard == 1 + runtime::net::MOST_INTRODUCTIONS_IN_HAND as u64);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(nec_net.introductions().heard, 1 + runtime::net::MOST_INTRODUCTIONS_IN_HAND as u64);
+    // One more, of a ship nothing is known of, with Urbit ID silent again: stopped with that
+    // introduction in hand, the network stops at once.
+    urbit.1.store(true, Ordering::SeqCst);
+    let (late, late_key) = (ob::ship_name(0x4234_0100), SigningKey::from_bytes(&[250; 32]));
+    urbit.list(&late, late_key.verifying_key().to_bytes());
+    let asked = urbit.2.load(Ordering::SeqCst);
+    liar.push(introduction("~nec", whereabouts::sign(&late, &[watch.local_addr().unwrap()], now_ms(), &late_key, None).unwrap()), false);
+    eventually("it waits on Urbit ID", || urbit.2.load(Ordering::SeqCst) > asked);
+    let started = Instant::now();
+    drop(nec_net);
+    assert!(started.elapsed() < Duration::from_secs(2), "stopping took {:?}", started.elapsed());
+    urbit.1.store(false, Ordering::SeqCst);
+}
+
+#[test]
+fn a_caller_stops_promptly_while_its_introduction_is_being_answered() {
+    let (a, b) = (TempDir::new("callerstop-a"), TempDir::new("callerstop-b"));
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    // The point holds every request for an introduction back.
+    *liar.introduce_after.lock().unwrap() = Duration::from_secs(60);
+    let seed = [180u8; 32];
+    let (_nec, nec_net, _) = keyed_ship_on(&b, "~nec", seed, &urbit, eager());
+    let (zod, zod_net, _) = crew(&a, "~zod", &urbit, with(finding(liar.addr)));
+    eventually("~zod is announced", || !liar.records().is_empty());
+    liar.say(Lie::Record(whereabouts::sign_flagged("~nec", &[nec_net.addr()], now_ms(), true, &SigningKey::from_bytes(&seed), None).unwrap()));
+    // A command for ~nec: carrying it, ~zod finds ~nec's record asks to be introduced, and asks.
+    assert_eq!(String::from_utf8(zod.deliver("~zod", "tally", b"tell nec inc hits").unwrap().reply).unwrap(), "sent");
+    eventually("~zod asks to be introduced", || liar.introductions.load(Ordering::SeqCst) >= 1);
+    let started = Instant::now();
+    drop(zod_net);
+    assert!(started.elapsed() < Duration::from_secs(2), "stopping took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_runtime_with_nothing_stated_announces_what_its_point_sees_and_stated_addresses_win() {
+    let dirs: Vec<TempDir> = (0..5).map(|n| TempDir::new(&format!("seen-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_pr, point) = point_on(&dirs[0], &urbit, None, PointBounds::default(), "127.0.0.1:0");
+    let record_of = |ship: &str| {
+        let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        tokio.block_on(async {
+            let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let connection = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+            found(ask_point(&connection, &question(ship)).await).map(|record| ship_proto::Whereabouts::decode(&*record).unwrap())
+        })
+    };
+    let addr_of = |record: &ship_proto::Whereabouts| record.addresses.iter().map(|bytes| bytes.clone()).collect::<Vec<_>>();
+    // Listening where it is reached: the point sees just that, and callers need no introduction.
+    let (_zod, zod_net, _) = ship_on(&dirs[1], "~zod", &urbit, with(finding(point.addr())));
+    eventually("~zod is announced", || record_of("~zod").is_some());
+    let zod_record = record_of("~zod").unwrap();
+    assert_eq!(addr_of(&zod_record), vec![address_bytes(zod_net.addr())]);
+    assert!(!zod_record.introduce);
+    // Listening on "any address", which says nothing of where it is reached: the address the
+    // point sees is announced, and callers are asked to be introduced, since it is not the one
+    // listened on. And it is called by name, through an introduction.
+    let (_nec, nec_net, _) = ship_on(&dirs[2], "~nec", &urbit, NetConfig { addr: "0.0.0.0:0".into(), ..with(finding(point.addr())) });
+    eventually("~nec is announced", || record_of("~nec").is_some());
+    let nec_record = record_of("~nec").unwrap();
+    assert_eq!(addr_of(&nec_record), vec![address_bytes(SocketAddr::from(([127, 0, 0, 1], nec_net.addr().port())))]);
+    assert!(nec_record.introduce);
+    // ~nec calls ~zod, whose record asks for no introduction: none is asked for.
+    assert!(reaches(&nec_net, "~nec", "~zod"));
+    assert_eq!(point.point_status().unwrap().introduced, 0);
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert_eq!(point.point_status().unwrap().introduced, 1);
+    // Stated by hand: exactly what is stated, whatever the point sees, and no introduction
+    // unless the runtime says it is behind a router.
+    let stated: SocketAddr = "203.0.113.5:7".parse().unwrap();
+    let (_bud, _bud_net, _) = ship_on(&dirs[3], "~bud", &urbit, with(Lookup { announce: vec![stated], ..finding(point.addr()) }));
+    eventually("~bud is announced", || record_of("~bud").is_some());
+    let bud_record = record_of("~bud").unwrap();
+    assert_eq!(addr_of(&bud_record), vec![address_bytes(stated)]);
+    assert!(!bud_record.introduce);
+    let (_wes, _wes_net, _) = ship_on(&dirs[4], "~wes", &urbit, with(Lookup { announce: vec![stated], behind_router: true, ..finding(point.addr()) }));
+    eventually("~wes is announced", || record_of("~wes").is_some());
+    let wes_record = record_of("~wes").unwrap();
+    assert_eq!(addr_of(&wes_record), vec![address_bytes(stated)]);
+    assert!(wes_record.introduce);
+}
+
+#[test]
+fn a_point_listening_on_both_kinds_of_address_reports_an_ipv4_caller_as_ipv4() {
+    let (p, a) = (TempDir::new("dualstack-p"), TempDir::new("dualstack-a"));
+    let urbit = Arc::new(Listings::default());
+    // On this machine a socket bound to [::] takes IPv4 callers too, and sees them written as
+    // IPv6 (::ffff:127.0.0.1). What a point reports, and what a ship announces, is plain IPv4.
+    let (_pr, point) = point_on(&p, &urbit, None, PointBounds::default(), "[::]:0");
+    let at = SocketAddr::from(([127, 0, 0, 1], point.addr().port()));
+    let (_zod, zod_net, _) = ship_on(&a, "~zod", &urbit, with(finding(at)));
+    eventually("~zod is announced", || point.point_status().unwrap().records == 1);
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = endpoint.connect_with(where_client(), at, "lookup").await_connected().await;
+        let seen = ask_point(&connection, &ship_proto::WhereRequest { body: Some(ship_proto::where_request::Body::Seen(ship_proto::Seen {})) }.encode_to_vec()).await;
+        let Some(ship_proto::where_reply::Body::Saw(saw)) = seen.and_then(|reply| reply.body) else { panic!("no answer") };
+        assert_eq!(saw.address, address_bytes(endpoint.local_addr().unwrap()));
+        let record = ship_proto::Whereabouts::decode(&*found(ask_point(&connection, &question("~zod")).await).unwrap()).unwrap();
+        assert_eq!(record.addresses, vec![address_bytes(zod_net.addr())]);
+        assert!(!record.introduce);
+    });
+}
+
+#[test]
+fn a_ship_is_announced_again_at_once_when_its_connection_to_the_point_drops() {
+    let (p, q, a) = (TempDir::new("redo-p"), TempDir::new("redo-q"), TempDir::new("redo-a"));
+    let urbit = Arc::new(Listings::default());
+    let at = free_port();
+    let (point_rt, point) = point_on(&p, &urbit, None, PointBounds::default(), &at.to_string());
+    // Announced every two minutes, as by default.
+    let (_zod, _zod_net, _) = ship_on(&a, "~zod", &urbit, with(Lookup { announce_every: Duration::from_secs(120), ..finding(at) }));
+    eventually("~zod is announced", || point.point_status().unwrap().attending == 1);
+    // The point goes and comes back, empty. The connection ~zod announced over has dropped,
+    // so ~zod is announced again over a new one, at once, not two minutes later.
+    drop(point);
+    drop(point_rt);
+    let (_point_rt, point) = point_on(&q, &urbit, None, PointBounds::default(), &at.to_string());
+    eventually("~zod is announced again, and attends on the new connection", || point.point_status().unwrap().attending == 1);
+}
+
+#[test]
+fn what_a_point_says_of_where_it_sees_a_runtime_is_used_only_if_a_record_may_carry_it() {
+    let (a, b) = (TempDir::new("seenlie-a"), TempDir::new("seenlie-b"));
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    let lookup = Lookup { ask_again: Duration::from_millis(100), ..finding(liar.addr) };
+    // A refused kind of address, rubbish, a refusal, and silence: nothing is announced, and
+    // the next round asks again.
+    liar.see(SeenLie::Address(address_bytes("0.0.0.0:4433".parse().unwrap())));
+    let (_zod, zod_net, _) = ship_on(&a, "~zod", &urbit, with(lookup.clone()));
+    for lie in [SeenLie::Address(address_bytes("0.0.0.0:4433".parse().unwrap())), SeenLie::Address(vec![1, 2, 3, 4, 5]), SeenLie::Refuse, SeenLie::Silent] {
+        liar.see(lie);
+        let asked = liar.seens.load(Ordering::SeqCst);
+        eventually("the point is asked again", || liar.seens.load(Ordering::SeqCst) >= asked + 2);
+        assert!(liar.records().is_empty(), "something was announced on a lie");
+    }
+    assert!(zod_net.lookup_trouble().is_some_and(|why| why.contains("sees this runtime") || why.contains("where it sees")), "{:?}", zod_net.lookup_trouble());
+    // The truth: announced, and since it is where ~zod listens, no introduction is asked for.
+    liar.see(SeenLie::Truth);
+    eventually("~zod is announced", || !liar.records().is_empty());
+    let record = liar.records().last().unwrap().clone();
+    assert_eq!(record.addresses, vec![address_bytes(zod_net.addr())]);
+    assert!(!record.introduce);
+    // Somewhere else: announced there, asking for introductions.
+    let there: SocketAddr = "203.0.113.9:4433".parse().unwrap();
+    liar.see(SeenLie::Address(address_bytes(there)));
+    eventually("~zod is announced where the point says", || liar.records().last().is_some_and(|record| record.addresses == vec![address_bytes(there)]));
+    assert!(liar.records().last().unwrap().introduce);
+    // With addresses stated by hand, the point is not asked at all, and what it would say
+    // changes nothing.
+    let stated: SocketAddr = "203.0.113.5:7".parse().unwrap();
+    let other = crate::liar();
+    other.see(SeenLie::Address(address_bytes(there)));
+    let (_nec, _nec_net, _) = ship_on(&b, "~nec", &urbit, with(Lookup { announce: vec![stated], ..finding(other.addr) }));
+    eventually("~nec is announced", || !other.records().is_empty());
+    assert!(other.records().iter().all(|record| record.addresses == vec![address_bytes(stated)] && !record.introduce));
+    assert_eq!(other.seens.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn with_an_address_set_by_hand_no_introduction_is_asked_for() {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("handintro-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_pr, point) = point_on(&dirs[0], &urbit, None, PointBounds::default(), "127.0.0.1:0");
+    // ~nec asks callers to be introduced.
+    let (_nec, nec_net, _) = ship_on(&dirs[1], "~nec", &urbit, NetConfig { addr: "0.0.0.0:0".into(), ..with(finding(point.addr())) });
+    let (_zod, zod_net, zod_dir) = ship_on(&dirs[2], "~zod", &urbit, with(finding(point.addr())));
+    eventually("both are announced", || point.point_status().unwrap().attending == 2);
+    zod_dir.place("~nec", SocketAddr::from(([127, 0, 0, 1], nec_net.addr().port()))).unwrap();
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert_eq!(point.point_status().unwrap().introduced, 0);
+    assert_eq!(point.point_status().unwrap().questions, 0);
+}
+
+#[test]
+fn the_packet_that_opens_a_router_draws_no_answer_from_quic_and_a_flood_of_them_changes_nothing() {
+    let (a, b) = (TempDir::new("quiet-a"), TempDir::new("quiet-b"));
+    let urbit = Arc::new(Listings::default());
+    let (_nec, nec_net, _) = ship_on(&a, "~nec", &urbit, eager());
+    let (_zod, zod_net, zod_dir) = ship_on(&b, "~zod", &urbit, eager());
+    zod_dir.place("~nec", nec_net.addr()).unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    // Something QUIC does answer, to show that an answer would be seen: a long header of a
+    // version it does not speak, padded to 1,200 bytes, draws a version negotiation.
+    let mut unknown = vec![0xc0, 0x1a, 0x2a, 0x3a, 0x4a, 8];
+    unknown.extend_from_slice(&[7; 8]);
+    unknown.push(8);
+    unknown.extend_from_slice(&[9; 8]);
+    unknown.resize(1200, 0);
+    socket.send_to(&unknown, nec_net.addr()).unwrap();
+    let answered = packets(&socket, Duration::from_millis(500));
+    assert!(answered.len() == 1 && answered[0].0[1..5] == [0, 0, 0, 0], "no version negotiation came back: {answered:?}");
+    // The packet that opens a router: nothing comes back.
+    for _ in 0..3 {
+        socket.send_to(runtime::net::PUNCH, nec_net.addr()).unwrap();
+    }
+    assert!(packets(&socket, Duration::from_millis(500)).is_empty());
+    // A flood of them, while ~zod calls ~nec: every call goes through, and nothing is answered.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for _ in 0..20_000 {
+                let _ = socket.send_to(runtime::net::PUNCH, nec_net.addr());
+            }
+        });
+        for _ in 0..5 {
+            assert!(reaches(&zod_net, "~zod", "~nec"));
+        }
+    });
+    assert!(packets(&socket, Duration::from_millis(500)).is_empty());
+}
+
+#[test]
+fn a_point_may_open_only_four_streams_at_a_ship_and_pass_it_only_so_much() {
+    let a = TempDir::new("pushbound-a");
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    let (_nec, nec_net, _) = ship_on(&a, "~nec", &urbit, with(finding(liar.addr)));
+    eventually("~nec is announced, asking to be introduced", || liar.records().last().is_some_and(|record| record.introduce));
+    // Four streams the point may open at once, and no fifth while they are open. (A stream
+    // frees its place when the point ends it; one that a point holds open holds its place, and
+    // so only that point's own introductions are held up.)
+    for n in 0..4 {
+        assert!(liar.opens(Duration::from_secs(2)), "stream {n} could not be opened");
+    }
+    assert!(!liar.opens(Duration::ZERO), "a fifth stream was opened");
+    eventually("room for a stream again once the point ends them", || liar.opens(Duration::ZERO));
+    std::thread::sleep(Duration::from_millis(300));
+    // An introduction too large to be one is not taken, though the record in it is genuine.
+    let watch = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bus = SigningKey::from_bytes(&[190; 32]);
+    urbit.list("~bus", bus.verifying_key().to_bytes());
+    let record = whereabouts::sign("~bus", &[watch.local_addr().unwrap()], now_ms(), &bus, None).unwrap();
+    let padded = [introduction("~nec", record.clone()), vec![0x7a, 0x80, 0x10], vec![0; 2048]].concat();
+    assert!(ship_proto::Introduction::decode(&*padded).is_ok());
+    let heard = nec_net.introductions().heard;
+    liar.push(padded, false);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(nec_net.introductions().heard, heard);
+    liar.push(introduction("~nec", record), false);
+    assert_eq!(packets(&watch, Duration::from_millis(800)).len(), 3);
+}
+
+#[test]
+fn a_ship_that_does_not_read_what_is_passed_to_it_holds_up_only_its_own_introductions_and_only_so_long() {
+    let p = TempDir::new("slowread-p");
+    let urbit = Arc::new(Listings::default());
+    let bounds = PointBounds { introductions_each: 100, ..PointBounds::default() };
+    let (_pr, point) = point_on(&p, &urbit, None, bounds, "127.0.0.1:0");
+    let (callee, callee_key) = (ob::ship_name(0x1234_0100), SigningKey::from_bytes(&[152; 32]));
+    let (caller, caller_key) = (ob::ship_name(0x1235_0100), SigningKey::from_bytes(&[153; 32]));
+    urbit.list(&callee, callee_key.verifying_key().to_bytes());
+    urbit.list(&caller, caller_key.verifying_key().to_bytes());
+    let at: SocketAddr = "198.51.100.4:4433".parse().unwrap();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        // The callee takes streams but reads nothing from them, and has room for only a few
+        // bytes on each: the point cannot finish writing an introduction to it.
+        let mut client = where_client();
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(32u32.into());
+        client.transport_config(Arc::new(transport));
+        let own = endpoint.connect_with(client, point.addr(), "lookup").await_connected().await;
+        let record = whereabouts::sign(&callee, &[at], now_ms(), &callee_key, None).unwrap();
+        assert_eq!(outcomes(ask_point(&own, &announce_with(vec![record.clone()], vec![presence_on(&own, &record, &callee_key)])).await), [String::new()]);
+        let asker = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        for _ in 0..2 {
+            assert_eq!(refusal(ask_point(&asker, &introduce_on(&asker, &callee, &caller, &caller_key, now_ms(), at)).await), "");
+        }
+        // The first is begun, and not finished. Only after its time is it given up, and the
+        // second begun.
+        let first = tokio::time::timeout(Duration::from_secs(2), own.accept_uni()).await.expect("the first was not begun").unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(500), own.accept_uni()).await.is_err(), "the second was begun before the first was given up");
+        let second = tokio::time::timeout(Duration::from_secs(3), own.accept_uni()).await.expect("the second was never begun").unwrap();
+        drop((first, second));
+        // Meanwhile the point answered everyone else as ever.
+        assert_eq!(found(ask_point(&asker, &question(&callee)).await), Some(record));
+    });
+}
+
+#[test]
+fn a_point_holds_only_so_many_introductions_waiting_on_one_connection() {
+    let p = TempDir::new("connwait-p");
+    let urbit = Arc::new(Listings::default());
+    let bounds = PointBounds { introductions_each: 100, ..PointBounds::default() };
+    let (_pr, point) = point_on(&p, &urbit, None, bounds, "127.0.0.1:0");
+    // Five ships announced over one connection that takes nothing passed to it.
+    let callees = planets_keyed(&urbit, 0x1234_0100, 5);
+    let (caller, caller_key) = (ob::ship_name(0x2235_0100), SigningKey::from_bytes(&[154; 32]));
+    urbit.list(&caller, caller_key.verifying_key().to_bytes());
+    let at: SocketAddr = "198.51.100.4:4433".parse().unwrap();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let own = endpoint.connect_with(deaf_client(), point.addr(), "lookup").await_connected().await;
+        assert!(outcomes(ask_point(&own, &announce_on(&own, &callees)).await).iter().all(String::is_empty));
+        assert_eq!(point.point_status().unwrap().attending, 5);
+        let asker = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        let mut said = Vec::new();
+        for (record, _) in &callees {
+            let callee = ob::any_name(whereabouts::ship_of(record).unwrap());
+            for _ in 0..runtime::lookup::MOST_WAITING_EACH {
+                said.push(refusal(ask_point(&asker, &introduce_on(&asker, &callee, &caller, &caller_key, now_ms(), at)).await));
+            }
+        }
+        // Sixteen wait (and one may be on its way); past that, each is refused for that reason.
+        let taken = said.iter().filter(|why| why.is_empty()).count();
+        assert!(taken == 16 || taken == 17, "{said:?}");
+        assert!(said.last().unwrap().contains("waiting for that ship's connection"), "{said:?}");
+    });
+}
+
+#[test]
+fn a_point_that_says_nothing_of_an_introduction_does_not_stop_or_delay_the_call() {
+    let (a, b) = (TempDir::new("silentintro-a"), TempDir::new("silentintro-b"));
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    *liar.introduce_after.lock().unwrap() = Duration::from_secs(60);
+    let seed = [181u8; 32];
+    let (_nec, nec_net, _) = keyed_ship_on(&b, "~nec", seed, &urbit, eager());
+    // Ten seconds for a call, as by default.
+    let cfg = NetConfig { request_timeout: Duration::from_secs(10), ..with(Lookup { ask_again: Duration::from_millis(100), ..finding(liar.addr) }) };
+    let (_zod, zod_net, _) = ship_on(&a, "~zod", &urbit, cfg);
+    eventually("~zod is announced", || !liar.records().is_empty());
+    // ~nec's record asks to be introduced; the point never answers that request. The call
+    // waits for it a second at most, tries ~nec anyway, and gets through.
+    liar.say(Lie::Record(whereabouts::sign_flagged("~nec", &[nec_net.addr()], now_ms(), true, &SigningKey::from_bytes(&seed), None).unwrap()));
+    let started = Instant::now();
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert!(started.elapsed() < Duration::from_millis(1800), "{:?}", started.elapsed());
+    assert_eq!(liar.introductions.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn settings_for_staying_reachable_that_make_no_sense_are_refused() {
+    let a = TempDir::new("keepalive-a");
+    let rt = Arc::new(Runtime::open(&a.0, fast()).unwrap());
+    let point: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    // A packet every twenty seconds keeps nothing open that is closed after ten idle.
+    let cfg = NetConfig { idle_timeout: Duration::from_secs(10), lookup: Lookup { keep_alive: Duration::from_secs(20), ..finding(point) }, ..eager() };
+    assert!(Network::start(rt.clone(), Directory::new(), cfg).is_err());
+    for lookup in [
+        Lookup { keep_alive: Duration::from_millis(500), ..finding(point) },
+        Lookup { keep_alive: Duration::from_secs(26), ..finding(point) },
+        Lookup { behind_router: true, ..Lookup::default() },
+    ] {
+        assert!(Network::start(rt.clone(), Directory::new(), with(lookup)).is_err());
+    }
+    assert!(Network::start(rt, Directory::new(), with(finding(point))).is_ok());
+}
+
+#[test]
+fn an_announcement_with_more_presences_than_records_may_be_is_refused_unread() {
+    let p = TempDir::new("manypresence-p");
+    let urbit = Arc::new(Listings::default());
+    let (_pr, point) = point_on(&p, &urbit, None, PointBounds::default(), "127.0.0.1:0");
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        let request = announce_with(vec![vec![1]], vec![vec![2; 64]; 17]);
+        assert!(refusal(ask_point(&connection, &request).await).contains("too many records"));
+        assert_eq!(point.point_status().unwrap().rated, 0);
+    });
+}
+
+#[test]
+fn an_introductions_record_counts_against_the_record_rates_of_its_connection() {
+    let p = TempDir::new("introrate-p");
+    let urbit = Arc::new(Listings::default());
+    // Two records an hour on any one connection; introductions themselves are plentiful.
+    let bounds = PointBounds { per_connection: 2, introductions_each: 100, rate_period: Duration::from_secs(3600), ..PointBounds::default() };
+    let (_pr, point) = point_on(&p, &urbit, None, bounds, "127.0.0.1:0");
+    let (callee, callee_key) = (ob::ship_name(0x1234_0100), SigningKey::from_bytes(&[155; 32]));
+    let (caller, caller_key) = (ob::ship_name(0x1235_0100), SigningKey::from_bytes(&[156; 32]));
+    urbit.list(&callee, callee_key.verifying_key().to_bytes());
+    urbit.list(&caller, caller_key.verifying_key().to_bytes());
+    let at: SocketAddr = "198.51.100.4:4433".parse().unwrap();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let own = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        let record = whereabouts::sign(&callee, &[at], now_ms(), &callee_key, None).unwrap();
+        assert_eq!(outcomes(ask_point(&own, &announce_with(vec![record.clone()], vec![presence_on(&own, &record, &callee_key)])).await), [String::new()]);
+        let asker = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        for _ in 0..2 {
+            assert_eq!(refusal(ask_point(&asker, &introduce_on(&asker, &callee, &caller, &caller_key, now_ms(), at)).await), "");
+        }
+        assert_eq!(refusal(ask_point(&asker, &introduce_on(&asker, &callee, &caller, &caller_key, now_ms(), at)).await), "too many records on this connection just now; try again later");
+    });
+}
+
+// Round two of phase 2.
+
+#[test]
+fn an_introduction_of_a_record_older_than_one_already_believed_sends_nothing() {
+    let a = TempDir::new("introfloor-a");
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    let lookup = Lookup { ask_again: Duration::from_millis(100), ..finding(liar.addr) };
+    let (_nec, nec_net, _) = ship_on(&a, "~nec", &urbit, with(lookup));
+    eventually("~nec is announced, asking to be introduced", || liar.records().last().is_some_and(|record| record.introduce));
+    let bus = SigningKey::from_bytes(&[164; 32]);
+    urbit.list("~bus", bus.verifying_key().to_bytes());
+    let watch = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let here = watch.local_addr().unwrap();
+    let (_quiet, nowhere) = silent();
+    let now = now_ms();
+    // ~nec looks ~bus up, the ordinary way, and believes R2 (whose address does not answer).
+    liar.say(Lie::Record(whereabouts::sign("~bus", &[nowhere], now, &bus, None).unwrap()));
+    assert!(nec_net.ping("~nec", "~bus").is_err());
+    // The point then passes on ~bus's genuine R1, older than R2 and still good: nothing.
+    let heard = nec_net.introductions().heard;
+    liar.push(introduction("~nec", whereabouts::sign("~bus", &[here], now - 1000, &bus, None).unwrap()), false);
+    // And R3, newer: three packets. (Weighed in order, so R1 was weighed first.)
+    liar.push(introduction("~nec", whereabouts::sign("~bus", &[here], now + 1000, &bus, None).unwrap()), false);
+    eventually("both are heard", || nec_net.introductions().heard >= heard + 2);
+    assert_eq!(packets(&watch, Duration::from_millis(800)).len(), 3);
+}
+
+#[test]
+fn a_strangers_introductions_are_metered_by_its_own_connection_before_the_point_looks() {
+    let p = TempDir::new("intrometer-p");
+    let urbit = Arc::new(Listings::default());
+    let (_pr, point) = point_on(&p, &urbit, None, PointBounds::default(), "127.0.0.1:0");
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let stranger = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        let honest = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        // Requests to introduce nobody to a ship that is not there, with nothing in them, as
+        // fast as they can be sent: past its own allowance of questions, each is refused for
+        // that, before the point looks at who attends.
+        let request = introduce_with("~nec", Vec::new(), Vec::new());
+        let mut said = Vec::new();
+        let started = Instant::now();
+        for _ in 0..150 {
+            said.push(refusal(ask_point(&stranger, &request).await));
+        }
+        // At most 64 at a stroke and 64 a second earned back get as far as the table; the rest
+        // were refused for that, however slowly the requests went.
+        let metered = said.iter().filter(|why| why.contains("too many questions")).count();
+        let took = started.elapsed();
+        // Slower than this, too much is earned back for the count to mean anything.
+        assert!(took < Duration::from_secs(1), "inconclusive: 150 requests took {took:?}");
+        let let_through = 64.0 + 64.0 * took.as_secs_f64();
+        assert!(150.0 - metered as f64 <= let_through.floor(), "{metered} metered in {:?}", started.elapsed());
+        assert!(said.iter().all(|why| why.contains("too many questions") || why == "that ship is not attending this lookup point"), "{said:?}");
+        // Another connection's question is answered as ever.
+        assert!(ask_point(&honest, &question("~zod")).await.is_some_and(|reply| reply.body.is_some()));
+    });
+}
+
+#[test]
+fn a_ship_whose_record_is_taken_is_introduced_though_another_of_its_galaxy_is_refused() {
+    let a = TempDir::new("partial-a");
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    // The point refuses ~nec's record every time, and takes ~marnec's (both of ~nec's galaxy).
+    liar.refuse.lock().unwrap().push(1);
+    let rt = Arc::new(Runtime::open(&a.0, fast()).unwrap());
+    for ship in ["~nec", "~marnec"] {
+        rt.create_ship(ship, &kernel(&rt)).unwrap();
+        urbit.list(ship, rt.public_key(ship).unwrap());
+    }
+    let net = Network::start(rt.clone(), Directory::reading(urbit.clone()), with(Lookup { ask_again: Duration::from_millis(100), ..finding(liar.addr) })).unwrap();
+    eventually("~marnec is recorded as announced, asking to be introduced", || net.announced_as("~marnec").is_some_and(|(_, introduce)| introduce));
+    assert_eq!(net.announced_as("~nec"), None);
+    // ~marnec is introduced: a caller's packets go out.
+    let bus = SigningKey::from_bytes(&[165; 32]);
+    urbit.list("~bus", bus.verifying_key().to_bytes());
+    let watch = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    liar.push(introduction("~marnec", whereabouts::sign("~bus", &[watch.local_addr().unwrap()], now_ms(), &bus, None).unwrap()), false);
+    assert_eq!(packets(&watch, Duration::from_millis(800)).len(), 3);
+    // And ~marnec, calling a ship that asks to be introduced, asks for it.
+    let seed = [166u8; 32];
+    urbit.list("~wes", SigningKey::from_bytes(&seed).verifying_key().to_bytes());
+    let (_quiet, nowhere) = silent();
+    liar.say(Lie::Record(whereabouts::sign_flagged("~wes", &[nowhere], now_ms(), true, &SigningKey::from_bytes(&seed), None).unwrap()));
+    assert!(net.ping("~marnec", "~wes").is_err());
+    assert!(liar.introductions.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn a_point_that_writes_an_ipv4_address_as_ipv6_is_read_as_ipv4() {
+    let a = TempDir::new("mapped-a");
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    let mut mapped = std::net::Ipv4Addr::new(203, 0, 113, 9).to_ipv6_mapped().octets().to_vec();
+    mapped.extend_from_slice(&4433u16.to_be_bytes());
+    liar.see(SeenLie::Address(mapped));
+    let (_zod, _zod_net, _) = ship_on(&a, "~zod", &urbit, with(finding(liar.addr)));
+    eventually("~zod is announced", || !liar.records().is_empty());
+    assert_eq!(liar.records().last().unwrap().addresses, vec![address_bytes("203.0.113.9:4433".parse().unwrap())]);
+}
+
+#[test]
+fn introductions_are_weighed_only_so_many_a_second_and_not_at_all_for_a_ship_that_asked_for_none() {
+    let a = TempDir::new("weighrate-a");
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    let (_nec, nec_net, _) = ship_on(&a, "~nec", &urbit, with(finding(liar.addr)));
+    eventually("~nec is announced, asking to be introduced", || liar.records().last().is_some_and(|record| record.introduce));
+    let bus = SigningKey::from_bytes(&[167; 32]);
+    urbit.list("~bus", bus.verifying_key().to_bytes());
+    let watch = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let record = whereabouts::sign("~bus", &[watch.local_addr().unwrap()], now_ms(), &bus, None).unwrap();
+    // Two hundred introductions of one caller, as fast as they can be passed on: no more are
+    // weighed than the allowance for weighing lets through, whole at the start.
+    let started = Instant::now();
+    for _ in 0..200 {
+        liar.push(introduction("~nec", record.clone()), false);
+    }
+    let mut last = (nec_net.introductions().heard, Instant::now());
+    while last.1.elapsed() < Duration::from_millis(300) {
+        std::thread::sleep(Duration::from_millis(20));
+        let now = nec_net.introductions().heard;
+        if now != last.0 {
+            last = (now, Instant::now());
+        }
+    }
+    let took = (last.1 - started).as_secs_f64();
+    let weighed = nec_net.introductions().weighed as f64;
+    let most = f64::from(runtime::net::INTRODUCTIONS_WEIGHED) * (1.0 + took);
+    assert!(weighed <= most, "{weighed} weighed in {took}s");
+    assert!(nec_net.introductions().heard as f64 > most, "{:?}: not enough were heard to show the limit", nec_net.introductions());
+    // ~nec stops asking for introductions. One of a ship nothing is known of costs no
+    // question to Urbit ID at all, and nothing is weighed.
+    liar.see(SeenLie::Truth);
+    eventually("~nec is announced asking for none", || liar.records().last().is_some_and(|record| !record.introduce));
+    std::thread::sleep(Duration::from_millis(1100));
+    let wes = SigningKey::from_bytes(&[168; 32]);
+    urbit.list("~wes", wes.verifying_key().to_bytes());
+    let (asked, heard, weighed) = (urbit.2.load(Ordering::SeqCst), nec_net.introductions().heard, nec_net.introductions().weighed);
+    liar.push(introduction("~nec", whereabouts::sign("~wes", &[watch.local_addr().unwrap()], now_ms(), &wes, None).unwrap()), false);
+    eventually("it is heard", || nec_net.introductions().heard > heard);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(urbit.2.load(Ordering::SeqCst), asked, "Urbit ID was asked about a caller of a ship that asked for no introductions");
+    assert_eq!(nec_net.introductions().weighed, weighed);
+}
+
+#[test]
+fn an_address_set_by_hand_while_a_flagged_answer_is_held_means_no_introduction() {
+    let (a, b) = (TempDir::new("holdintro-a"), TempDir::new("holdintro-b"));
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    let seed = [169u8; 32];
+    let (_nec, nec_net, _) = keyed_ship_on(&b, "~nec", seed, &urbit, eager());
+    let cfg = NetConfig { request_timeout: Duration::from_secs(10), ..with(Lookup { ask_again: Duration::from_millis(100), ..finding(liar.addr) }) };
+    let (_zod, zod_net, zod_dir) = ship_on(&a, "~zod", &urbit, cfg);
+    eventually("~zod is announced", || !liar.records().is_empty());
+    liar.say(Lie::Record(whereabouts::sign_flagged("~nec", &[nec_net.addr()], now_ms(), true, &SigningKey::from_bytes(&seed), None).unwrap()));
+    // The point's answer, which asks for an introduction, is held. Meanwhile an address is
+    // set by hand. Once the answer comes, no introduction is asked for.
+    liar.hold.store(true, Ordering::SeqCst);
+    let asked = liar.asked.load(Ordering::SeqCst);
+    std::thread::scope(|scope| {
+        let call = scope.spawn(|| zod_net.ping("~zod", "~nec"));
+        eventually("the point is asked", || liar.asked.load(Ordering::SeqCst) > asked);
+        zod_dir.place("~nec", nec_net.addr()).unwrap();
+        liar.hold.store(false, Ordering::SeqCst);
+        let _ = call.join().unwrap();
+    });
+    assert_eq!(liar.introductions.load(Ordering::SeqCst), 0, "an introduction was asked for after the address was set by hand");
+}
+
+// Round three of phase 2.
+
+#[test]
+fn an_introduced_moon_is_weighed_by_the_key_set_by_hand_for_it() {
+    let dirs: Vec<TempDir> = (0..2).map(|n| TempDir::new(&format!("handmoon-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    let (planet_name, moon_name) = ("~sampel-palnet", "~doznec-sampel-palnet");
+    let planet = Runtime::open(&dirs[0].0, fast()).unwrap();
+    planet.create_ship(planet_name, &kernel(&planet)).unwrap();
+    urbit.list(planet_name, planet.public_key(planet_name).unwrap());
+    // The parent vouches for two keys of the moon's, at revisions one and two.
+    let words = |keyfile: &str| {
+        let read = runtime::urbit_id::Keyfile::parse(keyfile).unwrap();
+        (SigningKey::from_bytes(&read.keys.auth), runtime::moon::Proof { revision: read.revision, signed: read.signed.unwrap() })
+    };
+    let (first_key, first_word) = words(&planet.moon_keyfile(planet_name, moon_name, 1).unwrap());
+    let (second_key, second_word) = words(&planet.moon_keyfile(planet_name, moon_name, 2).unwrap());
+    let (_nec, nec_net, nec_dir) = ship_on(&dirs[1], "~nec", &urbit, with(finding(liar.addr)));
+    eventually("~nec is announced, asking to be introduced", || nec_net.announced_as("~nec").is_some_and(|(_, introduce)| introduce));
+    // ~nec's directory has the moon's second key set by hand.
+    nec_dir.set(moon_name, second_key.verifying_key().to_bytes(), "127.0.0.1:9".parse().unwrap()).unwrap();
+    let watch = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let here = watch.local_addr().unwrap();
+    // Introduced under the first key, which its parent vouches for but is not the key set by
+    // hand: refused, as an ordinary lookup refuses it; nothing is sent.
+    let heard = nec_net.introductions().heard;
+    liar.push(introduction("~nec", whereabouts::sign(moon_name, &[here], now_ms(), &first_key, Some(first_word)).unwrap()), false);
+    // Introduced under the key set by hand, which its parent vouches for too: acted on, three
+    // packets, as an ordinary lookup would believe it. (Weighed in order: the first, first.)
+    liar.push(introduction("~nec", whereabouts::sign(moon_name, &[here], now_ms() + 1, &second_key, Some(second_word)).unwrap()), false);
+    eventually("both are heard", || nec_net.introductions().heard >= heard + 2);
+    assert_eq!(packets(&watch, Duration::from_millis(800)).len(), 3);
+    // Nothing of either was kept: the key set by hand is still the one held.
+    assert_eq!(nec_dir.key_of(moon_name), Some(second_key.verifying_key().to_bytes()));
+}
+
+#[test]
+fn what_an_earlier_chunk_of_a_round_achieved_survives_a_later_chunks_failure() {
+    let a = TempDir::new("chunks-a");
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    // Seventeen stars of ~nec's galaxy on one runtime: two chunks, sixteen and one.
+    let rt = Arc::new(Runtime::open(&a.0, fast()).unwrap());
+    let kernel = kernel(&rt);
+    let mut ships: Vec<String> = (1..=17u32).map(|k| ob::ship_name(k << 8 | 1)).collect();
+    for ship in &ships {
+        rt.create_ship(ship, &kernel).unwrap();
+        urbit.list(ship, rt.public_key(ship).unwrap());
+    }
+    ships.sort();
+    let first = ships[0].clone();
+    let net = Network::start(rt.clone(), Directory::reading(urbit.clone()), with(Lookup { ask_again: Duration::from_millis(100), ..finding(liar.addr) })).unwrap();
+    eventually("every ship is recorded as asking to be introduced", || ships.iter().all(|ship| net.announced_as(ship).is_some_and(|(_, introduce)| introduce)));
+    // The point answers the second chunk of each round with rubbish; and then sees the
+    // runtime where it listens, so its records ask for no introduction. (In that order, so
+    // that no whole round asking for none gets through in between.)
+    liar.garble_short.store(true, Ordering::SeqCst);
+    liar.see(SeenLie::Truth);
+    eventually("the first chunk's ship is recorded as asking for none", || net.announced_as(&first).is_some_and(|(_, introduce)| !introduce));
+    // (Each garbled round closes the connection; so that an introduction has one to come on,
+    // the point stops garbling, and a whole round goes through.)
+    liar.garble_short.store(false, Ordering::SeqCst);
+    eventually("a whole round goes through", || ships.iter().all(|ship| net.announced_as(ship).is_some_and(|(_, introduce)| !introduce)));
+    // An introduction to the first chunk's ship sends nothing.
+    let bus = SigningKey::from_bytes(&[170; 32]);
+    urbit.list("~bus", bus.verifying_key().to_bytes());
+    let watch = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let heard = net.introductions().heard;
+    liar.push(introduction(&first, whereabouts::sign("~bus", &[watch.local_addr().unwrap()], now_ms(), &bus, None).unwrap()), false);
+    eventually("it is heard", || net.introductions().heard > heard);
+    assert!(packets(&watch, Duration::from_millis(800)).is_empty());
 }

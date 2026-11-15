@@ -12,8 +12,10 @@
 //! ships, under a protocol name of its own (`ship-where/1`), so nothing it does shares a path
 //! with ship-to-ship requests once the connection is made. It has no identity worth proving:
 //! it shows a key made when it starts, and callers take any key. That is safe because nothing
-//! a point says is taken on its word. A record is believed only if the ship signed it, so a
-//! point can keep one back, or hand out one that has not run out yet, and nothing more. The
+//! a point says about who anyone is, or about what a ship's record says, is taken on its word.
+//! A record is believed only if the ship signed it, so a point can keep one back, or hand out
+//! one that has not run out yet, and nothing more; the one thing a ship does take on a point's
+//! word is where that point sees it from (`Seen`, below), with the limits said there. The
 //! point checks what it is given too, against its own copy of Urbit ID, and keeps and hands
 //! out only records that pass its own checks. A ship that asks may know more than the point
 //! (a later word of a moon's parent, a newer record of the ship) and refuse what the point
@@ -47,11 +49,35 @@
 //! A runtime with none of these settings sends nothing new, listens for nothing new, and keeps
 //! nothing new: everything here is off unless asked for.
 //!
-//! What this does not do yet: learn the address a runtime is seen at from outside its router,
-//! introduce two ships to each other, open a path through home routers, or carry traffic for
-//! ships that cannot be reached directly. Ships behind home routers stay unreachable for now.
+//! The outside address. A runtime asks the point of its own galaxy, over the connection it
+//! announces on, what address that connection comes from (`Seen`), and announces that, unless
+//! whoever runs it has stated the addresses by hand, which always win. What a point reports
+//! is believed only for the ships of that point's own galaxy, only over the connection it was
+//! asked on, and only as an address a record may carry.
+//!
+//! Presence. A ship gives its record to a point together with its presence on that one
+//! connection (see `crate::whereabouts`), and the point keeps the record only with it. So the
+//! point knows, for each record it holds, the connection the ship itself is on: where the ship
+//! attends. That stops being so when the connection closes, the record runs out, or a newer
+//! record of the ship is kept, which names its own connection. The connection stays open, with
+//! a packet every `keep_alive` so that a home router keeps its way in open, and is made again
+//! at once if it drops, with fresh presence.
+//!
+//! Introductions. A ship behind a home router can be reached only once it has sent something
+//! toward its caller, which opens its router to that caller. Its record says so, under its
+//! signature, and a caller about to try such a record first asks the ship's point to introduce
+//! it (`Introduce`), showing its own record and its presence. The point checks both as it
+//! would an announcement, keeps nothing, and passes the caller's record to the ship over the
+//! connection the ship attends on, never anywhere else. The ship checks the record itself, and
+//! sends three small packets from its own port to the caller's addresses, and nothing else:
+//! its router then lets the caller's ordinary connection attempt in. Nothing on this path is
+//! believed about who anyone is; the connection that follows is proved as any other is.
+//!
+//! What this does not do: carry traffic for ships that cannot be reached directly. Two ships
+//! behind routers of the strict kind, which give each destination a port of its own, cannot
+//! reach each other; the call fails in its time and says so.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -66,14 +92,16 @@ use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use ship_proto::{where_reply, where_request, Announce, Announced, Found, Message, Where, WhereReply, WhereRequest};
-use tokio::sync::Semaphore;
+use ship_proto::{
+    where_reply, where_request, Announce, Announced, Found, Introduce, Introduced, Introduction, Message, Saw, Seen, Where, WhereReply, WhereRequest,
+};
+use tokio::sync::{Notify, Semaphore};
 use urbit_id::ob;
 
 use crate::azimuth::Keys;
 use crate::net::{self, Directory, NetConfig, NetError};
 use crate::store::now_ms;
-use crate::whereabouts::{self, Believed, Known};
+use crate::whereabouts::{self, Believed, Binding, Known};
 use crate::{lock, Runtime};
 
 /// The name of the lookup protocol, agreed while connecting. A runtime that is not a lookup
@@ -110,7 +138,8 @@ const MOST_POINT_READING: usize = 8;
 /// about 1.5 MiB in all. Past it a request is refused at once, before any of it is read.
 pub const MOST_IN_HAND: usize = 64;
 
-/// How many questions about ships one connection to a lookup point may ask in a second. A
+/// How many questions about ships one connection to a lookup point may ask at a stroke, and
+/// are earned back a second. A
 /// question costs the point next to nothing, so this is only there so that it costs
 /// something to ask about every ship there is.
 const MOST_QUESTIONS_EACH: u32 = 64;
@@ -161,6 +190,70 @@ const ANNOUNCE_TICK: Duration = Duration::from_secs(1);
 /// The longest any time setting here may be.
 const MAX_SETTING: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The shortest and longest `keep_alive` may be. A home router forgets an opening it has seen
+/// nothing on for some tens of seconds, and a connection with nothing on it for the idle time
+/// (thirty seconds unless set otherwise) is closed, so a packet must go well inside both; more
+/// often than once a second is more than any router needs.
+const MIN_KEEP_ALIVE: Duration = Duration::from_secs(1);
+const MAX_KEEP_ALIVE: Duration = Duration::from_secs(25);
+
+/// How many introductions a point may have open toward one ship's connection at once. Each is
+/// a stream the point opens, carrying one introduction.
+const MOST_PUSHES_OPEN: u32 = 4;
+
+/// The most an introduction passed to a ship may come to: the ship's number, a record as large
+/// as a record may be, and their framing.
+pub(crate) const MOST_PUSH_BYTES: usize = whereabouts::MOST_RECORD_BYTES + 64;
+
+/// The longest a point gives one introduction to reach a ship, once it begins to pass it on:
+/// a few hundred bytes, which an honest ship takes in one trip there and back. After that the
+/// stream is given up, and the next introduction begun.
+const PUSH_LIMIT: Duration = Duration::from_secs(1);
+
+/// The longest an introduction waits to be passed on at all. After that it is dropped: the
+/// caller it is for has given up on the attempt it was for (`TRY_INTRODUCED`) or soon will.
+const PUSH_WAIT: Duration = Duration::from_secs(3);
+
+/// The longest a ship gives the point to finish one introduction it has begun to pass on.
+const PUSH_READ_LIMIT: Duration = Duration::from_secs(2);
+
+/// How many introductions may wait to be passed over one connection at once, and how many of
+/// them for any one ship.
+const MOST_WAITING: usize = 16;
+pub const MOST_WAITING_EACH: usize = 4;
+
+/// How many callers a point keeps count of introductions for. Past this, those whose
+/// allowance is whole again are forgotten; if none is, a new caller is refused for a moment.
+const MOST_INTRODUCERS: usize = 4096;
+
+/// The longest one attempt at an address of a record that asks for introductions is given: a
+/// caller's first packet may arrive before the ship's own packets have opened its router, and
+/// is then lost, and QUIC sends it again after about a second (its first guess at the time a
+/// packet takes there and back is a third of a second, and it waits three of those and a bit
+/// before sending again). Then the ship asks the caller to show it is at the address it says
+/// (one more time there and back), and the handshake follows. Four seconds leaves room for
+/// all of that over real distances.
+const TRY_INTRODUCED: Duration = Duration::from_secs(4);
+
+/// The longest a caller waits for a point to say it has passed an introduction on, never more
+/// than a quarter of the time left. A point that does not answer in time does not stop the
+/// call: the ship is tried anyway.
+const INTRODUCE_WAIT: Duration = Duration::from_secs(1);
+
+/// The value both ends of a connection work out from its handshake, for a ship's presence on
+/// it. `None` if the TLS library cannot give it, and then no presence can be made
+/// or checked on the connection.
+pub(crate) fn binding_of(connection: &Connection) -> Option<Binding> {
+    let mut binding = [0u8; 32];
+    connection.export_keying_material(&mut binding, whereabouts::BINDING_LABEL, b"").ok()?;
+    Some(binding)
+}
+
+/// An address as it is, with an IPv4 address that came written as IPv6 written as IPv4.
+fn plain(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 /// Somewhere to look names up. The system's resolver is the one used, unless a test or a
 /// private network gives another.
 pub trait Resolve: Send + Sync {
@@ -197,13 +290,26 @@ pub struct PointBounds {
     pub in_all: u32,
     /// The span of time the record rates are counted over: a second, unless set otherwise.
     pub rate_period: Duration,
+    /// Introductions passed on each `rate_period`, in all, and for any one caller.
+    pub introductions: u32,
+    pub introductions_each: u32,
 }
 
 impl Default for PointBounds {
     fn default() -> Self {
         // Sixty-five thousand ships each announcing every two minutes is some five hundred
         // records a second.
-        PointBounds { records: 1 << 16, moons: 1 << 14, moons_each: 64, connections: 256, per_connection: 256, in_all: 2048, rate_period: Duration::from_secs(1) }
+        PointBounds {
+            records: 1 << 16,
+            moons: 1 << 14,
+            moons_each: 64,
+            connections: 256,
+            per_connection: 256,
+            in_all: 2048,
+            rate_period: Duration::from_secs(1),
+            introductions: 512,
+            introductions_each: 4,
+        }
     }
 }
 
@@ -239,9 +345,18 @@ pub struct Lookup {
     /// What names are looked up through. The system's resolver if not given.
     pub resolver: Option<Arc<dyn Resolve>>,
     /// The addresses to announce this runtime's ships at, as they are reached from outside.
-    /// With none, the address the runtime listens on, unless that is one that means "any"
-    /// (`0.0.0.0` or `::`), in which case nothing is announced.
+    /// With none, the address the lookup point of each ship's galaxy sees this runtime's
+    /// connection come from. Stated addresses always win: what a point says is then not used.
     pub announce: Vec<SocketAddr>,
+    /// Ask callers to be introduced first, even with addresses stated by hand: for a runtime
+    /// that knows its outside address but whose router lets nothing in unasked. With no
+    /// addresses stated, callers are asked to be introduced whenever the address the point
+    /// sees is not the one this runtime listens on, whatever this says.
+    pub behind_router: bool,
+    /// How often a packet goes over the connection to each lookup point this runtime announces
+    /// to, and over a connection made to a ship that asks for introductions, so that a home
+    /// router keeps the way in open. One to twenty-five seconds, and less than `idle_timeout`.
+    pub keep_alive: Duration,
     /// How often each ship is announced again. Records last ten minutes, so this must leave
     /// room for some announcements to go astray.
     pub announce_every: Duration,
@@ -260,6 +375,8 @@ impl Default for Lookup {
             domain: None,
             resolver: None,
             announce: Vec::new(),
+            behind_router: false,
+            keep_alive: Duration::from_secs(15),
             announce_every: Duration::from_secs(120),
             ask_again: Duration::from_secs(3),
             resolved_for: Duration::from_secs(300),
@@ -275,6 +392,8 @@ impl fmt::Debug for Lookup {
             .field("domain", &self.domain)
             .field("resolver", &self.resolver.as_ref().map(|_| "given"))
             .field("announce", &self.announce)
+            .field("behind_router", &self.behind_router)
+            .field("keep_alive", &self.keep_alive)
             .field("announce_every", &self.announce_every)
             .field("ask_again", &self.ask_again)
             .field("resolved_for", &self.resolved_for)
@@ -299,6 +418,12 @@ impl Lookup {
         if self.announce_every.is_zero() || self.announce_every.as_millis() > u128::from(whereabouts::LIFETIME_MS / 2) {
             return Err("announce_every must be more than nothing and at most five minutes".into());
         }
+        if self.keep_alive < MIN_KEEP_ALIVE || self.keep_alive > MAX_KEEP_ALIVE {
+            return Err("keep_alive must be from one second to twenty-five".into());
+        }
+        if self.behind_router && !self.finds() {
+            return Err("behind_router needs somewhere to announce: a lookup point's address or domain".into());
+        }
         if !self.announce.is_empty() {
             if !self.finds() {
                 return Err("addresses to announce at need somewhere to announce them: a lookup point's address or domain".into());
@@ -316,7 +441,7 @@ impl Lookup {
         }
         if let Some(point) = &self.serve {
             let b = point.bounds;
-            if b.records == 0 || b.moons == 0 || b.moons_each == 0 || b.connections == 0 || b.per_connection == 0 || b.in_all == 0 {
+            if b.records == 0 || b.moons == 0 || b.moons_each == 0 || b.connections == 0 || b.per_connection == 0 || b.in_all == 0 || b.introductions == 0 || b.introductions_each == 0 {
                 return Err("a lookup point's bounds must each be more than nothing".into());
             }
             if !within(b.rate_period) {
@@ -341,8 +466,31 @@ pub(crate) fn try_limit(deadline: tokio::time::Instant) -> Duration {
     TRY_ADDRESS.min(deadline.saturating_duration_since(tokio::time::Instant::now()) / 2)
 }
 
+/// How long to give one try at an address of a record that asks for introductions:
+/// `TRY_INTRODUCED`, or three quarters of what is left if that is less.
+pub(crate) fn introduced_limit(deadline: tokio::time::Instant) -> Duration {
+    introduced_limit_at(deadline, tokio::time::Instant::now())
+}
+
+/// The same, with the clock read already (`now`).
+fn introduced_limit_at(deadline: tokio::time::Instant, now: tokio::time::Instant) -> Duration {
+    let left = deadline.saturating_duration_since(now);
+    TRY_INTRODUCED.min(left - left / 4)
+}
+
+/// How long to wait for a point to say it has passed an introduction on: `INTRODUCE_WAIT`, or
+/// a quarter of what is left if that is less.
+pub(crate) fn introduce_wait(deadline: tokio::time::Instant) -> Duration {
+    introduce_wait_at(deadline, tokio::time::Instant::now())
+}
+
+/// The same, with the clock read already (`now`).
+fn introduce_wait_at(deadline: tokio::time::Instant, now: tokio::time::Instant) -> Duration {
+    INTRODUCE_WAIT.min(deadline.saturating_duration_since(now) / 4)
+}
+
 /// So many things allowed in a second, topped up as time passes, up to a second's worth.
-struct Bucket {
+pub(crate) struct Bucket {
     left: f64,
     /// The most there may be, which is one period's worth.
     most: f64,
@@ -353,18 +501,29 @@ struct Bucket {
 
 impl Bucket {
     /// So many a second.
-    fn new(rate: u32) -> Bucket {
+    pub(crate) fn new(rate: u32) -> Bucket {
         Bucket::per(rate, Duration::from_secs(1))
     }
 
     /// So many each `period`, which is more than nothing.
-    fn per(rate: u32, period: Duration) -> Bucket {
+    pub(crate) fn per(rate: u32, period: Duration) -> Bucket {
         let most = f64::from(rate);
         Bucket { left: most, most, per_second: most / period.as_secs_f64().max(f64::MIN_POSITIVE), at: Instant::now() }
     }
 
+    /// Whether it has earned back all it may hold: nothing has been taken from it lately.
+    pub(crate) fn whole(&self) -> bool {
+        self.left + self.at.elapsed().as_secs_f64() * self.per_second >= self.most
+    }
+
+    /// How many it holds now, earned back so far included. For tests, to see what was taken.
+    #[cfg(test)]
+    pub(crate) fn holds(&self) -> f64 {
+        (self.left + self.at.elapsed().as_secs_f64() * self.per_second).min(self.most)
+    }
+
     /// Take one, if there is one.
-    fn take(&mut self) -> bool {
+    pub(crate) fn take(&mut self) -> bool {
         let now = Instant::now();
         self.left = (self.left + now.duration_since(self.at).as_secs_f64() * self.per_second).min(self.most);
         self.at = now;
@@ -383,18 +542,94 @@ struct Held {
     record: Vec<u8>,
     issued: u64,
     moon: Option<(u32, [u8; 32])>,
+    /// The connection the ship proved it is on when this record was kept, by the number the
+    /// point gave the connection, while that connection is open: where the ship attends.
+    attends: Option<u64>,
 }
 
-/// What a lookup point holds, by ship number, with its moons counted as they come and go.
+/// A connection to a lookup point, while the point has it open: the ships that attend on it,
+/// and the introductions waiting to be passed to them over it.
+struct Present {
+    ships: HashSet<u64>,
+    waiting: VecDeque<Push>,
+    /// Rung when an introduction is put in `waiting`.
+    wake: Arc<Notify>,
+}
+
+/// An introduction waiting to be passed to a ship: the caller's record, and when it was taken.
+struct Push {
+    callee: u64,
+    record: Vec<u8>,
+    at: Instant,
+}
+
+/// Why an introduction is refused when the ship is not where it can be passed to.
+const NOT_ATTENDING: &str = "that ship is not attending this lookup point";
+
+/// What a lookup point holds, by ship number, with its moons counted as they come and go, and
+/// the connections it has open, with who attends on each.
 #[derive(Default)]
 struct Table {
     held: HashMap<u64, Held>,
     moons: usize,
     moons_of: HashMap<u32, usize>,
     swept: Option<Instant>,
+    present: HashMap<u64, Present>,
 }
 
 impl Table {
+    /// A connection under the lookup protocol has opened. Records may be kept from it from now
+    /// on, and introductions passed over it.
+    fn open(&mut self, connection: u64, wake: Arc<Notify>) {
+        self.present.insert(connection, Present { ships: HashSet::new(), waiting: VecDeque::new(), wake });
+    }
+
+    /// A connection has closed. No ship attends on it any more, and what was waiting to be
+    /// passed over it is dropped. Its records stay, and are handed out until they run out.
+    fn close(&mut self, connection: u64) {
+        if let Some(present) = self.present.remove(&connection) {
+            for ship in present.ships {
+                if let Some(held) = self.held.get_mut(&ship).filter(|held| held.attends == Some(connection)) {
+                    held.attends = None;
+                }
+            }
+        }
+    }
+
+    /// The connection a ship attends on, if its record is still good and the connection open.
+    fn attending(&self, ship: u64, now: u64) -> Option<u64> {
+        self.held.get(&ship).filter(|held| whereabouts::fresh(held.issued, now)).and_then(|held| held.attends)
+    }
+
+    /// Put an introduction in the way of being passed to a ship, over the connection it attends
+    /// on, if it attends anywhere and there is room. Weighed with the table held, at `now`.
+    fn pass(&mut self, callee: u64, record: Vec<u8>, now: u64) -> Result<(), &'static str> {
+        let connection = self.attending(callee, now).ok_or(NOT_ATTENDING)?;
+        let present = self.present.get_mut(&connection).ok_or(NOT_ATTENDING)?;
+        present.waiting.retain(|push| push.at.elapsed() < PUSH_WAIT);
+        if present.waiting.iter().filter(|push| push.callee == callee).count() >= MOST_WAITING_EACH {
+            return Err("that ship has as many introductions waiting as it may; try again later");
+        }
+        if present.waiting.len() >= MOST_WAITING {
+            return Err("as many introductions are waiting for that ship's connection as may be; try again later");
+        }
+        present.waiting.push_back(Push { callee, record, at: Instant::now() });
+        present.wake.notify_one();
+        Ok(())
+    }
+
+    /// The next introduction to pass over a connection: one that has not waited too long, for a
+    /// ship that still attends on this connection, weighed with the table held, at `now`. The
+    /// rest are dropped as they are come to.
+    fn next_push(&mut self, connection: u64, now: u64) -> Option<Push> {
+        loop {
+            let push = self.present.get_mut(&connection)?.waiting.pop_front()?;
+            if push.at.elapsed() < PUSH_WAIT && self.attending(push.callee, now) == Some(connection) {
+                return Some(push);
+            }
+        }
+    }
+
     /// What is held of a ship, to weigh a new record against: the record held, until it has
     /// run out, and with it the moon's word it carried.
     fn known(&self, ship: u64, now: u64) -> Known {
@@ -402,7 +637,11 @@ impl Table {
     }
 
     fn remove(&mut self, ship: u64) {
-        if self.held.remove(&ship).is_some() && ship > u64::from(u32::MAX) {
+        let Some(held) = self.held.remove(&ship) else { return };
+        if let Some(present) = held.attends.and_then(|connection| self.present.get_mut(&connection)) {
+            present.ships.remove(&ship);
+        }
+        if ship > u64::from(u32::MAX) {
             self.moons -= 1;
             let parent = ob::moon_parent(ship);
             if let Some(count) = self.moons_of.get_mut(&parent) {
@@ -443,14 +682,12 @@ impl Table {
         Ok(())
     }
 
-    /// Keep a record that has been checked, in the place of the ship's last. Weighed again,
-    /// with the lock held and the clock read after the checking (`now`): checking waits on
-    /// the source of keys, and meanwhile the record may have run out, or another
-    /// announcement of the same ship may have been kept.
-    fn keep(&mut self, believed: &Believed, record: Vec<u8>, bounds: &PointBounds, now: u64) -> Result<(), &'static str> {
-        if !whereabouts::fresh(believed.issued, now) {
-            return Err("the record ran out, or this clock went back, while it was being checked");
-        }
+    /// Whether a believed record still stands against what is held of its ship, at `now`, read
+    /// with the table held: newer than the record held while that holds older ones off, and
+    /// for a moon, at no earlier a revision of its parent's word than held, and at the same
+    /// revision only for the same key. Used where a record is kept, and where a caller's
+    /// record is passed on in an introduction.
+    fn weighs_against_held(&self, believed: &Believed, now: u64) -> Result<(), &'static str> {
         let known = self.known(believed.number, now);
         if known.issued.is_some_and(|seen| believed.issued <= seen) {
             return Err("a record of the ship as new or newer is already held");
@@ -463,6 +700,22 @@ impl Table {
                 return Err("another key has been seen for the moon at this revision");
             }
         }
+        Ok(())
+    }
+
+    /// Keep a record that has been checked, in the place of the ship's last, with the ship
+    /// attending on `connection`, where its presence was checked. Weighed again, with the lock
+    /// held and the clock read after the checking (`now`): checking waits on the source of
+    /// keys, and meanwhile the record may have run out, another announcement of the same ship
+    /// may have been kept, or the connection may have closed.
+    fn keep(&mut self, believed: &Believed, record: Vec<u8>, bounds: &PointBounds, now: u64, connection: u64) -> Result<(), &'static str> {
+        if !self.present.contains_key(&connection) {
+            return Err("the connection the record came on has closed");
+        }
+        if !whereabouts::fresh(believed.issued, now) {
+            return Err("the record ran out, or this clock went back, while it was being checked");
+        }
+        self.weighs_against_held(believed, now)?;
         if !self.held.contains_key(&believed.number) {
             if self.room(believed.number, bounds).is_err() {
                 self.sweep(now);
@@ -473,7 +726,14 @@ impl Table {
                 *self.moons_of.entry(ob::moon_parent(believed.number)).or_default() += 1;
             }
         }
-        self.held.insert(believed.number, Held { record, issued: believed.issued, moon: believed.moon });
+        let before = self.held.insert(believed.number, Held { record, issued: believed.issued, moon: believed.moon, attends: Some(connection) });
+        // The newer record names its own connection: the ship no longer attends on the old one.
+        if let Some(present) = before.and_then(|held| held.attends).filter(|&old| old != connection).and_then(|old| self.present.get_mut(&old)) {
+            present.ships.remove(&believed.number);
+        }
+        if let Some(present) = self.present.get_mut(&connection) {
+            present.ships.insert(believed.number);
+        }
         Ok(())
     }
 }
@@ -493,6 +753,16 @@ pub struct PointStatus {
     pub announced: u64,
     /// Records announced whose place in the rates has been decided, let in or refused.
     pub rated: u64,
+    /// Questions about where a connection comes from, since it started.
+    pub seen: u64,
+    /// Ships whose records are held and who attend on a connection open now.
+    pub attending: usize,
+    /// Introductions put in the way of being passed on, and those passed over a ship's
+    /// connection, since it started.
+    pub introduced: u64,
+    pub pushed: u64,
+    /// Connections refused because every number for one has been given.
+    pub unnumbered: u64,
 }
 
 /// A runtime's role as a lookup point.
@@ -509,12 +779,21 @@ pub(crate) struct Point {
     /// Places among the requests in hand, point-wide: being read, waiting, or being checked.
     in_hand: Arc<Semaphore>,
     in_all: Mutex<Bucket>,
+    /// Introductions that may still be passed on just now, in all, and for each caller.
+    introductions: Mutex<Bucket>,
+    introducers: Mutex<HashMap<u64, Bucket>>,
+    /// The number the next connection under the lookup protocol is given.
+    pub(crate) next_connection: AtomicU64,
     /// How far this point's clock is set from the machine's, in milliseconds. Nothing but a
     /// test sets it, to step the clock back or forward; otherwise it is the machine's clock.
     skew: AtomicI64,
     questions: AtomicU64,
     announced: AtomicU64,
     rated: AtomicU64,
+    seen: AtomicU64,
+    introduced: AtomicU64,
+    pushed: AtomicU64,
+    unnumbered: AtomicU64,
 }
 
 /// A place among the connections to a lookup point, given up when the connection ends.
@@ -550,10 +829,17 @@ impl Point {
             reading: Arc::new(Semaphore::new(MOST_POINT_READING)),
             in_hand: Arc::new(Semaphore::new(MOST_IN_HAND)),
             in_all: Mutex::new(Bucket::per(cfg.bounds.in_all, cfg.bounds.rate_period)),
+            introductions: Mutex::new(Bucket::per(cfg.bounds.introductions, cfg.bounds.rate_period)),
+            introducers: Mutex::default(),
+            next_connection: AtomicU64::new(0),
             skew: AtomicI64::new(0),
             questions: AtomicU64::new(0),
             announced: AtomicU64::new(0),
             rated: AtomicU64::new(0),
+            seen: AtomicU64::new(0),
+            introduced: AtomicU64::new(0),
+            pushed: AtomicU64::new(0),
+            unnumbered: AtomicU64::new(0),
         })
     }
 
@@ -567,6 +853,11 @@ impl Point {
             questions: self.questions.load(Ordering::SeqCst),
             announced: self.announced.load(Ordering::SeqCst),
             rated: self.rated.load(Ordering::SeqCst),
+            seen: self.seen.load(Ordering::SeqCst),
+            attending: table.held.values().filter(|held| held.attends.is_some()).count(),
+            introduced: self.introduced.load(Ordering::SeqCst),
+            pushed: self.pushed.load(Ordering::SeqCst),
+            unnumbered: self.unnumbered.load(Ordering::SeqCst),
         }
     }
 
@@ -577,16 +868,27 @@ impl Point {
         self.keys.listing(number).ok().flatten()?.key
     }
 
-    /// Take the records of an announcement, each checked against Urbit ID and kept if it is
+    /// Take the records of an announcement, each with its ship's presence, on the connection
+    /// tests announce on (`TESTING`), each checked against Urbit ID and kept if it is
     /// believed. What became of each, in order: empty if it was kept, or why not. This waits
     /// on the source of keys, so it is for a thread that may wait.
+    /// (The tests' records are signed with keys the tests can work out again, and their
+    /// presence is made here.)
     #[cfg(test)]
     fn take(&self, records: Vec<Vec<u8>>, each: &Mutex<Bucket>) -> Vec<String> {
-        self.check_all(self.admit(records, each), &Mutex::new(false))
+        let presence = records.iter().map(|record| tests::presence_for(record)).collect();
+        self.check_all(self.admit(records, each), presence, Some(TESTING.1), TESTING.0, &Mutex::new(false))
     }
 
-    /// Count the records of an announcement against what may be checked in a second, on
-    /// this connection and in all. Done as the request arrives, before it waits for a thread
+    /// The same, for a caller whose going is marked by `gone`.
+    #[cfg(test)]
+    fn take_gone(&self, records: Vec<Vec<u8>>, gone: &Mutex<bool>) -> Vec<String> {
+        let presence = records.iter().map(|record| tests::presence_for(record)).collect();
+        self.check_all(self.admit(records, &Mutex::new(Bucket::new(1 << 20))), presence, Some(TESTING.1), TESTING.0, gone)
+    }
+
+    /// Count the records of an announcement against the allowances for checking (a burst,
+    /// earned back as time passes), on this connection and in all. Done as the request arrives, before it waits for a thread
     /// to check on: a record past the allowance is refused then, and costs nothing more.
     fn admit(&self, records: Vec<Vec<u8>>, each: &Mutex<Bucket>) -> Vec<Result<Vec<u8>, &'static str>> {
         records
@@ -614,18 +916,21 @@ impl Point {
     /// out). From then on nothing of the batch is kept, and nothing more is asked of the
     /// source of keys but at most the one question that was already begun, or beginning, as
     /// the caller went; its answer is thrown away.
-    fn check_all(&self, admitted: Vec<Result<Vec<u8>, &'static str>>, gone: &Mutex<bool>) -> Vec<String> {
+    ///
+    /// Each record comes with its ship's presence on the connection it came on (`connection`,
+    /// whose value is `binding`), and is kept only with it, with the ship attending there.
+    fn check_all(&self, admitted: Vec<Result<Vec<u8>, &'static str>>, presence: Vec<Vec<u8>>, binding: Option<Binding>, connection: u64, gone: &Mutex<bool>) -> Vec<String> {
         admitted
             .into_iter()
-            .map(|record| match record.and_then(|record| self.take_one(record, gone)) {
+            .zip(presence)
+            .map(|(record, presence)| match record.and_then(|record| self.take_one(record, &presence, binding.as_ref(), connection, gone)) {
                 Ok(()) => String::new(),
                 Err(why) => why.to_string(),
             })
             .collect()
     }
 
-    fn take_one(&self, record: Vec<u8>, gone: &Mutex<bool>) -> Result<(), &'static str> {
-        const GONE: &str = "whoever announced this has gone";
+    fn take_one(&self, record: Vec<u8>, presence: &[u8], binding: Option<&Binding>, connection: u64, gone: &Mutex<bool>) -> Result<(), &'static str> {
         let ship = whereabouts::ship_of(&record).ok_or("not a record")?;
         if self.galaxies.as_ref().is_some_and(|galaxies| !galaxies.contains(&whereabouts::galaxy_of(ship))) {
             return Err("this lookup point does not keep records for that ship's galaxy");
@@ -645,6 +950,9 @@ impl Point {
             return Err(GONE);
         }
         let believed = whereabouts::check(&record, &|name: &str| self.key_of(name), known, now)?;
+        // Only the ship can give its record here: its presence on this very connection, by the
+        // key that signed the record, is what says so.
+        whereabouts::present(&believed, binding.ok_or(NO_BINDING)?, presence)?;
         // The record is kept only with the table and the mark both held, in that order, so
         // that a caller that goes while this waits for the table is seen to have gone, and
         // nothing is kept for it. Neither lock is held across a question to the source of
@@ -657,7 +965,67 @@ impl Point {
             return Err(GONE);
         }
         let now = self.now();
-        table.keep(&believed, record, &self.bounds, now)
+        table.keep(&believed, record, &self.bounds, now, connection)
+    }
+
+    /// Whether a ship attends here now, read with the table held. Only to refuse early: the
+    /// introduction itself is weighed again where it is passed on.
+    fn attends(&self, ship: u64) -> bool {
+        let table = lock(&self.table);
+        let now = self.now();
+        table.attending(ship, now).is_some()
+    }
+
+    /// Count one introduction against a caller's allowance, if it has one left. Only so many
+    /// callers are counted; past that, those whose allowance is whole are forgotten.
+    fn introducer(&self, caller: u64) -> Result<(), &'static str> {
+        let mut introducers = lock(&self.introducers);
+        if !introducers.contains_key(&caller) && introducers.len() >= MOST_INTRODUCERS {
+            introducers.retain(|_, bucket| !bucket.whole());
+            if introducers.len() >= MOST_INTRODUCERS {
+                return Err("this lookup point is counting as many callers as it may; try again later");
+            }
+        }
+        let bucket = introducers.entry(caller).or_insert_with(|| Bucket::per(self.bounds.introductions_each, self.bounds.rate_period));
+        if bucket.take() { Ok(()) } else { Err("too many introductions from that ship just now; try again later") }
+    }
+
+    /// Check a caller's record and its presence on the connection the request came on, as an
+    /// announcement would be checked, keep nothing of it, and pass it to `callee` over the
+    /// connection `callee` attends on. This waits on the source of keys, so it is for a thread
+    /// that may wait. Nothing is passed for a caller that has gone (`gone`).
+    fn introduce_one(&self, callee: u64, record: Vec<u8>, presence: &[u8], binding: Option<&Binding>, gone: &Mutex<bool>) -> Result<(), &'static str> {
+        let caller = whereabouts::ship_of(&record).ok_or("not a record")?;
+        let (known, now) = {
+            let table = lock(&self.table);
+            let now = self.now();
+            (table.known(caller, now), now)
+        };
+        if *lock(gone) {
+            return Err(GONE);
+        }
+        let believed = whereabouts::check(&record, &|name: &str| self.key_of(name), known, now)?;
+        // Nobody else can name a ship as a caller, or spend its allowance: its presence on
+        // this very connection says the caller is here.
+        whereabouts::present(&believed, binding.ok_or(NO_BINDING)?, presence)?;
+        self.introducer(caller)?;
+        // Passed on only with the table and the mark both held, in that order, with the clock
+        // read then: the ship must attend on an open connection at this moment.
+        let mut table = lock(&self.table);
+        let gone = lock(gone);
+        if *gone {
+            return Err(GONE);
+        }
+        let now = self.now();
+        if !whereabouts::fresh(believed.issued, now) {
+            return Err("the record ran out, or this clock went back, while it was being checked");
+        }
+        // What is held of the caller may have moved on while its key was asked about: the
+        // record is weighed against it again here, as it would be if it were being kept.
+        table.weighs_against_held(&believed, now)?;
+        table.pass(callee, record, now)?;
+        self.introduced.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// The record held for a ship, if one is and it is still good.
@@ -675,13 +1043,56 @@ impl Point {
     }
 }
 
+/// Why nothing is kept or passed on for a caller whose request has ended.
+const GONE: &str = "whoever announced this has gone";
+
+/// Why a presence cannot be checked on a connection whose handshake gave no value for it.
+const NO_BINDING: &str = "this connection has nothing a ship's presence could be checked against";
+
+/// The connection number and value the unit tests announce on, as if over a connection open
+/// at a point. A test point opens it in its table when it is made.
+#[cfg(test)]
+const TESTING: (u64, Binding) = (u64::MAX, [9; 32]);
+
+/// One connection under the lookup protocol, as its requests see it.
+struct Asker {
+    /// Records, and questions, it may still have checked or answered just now.
+    each: Arc<Mutex<Bucket>>,
+    questions: Arc<Mutex<Bucket>>,
+    /// The number the point gave it, and the value both ends work out from its handshake.
+    connection: u64,
+    binding: Option<Binding>,
+    /// Where it comes from, as this point sees it.
+    from: SocketAddr,
+}
+
+/// While a point has a connection open: it is in the table, and when this is dropped, however
+/// the connection's task ends, it is taken out, so that no ship attends on it any more.
+struct Attendance(Arc<Point>, u64);
+
+impl Attendance {
+    fn open(point: &Arc<Point>, connection: u64, wake: Arc<Notify>) -> Attendance {
+        lock(&point.table).open(connection, wake);
+        Attendance(point.clone(), connection)
+    }
+}
+
+impl Drop for Attendance {
+    fn drop(&mut self) {
+        lock(&self.0.table).close(self.1);
+    }
+}
+
 /// Answer one connection under the lookup protocol until it closes.
 ///
 /// What bounds the work a point does for strangers is the count of requests in hand
 /// (`MOST_IN_HAND`, point-wide, taken before a byte of a request is read), the size of a
-/// request, and the rates of records and questions. The stream limit and receive window set
-/// here hold only the credit given from now on: what was given at the handshake (the ships'
-/// transport allowance) stays usable, since QUIC cannot take credit back.
+/// request, and the rates of records, questions and introductions. The stream limit and
+/// receive window set here hold only the credit given from now on: what was given at the
+/// handshake (the ships' transport allowance) stays usable, since QUIC cannot take credit back.
+///
+/// The point opens streams of its own on the connection only to pass introductions to ships
+/// that attend on it, one at a time, each within `PUSH_LIMIT`.
 pub(crate) async fn serve(point: Arc<Point>, connection: Connection, limit: Duration) {
     let Some(_place) = PointPlace::take(&point) else {
         connection.close(VarInt::from_u32(4), b"this lookup point has as many connections as it may");
@@ -691,10 +1102,26 @@ pub(crate) async fn serve(point: Arc<Point>, connection: Connection, limit: Dura
     // from here on.
     connection.set_max_concurrent_bi_streams(VarInt::from_u32(MOST_POINT_STREAMS));
     connection.set_receive_window(VarInt::from_u32((MOST_WHERE_BYTES as u32).saturating_mul(MOST_POINT_STREAMS)));
-    let each = Arc::new(Mutex::new(Bucket::per(point.bounds.per_connection, point.bounds.rate_period)));
-    let questions = Arc::new(Mutex::new(Bucket::new(MOST_QUESTIONS_EACH)));
-    // The requests of this connection, so that what they leave waiting stops when it closes.
+    // Each connection is given a number never given to another; when there are none left,
+    // which takes 2^64 connections, no more are taken.
+    let Ok(number) = point.next_connection.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| next.checked_add(1)) else {
+        point.unnumbered.fetch_add(1, Ordering::SeqCst);
+        connection.close(VarInt::from_u32(4), b"this lookup point has numbered as many connections as it can");
+        return;
+    };
+    let wake = Arc::new(Notify::new());
+    let _attendance = Attendance::open(&point, number, wake.clone());
+    let asker = Arc::new(Asker {
+        each: Arc::new(Mutex::new(Bucket::per(point.bounds.per_connection, point.bounds.rate_period))),
+        questions: Arc::new(Mutex::new(Bucket::new(MOST_QUESTIONS_EACH))),
+        connection: number,
+        binding: binding_of(&connection),
+        from: plain(connection.remote_address()),
+    });
+    // The requests of this connection, so that what they leave waiting stops when it closes,
+    // and what passes introductions over it.
     let mut answering = tokio::task::JoinSet::new();
+    answering.spawn(pass_on(point.clone(), number, connection.clone(), wake));
     while let Ok((mut send, mut receive)) = connection.accept_bi().await {
         while answering.try_join_next().is_some() {}
         // A place among the requests in hand, point-wide, or the request is refused at once
@@ -704,7 +1131,7 @@ pub(crate) async fn serve(point: Arc<Point>, connection: Connection, limit: Dura
             let _ = send.reset(VarInt::from_u32(4));
             continue;
         };
-        answering.spawn(answer(point.clone(), each.clone(), questions.clone(), send, receive, limit, turn));
+        answering.spawn(answer(point.clone(), asker.clone(), send, receive, limit, turn));
     }
     // The connection has gone. Requests of it still waiting, for a thread to check on or
     // anything else, stop now and give up their places. A question to the source of keys
@@ -713,29 +1140,54 @@ pub(crate) async fn serve(point: Arc<Point>, connection: Connection, limit: Dura
     answering.abort_all();
 }
 
+/// Pass the introductions waiting for ships that attend on one connection, for as long as it
+/// is open. Each is taken off the queue with the table held, and only if its ship still
+/// attends on this connection and it has not waited too long: that is the moment it is passed
+/// on. Then a stream is opened and the introduction written, all within `PUSH_LIMIT`.
+async fn pass_on(point: Arc<Point>, number: u64, connection: Connection, wake: Arc<Notify>) {
+    loop {
+        wake.notified().await;
+        loop {
+            let next = {
+                let mut table = lock(&point.table);
+                let now = point.now();
+                table.next_push(number, now)
+            };
+            let Some(push) = next else { break };
+            let message = Introduction { callee: push.callee, record: push.record }.encode_to_vec();
+            let deadline = tokio::time::Instant::now() + PUSH_LIMIT;
+            let Ok(Ok(mut stream)) = tokio::time::timeout_at(deadline, connection.open_uni()).await else { continue };
+            match tokio::time::timeout_at(deadline, stream.write_all(&message)).await {
+                Ok(Ok(())) => {
+                    let _ = stream.finish();
+                    point.pushed.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {
+                    let _ = stream.reset(VarInt::from_u32(3));
+                }
+            }
+        }
+    }
+}
+
 /// One request to a lookup point. `_turn` is its place among the requests in hand.
-async fn answer(
-    point: Arc<Point>,
-    each: Arc<Mutex<Bucket>>,
-    questions: Arc<Mutex<Bucket>>,
-    mut send: SendStream,
-    mut receive: RecvStream,
-    limit: Duration,
-    _turn: tokio::sync::OwnedSemaphorePermit,
-) {
+async fn answer(point: Arc<Point>, asker: Arc<Asker>, mut send: SendStream, mut receive: RecvStream, limit: Duration, _turn: tokio::sync::OwnedSemaphorePermit) {
     let refused = |why: &str| WhereReply { body: None, refused: why.to_string() };
     let served = tokio::time::timeout(limit, async {
         let Some(bytes) = net::read_whole(&mut receive, MOST_WHERE_BYTES).await else {
             return send_back(&mut send, &refused("the request could not be read, or was too large")).await;
         };
-        // Counted before it is decoded: a request can be all empty records.
-        if !net::repeats_within(&bytes, 1, 1, MOST_ANNOUNCED) {
+        // Counted before it is decoded: a request can be all empty records, or presences.
+        if !net::repeats_within(&bytes, 1, 1, MOST_ANNOUNCED) || !net::repeats_within(&bytes, 1, 2, MOST_ANNOUNCED) {
             return send_back(&mut send, &refused("not a request, or one with too many records")).await;
         }
         let reply = match WhereRequest::decode(&*bytes).map(|request| request.body) {
-            Ok(Some(where_request::Body::Announce(Announce { records }))) => {
+            Ok(Some(where_request::Body::Announce(Announce { records, presence }))) if presence.len() != records.len() => {
+                refused("each record must come with its ship's presence on this connection, and only one")
+            }
+            Ok(Some(where_request::Body::Announce(Announce { records, presence }))) => {
                 // Counted against the rates now, before waiting for anything.
-                let admitted = point.admit(records, &each);
+                let admitted = point.admit(records, &asker.each);
                 if admitted.iter().all(Result::is_err) {
                     // Nothing to check (no records, or all past the rates): answered now,
                     // without waiting for a thread to check on.
@@ -749,9 +1201,9 @@ async fn answer(
                     let gone = Arc::new(Mutex::new(false));
                     let _going = Going(gone.clone());
                     let Ok(turn) = point.reading.clone().acquire_owned().await else { return };
-                    let checking = point.clone();
+                    let (checking, binding, connection) = (point.clone(), asker.binding, asker.connection);
                     let taken = tokio::task::spawn_blocking(move || {
-                        let outcomes = checking.check_all(admitted, &gone);
+                        let outcomes = checking.check_all(admitted, presence, binding, connection, &gone);
                         drop(turn);
                         outcomes
                     });
@@ -762,13 +1214,22 @@ async fn answer(
                 }
             }
             Ok(Some(where_request::Body::Ask(Where { ship }))) => {
-                if lock(&questions).take() {
+                if lock(&asker.questions).take() {
                     let record = point.find(ship).unwrap_or_default();
                     WhereReply { body: Some(where_reply::Body::Found(Found { record })), refused: String::new() }
                 } else {
                     refused("too many questions just now; try again later")
                 }
             }
+            Ok(Some(where_request::Body::Seen(Seen {}))) => {
+                if lock(&asker.questions).take() {
+                    point.seen.fetch_add(1, Ordering::SeqCst);
+                    WhereReply { body: Some(where_reply::Body::Saw(Saw { address: whereabouts::address_bytes(&asker.from) })), refused: String::new() }
+                } else {
+                    refused("too many questions just now; try again later")
+                }
+            }
+            Ok(Some(where_request::Body::Introduce(Introduce { callee, record, presence }))) => introduce(&point, &asker, callee, record, presence).await,
             _ => refused("not a request this lookup point answers"),
         };
         send_back(&mut send, &reply).await;
@@ -777,6 +1238,49 @@ async fn answer(
     if served.is_err() {
         let _ = send.reset(VarInt::from_u32(3));
         let _ = receive.stop(VarInt::from_u32(3));
+    }
+}
+
+/// A caller asks to be introduced to `callee`. In order: the connection's allowance of
+/// questions; refused at once if the ship does not attend here; the record counted against the
+/// record rates, the connection's and then the point's; the point's allowance of introductions;
+/// then checked on a thread that may wait, as an announcement is, before being passed on. The
+/// answer does not wait for the ship.
+async fn introduce(point: &Arc<Point>, asker: &Asker, callee: u64, record: Vec<u8>, presence: Vec<u8>) -> WhereReply {
+    let refused = |why: &str| WhereReply { body: None, refused: why.to_string() };
+    // Cheapest and narrowest first. The connection's own allowance of questions, as for
+    // `Where`, before the table is looked at: a stranger's introductions cost the table no
+    // more each second than its questions would.
+    if !lock(&asker.questions).take() {
+        return refused("too many questions just now; try again later");
+    }
+    // An early reading, only to refuse: passing on weighs it again.
+    if !point.attends(callee) {
+        return refused(NOT_ATTENDING);
+    }
+    // The record is counted against the record rates, this connection's first, then the
+    // point's; and only then against the point's allowance of introductions.
+    let record = match point.admit(vec![record], &asker.each).pop() {
+        Some(Ok(record)) => record,
+        Some(Err(why)) => return refused(why),
+        None => return refused("not a record"),
+    };
+    if !lock(&point.introductions).take() {
+        return refused("too many introductions at this point just now; try again later");
+    }
+    let gone = Arc::new(Mutex::new(false));
+    let _going = Going(gone.clone());
+    let Ok(turn) = point.reading.clone().acquire_owned().await else { return refused("this lookup point is stopping") };
+    let (checking, binding) = (point.clone(), asker.binding);
+    let passed = tokio::task::spawn_blocking(move || {
+        let passed = checking.introduce_one(callee, record, &presence, binding.as_ref(), &gone);
+        drop(turn);
+        passed
+    });
+    match passed.await {
+        Ok(Ok(())) => WhereReply { body: Some(where_reply::Body::Introduced(Introduced {})), refused: String::new() },
+        Ok(Err(why)) => refused(why),
+        Err(_) => refused("the introduction could not be checked; try again"),
     }
 }
 
@@ -803,12 +1307,22 @@ async fn send_back(send: &mut SendStream, reply: &WhereReply) {
 
 // Asking lookup points, and announcing to them.
 
+/// What a call to a ship found through a point goes on: the number the record was kept under,
+/// its addresses, and whether its ship asks callers to be introduced first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Lead {
+    pub(crate) kept_as: u64,
+    pub(crate) addresses: Vec<SocketAddr>,
+    pub(crate) introduce: bool,
+}
+
 /// A ship's record, as this runtime last believed it.
 struct Cached {
     /// The number this record was kept under, never used for another.
     kept_as: u64,
     issued: u64,
     addresses: Vec<SocketAddr>,
+    introduce: bool,
     /// None of its addresses answered as the ship when last tried. The record still holds
     /// older ones off until it runs out, but its addresses are not tried again.
     failed: bool,
@@ -837,15 +1351,16 @@ impl Floors {
         self.held.get(ship).map(|held| held.issued).filter(|&issued| whereabouts::holds_off(issued, now))
     }
 
-    /// The record held for a ship, by the number it was kept under, with its addresses, if it
-    /// is still good and they have not failed. A record that has run out is let go of here.
-    fn addresses(&mut self, ship: &str, now: u64) -> Option<(u64, Vec<SocketAddr>)> {
+    /// The record held for a ship, by the number it was kept under, with its addresses and
+    /// whether to be introduced, if it is still good and they have not failed. A record that
+    /// has run out is let go of here.
+    fn addresses(&mut self, ship: &str, now: u64) -> Option<Lead> {
         match self.held.get(ship) {
             Some(held) if !whereabouts::holds_off(held.issued, now) => {
                 self.held.remove(ship);
                 None
             }
-            Some(held) if !held.failed && whereabouts::fresh(held.issued, now) => Some((held.kept_as, held.addresses.clone())),
+            Some(held) if !held.failed && whereabouts::fresh(held.issued, now) => Some(Lead { kept_as: held.kept_as, addresses: held.addresses.clone(), introduce: held.introduce }),
             _ => None,
         }
     }
@@ -879,7 +1394,7 @@ impl Floors {
         // takes 2^64 records, no more are kept.
         let kept_as = self.next;
         self.next = self.next.checked_add(1).ok_or("this runtime has named as many records as it can")?;
-        self.held.insert(believed.ship, Cached { kept_as, issued: believed.issued, addresses: believed.addresses, failed: false });
+        self.held.insert(believed.ship, Cached { kept_as, issued: believed.issued, addresses: believed.addresses, introduce: believed.introduce, failed: false });
         Ok(())
     }
 }
@@ -909,8 +1424,15 @@ struct Lane {
     /// After a failure, how long the wait was. It doubles with each failure, and starts over
     /// after a success.
     delay: Duration,
-    /// The ships whose records the point has taken.
-    announced: HashSet<String>,
+    /// For each ship whose record the point took, by that record's own outcome: the
+    /// addresses it was announced at, and whether callers were asked to be introduced. What a
+    /// ship shows of itself when it asks to be introduced, and whether an introduction to it
+    /// makes this runtime send anything. A record the point refuses leaves its ship's entry as
+    /// it was (the point still holds that ship's last record, if any).
+    shown: HashMap<String, (Vec<SocketAddr>, bool)>,
+    /// The connection to the galaxy's point the ships were last announced over, and attend on.
+    /// It is kept open, and made again if it drops.
+    connection: Option<Connection>,
 }
 
 /// A runtime's means of finding other ships through lookup points, and of announcing its own.
@@ -918,6 +1440,18 @@ pub(crate) struct Finder {
     lookup: Lookup,
     endpoint: Endpoint,
     client: quinn::ClientConfig,
+    /// For the connection to each galaxy's point that ships are announced over: it sends a
+    /// packet every `keep_alive`, and lets the point open a few streams of its own, small ones,
+    /// to pass introductions.
+    announcing: quinn::ClientConfig,
+    /// The address this runtime listens on.
+    bound: SocketAddr,
+    /// Where introductions points pass to this runtime's ships go, to be weighed. Only so many
+    /// wait there; past that they are dropped.
+    pushed: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// Whether this runtime asks to be introduced to ships whose records ask for it. Nothing
+    /// but a test turns it off, to show what happens without.
+    pub(crate) introducing: std::sync::atomic::AtomicBool,
     resolver: Arc<dyn Resolve>,
     /// How long one question to a point may take, and how long to wait between tries at
     /// announcing: as for ships.
@@ -930,6 +1464,9 @@ pub(crate) struct Finder {
     /// A connection to each lookup point, by address. Each has a lock of its own, held while
     /// connecting, so that two questions to one point share one connection.
     points: Mutex<HashMap<SocketAddr, Arc<tokio::sync::Mutex<Option<Connection>>>>>,
+    /// The same for the connections ships are announced over, which stay open: one to each
+    /// point, however many galaxies' ships it takes.
+    kept: Mutex<HashMap<SocketAddr, Arc<tokio::sync::Mutex<Option<Connection>>>>>,
     floors: Mutex<Floors>,
     /// When each ship was last asked about.
     asked: Mutex<HashMap<String, Instant>>,
@@ -946,7 +1483,14 @@ pub(crate) struct Finder {
 }
 
 impl Finder {
-    pub(crate) fn new(lookup: Lookup, cfg: &NetConfig, endpoint: Endpoint, provider: &Arc<CryptoProvider>) -> std::io::Result<Finder> {
+    pub(crate) fn new(
+        lookup: Lookup,
+        cfg: &NetConfig,
+        endpoint: Endpoint,
+        provider: &Arc<CryptoProvider>,
+        bound: SocketAddr,
+        pushed: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    ) -> std::io::Result<Finder> {
         // A caller shows a key of its own, made now, which names nobody: the point needs no
         // proof of who is asking, and the ship protocol, on the same port, needs every caller
         // to show some key.
@@ -962,11 +1506,25 @@ impl Finder {
         tls.resumption = rustls::client::Resumption::disabled();
         let mut client = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).map_err(std::io::Error::other)?));
         client.transport_config(Arc::new(net::transport(cfg, 0)?));
+        // The connection ships are announced over stays open, a packet going every
+        // `keep_alive`, so that a router keeps its way in open; and the point may open up to
+        // four streams on it, each to pass one small introduction, with little room for each.
+        let mut kept = net::transport(cfg, 0)?;
+        kept.keep_alive_interval(Some(lookup.keep_alive));
+        kept.max_concurrent_uni_streams(VarInt::from_u32(MOST_PUSHES_OPEN));
+        kept.stream_receive_window(VarInt::from_u32(MOST_WHERE_BYTES as u32));
+        kept.receive_window(VarInt::from_u32((MOST_WHERE_BYTES as u32) * MOST_PUSHES_OPEN));
+        let mut announcing = client.clone();
+        announcing.transport_config(Arc::new(kept));
         let resolver = lookup.resolver.clone().unwrap_or_else(|| Arc::new(SystemResolver));
         Ok(Finder {
             lookup,
             endpoint,
             client,
+            announcing,
+            bound,
+            pushed,
+            introducing: std::sync::atomic::AtomicBool::new(true),
             resolver,
             limit: cfg.request_timeout,
             retry_delay: cfg.retry_delay,
@@ -974,6 +1532,7 @@ impl Finder {
             resolved: Mutex::default(),
             resolving: Arc::new(Semaphore::new(MOST_RESOLVING)),
             points: Mutex::default(),
+            kept: Mutex::default(),
             floors: Mutex::new(Floors::new(MOST_FLOORS)),
             asked: Mutex::default(),
             asking: Mutex::default(),
@@ -1037,17 +1596,63 @@ impl Finder {
 
     /// The place where the connection to a point is kept.
     fn point_slot(&self, addr: SocketAddr) -> Result<Arc<tokio::sync::Mutex<Option<Connection>>>, String> {
-        let mut points = lock(&self.points);
-        if !points.contains_key(&addr) && points.len() >= MOST_POINTS {
-            // Forget points nothing is using and whose connections have closed.
-            points.retain(|_, kept| Arc::strong_count(kept) > 1 || kept.try_lock().map_or(true, |held| held.as_ref().is_some_and(|c| c.close_reason().is_none())));
-            if points.len() >= MOST_POINTS {
-                return Err("this runtime is already talking to as many lookup points as it may".into());
-            }
-        }
-        Ok(points.entry(addr).or_default().clone())
+        slot_in(&self.points, addr)
     }
 
+    /// The place where the connection ships are announced over to a point is kept. When there
+    /// is no room, connections no lane announces over are let go of first.
+    fn kept_slot(&self, addr: SocketAddr) -> Result<Arc<tokio::sync::Mutex<Option<Connection>>>, String> {
+        let full = {
+            let kept = lock(&self.kept);
+            !kept.contains_key(&addr) && kept.len() >= MOST_POINTS
+        };
+        if full {
+            self.retire_unused();
+        }
+        slot_in(&self.kept, addr)
+    }
+
+    /// Let go of the connections ships are announced over that no lane announces over now:
+    /// each is closed, which ends the task hearing introductions on it, and its place freed.
+    /// One whose slot someone holds (connecting through it) is left. Which lanes use which
+    /// connection is read first, and the map is then changed under its own lock; a lane that
+    /// takes a connection between the two finds it closed, and its round fails and is tried
+    /// again, as for any connection that drops.
+    fn retire_unused(&self) {
+        let used: HashSet<SocketAddr> = lock(&self.lanes).values().filter_map(|lane| lane.connection.as_ref()).filter(|connection| connection.close_reason().is_none()).map(Connection::remote_address).collect();
+        lock(&self.kept).retain(|addr, slot| {
+            if used.contains(addr) || Arc::strong_count(slot) > 1 {
+                return true;
+            }
+            match slot.try_lock() {
+                Ok(mut held) => {
+                    if let Some(connection) = held.take() {
+                        connection.close(VarInt::from_u32(2), b"no longer announced over");
+                    }
+                    false
+                }
+                Err(_) => true,
+            }
+        });
+    }
+}
+
+/// The place in `map` where the connection to the point at `addr` is kept, made if need be.
+/// Only so many points are kept: past that, those nothing is using and whose connections have
+/// closed are forgotten.
+fn slot_in(map: &Mutex<HashMap<SocketAddr, Arc<tokio::sync::Mutex<Option<Connection>>>>>, addr: SocketAddr) -> Result<Arc<tokio::sync::Mutex<Option<Connection>>>, String> {
+    let mut points = lock(map);
+    if !points.contains_key(&addr) && points.len() >= MOST_POINTS {
+        // Forget points nothing is using and whose connections have closed.
+        points.retain(|_, kept| Arc::strong_count(kept) > 1 || kept.try_lock().map_or(true, |held| held.as_ref().is_some_and(|c| c.close_reason().is_none())));
+        if points.len() >= MOST_POINTS {
+            return Err("this runtime is already talking to as many lookup points as it may".into());
+        }
+    }
+    Ok(points.entry(addr).or_default().clone())
+}
+
+impl Finder {
     /// Let go of the connection to a point, so the next question makes a new one.
     fn forget_point(&self, addr: SocketAddr) {
         if let Some(kept) = lock(&self.points).remove(&addr) {
@@ -1059,8 +1664,9 @@ impl Finder {
         }
     }
 
-    /// Send one request to the point at one address and read its reply.
-    async fn over(&self, addr: SocketAddr, request: &[u8]) -> Result<WhereReply, String> {
+    /// Send one request to the point at one address and read its reply. The request is made
+    /// once the connection is in hand, by `make`, since it may have to be bound to it.
+    async fn over(&self, addr: SocketAddr, make: &(dyn Fn(&Connection) -> Result<Vec<u8>, String> + Send + Sync)) -> Result<WhereReply, String> {
         let slot = self.point_slot(addr)?;
         let connection = {
             let mut kept = slot.lock().await;
@@ -1074,21 +1680,22 @@ impl Finder {
                 }
             }
         };
-        let lost = |e: &dyn fmt::Display| format!("the lookup point at {addr} was lost: {e}");
-        let (mut send, mut receive) = connection.open_bi().await.map_err(|e| lost(&e))?;
-        send.write_all(request).await.map_err(|e| lost(&e))?;
-        send.finish().map_err(|e| lost(&e))?;
-        let answer = net::read_whole(&mut receive, MOST_WHERE_BYTES).await.ok_or_else(|| format!("the answer of the lookup point at {addr} could not be read, or was too large"))?;
-        WhereReply::decode(&*answer).map_err(|_| format!("the answer of the lookup point at {addr} made no sense"))
+        let request = make(&connection)?;
+        request_on(&connection, addr, &request).await
     }
 
     /// Send one request to the lookup point for a galaxy, trying each of its addresses in
     /// turn, all within `deadline`.
     async fn exchange(&self, galaxy: u8, request: WhereRequest, deadline: tokio::time::Instant) -> Result<WhereReply, String> {
         let request = request.encode_to_vec();
+        self.exchange_with(galaxy, &|_| Ok(request.clone()), deadline).await
+    }
+
+    /// The same, with the request made by `make` once a connection is in hand.
+    async fn exchange_with(&self, galaxy: u8, make: &(dyn Fn(&Connection) -> Result<Vec<u8>, String> + Send + Sync), deadline: tokio::time::Instant) -> Result<WhereReply, String> {
         let mut why = format!("no lookup point is known for ~{}", galaxy_name(galaxy));
         for addr in self.points_for(galaxy, deadline).await? {
-            match tokio::time::timeout(try_limit(deadline), self.over(addr, &request)).await {
+            match tokio::time::timeout(try_limit(deadline), self.over(addr, make)).await {
                 Ok(Ok(reply)) => return Ok(reply),
                 Ok(Err(failed)) => why = failed,
                 Err(_) => why = format!("the lookup point at {addr} did not answer in time"),
@@ -1103,9 +1710,10 @@ impl Finder {
         (self.clock)()
     }
 
-    /// The record held for a ship, by the number it was kept under, and its addresses, if
-    /// there is one, it is still good, and they have not failed.
-    pub(crate) fn cached(&self, ship: &str) -> Option<(u64, Vec<SocketAddr>)> {
+    /// The record held for a ship, by the number it was kept under, its addresses, and
+    /// whether to be introduced first, if there is one, it is still good, and they have not
+    /// failed.
+    pub(crate) fn cached(&self, ship: &str) -> Option<Lead> {
         let mut floors = lock(&self.floors);
         let now = self.now();
         floors.addresses(ship, now)
@@ -1124,7 +1732,7 @@ impl Finder {
     /// waiting for them, and given back with what is known, to weigh the record by. That is
     /// an early reading: whatever is kept on the strength of it is weighed again where it is
     /// kept.
-    fn known(&self, ship: &str, directory: &Directory) -> (Known, u64) {
+    pub(crate) fn known(&self, ship: &str, directory: &Directory) -> (Known, u64) {
         let moon = directory.moon_seen(ship);
         let floors = lock(&self.floors);
         let now = self.now();
@@ -1154,7 +1762,7 @@ impl Finder {
     /// up. A ship is asked about at most once every `ask_again`, whatever the answer. If a
     /// record whose addresses may be tried is held already (one that took the place of a
     /// record being tried), it is handed back without asking.
-    pub(crate) async fn ask(self: &Arc<Self>, directory: &Arc<Directory>, ship: &str, deadline: tokio::time::Instant) -> Result<(u64, Vec<SocketAddr>), NetError> {
+    pub(crate) async fn ask(self: &Arc<Self>, directory: &Arc<Directory>, ship: &str, deadline: tokio::time::Instant) -> Result<Lead, NetError> {
         if let Some(found) = self.cached(ship) {
             return Ok(found);
         }
@@ -1237,9 +1845,12 @@ impl Finder {
     }
 
     /// Announce this runtime's ships to the lookup points for their galaxies, for as long as
-    /// the network runs: each at start, then every `announce_every`, and any ship that is new
-    /// at once. A point that is down or refuses is tried again after a wait that doubles.
-    pub(crate) async fn announce(self: Arc<Self>, runtime: Arc<Runtime>, addresses: Vec<SocketAddr>) {
+    /// the network runs: each at start, then every `announce_every`, any ship that is new at
+    /// once, and all of a galaxy's at once if the connection to its point drops. A point that
+    /// is down or refuses is tried again after a wait that doubles. `stated` are the addresses
+    /// given by hand; with none, each galaxy's ships are announced at the address its point
+    /// sees.
+    pub(crate) async fn announce(self: Arc<Self>, runtime: Arc<Runtime>, stated: Vec<SocketAddr>) {
         loop {
             let mut galaxies: HashMap<u8, Vec<String>> = HashMap::new();
             for ship in runtime.held_ships() {
@@ -1252,51 +1863,38 @@ impl Finder {
                 {
                     let mut lanes = lock(&self.lanes);
                     let lane = lanes.entry(galaxy).or_default();
-                    let new = ships.iter().any(|ship| !lane.announced.contains(ship));
-                    let due = lane.next_at.is_none_or(|at| Instant::now() >= at) || (new && lane.delay.is_zero());
+                    let new = ships.iter().any(|ship| !lane.shown.contains_key(ship));
+                    // A connection that has dropped is made again, and the ships announced over
+                    // the new one: a point keeps a record only with presence on the connection
+                    // it came on.
+                    let lost = lane.connection.as_ref().is_some_and(|connection| connection.close_reason().is_some());
+                    let due = lane.next_at.is_none_or(|at| Instant::now() >= at) || ((new || lost) && lane.delay.is_zero());
                     if lane.busy || !due {
                         continue;
                     }
                     lane.busy = true;
                 }
-                tokio::spawn(self.clone().announce_galaxy(runtime.clone(), galaxy, ships, addresses.clone()));
+                tokio::spawn(self.clone().announce_galaxy(runtime.clone(), galaxy, ships, stated.clone()));
             }
             tokio::time::sleep(ANNOUNCE_TICK).await;
         }
     }
 
     /// Announce the ships of one galaxy, and settle when to do so again.
-    async fn announce_galaxy(self: Arc<Self>, runtime: Arc<Runtime>, galaxy: u8, ships: Vec<String>, addresses: Vec<SocketAddr>) {
-        let mut why = None;
-        for some in ships.chunks(MOST_ANNOUNCED) {
-            let mut named = Vec::new();
-            let mut records = Vec::new();
-            for ship in some {
-                let Ok(key) = runtime.signing_key(ship) else { continue };
-                match whereabouts::sign(ship, &addresses, self.next_issued(), &key, runtime.moon_proof(ship)) {
-                    Ok(record) => {
-                        named.push(ship);
-                        records.push(record);
-                    }
-                    Err(failed) => why = Some(format!("~{ship}: no record could be made: {failed}")),
+    async fn announce_galaxy(self: Arc<Self>, runtime: Arc<Runtime>, galaxy: u8, ships: Vec<String>, stated: Vec<SocketAddr>) {
+        let deadline = tokio::time::Instant::now() + self.limit;
+        let why = match self.lane_connection(galaxy, deadline).await {
+            Err(failed) => Some(failed),
+            Ok(connection) => match self.announce_over(&runtime, galaxy, &ships, &stated, &connection, deadline).await {
+                Ok(refused) => refused,
+                // The connection did not do what was asked of it: it is let go of, and made
+                // again next time.
+                Err(failed) => {
+                    connection.close(VarInt::from_u32(2), b"no answer");
+                    Some(failed)
                 }
-            }
-            let count = records.len();
-            let request = WhereRequest { body: Some(where_request::Body::Announce(Announce { records })) };
-            let deadline = tokio::time::Instant::now() + self.limit;
-            match self.exchange(galaxy, request, deadline).await {
-                Ok(WhereReply { body: Some(where_reply::Body::Announced(Announced { outcomes })), .. }) if outcomes.len() == count => {
-                    for (ship, outcome) in named.iter().zip(&outcomes) {
-                        if !outcome.is_empty() {
-                            why = Some(format!("~{ship}: the lookup point did not keep its record: {}", outcome.chars().take(200).collect::<String>()));
-                        }
-                    }
-                }
-                Ok(WhereReply { refused, body: None }) => why = Some(format!("the lookup point for ~{} refused: {}", galaxy_name(galaxy), refused.chars().take(200).collect::<String>())),
-                Ok(_) => why = Some(format!("the answer of the lookup point for ~{} made no sense", galaxy_name(galaxy))),
-                Err(failed) => why = Some(failed),
-            }
-        }
+            },
+        };
         let mut lanes = lock(&self.lanes);
         let lane = lanes.entry(galaxy).or_default();
         lane.busy = false;
@@ -1304,7 +1902,6 @@ impl Finder {
             None => {
                 lane.next_at = Some(Instant::now() + self.lookup.announce_every);
                 lane.delay = Duration::ZERO;
-                lane.announced = ships.into_iter().collect();
             }
             Some(why) => {
                 lane.delay = if lane.delay.is_zero() { self.retry_delay } else { (lane.delay * 2).min(self.max_retry_delay) };
@@ -1314,6 +1911,202 @@ impl Finder {
             }
         }
     }
+
+    /// The connection a galaxy's ships are announced over: the one kept, if it is still open,
+    /// or a new one to the galaxy's point, trying each of its addresses in turn. The
+    /// introductions the point passes over a new one are heard from then on.
+    async fn lane_connection(self: &Arc<Self>, galaxy: u8, deadline: tokio::time::Instant) -> Result<Connection, String> {
+        let addresses = self.points_for(galaxy, deadline).await?;
+        // The lane's connection, if it is still open and still to one of the point's
+        // addresses, is the one to use.
+        let current = lock(&self.lanes).get(&galaxy).and_then(|lane| lane.connection.clone());
+        if let Some(current) = current.filter(|current| current.close_reason().is_none() && addresses.contains(&current.remote_address())) {
+            return Ok(current);
+        }
+        // Otherwise the point has moved, or the connection dropped. The lane gives up its old
+        // connection first, and it is let go of unless another lane announces over it, so
+        // that its place is free before one is taken for the new.
+        if lock(&self.lanes).entry(galaxy).or_default().connection.take().is_some() {
+            self.retire_unused();
+        }
+        let mut why = format!("no lookup point is known for ~{}", galaxy_name(galaxy));
+        for addr in addresses {
+            match tokio::time::timeout(try_limit(deadline), self.kept_connection(addr)).await {
+                Ok(Ok(connection)) => {
+                    lock(&self.lanes).entry(galaxy).or_default().connection = Some(connection.clone());
+                    // Read again after the lane took it: another lane may have let it go just
+                    // before.
+                    if connection.close_reason().is_some() {
+                        why = format!("the connection to the lookup point at {addr} was let go of; trying again");
+                        continue;
+                    }
+                    return Ok(connection);
+                }
+                Ok(Err(failed)) => why = failed,
+                Err(_) => why = format!("the lookup point at {addr} did not answer in time"),
+            }
+        }
+        Err(why)
+    }
+
+    /// The connection ships are announced over to the point at `addr`: the one kept, if it is
+    /// still open, or a new one, whose introductions are heard from then on.
+    async fn kept_connection(self: &Arc<Self>, addr: SocketAddr) -> Result<Connection, String> {
+        let slot = self.kept_slot(addr)?;
+        let mut kept = slot.lock().await;
+        if let Some(connection) = kept.as_ref().filter(|connection| connection.close_reason().is_none()) {
+            return Ok(connection.clone());
+        }
+        let connecting = self.endpoint.connect_with(self.announcing.clone(), addr, POINT_NAME).map_err(|e| format!("the lookup point at {addr} could not be reached: {e}"))?;
+        let connection = connecting.await.map_err(|e| format!("the lookup point at {addr} could not be reached: {e}"))?;
+        *kept = Some(connection.clone());
+        tokio::spawn(self.clone().hear(connection.clone()));
+        Ok(connection)
+    }
+
+    /// Announce ships over the connection to their galaxy's point, each record with the
+    /// ship's presence on that connection: at the addresses stated by hand, or with none, at
+    /// the address that point sees this connection come from. Each ship whose record the point
+    /// took is recorded in the lane at once, chunk by chunk as the answers come, with what it
+    /// was shown as (the addresses, and whether callers are asked to be introduced), whatever
+    /// becomes of the other ships or of later chunks. Why some record was not kept, if one was
+    /// not; an error if the connection did not do what was asked of it.
+    async fn announce_over(&self, runtime: &Runtime, galaxy: u8, ships: &[String], stated: &[SocketAddr], connection: &Connection, deadline: tokio::time::Instant) -> Result<Option<String>, String> {
+        let point = connection.remote_address();
+        let binding = binding_of(connection).ok_or_else(|| NO_BINDING.to_string())?;
+        // Stated by hand wins, and then what the point says is not asked. Otherwise what the
+        // point sees is announced, alone, and callers are asked to be introduced unless it is
+        // the very address this runtime listens on.
+        let (addresses, introduce) = if stated.is_empty() {
+            let seen = self.seen(connection, deadline).await?;
+            (vec![seen], seen != self.bound || self.lookup.behind_router)
+        } else {
+            (stated.to_vec(), self.lookup.behind_router)
+        };
+        let mut why = None;
+        for some in ships.chunks(MOST_ANNOUNCED) {
+            let (mut named, mut records, mut presence) = (Vec::new(), Vec::new(), Vec::new());
+            for ship in some {
+                let (Ok(key), Some(number)) = (runtime.signing_key(ship), ob::any_number(ship)) else { continue };
+                let issued = self.next_issued();
+                match whereabouts::sign_flagged(ship, &addresses, issued, introduce, &key, runtime.moon_proof(ship)) {
+                    Ok(record) => {
+                        named.push(ship);
+                        records.push(record);
+                        presence.push(whereabouts::presence(number, issued, &binding, &key));
+                    }
+                    Err(failed) => why = Some(format!("~{ship}: no record could be made: {failed}")),
+                }
+            }
+            let count = records.len();
+            let request = WhereRequest { body: Some(where_request::Body::Announce(Announce { records, presence })) }.encode_to_vec();
+            let reply = tokio::time::timeout_at(deadline, request_on(connection, point, &request)).await.map_err(|_| format!("the lookup point at {point} did not answer in time"))??;
+            match reply {
+                WhereReply { body: Some(where_reply::Body::Announced(Announced { outcomes })), .. } if outcomes.len() == count => {
+                    let mut lanes = lock(&self.lanes);
+                    let lane = lanes.entry(galaxy).or_default();
+                    for (ship, outcome) in named.iter().zip(&outcomes) {
+                        if outcome.is_empty() {
+                            lane.shown.insert(ship.to_string(), (addresses.clone(), introduce));
+                        } else {
+                            why = Some(format!("~{ship}: the lookup point did not keep its record: {}", outcome.chars().take(200).collect::<String>()));
+                        }
+                    }
+                }
+                WhereReply { refused, body: None } => why = Some(format!("the lookup point at {point} refused: {}", refused.chars().take(200).collect::<String>())),
+                _ => return Err(format!("the answer of the lookup point at {point} made no sense")),
+            }
+        }
+        Ok(why)
+    }
+
+    /// Where the point sees a connection come from, if it says, and if that is an address a
+    /// record may carry.
+    async fn seen(&self, connection: &Connection, deadline: tokio::time::Instant) -> Result<SocketAddr, String> {
+        let point = connection.remote_address();
+        let request = WhereRequest { body: Some(where_request::Body::Seen(Seen {})) }.encode_to_vec();
+        let reply = tokio::time::timeout_at(deadline, request_on(connection, point, &request)).await.map_err(|_| format!("the lookup point at {point} did not say in time where it sees this runtime"))??;
+        let address = match reply {
+            WhereReply { body: Some(where_reply::Body::Saw(Saw { address })), .. } => address,
+            WhereReply { refused, body: None } if !refused.is_empty() => {
+                return Err(format!("the lookup point at {point} would not say where it sees this runtime: {}", refused.chars().take(200).collect::<String>()));
+            }
+            _ => return Err(format!("the lookup point at {point} said nothing that makes sense about where it sees this runtime")),
+        };
+        let seen = whereabouts::address_read(&address).map(plain).ok_or_else(|| format!("the lookup point at {point} said this runtime is at something that is not an address"))?;
+        whereabouts::fits(&[seen]).map_err(|why| format!("the lookup point at {point} sees this runtime at {seen}, which cannot be announced: {why}"))?;
+        Ok(seen)
+    }
+
+    /// Hear the introductions the point passes over a connection ships are announced on, for
+    /// as long as it is open, and hand each on to be weighed. Each is read within
+    /// `PUSH_READ_LIMIT`, and no more than `MOST_PUSH_BYTES` of it; what will not fit where
+    /// introductions wait to be weighed is dropped.
+    async fn hear(self: Arc<Self>, connection: Connection) {
+        while let Ok(mut receive) = connection.accept_uni().await {
+            match tokio::time::timeout(PUSH_READ_LIMIT, net::read_whole(&mut receive, MOST_PUSH_BYTES)).await {
+                Ok(Some(introduction)) => {
+                    if let Some(pushed) = &self.pushed {
+                        let _ = pushed.try_send(introduction);
+                    }
+                }
+                _ => {
+                    let _ = receive.stop(VarInt::from_u32(4));
+                }
+            }
+        }
+    }
+
+    /// What a ship of this runtime was last announced as, if the point for its galaxy took it:
+    /// its addresses, and whether callers are asked to be introduced.
+    pub(crate) fn shown_as(&self, ship: &str) -> Option<(Vec<SocketAddr>, bool)> {
+        let galaxy = whereabouts::galaxy_of(ob::any_number(ship)?);
+        lock(&self.lanes).get(&galaxy)?.shown.get(ship).cloned()
+    }
+
+    /// Whether a ship of this runtime was last announced asking callers to be introduced. Only
+    /// for such a ship does an introduction make this runtime send anything.
+    pub(crate) fn introduces(&self, ship: &str) -> bool {
+        self.shown_as(ship).is_some_and(|(_, introduce)| introduce)
+    }
+
+    /// Ask the point for `to`'s galaxy to introduce `from` to it: `from`'s record, signed now at
+    /// the addresses it is announced at, with its presence on the connection the request goes
+    /// over. Fails if `from` announces no record of its own, or the point refuses.
+    pub(crate) async fn introduce(&self, runtime: &Runtime, from: &str, to: &str, deadline: tokio::time::Instant) -> Result<(), String> {
+        if !self.introducing.load(Ordering::SeqCst) {
+            return Err("this runtime does not ask for introductions".into());
+        }
+        let (Some(number), Some(callee)) = (ob::any_number(from), ob::any_number(to)) else { return Err("not the name of a ship".into()) };
+        let no_record = "this ship announces no record of its own, so it cannot be introduced";
+        self.shown_as(from).ok_or(no_record)?;
+        let key = runtime.signing_key(from).map_err(|e| e.to_string())?;
+        let proof = runtime.moon_proof(from);
+        // Made once the connection is in hand, which may have waited: what the ship is
+        // announced as is read then.
+        let make = |connection: &Connection| -> Result<Vec<u8>, String> {
+            let (addresses, introduce) = self.shown_as(from).ok_or(no_record)?;
+            let binding = binding_of(connection).ok_or_else(|| NO_BINDING.to_string())?;
+            let issued = self.next_issued();
+            let record = whereabouts::sign_flagged(from, &addresses, issued, introduce, &key, proof)?;
+            let presence = whereabouts::presence(number, issued, &binding, &key);
+            Ok(WhereRequest { body: Some(where_request::Body::Introduce(Introduce { callee, record, presence })) }.encode_to_vec())
+        };
+        match self.exchange_with(whereabouts::galaxy_of(callee), &make, deadline).await? {
+            WhereReply { body: Some(where_reply::Body::Introduced(Introduced {})), .. } => Ok(()),
+            WhereReply { refused, .. } => Err(format!("the lookup point did not introduce ~{from} to ~{to}: {}", refused.chars().take(200).collect::<String>())),
+        }
+    }
+}
+
+/// Send one request on a connection to a lookup point (at `addr`), and read its reply.
+async fn request_on(connection: &Connection, addr: SocketAddr, request: &[u8]) -> Result<WhereReply, String> {
+    let lost = |e: &dyn fmt::Display| format!("the lookup point at {addr} was lost: {e}");
+    let (mut send, mut receive) = connection.open_bi().await.map_err(|e| lost(&e))?;
+    send.write_all(request).await.map_err(|e| lost(&e))?;
+    send.finish().map_err(|e| lost(&e))?;
+    let answer = net::read_whole(&mut receive, MOST_WHERE_BYTES).await.ok_or_else(|| format!("the answer of the lookup point at {addr} could not be read, or was too large"))?;
+    WhereReply::decode(&*answer).map_err(|_| format!("the answer of the lookup point at {addr} made no sense"))
 }
 
 /// The time to put on a record made at `now`, given when the last was made (`last`, which
@@ -1327,7 +2120,8 @@ fn next_after(last: &AtomicU64, now: u64) -> u64 {
 }
 
 /// For a caller of a lookup point: any key will do, so long as the point proves it holds it.
-/// Nothing a point says is taken on its word, so who it is does not matter.
+/// Nothing a point says about who anyone is, or about what a record says, is taken on its word,
+/// so who it is does not matter.
 #[derive(Debug)]
 struct AnyPoint {
     supported: WebPkiSupportedAlgorithms,
@@ -1383,7 +2177,23 @@ mod tests {
     }
 
     fn point(bounds: PointBounds, galaxies: Option<Vec<u8>>) -> Point {
-        Point::new(PointConfig { keys: Arc::new(Everyone), galaxies, bounds }, &rustls::crypto::ring::default_provider()).unwrap()
+        testing(Point::new(PointConfig { keys: Arc::new(Everyone), galaxies, bounds }, &rustls::crypto::ring::default_provider()).unwrap())
+    }
+
+    /// A point with the connection the tests announce on open.
+    fn testing(point: Point) -> Point {
+        lock(&point.table).open(TESTING.0, Arc::new(Notify::new()));
+        point
+    }
+
+    /// The presence, on the connection the tests announce on, of the ship whose record this
+    /// is, signed with the key the tests made it with: a planet's from its number, a moon's
+    /// from its number or the revision of its parent's word. Nothing for what is no record.
+    pub(super) fn presence_for(record: &[u8]) -> Vec<u8> {
+        let Ok(read) = ship_proto::Whereabouts::decode(record) else { return Vec::new() };
+        let candidates = [key_of(read.ship), SigningKey::from_bytes(&[(read.ship >> 32) as u8; 32]), SigningKey::from_bytes(&[read.proof.as_ref().map_or(0, |proof| proof.revision as u8).wrapping_add(60); 32])];
+        let signer = if read.moon_key.is_empty() { Some(&candidates[0]) } else { candidates[1..].iter().find(|key| key.verifying_key().to_bytes().as_slice() == read.moon_key.as_slice()) };
+        signer.map_or(Vec::new(), |key| whereabouts::presence(read.ship, read.issued, &TESTING.1, key))
     }
 
     fn record(ship: u64, issued: u64) -> Vec<u8> {
@@ -1518,7 +2328,7 @@ mod tests {
             let (newer, older) = (record(ship, now - 500), record(ship, now - 1000));
             floors.keep(checked(&newer, &floors).unwrap(), now).unwrap();
             if failed {
-                let (kept_as, _) = floors.addresses(&name(ship), now).unwrap();
+                let kept_as = floors.addresses(&name(ship), now).unwrap().kept_as;
                 floors.failed(&name(ship), kept_as);
                 assert_eq!(floors.addresses(&name(ship), now), None);
             }
@@ -1552,13 +2362,14 @@ mod tests {
         let ahead = now + whereabouts::LIFETIME_MS;
         let bounds = PointBounds { records: 1, ..PointBounds::default() };
         let mut table = Table::default();
-        table.keep(&believed(PLANET, ahead), record(PLANET, ahead), &bounds, ahead).unwrap();
+        table.open(TESTING.0, Arc::new(Notify::new()));
+        table.keep(&believed(PLANET, ahead), record(PLANET, ahead), &bounds, ahead, TESTING.0).unwrap();
         // An older record, good by the clock as it is now, does not take its place.
-        assert_eq!(table.keep(&believed(PLANET, now), record(PLANET, now), &bounds, now), Err("a record of the ship as new or newer is already held"));
+        assert_eq!(table.keep(&believed(PLANET, now), record(PLANET, now), &bounds, now, TESTING.0), Err("a record of the ship as new or newer is already held"));
         // And when the table is full, sweeping does not take the record dated ahead for one
         // that has run out.
         let other = PLANET + (1 << 16);
-        assert_eq!(table.keep(&believed(other, now), record(other, now), &bounds, now), Err("this lookup point is full; try again later"));
+        assert_eq!(table.keep(&believed(other, now), record(other, now), &bounds, now, TESTING.0), Err("this lookup point is full; try again later"));
         assert_eq!(table.known(PLANET, now).issued, Some(ahead));
     }
 
@@ -1601,7 +2412,7 @@ mod tests {
     }
 
     fn gated_point(gate: &Arc<Gate>) -> Arc<Point> {
-        Arc::new(Point::new(PointConfig { keys: gate.clone(), galaxies: None, bounds: PointBounds::default() }, &rustls::crypto::ring::default_provider()).unwrap())
+        Arc::new(testing(Point::new(PointConfig { keys: gate.clone(), galaxies: None, bounds: PointBounds::default() }, &rustls::crypto::ring::default_provider()).unwrap()))
     }
 
     /// Wait, briefly, for something another thread does.
@@ -1620,7 +2431,7 @@ mod tests {
         let gone = Arc::new(Mutex::new(false));
         let worker = {
             let (point, gone) = (point.clone(), gone.clone());
-            std::thread::spawn(move || point.check_all(point.admit(vec![record(PLANET, now_ms())], &plenty()), &gone))
+            std::thread::spawn(move || point.take_gone(vec![record(PLANET, now_ms())], &gone))
         };
         // The worker's question is out. The table is held, and the question answered: the
         // worker now goes on to keep the record, and waits for the table.
@@ -1648,7 +2459,7 @@ mod tests {
         let table = lock(&point.table);
         let worker = {
             let (point, gone) = (point.clone(), gone.clone());
-            std::thread::spawn(move || point.check_all(point.admit(vec![record(PLANET, now_ms())], &plenty()), &gone))
+            std::thread::spawn(move || point.take_gone(vec![record(PLANET, now_ms())], &gone))
         };
         // The worker's few instructions up to the wait for the table.
         std::thread::sleep(Duration::from_millis(50));
@@ -1692,7 +2503,7 @@ mod tests {
         point.skew.store(-60_000, Ordering::SeqCst);
         let second = moon_word_record(moon, 2, start - whereabouts::LIFETIME_MS - 1000);
         let believed = whereabouts::check(&second, &listed, Known::default(), point.now()).unwrap();
-        table.keep(&believed, second.clone(), &PointBounds::default(), point.now()).unwrap();
+        table.keep(&believed, second.clone(), &PointBounds::default(), point.now(), TESTING.0).unwrap();
         drop(table);
         // A weighs its record by the clock as it is when it keeps it: revision two is held,
         // and revision one does not take its place.
@@ -1719,7 +2530,7 @@ mod tests {
         point.skew.store(-60_000, Ordering::SeqCst);
         let second = record(PLANET, start - whereabouts::LIFETIME_MS - 1000);
         let believed = whereabouts::check(&second, &listed, Known::default(), point.now()).unwrap();
-        table.keep(&believed, second.clone(), &PointBounds::default(), point.now()).unwrap();
+        table.keep(&believed, second.clone(), &PointBounds::default(), point.now(), TESTING.0).unwrap();
         drop(table);
         // A weighs its record by the clock read with the table held: its record is good by
         // that clock, and the newer one held keeps it off. (By a clock read before the wait,
@@ -1734,13 +2545,13 @@ mod tests {
         let mut floors = Floors::new(4);
         let first = whereabouts::check(&record(PLANET, now - 1000), &listed, Known::default(), now).unwrap();
         floors.keep(first, now).unwrap();
-        let (tried, _) = floors.addresses(&name(PLANET), now).unwrap();
+        let tried = floors.addresses(&name(PLANET), now).unwrap().kept_as;
         // While R1's addresses are being tried, R2 takes its place. R1 then fails: R2 is left
         // as it is, and its addresses are handed out.
         let second = whereabouts::check(&record(PLANET, now), &listed, Known::default(), now).unwrap();
         floors.keep(second, now).unwrap();
         floors.failed(&name(PLANET), tried);
-        let (newer, _) = floors.addresses(&name(PLANET), now).unwrap();
+        let newer = floors.addresses(&name(PLANET), now).unwrap().kept_as;
         assert_ne!(newer, tried);
         // R2 failing is marked.
         floors.failed(&name(PLANET), newer);
@@ -1753,13 +2564,13 @@ mod tests {
         let mut floors = Floors::new(4);
         let issued = now - 1000;
         floors.keep(whereabouts::check(&record(PLANET, issued), &listed, Known::default(), now).unwrap(), now).unwrap();
-        let (tried, _) = floors.addresses(&name(PLANET), now).unwrap();
+        let tried = floors.addresses(&name(PLANET), now).unwrap().kept_as;
         assert_eq!(floors.addresses(&name(PLANET), issued + whereabouts::LIFETIME_MS), None);
         let elsewhere: SocketAddr = "198.51.100.9:4433".parse().unwrap();
         let other = whereabouts::sign(&name(PLANET), &[elsewhere], issued, &key_of(PLANET), None).unwrap();
         floors.keep(whereabouts::check(&other, &listed, Known::default(), now).unwrap(), now).unwrap();
         floors.failed(&name(PLANET), tried);
-        assert_eq!(floors.addresses(&name(PLANET), now).map(|(_, addresses)| addresses), Some(vec![elsewhere]));
+        assert_eq!(floors.addresses(&name(PLANET), now).map(|lead| lead.addresses), Some(vec![elsewhere]));
 
         // When the numbers run out, no more records are kept, and none is named twice.
         let mut floors = Floors::new(4);
@@ -1786,13 +2597,18 @@ mod tests {
     /// `step` every time after: as if the clock stepped between the first reading and any
     /// later one.
     fn stepping_finder(first: u64, step: i64) -> (tokio::runtime::Runtime, Finder) {
+        finder_with(Lookup::default(), first, step)
+    }
+
+    /// The same, with these lookup settings.
+    fn finder_with(lookup: Lookup, first: u64, step: i64) -> (tokio::runtime::Runtime, Finder) {
         let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let endpoint = {
             let _entered = tokio.enter();
             Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap()
         };
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut finder = Finder::new(Lookup::default(), &NetConfig::default(), endpoint, &provider).unwrap();
+        let mut finder = Finder::new(lookup, &NetConfig::default(), endpoint, &provider, "127.0.0.1:9".parse().unwrap(), None).unwrap();
         let readings = AtomicUsize::new(0);
         finder.clock = Box::new(move || if readings.fetch_add(1, Ordering::SeqCst) == 0 { first } else { first.saturating_add_signed(step) });
         (tokio, finder)
@@ -1843,7 +2659,7 @@ mod tests {
 
     fn slow_point(delay: Duration) -> Arc<Point> {
         let keys = Arc::new(SlowOnce(std::sync::atomic::AtomicBool::new(true), delay));
-        Arc::new(Point::new(PointConfig { keys, galaxies: None, bounds: PointBounds::default() }, &rustls::crypto::ring::default_provider()).unwrap())
+        Arc::new(testing(Point::new(PointConfig { keys, galaxies: None, bounds: PointBounds::default() }, &rustls::crypto::ring::default_provider()).unwrap()))
     }
 
     #[test]
@@ -1886,6 +2702,308 @@ mod tests {
     }
 
     #[test]
+    fn a_ship_attends_on_the_connection_its_newest_record_came_on_and_nowhere_once_it_closes() {
+        let now = now_ms();
+        let believed = |issued: u64| whereabouts::check(&record(PLANET, issued), &listed, Known::default(), now).unwrap();
+        let bounds = PointBounds::default();
+        let mut table = Table::default();
+        let (first, second) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        table.open(1, first.clone());
+        table.open(2, second.clone());
+        // Kept from connection one: the ship attends there, and an introduction waits there.
+        table.keep(&believed(now - 10), record(PLANET, now - 10), &bounds, now, 1).unwrap();
+        assert_eq!(table.attending(PLANET, now), Some(1));
+        table.pass(PLANET, vec![1], now).unwrap();
+        // A newer record from connection two moves the ship: what waited on one is not passed
+        // there, and introductions go to two.
+        table.keep(&believed(now), record(PLANET, now), &bounds, now, 2).unwrap();
+        assert_eq!(table.attending(PLANET, now), Some(2));
+        assert!(table.next_push(1, now).is_none());
+        table.pass(PLANET, vec![2], now).unwrap();
+        assert_eq!(table.next_push(2, now).map(|push| push.record), Some(vec![2]));
+        // An older record from one does not move it back.
+        assert!(table.keep(&believed(now - 5), record(PLANET, now - 5), &bounds, now, 1).is_err());
+        // Two closes: the ship attends nowhere, nothing waits, nothing is passed, and nothing is
+        // kept from the closed connection. The record is still handed out.
+        table.pass(PLANET, vec![3], now).unwrap();
+        table.close(2);
+        assert_eq!(table.attending(PLANET, now), None);
+        assert!(table.next_push(2, now).is_none());
+        assert_eq!(table.pass(PLANET, vec![4], now), Err(NOT_ATTENDING));
+        assert_eq!(table.keep(&believed(now + 5), record(PLANET, now + 5), &bounds, now, 2), Err("the connection the record came on has closed"));
+        assert!(table.held.contains_key(&PLANET));
+        // A record that has run out: the ship attends nowhere, whatever its connection.
+        table.keep(&believed(now + 5), record(PLANET, now + 5), &bounds, now, 1).unwrap();
+        assert_eq!(table.attending(PLANET, now + 5 + whereabouts::LIFETIME_MS), None);
+        // And when a record is dropped, its connection no longer counts it.
+        table.remove(PLANET);
+        assert!(table.present[&1].ships.is_empty());
+    }
+
+    #[test]
+    fn an_introduction_whose_record_runs_out_while_it_is_checked_is_not_passed_on() {
+        let gate = Arc::new(Gate::default());
+        let point = gated_point(&gate);
+        let start = now_ms();
+        // The callee attends on the tests' connection, with a record dated as far ahead as may
+        // be, so that it is still good eleven minutes on.
+        let callee = PLANET + (1 << 16);
+        {
+            let mut table = lock(&point.table);
+            let believed = whereabouts::check(&record(callee, start + whereabouts::MOST_AHEAD_MS), &listed, Known::default(), start).unwrap();
+            table.keep(&believed, record(callee, start + whereabouts::MOST_AHEAD_MS), &PointBounds::default(), start, TESTING.0).unwrap();
+        }
+        // The caller's record is good now, with half a minute left. Its key question is held,
+        // then the table, then the question answered: the worker waits for the table to pass
+        // the introduction on. The clock steps on a minute meanwhile.
+        let caller = record(PLANET, start - whereabouts::LIFETIME_MS + 30_000);
+        let presence = tests::presence_for(&caller);
+        let worker = {
+            let point = point.clone();
+            std::thread::spawn(move || point.introduce_one(callee, caller, &presence, Some(&TESTING.1), &Mutex::new(false)))
+        };
+        until(|| gate.asked.load(Ordering::SeqCst) >= 1);
+        let table = lock(&point.table);
+        gate.open.store(true, Ordering::SeqCst);
+        until(|| gate.answered.load(Ordering::SeqCst));
+        // The few instructions from the answer to the wait for the table.
+        std::thread::sleep(Duration::from_millis(50));
+        point.skew.store(60_000, Ordering::SeqCst);
+        drop(table);
+        assert_eq!(worker.join().unwrap(), Err("the record ran out, or this clock went back, while it was being checked"));
+        assert!(lock(&point.table).next_push(TESTING.0, point.now()).is_none());
+    }
+
+    /// A point with a ship attending on the tests' connection, whose record is good now; and a
+    /// caller's record with its presence there.
+    fn introducing(gate: &Arc<Gate>) -> (Arc<Point>, u64, Vec<u8>, Vec<u8>) {
+        let point = gated_point(gate);
+        let now = now_ms();
+        let callee = PLANET + (1 << 16);
+        let believed = whereabouts::check(&record(callee, now), &listed, Known::default(), now).unwrap();
+        lock(&point.table).keep(&believed, record(callee, now), &PointBounds::default(), now, TESTING.0).unwrap();
+        let caller = record(PLANET, now);
+        let presence = tests::presence_for(&caller);
+        (point, callee, caller, presence)
+    }
+
+    #[test]
+    fn nothing_is_passed_on_for_a_caller_that_goes_while_its_introduction_waits_for_the_table() {
+        let gate = Arc::new(Gate::default());
+        let (point, callee, caller, presence) = introducing(&gate);
+        let gone = Arc::new(Mutex::new(false));
+        let worker = {
+            let (point, gone) = (point.clone(), gone.clone());
+            std::thread::spawn(move || point.introduce_one(callee, caller, &presence, Some(&TESTING.1), &gone))
+        };
+        // The worker's question is out. The table is held, and the question answered: the
+        // worker goes on to pass the introduction on, and waits for the table.
+        until(|| gate.asked.load(Ordering::SeqCst) >= 1);
+        let table = lock(&point.table);
+        gate.open.store(true, Ordering::SeqCst);
+        until(|| gate.answered.load(Ordering::SeqCst));
+        // The few instructions from the answer to the wait for the table.
+        std::thread::sleep(Duration::from_millis(50));
+        *lock(&gone) = true;
+        drop(table);
+        assert_eq!(worker.join().unwrap(), Err(GONE));
+        assert!(lock(&point.table).next_push(TESTING.0, point.now()).is_none());
+        assert_eq!(point.status().introduced, 0);
+    }
+
+    #[test]
+    fn nothing_is_asked_for_a_caller_that_goes_while_its_introduction_waits_for_the_table() {
+        let gate = Arc::new(Gate::default());
+        gate.open.store(true, Ordering::SeqCst);
+        let (point, callee, caller, presence) = introducing(&gate);
+        let asked = gate.asked.load(Ordering::SeqCst);
+        let gone = Arc::new(Mutex::new(false));
+        // The table is held before the worker starts, so it waits at its first look at it.
+        let table = lock(&point.table);
+        let worker = {
+            let (point, gone) = (point.clone(), gone.clone());
+            std::thread::spawn(move || point.introduce_one(callee, caller, &presence, Some(&TESTING.1), &gone))
+        };
+        // The worker's few instructions up to the wait for the table.
+        std::thread::sleep(Duration::from_millis(50));
+        *lock(&gone) = true;
+        drop(table);
+        assert_eq!(worker.join().unwrap(), Err(GONE));
+        assert_eq!(gate.asked.load(Ordering::SeqCst), asked, "the source of keys was asked for a caller that had gone");
+    }
+
+    #[test]
+    fn an_introduction_is_weighed_again_against_the_callers_history_where_it_is_passed_on() {
+        // The reviewer's interleaving. An introduction of A (R1) to B waits on A's key. An
+        // announcement of A's newer R2 completes, and then one moving B from connection one to
+        // connection two. The introduction resumes: R1 is now older than what is held of A, so
+        // it is refused, and nothing waits for either connection.
+        let gate = Arc::new(Gate::default());
+        let point = gated_point(&gate);
+        let now = now_ms();
+        let callee = PLANET + (1 << 16);
+        let keep = |table: &mut Table, ship: u64, issued: u64, connection: u64| {
+            let believed = whereabouts::check(&record(ship, issued), &listed, Known::default(), now).unwrap();
+            table.keep(&believed, record(ship, issued), &PointBounds::default(), now, connection).unwrap();
+        };
+        {
+            let mut table = lock(&point.table);
+            table.open(1, Arc::new(Notify::new()));
+            table.open(2, Arc::new(Notify::new()));
+            keep(&mut table, callee, now - 100, 1);
+        }
+        let first = record(PLANET, now - 50);
+        let presence = tests::presence_for(&first);
+        let worker = {
+            let point = point.clone();
+            std::thread::spawn(move || point.introduce_one(callee, first, &presence, Some(&TESTING.1), &Mutex::new(false)))
+        };
+        until(|| gate.asked.load(Ordering::SeqCst) >= 1);
+        {
+            let mut table = lock(&point.table);
+            keep(&mut table, PLANET, now - 10, TESTING.0);
+            keep(&mut table, callee, now - 5, 2);
+        }
+        gate.open.store(true, Ordering::SeqCst);
+        assert_eq!(worker.join().unwrap(), Err("a record of the ship as new or newer is already held"));
+        let mut table = lock(&point.table);
+        assert!(table.next_push(1, now).is_none() && table.next_push(2, now).is_none());
+    }
+
+    #[test]
+    fn an_introduction_that_waited_too_long_is_dropped_when_taken_and_makes_room_when_more_come() {
+        let now = now_ms();
+        let mut table = Table::default();
+        table.open(1, Arc::new(Notify::new()));
+        let believed = whereabouts::check(&record(PLANET, now), &listed, Known::default(), now).unwrap();
+        table.keep(&believed, record(PLANET, now), &PointBounds::default(), now, 1).unwrap();
+        let long_ago = Instant::now().checked_sub(PUSH_WAIT + Duration::from_millis(100)).unwrap();
+        // One that has waited past its time, and nothing after it: when it is come to, it is
+        // dropped, not passed on.
+        table.present.get_mut(&1).unwrap().waiting.push_back(Push { callee: PLANET, record: vec![1], at: long_ago });
+        assert!(table.next_push(1, now).is_none());
+        // As many as may wait for the ship, all past their time: a new one finds room.
+        for _ in 0..MOST_WAITING_EACH {
+            table.present.get_mut(&1).unwrap().waiting.push_back(Push { callee: PLANET, record: vec![2], at: long_ago });
+        }
+        assert_eq!(table.pass(PLANET, vec![3], now), Ok(()));
+        assert_eq!(table.next_push(1, now).map(|push| push.record), Some(vec![3]));
+    }
+
+    #[test]
+    fn the_time_given_to_an_introduction_and_its_attempts_is_a_share_of_what_is_left() {
+        // One reading of the clock, so that the figures are exact.
+        let now = tokio::time::Instant::now();
+        let at = |left: u64| now + Duration::from_millis(left);
+        // Plenty left: the whole allowance.
+        assert_eq!(introduced_limit_at(at(60_000), now), TRY_INTRODUCED);
+        assert_eq!(introduce_wait_at(at(60_000), now), INTRODUCE_WAIT);
+        // Little left: three quarters of it for an attempt, a quarter for the point's answer.
+        assert_eq!(introduced_limit_at(at(2000), now), Duration::from_millis(1500));
+        assert_eq!(introduce_wait_at(at(2000), now), Duration::from_millis(500));
+        // None left, or less than none: nothing.
+        assert_eq!(introduced_limit_at(now, now), Duration::ZERO);
+        assert_eq!(introduced_limit_at(now, now + Duration::from_secs(1)), Duration::ZERO);
+        assert_eq!(introduce_wait_at(now, now + Duration::from_secs(1)), Duration::ZERO);
+    }
+
+    /// `count` live lookup points, each a runtime of its own, under `base`.
+    fn live_points(base: &std::path::Path, count: usize) -> Vec<(Arc<crate::Runtime>, crate::net::Network)> {
+        (0..count)
+            .map(|n| {
+                let dir = base.join(n.to_string());
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let runtime = Arc::new(crate::Runtime::open(&dir, crate::Config { durability: crate::Durability::Normal, ..crate::Config::default() }).unwrap());
+                let lookup = Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds::default() }), ..Lookup::default() };
+                let net = crate::net::Network::start(runtime.clone(), Directory::new(), NetConfig { lookup, ..NetConfig::default() }).unwrap();
+                (runtime, net)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_lane_whose_point_moves_gives_up_its_old_connection_before_taking_room() {
+        let base = std::env::temp_dir().join(format!("urbit-wasm-{}-moving-points", std::process::id()));
+        let points = live_points(&base, MOST_POINTS + 1);
+        // Galaxy 0's point is now the last one; every other galaxy's is where it was.
+        let lookup = Lookup { at: vec![(Some(0), points[MOST_POINTS].1.addr())], ..Lookup::default() };
+        let (tokio, finder) = finder_with(lookup, now_ms(), 0);
+        let finder = Arc::new(finder);
+        tokio.block_on(async {
+            // Every place in the map is a connection some lane announces over.
+            for (galaxy, (_, point)) in points[..MOST_POINTS].iter().enumerate() {
+                let connection = finder.kept_connection(point.addr()).await.unwrap();
+                lock(&finder.lanes).entry(galaxy as u8).or_default().connection = Some(connection);
+            }
+            assert_eq!(lock(&finder.kept).len(), MOST_POINTS);
+            // Galaxy 0's lane gives up its old connection, and so finds room for the new.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let connection = finder.lane_connection(0, deadline).await.expect("the lane could not move");
+            assert_eq!(connection.remote_address(), points[MOST_POINTS].1.addr());
+            // The new point has taken the connection.
+            let started = Instant::now();
+            while points[MOST_POINTS].1.point_status().unwrap().connections == 0 {
+                assert!(started.elapsed() < Duration::from_secs(10), "the new point never took the connection");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let started = Instant::now();
+            while points[0].1.point_status().unwrap().connections > 0 {
+                assert!(started.elapsed() < Duration::from_secs(10), "the old point's connection was not closed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // The others' lanes are as they were.
+            assert!(points[1..MOST_POINTS].iter().all(|(_, point)| point.point_status().unwrap().connections == 1));
+        });
+        drop(points);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn connections_no_lane_announces_over_are_let_go_of_to_make_room() {
+        let (tokio, finder) = stepping_finder(now_ms(), 0);
+        let finder = Arc::new(finder);
+        // One live point more than a runtime keeps connections to.
+        let base = std::env::temp_dir().join(format!("urbit-wasm-{}-kept-points", std::process::id()));
+        let points = live_points(&base, MOST_POINTS + 1);
+        tokio.block_on(async {
+            let mut first = None;
+            for (_, point) in &points[..MOST_POINTS] {
+                let connection = finder.kept_connection(point.addr()).await.unwrap();
+                first.get_or_insert(connection);
+            }
+            // One lane announces over the first. Room for the last is made from the others.
+            lock(&finder.lanes).entry(0).or_default().connection = first.clone();
+            finder.kept_connection(points[MOST_POINTS].1.addr()).await.expect("no room was made");
+            let started = Instant::now();
+            while points[1..MOST_POINTS].iter().any(|(_, point)| point.point_status().unwrap().connections > 0) {
+                assert!(started.elapsed() < Duration::from_secs(10), "connections no lane uses were not closed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(first.unwrap().close_reason().is_none(), "the connection a lane announces over was let go of");
+            assert_eq!(points[0].1.point_status().unwrap().connections, 1);
+            assert_eq!(lock(&finder.kept).len(), 2);
+        });
+        drop(points);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_point_counts_only_so_many_callers_of_introductions() {
+        let point = point(PointBounds { introductions_each: 1, rate_period: Duration::from_millis(50), ..PointBounds::default() }, None);
+        for caller in 0..MOST_INTRODUCERS as u64 {
+            assert_eq!(point.introducer(caller), Ok(()));
+        }
+        assert_eq!(point.introducer(0), Err("too many introductions from that ship just now; try again later"));
+        assert_eq!(point.introducer(MOST_INTRODUCERS as u64), Err("this lookup point is counting as many callers as it may; try again later"));
+        // Once the allowances are whole again, those callers are forgotten, and a new one is
+        // counted.
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(point.introducer(MOST_INTRODUCERS as u64), Ok(()));
+        assert!(lock(&point.introducers).len() <= 2);
+    }
+
+    #[test]
     fn settings_that_make_no_sense_are_refused() {
         let at: SocketAddr = "203.0.113.7:4433".parse().unwrap();
         assert!(Lookup::default().sound().is_ok());
@@ -1907,6 +3025,11 @@ mod tests {
             Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: Some(vec![]), bounds: PointBounds::default() }), ..Lookup::default() },
             Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { in_all: 0, ..PointBounds::default() } }), ..Lookup::default() },
             Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { rate_period: Duration::ZERO, ..PointBounds::default() } }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { introductions: 0, ..PointBounds::default() } }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { introductions_each: 0, ..PointBounds::default() } }), ..Lookup::default() },
+            Lookup { keep_alive: Duration::from_millis(999), ..finds.clone() },
+            Lookup { keep_alive: Duration::from_millis(25_001), ..finds.clone() },
+            Lookup { behind_router: true, ..Lookup::default() },
         ] {
             assert!(bad.sound().is_err(), "{bad:?}");
         }

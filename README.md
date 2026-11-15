@@ -185,16 +185,21 @@ cargo run -p runtime --release --bin serve -- --dir /tmp/ships --keyfile my-plan
 Or find other ships by name alone, through lookup points (see Finding a ship by
 its name). Nobody runs public lookup points yet, so this is for a network of
 your own: one runtime is the point, with a copy of Azimuth to check records
-against, and the others are told where it is. A runtime listening on `0.0.0.0`
-must be told the address others reach it at:
+against, and the others are told where it is. Each of the others asks the
+point what address it is seen at, and announces that, so it works from a cloud
+machine or from behind a home router alike (the point itself needs an address
+others can reach):
 
 ```sh
 cargo run -p runtime --release --bin serve -- --dir /tmp/point --ethereum <node> \
   --azimuth-copy /tmp/azimuth.sqlite --net 0.0.0.0:4433 --lookup-point all
 cargo run -p runtime --release --bin serve -- --dir /tmp/ships --keyfile my-planet.key \
   --ethereum <node> --azimuth-copy /tmp/azimuth.sqlite --net 0.0.0.0:4433 \
-  --lookup-at 198.51.100.4:4433 --announce 203.0.113.7:4433
+  --lookup-at 198.51.100.4:4433
 ```
+
+To state the address yourself instead, add `--announce 203.0.113.7:4433`; and if
+that address is a router that lets nothing in unasked, `--behind-router` too.
 
 The server speaks plain HTTP on localhost. Before reaching it from anywhere
 else, put it behind a proxy that provides TLS, buffers request bodies, passes
@@ -1224,7 +1229,9 @@ starts it, and a runtime has at most one.
   Connection migration is off.
 - Each request and its reply travel on one bidirectional stream. Unidirectional
   streams and datagrams are not accepted. There is one connection per (calling
-  ship, called ship); a newer one replaces the older.
+  ship, called ship); a newer one replaces the older. (On the connection a
+  runtime keeps to a lookup point, the point may open up to 4 small streams of
+  its own, to pass introductions; see Finding a ship by its name.)
 - The code says an observer still sees which ship is being called, that this
   protocol is in use, the addresses, and the size and timing of traffic.
 - Before a request or reply is decoded, the runtime counts its repeated fields
@@ -1242,11 +1249,14 @@ lists for it, the same key the ship must prove when it is called.
 - The record (`Whereabouts`, `runtime/src/whereabouts.rs`) names the ship by
   number, one to four addresses (IPv4 or IPv6, each with a port), and when it
   was made, in milliseconds since 1970. A moon's record also carries its key
-  and its parent's word for that key, as a `Hello` does. The ship signs, with
-  its networking key, a fixed layout written out by hand: the label
-  `ship.v1.where\n`, the ship as 8 bytes, the time as 8, the number of
-  addresses as 1, then four slots of 19 bytes (kind, 16 bytes of address, the
-  port), empty slots zero. Never the protobuf encoding.
+  and its parent's word for that key, as a `Hello` does. And it says whether
+  callers should ask to be introduced before they call (see Home routers,
+  below). The ship signs, with its networking key, a fixed layout written out
+  by hand: the label `ship.v1.where\n`, the ship as 8 bytes, the time as 8,
+  whether to be introduced as 1 (one or nought), the number of addresses as 1,
+  then four slots of 19 bytes (kind, 16 bytes of address, the port), empty
+  slots zero. Never the protobuf encoding. So the flag is the ship's own word:
+  a point can neither set it nor clear it.
 - A record is believed only if all of these hold: decoding it and encoding it
   again gives the same bytes (nothing unknown, repeated, or padded), and it is
   at most 512 bytes; it names one to four addresses, none that means "any"
@@ -1268,19 +1278,39 @@ lists for it, the same key the ship must prove when it is called.
   --lookup-point`). It answers on the same UDP port as the ships, under its own
   ALPN, `ship-where/1`, which a runtime that is not a point does not offer. It
   shows a key made when it starts, and its callers accept any key: nothing a
-  point says is taken on its word. Its callers show a key made when their
+  point says about who anyone is, or about what a ship's record says, is
+  taken on its word. (The one thing a ship does take from its own galaxy's
+  point is where that point sees it from; see the announcing bullet below,
+  and the limits.) Its callers show a key made when their
   network starts, which names nobody, because the ship protocol on the same
   port needs every caller to show some key.
-- A point answers two requests. `Announce` carries up to 16 records; each is
+- Presence. Anyone can read a record from a point and hand it on, so a record
+  alone does not show that its ship is the one giving it. When a ship gives
+  its record to a point, it also signs, with the same key, a short statement:
+  the label `ship.v1.here\n`, the ship as 8 bytes, the record's time as 8, and
+  32 bytes that both ends of that one connection work out from its handshake
+  and nobody else can (TLS's exporter for the connection, asked for under
+  `ship.v1.here`). Those bytes come from secrets both ends make afresh for
+  every connection, and nothing is ever resumed, so they are never the same on
+  two connections, and someone between two handshakes cannot make them agree.
+  A point keeps a record only with its presence on the connection it came on.
+  So nobody but the ship can announce its record, and the point knows, for
+  each record it holds, the connection the ship itself is on: where the ship
+  attends. That stops when the connection closes, when the record runs out, or
+  when a newer record of the ship is kept, which names its own connection.
+- A point answers four requests. `Announce` carries up to 16 records, each with
+  its presence; each is
   checked against the point's own source of keys (in `serve`, the copy of
   Azimuth, which `--lookup-point` needs), read on threads that may wait (8 at
   once), and kept in the place of the ship's last if it is believed. The
   clock is read again after the check, which may have waited on the source of
   keys: a record that ran out meanwhile, or that a newer one took over from
   meanwhile, is not kept. The reply says, for each, kept or why not. `Where` names a ship by number; the reply is
-  its record if one is held and still good, or nothing. The point keeps records
-  in memory only, for all galaxies or a list, and refuses records of ships of
-  other galaxies.
+  its record if one is held and still good, or nothing. `Seen` is answered
+  with the address the point sees the connection coming from. `Introduce`
+  asks the point to pass the caller's record to a ship (see Home routers). The
+  point keeps records, and who attends where, in memory only, for all
+  galaxies or a list, and refuses records of ships of other galaxies.
 - A point's bounds (`PointBounds`): 65,536 records, 16,384 moons, 64 moons of
   any one ship; a record still good is never dropped to make room, so a full
   point refuses new ships and says so, and records that have run out are swept
@@ -1289,10 +1319,11 @@ lists for it, the same key the ship must prove when it is called.
   at once, all connections together (`MOST_IN_HAND`: being read, waiting for a
   thread, or being checked; about 1.5 MiB in all), counted before a byte of a
   request is read: past it a request is refused at once, unread. 16 KiB at
-  most for a request or reply. 256 records a second on one connection and
-  2,048 in all (`rate_period`, a second unless set otherwise), counted as a
-  request arrives, before it waits for a thread; 64
-  questions a second on one connection. When a connection closes, whatever its
+  most for a request or reply. Records checked: on one connection 256 at a
+  stroke and 256 earned back each `rate_period` (a second unless set
+  otherwise), and in all 2,048 at a stroke and 2,048 each `rate_period`,
+  counted as a request arrives, before it waits for a thread; questions: 64
+  at a stroke and 64 a second on one connection. When a connection closes, whatever its
   requests left waiting stops and gives up its place; a question to the source
   of keys already under way cannot be stopped, is one of the 8, and its answer
   is thrown away. Once a connection has gone, its announcement keeps nothing
@@ -1310,12 +1341,27 @@ lists for it, the same key the ship must prove when it is called.
   each ship it holds to the point for that ship's galaxy (a planet's star's
   galaxy, a moon's parent's) at start, every `announce_every` (2 minutes), and
   any ship that is new at once, over one connection per point however many
-  ships. It announces the addresses given (`Lookup::announce`, `serve
-  --announce`), or with none the address it listens on, unless that is
-  `0.0.0.0` or `::`, which says nothing of where it is reached: then it
-  announces nothing and says so (`Network::lookup_trouble`). A point that is
-  down or refuses is tried again after `retry_delay`, doubling to
-  `max_retry_delay`.
+  ships. Which address it announces:
+  - Addresses given by hand (`Lookup::announce`, `serve --announce`): exactly
+    those. The point is not even asked where it sees the runtime.
+  - None given: before each round it asks the point (`Seen`), over the very
+    connection it announces on, where it sees that connection come from, and
+    announces that address alone. This is what makes `--announce` unneeded on
+    most cloud machines and behind home routers: such a machine listens on
+    one address and is reached at another, and only something outside can say
+    which. The answer is believed only from the point of those ships' own
+    galaxy, only over the connection it was asked on, only for that galaxy's
+    ships, and only if it is an address a record may carry. If the point does
+    not say, or names something a record may not carry, nothing is announced
+    that round, the runtime says why (`Network::lookup_trouble`), and it tries
+    again after the usual wait. A runtime whose ships sit under two galaxies
+    may announce different addresses to each.
+
+  A point that is down or refuses is tried again after `retry_delay`, doubling
+  to `max_retry_delay`. The connection the ships are announced over is kept
+  open, with a small packet every `keep_alive` (15 seconds), and if it drops it
+  is made again and the ships are announced again at once, since a point keeps
+  a record only with presence on the connection it came on.
 - Calling a ship with no address given: first the addresses of the record
   already held for it, if it is still good; then, if there is none or none of
   its addresses answered as the ship, the point for its galaxy is asked, the
@@ -1334,7 +1380,9 @@ lists for it, the same key the ship must prove when it is called.
   it on the connection, the key the moon proves, and the check after the
   handshake. If the point's answer is not believed, or no record of it can be
   kept, the call's error says why. Each
-  address gets at most 3 seconds, and never more than half the time left. All
+  address gets at most 3 seconds, and never more than half the time left (a
+  record that asks callers to be introduced is tried as Home routers, below,
+  says). All
   of it is within the request's own `request_timeout`. A record none of whose
   addresses answered is not tried again, but holds older records off until it
   runs out. Only the record that was tried is marked so (each record kept is
@@ -1385,6 +1433,128 @@ lists for it, the same key the ship must prove when it is called.
   returns. At most 8 addresses
   are taken from an answer and each is tried in turn; an answer is used for
   `resolved_for` (5 minutes), a failure for `ask_again`.
+- Home routers. Most homes reach the internet through a router that shares
+  one public address among all the machines inside. When a machine inside
+  sends a packet out, the router picks an outside port for it and remembers,
+  for a while after the last packet (some tens of seconds), that packets
+  coming back from that destination to that port go to that machine. A packet
+  from anyone else is dropped: the router cannot tell which machine inside it
+  would be for, and strangers knocking are not wanted anyway. So a ship at
+  home can call out, but nobody can call it, even at the outside address its
+  point told it and it announced.
+
+  The way through is for the ship at home to send something toward its caller
+  first. Then its router has seen a packet go from that port to the caller, and
+  takes the caller's packets as answers to it. That needs the ship to know, at
+  the right moment, that someone wants to call it and from where, and that is
+  what its point is for: the ship keeps a connection open to its point, which
+  its router keeps open because packets keep going out on it, and the point
+  can say over it "this caller wants you". This is why two ships sending at
+  about the same moment get through where either alone would not.
+- How a call to such a ship goes:
+  1. A runtime that announces the address its point saw, and listens on a
+     different one (behind a router, the router's outside port is not the
+     machine's own), puts the flag in its records asking callers to be
+     introduced first. With addresses given by hand the flag is clear, since
+     whoever runs the runtime has said the ship can be reached, unless
+     `Lookup::behind_router` (`serve --behind-router`) says otherwise.
+  2. A caller about to try a record with the flag first asks that ship's point
+     to introduce it (`Introduce`), sending its own record, signed just then
+     at the addresses it announces itself at, and its presence on that
+     connection. The point checks both as it checks an announcement (the same
+     admission, threads and rates) and keeps nothing. If the ship attends on
+     a connection that is open, the point passes the caller's record to it
+     over that connection, on a stream of its own, and answers "passed on"
+     without waiting for the ship. It never sends anything to an address out
+     of a record.
+  3. The ship checks the caller's record itself, as it would any record: keys
+     from its own directory, fresh by its own clock. If it believes it, it
+     sends three packets of four bytes from its own port to each address in
+     the record, a quarter of a second apart, and nothing else. It keeps
+     nothing of the introduction and does not call the caller.
+  4. The caller does not wait for that. It dials the ship's address as for any
+     record. Its first packet may reach the router before the ship's packets
+     have opened the way, and is then lost, but QUIC sends it again about a
+     second later, and by then the way is open. So an attempt at such a record
+     is given 4 seconds, not 3 (and never more than three quarters of the time
+     left), and the caller waits for the point's "passed on" for at most a
+     second (and at most a quarter of the time left). A point that refuses, or
+     says nothing, does not stop the attempt.
+  5. Everything after the connection is made is as for any connection: the key
+     the ship proves, a moon's word, the checks against the directory. Nothing
+     on the way (the point's word, the introduction, the four-byte packets) is
+     believed about who anyone is. The four-byte packet is no QUIC packet:
+     any QUIC endpoint drops it without answering, and nothing is done on
+     receiving one.
+  6. A router forgets an idle opening sooner than a connection with nothing on
+     it is closed. So a connection made on a record with the flag also sends a
+     small packet every `keep_alive`, and the routers keep the way open for as
+     long as it lasts.
+
+  Two ships each at home can call each other this way when their routers are
+  of the usual kind, which give a machine inside the same outside port
+  whoever it sends to. Routers of a stricter kind give a different outside
+  port for each destination: the port the point saw is not the one the ship's
+  packets toward the caller leave from, and the caller's packets arrive at a
+  port that lets in only the point. Calls to a ship behind such a router fail
+  in their time, saying the ship could not be reached directly. Reaching it
+  needs a relay, which is not built.
+- A ship that announces no record of its own (on a runtime that announces
+  nothing, or whose point has not taken its record) cannot be introduced: it
+  tries the addresses anyway, which works only if the ship it calls can be
+  reached without.
+- Bounds on introductions, at the point (`PointBounds`): `introductions`
+  (512) passed on at a stroke and 512 earned back each `rate_period`, in all,
+  and `introductions_each` (4 at a stroke, 4 each `rate_period`) for any one
+  caller, which only that caller can spend, since it takes the caller's
+  presence; the caller's record also counts against the record
+  rates, as an announcement's does. A request to introduce is weighed in this
+  order, cheapest and narrowest first: the connection's own allowance of
+  questions (as for `Where`), before the point looks at who attends; then
+  whether the ship attends; then the record rates, the connection's and then
+  the point's; then the point's allowance of introductions. 4 introductions
+  waiting for any one ship
+  and 16 for any one connection, each for at most 3 seconds; one passed at a
+  time over a connection, each given at most a second; counts kept for 4,096
+  callers. A refusal says which limit it met. At a ship: the point may have at
+  most 4 streams open on the connection at once, each read for at most 2
+  seconds and 576 bytes; 8 introductions wait to be weighed and the rest are
+  dropped; each is weighed within 5 seconds, a question to Urbit ID included;
+  32 are weighed at a stroke and 32 earned back a second. The packets are sent
+  only for a ship of this runtime's last announced asking for introductions.
+  What limits the packets: an introduction is acted on only once it holds one
+  of 16 places among those under way, taken first and kept until its last
+  packet, and then only within an allowance for its caller ship (2 at a
+  stroke and 2 earned back a second) and one in all (16 at a stroke and 16 a
+  second). The allowance is per full ship name, so each moon has its own.
+  Each introduction acted on sends three packets to each of the caller's
+  addresses (at most four, so at most twelve), a quarter of a second apart.
+  So the packets in any span of T seconds come from introductions holding a
+  place when the span begins (at most 16) or charged within it (at most
+  2 + 2T for one caller ship, 16 + 16T in all), however busy the machine is:
+  at most 12 x (16 + 2 + 2T) = 216 + 24T packets attributable to one caller
+  ship, and 12 x (16 + 16 + 16T) = 384 + 192T in all. Kept up, that is 24 and
+  192 packets a second, but not in every single second. Each record may name
+  four new addresses, so the distinct addresses reached are at most 72 + 8T
+  for one caller ship and 128 + 64T in all (8 and 64 a second, kept up).
+  Several ships may name the same addresses, so what any one address can
+  receive is bounded only by the figures in all. Counts are kept for 1,024
+  callers. A caller's
+  key is looked up as any caller's is, under the same limits. The record is
+  weighed against what this runtime already believes of the caller (the
+  newest record it holds for it, and for a moon its parent's word by the
+  directory's own rules, a key set by hand for the moon included), as an
+  ordinary lookup would, and nothing of it is kept. Where it differs from an
+  ordinary lookup: an introduction of a caller whose address this runtime has
+  set by hand is still acted on, and the packets go to the addresses in the
+  caller's own signed record, while every call to that caller still goes to
+  the address set by hand, and nothing is kept; since nothing is kept, an
+  introduction is not refused for want of room to remember a moon or a
+  record, as a lookup would be; its freshness is weighed once, not again where
+  something is kept; and there is no limit in time on when a job's packets go,
+  only the limits stated above.
+  `Network::introductions` says how many introductions were heard, how many
+  were weighed, how many acted on, and how many packets sent.
 - With none of these settings, as by default, nothing of this is sent,
   listened for, or kept.
 
@@ -1407,8 +1577,14 @@ and the `WhereReply` the matching answer, or only `refused` with a reason.
 
 | Request | Reply | Purpose |
 | --- | --- | --- |
-| `Announce { records }` | `Announced { outcomes }` | Up to 16 encoded `Whereabouts`. For each, empty if kept, or why not |
+| `Announce { records, presence }` | `Announced { outcomes }` | Up to 16 encoded `Whereabouts`, each with its ship's presence on this connection. For each, empty if kept, or why not |
 | `Where { ship }` | `Found { record }` | The ship's record as the point holds it, or empty if it holds none still good |
+| `Seen {}` | `Saw { address }` | The address the point sees this connection coming from |
+| `Introduce { callee, record, presence }` | `Introduced {}` | Pass the caller's record, with its presence on this connection, to the ship named, over the connection it attends on |
+
+From a point to a ship, on a stream the point opens on the connection the ship
+attends on: `Introduction { callee, record }`, the caller's record for the
+ship named. Nothing in it is taken on the point's word.
 
 ### Commands between ships, exactly once
 
@@ -1638,14 +1814,17 @@ and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 | `at` | none | Lookup points' addresses, each for one galaxy or (`None`) for all |
 | `domain` | none | `(domain, port)`: the point for `~zod` is `zod.<domain>` |
 | `resolver` | the system's | What names are looked up through |
-| `announce` | none | Addresses to announce this runtime's ships at, up to 4 |
+| `announce` | none | Addresses to announce this runtime's ships at, up to 4. With none, the address each ship's galaxy's point sees this runtime at |
+| `behind_router` | false | Ask callers to be introduced first even with addresses given by hand |
+| `keep_alive` | 15 s | How often a packet goes over the connection to each point announced to, and over a connection made to a ship that asks for introductions. 1 to 25 seconds, and less than `idle_timeout` |
 | `announce_every` | 120 s | How often each ship is announced again; at most 5 minutes |
 | `ask_again` | 3 s | Least time between questions about one ship, and how long a failed name lookup is remembered |
 | `resolved_for` | 300 s | How long an answer from the resolver is used |
 
 `PointBounds` (in `PointConfig`): `records` 65,536, `moons` 16,384,
 `moons_each` 64, `connections` 256, `per_connection` 256 and `in_all` 2,048
-records each `rate_period` (1 s).
+records each `rate_period` (1 s), and `introductions` 512 and
+`introductions_each` 4 introductions passed on each `rate_period`.
 
 `Network::start` refuses settings that could wedge a ship: `max_ship_bytes`
 below 256 KiB, a `max_message_bytes` without room for the largest command or
@@ -1895,6 +2074,63 @@ through a stand-in resolver (a dead first address, no addresses, a ninth
 address, a resolver that hangs, or hangs once, answers looked up again once
 old); and stopping promptly with a point that never answers.
 
+For the outside address, presence and introductions, `runtime/tests/lookup.rs`
+also has: a record with no presence, or presence for another connection, ship,
+time or key, not kept, and a moon's presence by its own key; a record read from
+one point and announced to another by someone else, refused, with an
+introduction to the ship still reaching only the ship's own connection; what a
+runtime announces with nothing given (bound where it is reached, bound to
+"any address"), with addresses given, and with `behind_router`; a point that
+reports a refused kind of address, rubbish, a refusal or nothing, and nothing
+announced; introductions at a point refused for a ship not attending, one whose
+connection has just closed, a caller's record forged, run out or shown with
+another connection's presence, and each limit, each saying which (an
+introduction's record counting against its connection's record rates too); a
+caller that goes while its introduction is checked having nothing asked or
+passed on for it; a ship that
+takes nothing passed to it, or reads nothing of it, holding up only its own
+introductions, and only so long; a stand-in point passing a ship forged, run
+out and oversized introductions, its own record, rubbish, one that never ends,
+with the packets counted at a socket; a ship answering an ordinary call while
+an introduction is in hand (its caller's key held back), and every call
+succeeding while floods of introductions are pushed and weighed; at most four streams
+open from a point; a point that never answers an introduction not delaying
+the call; an address given by hand meaning no introduction is asked for; the
+four-byte packet drawing no answer from QUIC, beside a version negotiation
+that does, and a flood of them changing nothing; stopping promptly with an
+introduction in hand at the caller, the point and the ship; an introduction of a
+record older than one already believed sending nothing; a stranger's requests
+to introduce metered by its own connection before the point looks at who
+attends; a ship whose record is taken introduced though another ship of its
+galaxy is refused; a point writing an IPv4 address as IPv6; introductions
+weighed only so many a second, and none for a ship that asked for none; an
+address set by hand while an answer asking for an introduction is held back,
+with no introduction asked for after; a ship letting go of its connection
+to a point its name no longer leads to; a moon with its key set by hand,
+introduced under another key its parent vouches for (nothing sent) and under
+the key set by hand (acted on); and a galaxy of seventeen ships whose second
+chunk is answered with rubbish, the first chunk's outcomes still recorded. Unit tests in `lookup.rs` cover an
+introduction weighed again against the caller's history where it is passed on,
+introductions that waited too long, the time given to introductions and their
+attempts, room made among kept connections from those no lane uses, with 65
+live points, and a lane whose point moves finding room when every place is
+used by a lane. In `router_tests.rs`, an introduction's weighing called
+directly shows each of its limits on its own: a caller's allowance, the
+places under way (taken before any allowance is charged), and the overall
+allowance.
+
+Ships behind home routers are tested in `runtime/src/router_tests.rs`, inside
+the crate, because the stand-in router takes the place of a runtime's UDP
+socket through a door only the crate's own code can use. The stand-in comes in
+two kinds: one outside port that lets in only addresses the inside has sent to
+lately, and one with a port for each destination. With real runtimes and a
+real point: a ship behind the first kind called by name from a public address
+and from behind a router of its own, with commands and receipts both ways; the
+same call failing without the introduction; two ships behind the second kind
+failing in time, saying they could not reach each other directly; and a
+connection through a router that forgets idle openings after two seconds still
+answering at once after five idle seconds.
+
 The load test (`runtime/src/bin/loadtest.rs`) takes `--ships` (500),
 `--active` (50), `--events` (20,000), `--threads` (8), `--max-awake` (64),
 `--sync full|normal` (full), `--wasm`, `--kernel`, and `--dir` (a new
@@ -1967,19 +2203,61 @@ These are stated in the source.
   longer, up to the record's remaining life. How soon the newer record actually
   arrives also depends on when the ship next announces and when a caller next
   asks.
-- A ship is found through a lookup point only if its runtime has a public
-  address. A lookup point can keep a record back, or hand out one that has not
+- A lookup point can keep a record back, or hand out one that has not
   run out (up to 10 minutes after the time the record says it was signed, which
   can be 12 minutes after the point took it); it cannot make one up or
-  change one. A ship can name any address in its own record, so callers may be
+  change one. That is about records; what a point says of where it sees a
+  runtime is taken on its word, as the next limit says. A ship can name any address in its own record, so callers may be
   sent to try connecting there: at most 4 addresses, and one question about a
   ship every few seconds. A point learns which address asks about which ship.
   A point does not prove it is the galaxy, and the names points are found
-  under are not authenticated. A machine whose public address is not the one
-  it listens on (most cloud machines) must be given it (`--announce`). Ships
-  behind home routers cannot be reached yet: learning the outside address,
-  introductions, opening a path through routers, and carrying traffic for
-  ships that cannot be reached directly are not built.
+  under are not authenticated.
+- With no address given by hand, a runtime announces the address its point
+  says it sees. A point that lies can make a ship announce a wrong address.
+  That makes the ship unfindable (a point could already keep its record back)
+  and sends its callers' first packets to an address of the point's choosing,
+  as a ship naming any address in its own record already could, within the
+  same bounds. An address given by hand is never replaced or added to by what
+  a point says.
+- A ship behind a router that gives each destination a port of its own cannot
+  be reached, from home or from a public address, and two such ships cannot
+  reach each other: carrying traffic for ships that cannot be reached
+  directly (a relay) is not built. Such calls fail in their time and say so.
+- An introduction names the caller, and the caller's addresses, to the
+  ship's point and to the ship, which a question (`Where`) does not. That is
+  why only records that ask for it cost their callers one.
+- A runtime asks callers to be introduced whenever the address its point sees
+  is not the one it listens on. A machine listening on "any address" that can
+  in fact be reached directly (many cloud machines) asks too; that costs its
+  callers an introduction and nothing else, and `--announce` turns it off.
+- Introductions let a ship's owner have other ships send a few small packets
+  to any address it puts in its own record: at most 12 per introduction (three
+  to each of four addresses), held to the limits on introductions per caller
+  and in all, at the point and at each ship. A point that lies can have a
+  ship send them for any genuine record still good that it has seen and that
+  is newer than any that ship already holds of the caller, within the same
+  limits.
+- Two ships behind the same router are not helped: each is announced at the
+  router's outside address, and whether a router passes packets from inside
+  back inside through its own outside address varies. Local network addresses
+  are not found or announced. An address given by hand, or the one a point
+  sees, may itself be a private or loopback address, and is announced as it
+  is.
+- The timing of introductions (4 seconds an attempt, a second for the point's
+  answer, the packets a quarter of a second apart, the limits on passing and
+  reading an introduction) was judged from how QUIC behaves on this machine,
+  over loopback, not measured over real distances.
+- A point holds the streams it opens on a ship's connection to pass
+  introductions; the ship stops reading one after 2 seconds, but its place
+  comes back only when the point ends it. A point that never does holds all 4
+  places, and so holds up only its own introductions to that ship.
+- A connection made through a router that an introduction opened stays open
+  only while its packets keep the router's memory of it fresh. A router that
+  forgets an idle opening in less than `keep_alive` (15 seconds) loses it; the
+  connection is then noticed dead only at the idle timeout.
+- The stand-in router is a program in the tests. No real home router has been
+  tried, nor hole punching over IPv6. `--behind-router` has had no run from
+  end to end.
 - A point keeps a moon's latest revision only while it holds that moon's
   record, and builds no history of its own beyond that. The point is not
   trusted and its table is in memory only, so nothing it remembered could be a
@@ -2002,9 +2280,13 @@ These are stated in the source.
   addresses are already known, set by hand or found earlier, are not affected.
 - Records that are rubbish use up a point's overall allowance of records per
   second before they are checked, so one caller can spend it for everyone.
+  Introductions that are rubbish do the same, to the overall allowances of
+  records and of introductions, once they are past their own connection's
+  allowances and name a ship that attends.
 - Lookup points and the new `serve` flags have been run only on macOS. The
-  flags (`--lookup-at`, `--lookup-domain`, `--announce`, `--lookup-point`) have
-  been checked for what they refuse, but have had no run from end to end. The
+  flags (`--lookup-at`, `--lookup-domain`, `--announce`, `--behind-router`,
+  `--lookup-point`) have been checked for what they refuse, but have had no run
+  from end to end. The
   system's resolver is not exercised by the tests, which look names up through
   a stand-in.
 - A moon's key cannot be taken back at once. A ship that has not seen a later
