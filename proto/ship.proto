@@ -531,3 +531,66 @@ message Resynced {
   // Where the answering ship stands, once it has taken the asker's account into its own.
   Standing standing = 1;
 }
+
+// Where a ship is. Urbit ID says which key belongs to which ship, not where the ship can be
+// reached, so a ship says that itself: it signs a small record of its addresses and gives it
+// to a lookup point, and anyone who wants to call it asks the point for the record and checks
+// the signature. What is signed is not this encoding but a fixed layout of the same fields
+// (see `runtime/src/whereabouts.rs`), so a record is checked against exactly the bytes its
+// ship signed whatever protobuf library wrote it. A record is taken only if decoding it and
+// encoding it again gives the same bytes: nothing unknown, repeated, or padded rides along.
+message Whereabouts {
+  // The ship, by number. A moon's number is its parent's with more in front.
+  uint64 ship = 1;
+  // One to four addresses, each an IPv4 address and port (six bytes) or an IPv6 address and
+  // port (eighteen), port last, all in network order.
+  repeated bytes addresses = 2;
+  // When the ship made the record, in milliseconds since 1970.
+  uint64 issued = 3;
+  // For a moon, which Urbit ID does not list: the key that signed, and its parent's word for
+  // that key. Neither is signed: the signature is checked with the key, and the word with the
+  // parent's key from Urbit ID.
+  bytes moon_key = 4;
+  MoonProof proof = 5;
+  // The ship's signature, with its networking key, over the fixed layout.
+  bytes signature = 6;
+}
+
+// To a lookup point, over a connection of its own protocol (`ship-where/1`). One request and
+// one reply travel on each stream.
+message WhereRequest {
+  oneof body {
+    Announce announce = 1;
+    Where ask = 2;
+  }
+}
+
+// A runtime gives the point the records of some of its ships, each an encoded Whereabouts.
+message Announce {
+  repeated bytes records = 1;
+}
+
+// Anyone asks the point where a ship is, by number.
+message Where {
+  uint64 ship = 1;
+}
+
+message WhereReply {
+  oneof body {
+    Announced announced = 1;
+    Found found = 2;
+  }
+  // Set, with no body, when the request was not one the point would answer.
+  string refused = 15;
+}
+
+// For each record announced, in the same order: empty if the point kept it, or why not.
+message Announced {
+  repeated string outcomes = 1;
+}
+
+// The ship's record as the point holds it, or nothing if the point holds none that is still
+// good. Whoever asked checks it as if it came from anyone.
+message Found {
+  bytes record = 1;
+}

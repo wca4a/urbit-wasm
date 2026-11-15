@@ -182,6 +182,20 @@ cargo run -p runtime --release --bin serve -- --dir /tmp/ships --keyfile my-plan
   --ethereum https://ethereum.publicnode.com --net 0.0.0.0:4433 --peer '~sampel-palnet=203.0.113.7:4433'
 ```
 
+Or find other ships by name alone, through lookup points (see Finding a ship by
+its name). Nobody runs public lookup points yet, so this is for a network of
+your own: one runtime is the point, with a copy of Azimuth to check records
+against, and the others are told where it is. A runtime listening on `0.0.0.0`
+must be told the address others reach it at:
+
+```sh
+cargo run -p runtime --release --bin serve -- --dir /tmp/point --ethereum <node> \
+  --azimuth-copy /tmp/azimuth.sqlite --net 0.0.0.0:4433 --lookup-point all
+cargo run -p runtime --release --bin serve -- --dir /tmp/ships --keyfile my-planet.key \
+  --ethereum <node> --azimuth-copy /tmp/azimuth.sqlite --net 0.0.0.0:4433 \
+  --lookup-at 198.51.100.4:4433 --announce 203.0.113.7:4433
+```
+
 The server speaks plain HTTP on localhost. Before reaching it from anywhere
 else, put it behind a proxy that provides TLS, buffers request bodies, passes
 addresses through unchanged, and limits how fast one caller may ask. Serve
@@ -212,10 +226,13 @@ source rather than something the tests prove.
 | `runtime/src/replica.rs` | A copy of Azimuth in a local SQLite file, kept up to date from Ethereum alone, answering the same lookups as `azimuth.rs` |
 | `runtime/src/moon.rs` | A parent's signed word for its moon's key |
 | `runtime/src/net.rs` | QUIC transport, the directory of keys and addresses, identity checks against it, carrying commands and log entries between ships |
+| `runtime/src/whereabouts.rs` | A ship's signed record of where it is, and the one check of such a record |
+| `runtime/src/lookup.rs` | Lookup points: being one, finding the one for a galaxy, asking it where a ship is, and announcing this runtime's ships to it |
 | `runtime/src/server.rs` | The HTTP server for apps and browsers |
 | `runtime/src/bin/serve.rs` | Command-line wrapper around the HTTP server, with a demo ship |
 | `runtime/src/bin/loadtest.rs` | Load test |
 | `runtime/tests/runtime.rs` | Integration tests |
+| `runtime/tests/lookup.rs` | Integration tests of finding ships through lookup points |
 | `kernel/src/lib.rs` | The default kernel: agent registry and routing policy |
 | `proto/ship.proto` | Every message: runtime and kernel, runtime and agent, client and ship, ship and ship |
 | `sdk/src/lib.rs` | Guest-side bindings and the `agent!` macro |
@@ -1185,8 +1202,22 @@ starts it, and a runtime has at most one.
   older half are dropped when it fills. A connection is taken only on a key
   that has been proved.
 - Where a ship is (its socket address) is not in Urbit ID. It is given with
-  `place(ship, addr)`. A wrong address cannot pass one ship off as another,
-  since whatever answers must still prove the key.
+  `place(ship, addr)`, or for a ship with no address given, found through the
+  lookup point for its galaxy if the runtime has lookup settings (see Finding
+  a ship by its name). An address given by hand is always used, and nothing
+  else is tried. Two kinds of promise hold when an address is given while
+  calls are going on. A call that begins after `place` (or `set`) has returned
+  never uses a record, and no connection made through a record is kept or
+  used again once an address is given (this is settled under the directory's
+  lock). A call already under way when the address is given stops at its next
+  check (before each address it tries, before asking a point, when a kept
+  connection is proved again) if that re-read sees the address. Until then it
+  may go on: an attempt or question it had begun goes on, and it may begin one
+  more after the address is given, following its last check; such a call may
+  fairly be taken as having come before the address was given. Setting an
+  address does not go and close idle connections found through a point: each
+  is refused the next time it would be used, or dropped when room is made. A wrong address cannot pass one ship off as
+  another, since whatever answers must still prove the key.
 - If what the directory holds for a ship changes, connections made under the
   old listing are closed.
 - Session resumption is off, so every connection proves its keys afresh.
@@ -1199,6 +1230,163 @@ starts it, and a runtime has at most one.
 - Before a request or reply is decoded, the runtime counts its repeated fields
   without allocating: at most 256 messages in a `Deliver`, 256 logs in a
   `News`, and 256 entries in a `Fetched`.
+
+### Finding a ship by its name
+
+Without this, a runtime has to be told by hand where every other ship is. Keys
+come from Urbit ID; addresses do not, and cannot: they change far more often
+than anything worth writing to Ethereum. So a ship says where it is itself, in
+a record it signs, and anyone can check that record against the key Urbit ID
+lists for it, the same key the ship must prove when it is called.
+
+- The record (`Whereabouts`, `runtime/src/whereabouts.rs`) names the ship by
+  number, one to four addresses (IPv4 or IPv6, each with a port), and when it
+  was made, in milliseconds since 1970. A moon's record also carries its key
+  and its parent's word for that key, as a `Hello` does. The ship signs, with
+  its networking key, a fixed layout written out by hand: the label
+  `ship.v1.where\n`, the ship as 8 bytes, the time as 8, the number of
+  addresses as 1, then four slots of 19 bytes (kind, 16 bytes of address, the
+  port), empty slots zero. Never the protobuf encoding.
+- A record is believed only if all of these hold: decoding it and encoding it
+  again gives the same bytes (nothing unknown, repeated, or padded), and it is
+  at most 512 bytes; it names one to four addresses, none that means "any"
+  (`0.0.0.0`, `::`), a group, the broadcast address, port 0, or an IPv4
+  address written as IPv6, and no two the same; it was made no more than 2
+  minutes ahead of this machine's clock and less than 10 minutes before it (so
+  good for 10 minutes from the time it says it was signed, which is up to 12
+  minutes from when it is taken); it is
+  newer than the newest record already believed for the ship that has not yet
+  run out (a record held keeps older ones off until then, even if it is dated
+  ahead of a clock that has since stepped back); and it is signed by the key
+  Urbit ID lists for the ship, or for a moon by the key it carries, which its
+  parent (by the parent's key from Urbit ID) vouches for, at no earlier a
+  revision than any already seen for the moon, and at the same revision only
+  for the same key. One function makes this check, for lookup points and for
+  the ships that ask them, each with its own source of keys. Times are worked
+  out without overflow: a wrong clock makes records refused, never believed.
+- A lookup point is a role any runtime can play (`Lookup::serve`, `serve
+  --lookup-point`). It answers on the same UDP port as the ships, under its own
+  ALPN, `ship-where/1`, which a runtime that is not a point does not offer. It
+  shows a key made when it starts, and its callers accept any key: nothing a
+  point says is taken on its word. Its callers show a key made when their
+  network starts, which names nobody, because the ship protocol on the same
+  port needs every caller to show some key.
+- A point answers two requests. `Announce` carries up to 16 records; each is
+  checked against the point's own source of keys (in `serve`, the copy of
+  Azimuth, which `--lookup-point` needs), read on threads that may wait (8 at
+  once), and kept in the place of the ship's last if it is believed. The
+  clock is read again after the check, which may have waited on the source of
+  keys: a record that ran out meanwhile, or that a newer one took over from
+  meanwhile, is not kept. The reply says, for each, kept or why not. `Where` names a ship by number; the reply is
+  its record if one is held and still good, or nothing. The point keeps records
+  in memory only, for all galaxies or a list, and refuses records of ships of
+  other galaxies.
+- A point's bounds (`PointBounds`): 65,536 records, 16,384 moons, 64 moons of
+  any one ship; a record still good is never dropped to make room, so a full
+  point refuses new ships and says so, and records that have run out are swept
+  out when it is full, at most once a second. 256 connections under its
+  protocol, apart from the ships' own `max_connections`. 64 requests in hand
+  at once, all connections together (`MOST_IN_HAND`: being read, waiting for a
+  thread, or being checked; about 1.5 MiB in all), counted before a byte of a
+  request is read: past it a request is refused at once, unread. 16 KiB at
+  most for a request or reply. 256 records a second on one connection and
+  2,048 in all (`rate_period`, a second unless set otherwise), counted as a
+  request arrives, before it waits for a thread; 64
+  questions a second on one connection. When a connection closes, whatever its
+  requests left waiting stops and gives up its place; a question to the source
+  of keys already under way cannot be stopped, is one of the 8, and its answer
+  is thrown away. Once a connection has gone, its announcement keeps nothing
+  (a record is kept only with the table and a mark of whether the caller is
+  still there both held), and asks the source of keys nothing more except at
+  most the one question that was already begun, or beginning, as it went. An announcement that is empty, or all of whose records the rates
+  refused, is answered at once without waiting for a thread. Once the
+  handshake is over, credit given to a lookup connection from then on is held
+  to 4 requests in progress and 64 KiB of room to receive; the credit given at
+  the handshake (the ships' transport allowance: `max_streams`, and room for a
+  whole message on each) stays usable after it, since QUIC cannot take credit
+  back. What bounds a point's work is the count of requests in hand and the
+  sizes above, not the stream limit.
+- A runtime with lookup settings (`Lookup::at`, `Lookup::domain`) announces
+  each ship it holds to the point for that ship's galaxy (a planet's star's
+  galaxy, a moon's parent's) at start, every `announce_every` (2 minutes), and
+  any ship that is new at once, over one connection per point however many
+  ships. It announces the addresses given (`Lookup::announce`, `serve
+  --announce`), or with none the address it listens on, unless that is
+  `0.0.0.0` or `::`, which says nothing of where it is reached: then it
+  announces nothing and says so (`Network::lookup_trouble`). A point that is
+  down or refuses is tried again after `retry_delay`, doubling to
+  `max_retry_delay`.
+- Calling a ship with no address given: first the addresses of the record
+  already held for it, if it is still good; then, if there is none or none of
+  its addresses answered as the ship, the point for its galaxy is asked, the
+  answer checked with keys from this runtime's own directory, kept, and its
+  addresses tried. Immediately before each address is tried, and before a new
+  question to the point, the directory is read again, in one step, and nothing
+  waits between that reading and the attempt: if the re-read sees an address
+  given by hand, or a changed key for a galaxy, star or planet, nothing more
+  from the record is tried and the point is not asked. A call that overlaps
+  the change may still begin one more attempt or question after it, following
+  its last check (an attempt already begun cannot be called back, and what it
+  makes is refused when it is proved, in one step with the directory). For a
+  moon, the key held may have come from the very record being tried, so
+  whatever key is held then is let through to the attempt; what decides is the
+  parent's word, checked against the parent's key held now when the moon shows
+  it on the connection, the key the moon proves, and the check after the
+  handshake. If the point's answer is not believed, or no record of it can be
+  kept, the call's error says why. Each
+  address gets at most 3 seconds, and never more than half the time left. All
+  of it is within the request's own `request_timeout`. A record none of whose
+  addresses answered is not tried again, but holds older records off until it
+  runs out. Only the record that was tried is marked so (each record kept is
+  named by a number never used for another (when the numbers run out, which
+  takes 2^64 records, no more records are kept), so two records made at the same
+  moment are not taken for each other); a newer one that took its place while
+  the old one's addresses were being tried is left as it is, and is used by
+  the next round of this call, if there is one, or by the next call. A
+  record's content is kept in two places, and freshness is weighed at each by
+  the clock read there under its lock: the record itself, with the records
+  held, and a moon's word in it, with the directory held. A clock that moved
+  while the record was checked keeps neither if the move made the record no
+  longer good; but a genuine word taken while the record was still good stays,
+  even if the record is then refused.
+  The newest record believed for each ship is kept, for up to 65,536
+  ships, and is never dropped for room before it has run out, whether its
+  addresses answered or not; when every place holds a record still good, a
+  record of a new ship is not believed, and the call says why. A ship is asked
+  about at most once every `ask_again` (3 seconds) whatever the answer, one
+  question about a ship is out at a time, and at most 16 are out at once. A
+  connection made this way is tied to the address that worked. Each time it is
+  used again it is proved again in one step with the directory, and that step
+  refuses it if an address has been given by hand for the ship: it is closed,
+  that call fails as the directory having changed, and the next call goes by
+  the address given. A request already under way over it when the address is
+  given may finish; none is begun on it after the directory has the address.
+  (Between that proof and the first byte of a request there is no lock; that
+  interval, which can include waiting for room to open a stream, is the one
+  this cannot close.)
+- A moon's record carries its parent's word for its key. When a ship believes
+  such a record, the word is taken into its directory in the same step, by the
+  rules any moon's word is taken by (signed with the key held for the parent,
+  only forwards, one key to a revision, a key set by hand never changed); if
+  the directory will not take it, the record is not believed. The directory is
+  the one memory of a moon's keys at a ship, so a later word seen in a record
+  holds at once for calls made, callers taken, and connections already open,
+  whether or not any address in the record ever answers. The moon is not
+  marked as having proved anything; its parent is kept. The word counts
+  against the directory's moon bounds, is never dropped for room or when the
+  record runs out, and goes only when the parent's key it stands on is no
+  longer believed.
+- The point for a galaxy is at the address given for that galaxy, else at the
+  one given for all galaxies, else found by looking up `<galaxy>.<domain>`
+  (`zod.example.net` for `~zod`) through the system's resolver, or a stand-in
+  (`Resolve`) given by a test or a private network. A lookup runs on a thread
+  that may wait, at most 4 at once; a caller waits for it 5 seconds at most,
+  and a resolver that hangs keeps its thread, and one of the 4 places, until it
+  returns. At most 8 addresses
+  are taken from an answer and each is tried in turn; an answer is used for
+  `resolved_for` (5 minutes), a failure for `ask_again`.
+- With none of these settings, as by default, nothing of this is sent,
+  listened for, or kept.
 
 ### Wire messages
 
@@ -1213,6 +1401,14 @@ matching answer, or only `refused` with a reason.
 | `News { logs }` | `Heard { unknown }` | The publisher says these logs grew (or are closed to you). The follower says which it no longer follows |
 | `Resync { standing }` | `Resynced { standing }` | Two ships say where each stands, to get back in step after a restore |
 | `Hello { ship, proof }` | `Welcome { proof }` | First on every connection: which ship is calling. Each side sends its moon proof if it is a moon |
+
+To a lookup point, under `ship-where/1`, a `WhereRequest` holds one of these,
+and the `WhereReply` the matching answer, or only `refused` with a reason.
+
+| Request | Reply | Purpose |
+| --- | --- | --- |
+| `Announce { records }` | `Announced { outcomes }` | Up to 16 encoded `Whereabouts`. For each, empty if kept, or why not |
+| `Where { ship }` | `Found { record }` | The ship's record as the point holds it, or empty if it holds none still good |
 
 ### Commands between ships, exactly once
 
@@ -1432,6 +1628,24 @@ and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 | `retry_delay` | 200 ms | First wait after a failed delivery, doubling |
 | `max_retry_delay` | 30 s | Longest wait between tries |
 | `follow_check` | 600 s | How often to check other ships' incarnation marks and compare notes on unanswered commands |
+| `lookup` | off | Finding ships through lookup points, announcing to them, and being one; see below |
+
+`Lookup` (`runtime/src/lookup.rs`):
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `serve` | none | Be a lookup point: `PointConfig { keys, galaxies, bounds }` |
+| `at` | none | Lookup points' addresses, each for one galaxy or (`None`) for all |
+| `domain` | none | `(domain, port)`: the point for `~zod` is `zod.<domain>` |
+| `resolver` | the system's | What names are looked up through |
+| `announce` | none | Addresses to announce this runtime's ships at, up to 4 |
+| `announce_every` | 120 s | How often each ship is announced again; at most 5 minutes |
+| `ask_again` | 3 s | Least time between questions about one ship, and how long a failed name lookup is remembered |
+| `resolved_for` | 300 s | How long an answer from the resolver is used |
+
+`PointBounds` (in `PointConfig`): `records` 65,536, `moons` 16,384,
+`moons_each` 64, `connections` 256, `per_connection` 256 and `in_all` 2,048
+records each `rate_period` (1 s).
 
 `Network::start` refuses settings that could wedge a ship: `max_ship_bytes`
 below 256 KiB, a `max_message_bytes` without room for the largest command or
@@ -1482,8 +1696,8 @@ twice over, and any time limit that is zero or over a day.
   inline in WebAssembly text and compiled with the `wat` crate. Each test uses
   its own temporary data directory, and most use `Durability::Normal` to skip
   per-commit syncs.
-- Unit tests in `net.rs`, `seal.rs`, `server.rs`, `store.rs`, `moon.rs`, and
-  `azimuth.rs`. The Azimuth tests run against a stand-in JSON-RPC server on
+- Unit tests in `net.rs`, `seal.rs`, `server.rs`, `store.rs`, `moon.rs`,
+  `whereabouts.rs`, `lookup.rs`, and `azimuth.rs`. The Azimuth tests run against a stand-in JSON-RPC server on
   localhost that replays what Ethereum and the roller really answered for
   `~zod`, and answers like them for made-up ships. One more test asks the real
   Ethereum and the real roller; it is not run by default
@@ -1660,6 +1874,27 @@ at rest and sealed copies; ships made from a master ticket or a keyfile; a
 directory that reads keys from a stand-in for Urbit ID (key changes, removed
 keys, outages, impostors, the limit on unknown callers); and moons.
 
+`runtime/tests/lookup.rs` runs real runtimes on localhost with keys from a
+stand-in for Urbit ID and no address given by hand: ships finding each other
+through a point and trading commands; two galaxies with two points; a moon; a
+ship that comes back on another port; a point that starts late, goes away, and
+comes back; many ships announced over one connection; an address given by
+hand winning; the limit on asking about one ship; a stand-in point that lies
+(another ship's record, a forged or altered one, one run out or dated ahead,
+rubbish, an answer that never ends or is too large, an older record after a
+newer one) and an impostor at a signed address that would take the caller; a
+record that has run out not being used even where it would still work; a
+moon's later key seen in a record holding for calls made, callers taken, and
+an open connection; an address given by hand while the point is answering
+being the only one tried; a point's bounds against a raw client, its count of
+requests in hand against slow keys and reconnecting callers; seventeen
+questions at once; a caller offering both protocols or neither; a connection
+made to an address given by hand not being used once the ship is looked for;
+a runtime that is no point refusing the protocol; points found by name
+through a stand-in resolver (a dead first address, no addresses, a ninth
+address, a resolver that hangs, or hangs once, answers looked up again once
+old); and stopping promptly with a point that never answers.
+
 The load test (`runtime/src/bin/loadtest.rs`) takes `--ships` (500),
 `--active` (50), `--events` (20,000), `--threads` (8), `--max-awake` (64),
 `--sync full|normal` (full), `--wasm`, `--kernel`, and `--dir` (a new
@@ -1712,8 +1947,66 @@ These are stated in the source.
   revisions and continuity are kept in 32 bits, where `naive.hoon`'s have no
   limit; each would take four billion signed transactions on Ethereum to go
   round.
-- Where a ship is to be found is still a list handed in. Nothing finds a ship
-  through its sponsor yet.
+- When an address is given by hand, or a ship's key changes, while calls are
+  going on, the promise is in two parts. What is kept (records, keys, connections
+  kept for reuse) is decided under the lock that guards it, and never on a
+  reading that lock would show to be out of date. A call already under way only
+  notices at its next check, if that re-read sees the change, so an attempt or
+  a question it began before may go on, and it may begin one more after the
+  change, following its last check; nothing short of holding the directory
+  across network work could stop that.
+- A record believed just before a ship's key changes still stands as that
+  ship's newest record at this runtime, and refuses the ship's records dated no
+  later than it, until this runtime's clock reaches its date plus ten minutes.
+  Its addresses are still tried; whatever answers must prove the key now held,
+  so a call succeeds if the ship itself is still at one of them, and fails
+  otherwise. A record may be dated at most two minutes ahead of this runtime's
+  clock when it is taken, so if both clocks agree and neither is set back
+  afterwards, the ship's own later records are dated past it within two
+  minutes. If a clock is set back, or the ship's clock runs behind, it is
+  longer, up to the record's remaining life. How soon the newer record actually
+  arrives also depends on when the ship next announces and when a caller next
+  asks.
+- A ship is found through a lookup point only if its runtime has a public
+  address. A lookup point can keep a record back, or hand out one that has not
+  run out (up to 10 minutes after the time the record says it was signed, which
+  can be 12 minutes after the point took it); it cannot make one up or
+  change one. A ship can name any address in its own record, so callers may be
+  sent to try connecting there: at most 4 addresses, and one question about a
+  ship every few seconds. A point learns which address asks about which ship.
+  A point does not prove it is the galaxy, and the names points are found
+  under are not authenticated. A machine whose public address is not the one
+  it listens on (most cloud machines) must be given it (`--announce`). Ships
+  behind home routers cannot be reached yet: learning the outside address,
+  introductions, opening a path through routers, and carrying traffic for
+  ships that cannot be reached directly are not built.
+- A point keeps a moon's latest revision only while it holds that moon's
+  record, and builds no history of its own beyond that. The point is not
+  trusted and its table is in memory only, so nothing it remembered could be a
+  guarantee: a point that lies or restarts can hand out an old moon's record
+  anyway. What decides is the caller's own memory of the moon's keys, in its
+  directory. So a caller that has never met a moon cannot tell its parent's
+  latest word from an earlier one, with lookup points or without; and while
+  the real moon is not announcing, the holder of an earlier key the parent
+  once vouched for can announce under the moon's name and be believed by such
+  a caller. That comes of moon keys living off chain, not of lookup points.
+- Several addresses for one point, given or found by name, are tried in turn
+  as stand-ins for each other, not kept in step: a ship announces to the first
+  that answers.
+- A connection under the lookup protocol takes a place among the ships'
+  `max_connections` while its handshake runs, and gives it up as soon as the
+  protocol is known.
+- A stranger can hold all 64 places among a point's requests in hand with
+  requests it never finishes, each until its `request_timeout`, and while it
+  does there is no fairness for honest callers of the point. Ships whose
+  addresses are already known, set by hand or found earlier, are not affected.
+- Records that are rubbish use up a point's overall allowance of records per
+  second before they are checked, so one caller can spend it for everyone.
+- Lookup points and the new `serve` flags have been run only on macOS. The
+  flags (`--lookup-at`, `--lookup-domain`, `--announce`, `--lookup-point`) have
+  been checked for what they refuse, but have had no run from end to end. The
+  system's resolver is not exercised by the tests, which look names up through
+  a stand-in.
 - A moon's key cannot be taken back at once. A ship that has not seen a later
   proof goes on accepting an earlier one until the parent changes its own
   key. A parent keeps no list of its moons.

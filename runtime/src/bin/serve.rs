@@ -7,6 +7,11 @@
 //! ID lists for its name, read from Azimuth through the Ethereum node given with
 //! `--ethereum`. `--lookup` prints what Urbit ID lists for a ship, and stops.
 //!
+//! With `--lookup-at` or `--lookup-domain` the ships are also found by name alone: each of
+//! this runtime's ships is announced, with a record of where it is that it signs, to the
+//! lookup point for its galaxy, and a ship with no `--peer` address is looked for there.
+//! `--lookup-point` makes this runtime a lookup point itself.
+//!
 //! With `--azimuth-copy` those keys come from a copy of Azimuth kept in a file and worked
 //! out from Ethereum alone, in place of asking the roller about ships on layer 2. The copy
 //! can be started from a snapshot (`--azimuth-snapshot`), and a snapshot written of it
@@ -17,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use runtime::azimuth::{Azimuth, AzimuthConfig, Keys};
+use runtime::lookup::{Lookup, PointBounds, PointConfig};
 use runtime::replica::snapshot::{self, Summary};
 use runtime::replica::{Replica, ReplicaConfig, Restored, TroubleWatch};
 use runtime::net::{Directory, NetConfig, Network};
@@ -31,6 +37,8 @@ const USAGE: &str = "usage: serve --dir <data directory> [--addr 127.0.0.1:8080]
              [--azimuth-snapshot <file> [--azimuth-snapshot-sha256 <hex>]]
              [--azimuth-until <block>] [--azimuth-write-snapshot <file>]
              [--peer <ship>=<address>]...
+             [--lookup-at [<galaxy>=]<address>]... [--lookup-domain <domain>:<port>]
+             [--announce <address>]... [--lookup-point <all | galaxy,galaxy,...>]
              [--keyfile <file>] [--lookup <ship>]...
 
   --storage-key-file <file>
@@ -64,7 +72,24 @@ const USAGE: &str = "usage: serve --dir <data directory> [--addr 127.0.0.1:8080]
                          anything unless --azimuth-until is given. macOS and Linux only
   --net <address>        talk to ships on other runtimes, listening here (UDP), each ship
                          known by the key Urbit ID lists for it. Needs --ethereum
-  --peer <ship>=<addr>   where another ship is to be found. Its key comes from Urbit ID
+  --peer <ship>=<addr>   where another ship is to be found. Its key comes from Urbit ID. A ship
+                         given here is always called here, and never looked for elsewhere
+  --lookup-at [<galaxy>=]<address>
+                         where the lookup point for a galaxy is, or without a galaxy, for every
+                         galaxy. Ships with no --peer address are looked for there, and this
+                         runtime's ships are announced there. Wins over --lookup-domain
+  --lookup-domain <domain>:<port>
+                         find the lookup point for each galaxy by name, as <galaxy>.<domain>
+                         (the point for ~zod is zod.<domain>), through this machine's resolver
+  --announce <address>   the address other ships reach this runtime at, to announce its ships
+                         at; up to four. Without it, the address given to --net, unless that is
+                         0.0.0.0 or ::, which says nothing of where the runtime is reached, and
+                         then nothing is announced. Needs --lookup-at or --lookup-domain
+  --lookup-point <all | galaxy,galaxy,...>
+                         also be the lookup point for the ships of these galaxies (all, or a
+                         list such as ~zod,~nec): keep the signed records of where they are
+                         that are given here, checked against the copy of Azimuth, and hand
+                         them to whoever asks. Needs --net and --azimuth-copy
   --keyfile <file>       start the ship this keyfile is for, if it is not here already
   --lookup <ship>        print what Urbit ID lists for a ship, and stop. Needs --ethereum";
 
@@ -145,6 +170,41 @@ fn print_written(out: &std::path::Path, summary: &Summary) {
     println!("Wrote {}, and the same lines to {}.txt:\n{}", out.display(), out.display(), summary.lines());
 }
 
+/// A galaxy, by name or number of a galaxy.
+fn galaxy(written: &str) -> Option<u8> {
+    ob::ship_number(written).and_then(|number| u8::try_from(number).ok())
+}
+
+/// The settings for finding ships through lookup points, announcing to them, and being one,
+/// from what was given on the command line.
+fn lookup_settings(at: &[String], domain: Option<&str>, announce: &[String], point: Option<&str>, keys: &Arc<dyn Keys>) -> Lookup {
+    let at = at
+        .iter()
+        .map(|given| {
+            let (galaxy_written, addr) = match given.split_once('=') {
+                Some((galaxy_written, addr)) => (Some(galaxy_written), addr),
+                None => (None, given.as_str()),
+            };
+            let of = galaxy_written.map(|written| galaxy(written).unwrap_or_else(|| fail(&format!("--lookup-at {given}: {written} is not a galaxy"))));
+            let addr = addr.parse().unwrap_or_else(|_| fail(&format!("--lookup-at {given}: not [<galaxy>=]<address>")));
+            (of, addr)
+        })
+        .collect();
+    let domain = domain.map(|given| {
+        let (name, port) = given.rsplit_once(':').unwrap_or_else(|| fail(&format!("--lookup-domain {given}: not <domain>:<port>")));
+        (name.to_string(), port.parse().unwrap_or_else(|_| fail(&format!("--lookup-domain {given}: not <domain>:<port>"))))
+    });
+    let announce = announce.iter().map(|given| given.parse().unwrap_or_else(|_| fail(&format!("--announce {given}: not an address")))).collect();
+    let serve = point.map(|given| {
+        let galaxies = match given {
+            "all" => None,
+            list => Some(list.split(',').map(|written| galaxy(written).unwrap_or_else(|| fail(&format!("--lookup-point {given}: {written} is not a galaxy")))).collect()),
+        };
+        PointConfig { keys: keys.clone(), galaxies, bounds: PointBounds::default() }
+    });
+    Lookup { serve, at, domain, announce, ..Lookup::default() }
+}
+
 fn main() {
     let (mut dir, mut addr, mut host_suffix) = (None, "127.0.0.1:8080".to_string(), None);
     let (mut secure_cookies, mut demo) = (false, false);
@@ -152,6 +212,7 @@ fn main() {
     let (mut access_codes, mut signin_links) = (Vec::new(), Vec::new());
     let (mut ethereum, mut roller, mut net, mut peers, mut keyfile, mut lookups) = (None, None, None, Vec::new(), None, Vec::new());
     let mut azimuth_copy = None;
+    let (mut lookup_at, mut lookup_domain, mut announce, mut lookup_point) = (Vec::new(), None, Vec::new(), None);
     let (mut azimuth_snapshot, mut snapshot_sha256, mut azimuth_until, mut write_snapshot) = (None, None, None, None);
     let mut kernel = PathBuf::from("target/wasm/wasm32-unknown-unknown/release/kernel.wasm");
     let mut counter = PathBuf::from("target/wasm/wasm32-unknown-unknown/release/counter.wasm");
@@ -185,10 +246,27 @@ fn main() {
             "--azimuth-write-snapshot" => write_snapshot = Some(PathBuf::from(value())),
             "--net" => net = Some(value()),
             "--peer" => peers.push(value()),
+            "--lookup-at" => lookup_at.push(value()),
+            "--lookup-domain" => lookup_domain = Some(value()),
+            "--announce" => announce.push(value()),
+            "--lookup-point" => lookup_point = Some(value()),
             "--keyfile" => keyfile = Some(PathBuf::from(value())),
             "--lookup" => lookups.push(value()),
             _ => fail(&format!("unknown flag {flag}")),
         }
+    }
+    let finds = !lookup_at.is_empty() || lookup_domain.is_some();
+    if net.is_none() && (finds || lookup_point.is_some() || !announce.is_empty()) {
+        fail("--lookup-at, --lookup-domain, --announce and --lookup-point need --net");
+    }
+    if !announce.is_empty() && !finds {
+        fail("--announce needs somewhere to announce: --lookup-at or --lookup-domain");
+    }
+    // A lookup point checks every record it is given against Urbit ID. Asking an Ethereum
+    // node or the roller for each would let anyone who announces have this runtime ask them
+    // as fast as it can be given records; a copy answers from a file.
+    if lookup_point.is_some() && azimuth_copy.is_none() {
+        fail("--lookup-point needs --azimuth-copy, to check records against a copy of Azimuth kept here");
     }
     if azimuth_copy.is_some() && roller.is_some() {
         fail("--azimuth-copy needs no roller");
@@ -328,14 +406,21 @@ fn main() {
     // Held for as long as the program runs.
     let _network = net.map(|addr| {
         let azimuth = azimuth.unwrap_or_else(|| fail("--net needs --ethereum, to read other ships' keys from Urbit ID"));
-        let directory = Directory::reading(azimuth);
+        let directory = Directory::reading(azimuth.clone());
         for peer in &peers {
             let placed = peer.split_once('=').and_then(|(ship, addr)| Some((ship, addr.parse().ok()?)));
             let Some((ship, addr)) = placed else { fail(&format!("--peer {peer}: not <ship>=<address>")) };
             directory.place(ship, addr).unwrap_or_else(|e| fail(&format!("--peer {peer}: {e}")));
         }
-        let network = Network::start(runtime.clone(), directory, NetConfig { addr, ..NetConfig::default() }).unwrap_or_else(|e| fail(&format!("cannot start the network: {e}")));
+        let lookup = lookup_settings(&lookup_at, lookup_domain.as_deref(), &announce, lookup_point.as_deref(), &azimuth);
+        let network = Network::start(runtime.clone(), directory, NetConfig { addr, lookup, ..NetConfig::default() }).unwrap_or_else(|e| fail(&format!("cannot start the network: {e}")));
         println!("Talking to other ships at {} (UDP), with keys from Urbit ID.", network.addr());
+        if let Some(galaxies) = &lookup_point {
+            println!("Answering as the lookup point for the ships of {galaxies} galaxies, on the same address.");
+        }
+        if let Some(why) = network.lookup_trouble() {
+            eprintln!("{why}");
+        }
         network
     });
 

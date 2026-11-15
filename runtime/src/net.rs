@@ -38,9 +38,19 @@
 //! proved it holds is the one listed for that name. A directory can also be a fixed list,
 //! handed in by whoever starts the network, which is how the tests run.
 //!
-//! Where a ship is to be found is not in Urbit ID, and is still a list handed in. A wrong
-//! address there cannot pass one ship off as another: whatever answers must still prove
-//! the key. A ship's own key does not change while its runtime runs.
+//! Where a ship is to be found is not in Urbit ID. It can be set by hand, ship by ship, and
+//! what is set by hand is always used and nothing else is tried. Or, for a ship with no
+//! address set, it can be asked of the lookup point for the ship's galaxy, which hands out
+//! a record of where the ship is that the ship itself signed (see `crate::lookup` and
+//! `crate::whereabouts`). Either way, a wrong address cannot pass one ship off as another:
+//! whatever answers must still prove the key. A connection made to an address found that way
+//! is proved, each time it is made or used again, in one step with the directory that also
+//! settles that no address has been set by hand meanwhile: no such connection is kept or
+//! used once one is (an idle one is refused the next time it would be used, not closed at
+//! once). A call that begins after an address is set by hand never uses a record; a call
+//! already under way stops at its next check that sees the address, best effort, and may
+//! begin one more attempt or question after it. A ship's own key does not change while its
+//! runtime runs.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -69,6 +79,7 @@ use tokio::sync::Semaphore;
 use urbit_id::ob;
 
 use crate::azimuth::{Keys, Listing};
+use crate::lookup::{self, Finder, Lookup, Point, PointStatus};
 use crate::moon;
 use crate::ship::Taken;
 use crate::store::{PeerWork, Stand, MAX_BATCH_MESSAGES, MAX_FETCH_ENTRIES, MAX_NEWS_LOGS};
@@ -347,15 +358,26 @@ impl Directory {
         self.held(&listed, name).filter(|_| listed.keys.get(name).is_some_and(|entry| entry.proved))
     }
 
-    /// What is needed to call a ship, as things stand.
-    fn reach(&self, name: &str) -> Option<Reach> {
+    /// Where a ship stands, read in one step, so that what is set by hand and what key is
+    /// held are seen as they were at one moment: the address set by hand for it, if any, and
+    /// what is needed to call it, if that is known (its key, or for a moon met for the first
+    /// time nothing, provided its parent's key is known to check the moon's word against).
+    fn standing(&self, name: &str) -> (Option<SocketAddr>, Option<Option<[u8; 32]>>) {
         let listed = self.listed.read().unwrap_or_else(|e| e.into_inner());
-        let addr = *listed.places.get(name)?;
-        match self.held(&listed, name) {
-            Some(key) => Some(Reach { key: Some(key), addr }),
-            // A moon whose key is not known can be asked for its parent's word, provided
-            // the parent's key is known to check that word against.
-            None => self.held(&listed, &parent_of(name)?).map(|_| Reach { key: None, addr }),
+        let keyed = match self.held(&listed, name) {
+            Some(key) => Some(Some(key)),
+            None => parent_of(name).and_then(|parent| self.held(&listed, &parent)).map(|_| None),
+        };
+        (listed.places.get(name).copied(), keyed)
+    }
+
+    /// For a moon whose parent's word has been taken here and still stands: the revision of
+    /// that word, and the key it was for.
+    pub(crate) fn moon_seen(&self, name: &str) -> Option<(u32, [u8; 32])> {
+        let listed = self.listed.read().unwrap_or_else(|e| e.into_inner());
+        match listed.keys.get(name)?.from {
+            From::Vouched { revision, .. } => self.held(&listed, name).map(|key| (revision, key)),
+            _ => None,
         }
     }
 
@@ -513,7 +535,19 @@ impl Directory {
     /// held for it here, and it is now among the ships that are kept. Both are settled in
     /// one step: a connection is taken on the strength of this and nothing looser.
     fn prove(&self, name: &str, key: &[u8; 32]) -> bool {
+        self.prove_as(name, key, false)
+    }
+
+    /// The same, for a connection this runtime made or is about to use again. `found` says
+    /// it was made to an address found through a lookup point: then a third thing is settled
+    /// in the same step, that no address has been set by hand for the ship, since an address
+    /// set by hand is always the one used. A connection made to an address set by hand is
+    /// proved as `prove` proves it.
+    fn prove_as(&self, name: &str, key: &[u8; 32], found: bool) -> bool {
         let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
+        if found && listed.places.contains_key(name) {
+            return false;
+        }
         if self.held(&listed, name) != Some(*key) {
             return false;
         }
@@ -546,8 +580,37 @@ impl Directory {
     /// moon has proved it holds the key, so it is kept from here on, and so is its parent,
     /// whose key now has something standing on it.
     fn vouched(&self, name: &str, key: [u8; 32], proof: &moon::Proof) -> Result<(), &'static str> {
+        self.word(name, key, proof, true, None)
+    }
+
+    /// Take a moon's key on its parent's word as it came in a record of where the moon is
+    /// (see `crate::whereabouts`), by the same rules as `vouched`: signed with the key held
+    /// for the parent, only forwards, one key to a revision, and a key set here by hand is
+    /// never changed. The moon has not proved it holds the key, so it is not marked as having
+    /// proved anything; its parent is kept, as for any moon's word checked against its key.
+    ///
+    /// This is the one memory of a moon's keys at a ship. What a record shows here holds for
+    /// every connection after, made or taken, and for connections already open, whether or
+    /// not any address in the record ever answers. It is never dropped for room, nor when the
+    /// record runs out: only when the parent's key it stands on is no longer believed.
+    ///
+    /// `still_good` says whether the record the word came in is still good by the clock. It
+    /// is asked with the directory held, after waiting for it and before anything is
+    /// changed, so that a clock that moved while the record was checked cannot have a word
+    /// taken from a record that is no longer good.
+    pub(crate) fn recorded_word(&self, name: &str, key: [u8; 32], proof: &moon::Proof, still_good: &dyn Fn() -> bool) -> Result<(), &'static str> {
+        self.word(name, key, proof, false, Some(still_good))
+    }
+
+    /// Take a moon's word, as `vouched` and `recorded_word` describe. `proves` says the moon
+    /// has proved, on a connection, that it holds the key. `still_good`, for a word from a
+    /// record, is asked once the directory is held.
+    fn word(&self, name: &str, key: [u8; 32], proof: &moon::Proof, proves: bool, still_good: Option<&dyn Fn() -> bool>) -> Result<(), &'static str> {
         let (Some(number), Some(parent)) = (ob::moon_number(name), parent_of(name)) else { return Err("not a moon") };
         let mut listed = self.listed.write().unwrap_or_else(|e| e.into_inner());
+        if still_good.is_some_and(|good| !good()) {
+            return Err("the record the moon's word came in is no longer good by this clock");
+        }
         let by = self.held(&listed, &parent).ok_or("the moon's parent is not listed")?;
         if !moon::holds(&by, number, &key, proof) {
             return Err("not the word of the moon's parent for the key shown");
@@ -587,11 +650,22 @@ impl Directory {
                 return Err("there is no room to keep another moon's key");
             }
         }
+        // Whether the moon has proved a key goes with the moon, whatever its keys become.
+        // A moon that has not, and proves one now, takes a place among the ships that are
+        // kept, as any ship that proves its key does: if there is none, its word is still
+        // taken (that is what holds earlier keys off), but it is not kept as having proved
+        // anything, and `prove` refuses its connection for want of room. A moon new here had
+        // room made for it above.
+        let proved = match listed.keys.get(name).map(|entry| entry.proved) {
+            Some(true) => true,
+            Some(false) => proves && self.room_for_proved(&mut listed),
+            None => proves,
+        };
         // Making room drops only what is no longer believed, and the parent is believed.
         if self.held(&listed, &parent) != Some(by) {
             return Err("the moon's parent is not listed");
         }
-        listed.keys.insert(name.to_string(), Entry { key, from: From::Vouched { revision: proof.revision, by }, proved: true });
+        listed.keys.insert(name.to_string(), Entry { key, from: From::Vouched { revision: proof.revision, by }, proved });
         Ok(())
     }
 }
@@ -643,6 +717,10 @@ pub struct NetConfig {
     /// with it, for the like reason: that ship may have gone back to a state in which it
     /// never had them.
     pub follow_check: Duration,
+    /// Finding ships through lookup points, announcing this runtime's ships to them, and
+    /// being one. Off by default: with none of it set, nothing of it is sent, listened for,
+    /// or kept. See `crate::lookup`.
+    pub lookup: Lookup,
 }
 
 impl Default for NetConfig {
@@ -663,6 +741,7 @@ impl Default for NetConfig {
             retry_delay: Duration::from_millis(200),
             max_retry_delay: Duration::from_secs(30),
             follow_check: Duration::from_secs(600),
+            lookup: Lookup::default(),
         }
     }
 }
@@ -763,10 +842,35 @@ impl Drop for Threads {
 /// those still hold.
 struct Made {
     connection: Connection,
-    /// What the directory listed for the ship called.
+    /// What the directory listed for the ship called: its key, and the address it was
+    /// reached at.
     peer: Peer,
     /// The key the calling ship showed.
     shown: [u8; 32],
+    /// The address was not set by hand but found through a lookup point. Such a connection
+    /// is never used once an address is set by hand.
+    found: bool,
+}
+
+/// How a ship is to be called, as things stand.
+#[derive(Clone, Copy)]
+enum Route {
+    /// At the address set by hand for it. Nothing else is tried.
+    Placed(Reach),
+    /// No address is set for it, and it is to be found through the lookup point for its
+    /// galaxy. The key held for it, if one is: for a moon met for the first time there is
+    /// none, and its parent's is known.
+    Found(Option<[u8; 32]>),
+}
+
+impl Route {
+    /// Whether a connection made earlier was made as this route would make it now.
+    fn fits(&self, made: &Made) -> bool {
+        match self {
+            Route::Placed(reach) => !made.found && Some(made.peer.key) == reach.key && made.peer.addr == reach.addr,
+            Route::Found(key) => made.found && Some(made.peer.key) == *key,
+        }
+    }
 }
 
 type Pair = (String, String);
@@ -809,6 +913,10 @@ struct Shared {
     /// How many callers nothing is known of may still be looked up in Urbit ID just now,
     /// and when that was last topped up.
     meeting: Mutex<(u32, Instant)>,
+    /// The means to find ships through lookup points, if this runtime has settings for them.
+    finder: Option<Arc<Finder>>,
+    /// This runtime's role as a lookup point, if it has one.
+    point: Option<Arc<Point>>,
 }
 
 /// What the network knows about commands waiting to go to other ships.
@@ -926,12 +1034,14 @@ impl Network {
         if cfg.request_timeout.is_zero() || cfg.request_timeout > MAX_TIMEOUT || cfg.idle_timeout.is_zero() || cfg.idle_timeout > MAX_TIMEOUT {
             return Err(io::Error::other("request_timeout and idle_timeout must be more than nothing and at most a day"));
         }
+        cfg.lookup.sound().map_err(io::Error::other)?;
         // The ships' keys are read into memory now, and never from inside a connection being
         // made. If they cannot be read, there is no network.
         runtime.load_identities().map_err(io::Error::other)?;
         let threads = Threads(Some(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().thread_name("ship-net").build()?));
         let tokio = threads.get();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let point = cfg.lookup.serve.clone().map(|serve| Point::new(serve, &provider)).transpose()?.map(Arc::new);
 
         // The side that answers: it shows the key of whichever ship was asked for, and wants
         // proof of some key. Whose key it is, the caller says once connected.
@@ -939,8 +1049,13 @@ impl Network {
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(io::Error::other)?
             .with_client_cert_verifier(Arc::new(AnyCaller { supported: provider.signature_verification_algorithms }))
-            .with_cert_resolver(Arc::new(ShipKeys { runtime: runtime.clone(), provider: provider.clone() }));
+            .with_cert_resolver(Arc::new(ShipKeys { runtime: runtime.clone(), provider: provider.clone(), point: point.as_ref().map(|point| point.shown.clone()) }));
         answering.alpn_protocols = vec![PROTOCOL.to_vec()];
+        // A lookup point also answers its own protocol, second: a caller that offers both is
+        // taken as a ship.
+        if point.is_some() {
+            answering.alpn_protocols.push(lookup::WHERE_PROTOCOL.to_vec());
+        }
         // Every connection proves its keys afresh. None picks up where an earlier one left off.
         answering.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         answering.send_tls13_tickets = 0;
@@ -956,11 +1071,16 @@ impl Network {
             let _entered = tokio.enter();
             Endpoint::server(server, addr)?
         };
+        let bound = endpoint.local_addr()?;
         let reading = Arc::new(Semaphore::new(cfg.max_reading_bytes));
         let asking = Arc::new(Semaphore::new(cfg.max_requests));
         let working = Arc::new(Semaphore::new(cfg.max_working));
         let carrying = Arc::new(Semaphore::new(cfg.max_carrying));
         let carrier = Arc::new(Carrier::default());
+        let finder = match cfg.lookup.finds() {
+            true => Some(Arc::new(Finder::new(cfg.lookup.clone(), &cfg, endpoint.clone(), &provider)?)),
+            false => None,
+        };
         // Taken last of the things that can fail, so that a start that fails gives it back.
         let claim = Claim::take(&runtime).ok_or_else(|| io::Error::other("this runtime already has a network running"))?;
         let shared = Arc::new(Shared {
@@ -982,9 +1102,27 @@ impl Network {
             reading_keys: Arc::new(Semaphore::new(MOST_READING)),
             looking_up: Mutex::new(HashMap::new()),
             meeting: Mutex::new((MOST_MEETINGS, Instant::now())),
+            finder,
+            point,
         });
         tokio.spawn(answer_calls(shared.clone()));
         tokio.spawn(carry(shared.clone()));
+        // This runtime's ships are announced to the lookup points for their galaxies, at the
+        // addresses given, or else at the one listened on if that is one others could use.
+        if let Some(finder) = &shared.finder {
+            let addresses = match &shared.cfg.lookup.announce {
+                given if !given.is_empty() => given.clone(),
+                _ if bound.ip().is_unspecified() => Vec::new(),
+                _ => vec![bound],
+            };
+            if addresses.is_empty() {
+                finder.worried(format!(
+                    "not announcing this runtime's ships: it listens on {bound}, which says where it listens and not where it is reached from; give the addresses to announce"
+                ));
+            } else {
+                tokio.spawn(finder.clone().announce(shared.runtime.clone(), addresses));
+            }
+        }
         // From now on the runtime says when a ship has queued commands for other ships.
         let told = carrier.clone();
         shared.runtime.set_outbound_hook(Some(Arc::new(move |ship: &str, queued: bool| {
@@ -1028,6 +1166,17 @@ impl Network {
     /// How many connections are open, made or taken.
     pub fn open_connections(&self) -> usize {
         self.shared.endpoint.open_connections()
+    }
+
+    /// How this runtime is doing as a lookup point, if it is one.
+    pub fn point_status(&self) -> Option<PointStatus> {
+        self.shared.point.as_ref().map(|point| point.status())
+    }
+
+    /// The last thing that went wrong in finding ships through lookup points or announcing
+    /// this runtime's ships to them, if anything has.
+    pub fn lookup_trouble(&self) -> Option<String> {
+        self.shared.finder.as_ref().and_then(|finder| finder.trouble())
     }
 
     /// The (ship, other ship) pairs between which commands have stopped being carried,
@@ -1098,7 +1247,7 @@ impl Drop for Network {
 
 /// How a connection carries data. `streams` is how many requests the other end may have in
 /// progress on it at once.
-fn transport(cfg: &NetConfig, streams: u32) -> io::Result<TransportConfig> {
+pub(crate) fn transport(cfg: &NetConfig, streams: u32) -> io::Result<TransportConfig> {
     // The other end may send this much on one stream before this end has read any of it: a
     // whole message, or a small fixed amount where messages are smaller than that. How large
     // a message is taken is checked separately, as it is read.
@@ -1122,14 +1271,14 @@ fn wrapped(key: &[u8; 32]) -> Vec<u8> {
 }
 
 /// The key inside that wrapping, if it is an ed25519 key and nothing else.
-fn unwrapped(wrapped_key: &[u8]) -> Option<[u8; 32]> {
+pub(crate) fn unwrapped(wrapped_key: &[u8]) -> Option<[u8; 32]> {
     let key = <[u8; 32]>::try_from(wrapped_key.get(12..)?).ok()?;
     (wrapped(&key) == wrapped_key).then_some(key)
 }
 
 /// What a ship shows to prove who it is: its public key, and the means to sign with the
 /// private half. The private half stays in this process.
-fn proof(key: &ed25519_dalek::SigningKey, provider: &CryptoProvider) -> Result<Arc<CertifiedKey>, rustls::Error> {
+pub(crate) fn proof(key: &ed25519_dalek::SigningKey, provider: &CryptoProvider) -> Result<Arc<CertifiedKey>, rustls::Error> {
     // The private key in the standard wrapping (PKCS#8 version 2) the TLS library reads.
     let mut der = vec![0x30, 0x51, 0x02, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
     der.extend_from_slice(&key.to_bytes());
@@ -1142,7 +1291,7 @@ fn proof(key: &ed25519_dalek::SigningKey, provider: &CryptoProvider) -> Result<A
 
 /// Whether the other end signed the connection's handshake with the key it showed. Showing a
 /// key proves nothing, since public keys are public; signing with it is the proof.
-fn signed_with(
+pub(crate) fn signed_with(
     shown: &CertificateDer<'_>,
     message: &[u8],
     signed: &DigitallySignedStruct,
@@ -1151,15 +1300,18 @@ fn signed_with(
     verify_tls13_signature_with_raw_key(message, &SubjectPublicKeyInfoDer::from(shown.as_ref()), signed, supported)
 }
 
-fn refuse(why: &str) -> rustls::Error {
+pub(crate) fn refuse(why: &str) -> rustls::Error {
     rustls::Error::General(why.to_string())
 }
 
 /// For the side that answers: which key to show. It is the key of the ship the caller asked
 /// for, if this runtime holds that ship. Keys are held in memory, so this never waits on disk.
+/// A caller that asks only for the lookup protocol, of a runtime that is a lookup point, is
+/// shown the point's key instead, whatever ship it names.
 struct ShipKeys {
     runtime: Arc<Runtime>,
     provider: Arc<CryptoProvider>,
+    point: Option<Arc<CertifiedKey>>,
 }
 
 impl fmt::Debug for ShipKeys {
@@ -1170,6 +1322,15 @@ impl fmt::Debug for ShipKeys {
 
 impl ResolvesServerCert for ShipKeys {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // The protocol agreed is the first of this side's that the caller offers, and the
+        // ship protocol comes first. So the point's key is shown only where the lookup
+        // protocol is what will be agreed.
+        if let Some(point) = &self.point {
+            let offered = |protocol: &[u8]| hello.alpn().is_some_and(|mut offered| offered.any(|named| named == protocol));
+            if !offered(PROTOCOL) && offered(lookup::WHERE_PROTOCOL) {
+                return Some(point.clone());
+            }
+        }
         let key = self.runtime.signing_key(hello.server_name()?).ok()?;
         proof(&key, &self.provider).ok()
     }
@@ -1276,7 +1437,7 @@ impl Shared {
         let to = canonical_ship(to).map_err(|_| NetError::Unlisted(to.to_string()))?;
         let deadline = tokio::time::Instant::now().checked_add(self.cfg.request_timeout).ok_or(NetError::TimedOut)?;
         let lost = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
-        let (connection, key) = tokio::time::timeout_at(deadline, self.connection(&from, &to)).await.map_err(|_| NetError::TimedOut)??;
+        let (connection, key) = tokio::time::timeout_at(deadline, self.connection(&from, &to, deadline)).await.map_err(|_| NetError::TimedOut)??;
         let opened = tokio::time::timeout_at(deadline, connection.open_bi()).await.map_err(|_| NetError::TimedOut)?;
         let (mut send, mut receive) = opened.map_err(|e| lost(&e))?;
         // The streams are held out here, so that if time runs out part way they can be told
@@ -1320,7 +1481,7 @@ impl Shared {
                     // And neither does one to a ship that is no longer among those that are
                     // kept, and cannot be again: it could not be used either.
                     let keep = held.as_ref().is_some_and(|made| {
-                        made.connection.close_reason().is_none() && self.directory.lookup(to) == Some(made.peer) && self.directory.prove(to, &made.peer.key)
+                        made.connection.close_reason().is_none() && self.route(to).is_some_and(|route| route.fits(made)) && self.directory.prove_as(to, &made.peer.key, made.found)
                     });
                     if let Some(made) = held.as_ref().filter(|_| !keep) {
                         made.connection.close(VarInt::from_u32(2), b"no longer needed");
@@ -1335,15 +1496,30 @@ impl Shared {
         Ok(made.entry(pair.clone()).or_default().clone())
     }
 
+    /// How a ship is to be called, as things stand: at the address set by hand for it, or
+    /// through a lookup point if it has none and this runtime finds ships that way. `None`
+    /// if it cannot be called, for want of its key (or for a moon, its parent's).
+    fn route(&self, to: &str) -> Option<Route> {
+        // One reading of the directory, so that a place set by hand and the key held are
+        // weighed as they stood together.
+        match self.directory.standing(to) {
+            (Some(addr), keyed) => keyed.map(|key| Route::Placed(Reach { key, addr })),
+            // An address set by hand is never passed over: with one set, the ship is not
+            // looked for elsewhere, whatever else is or is not known of it.
+            (None, keyed) => keyed.filter(|_| self.finder.is_some()).map(Route::Found),
+        }
+    }
+
     /// The connection from one of this runtime's ships to another ship, made if there is
-    /// none, and the key the other ship proved it holds when it was made.
-    async fn connection(self: &Arc<Self>, from: &str, to: &str) -> Result<(Connection, [u8; 32]), NetError> {
+    /// none, and the key the other ship proved it holds when it was made. `deadline` is when
+    /// the request it is for runs out of time.
+    async fn connection(self: &Arc<Self>, from: &str, to: &str, deadline: tokio::time::Instant) -> Result<(Connection, [u8; 32]), NetError> {
         let key = self.runtime.signing_key(from).map_err(|_| NetError::NotHere(from.to_string()))?;
         let shown = key.verifying_key().to_bytes();
         let pair = (from.to_string(), to.to_string());
         // If the directory reads its keys from Urbit ID, see that it has this ship's.
         self.know(to, 0).await;
-        if self.directory.reach(to).is_none() {
+        if self.route(to).is_none() {
             // Not listed, so not called, whatever room there is for calls. A connection made
             // while it was listed is closed, unless some call is still holding it.
             let mut made = lock(&self.made);
@@ -1360,7 +1536,7 @@ impl Shared {
         // and does not make another. Calls to other ships have their own.
         let mut kept = slot.lock().await;
         // Read after any wait, so it is what the directory says now.
-        let Some(reach) = self.directory.reach(to) else {
+        let Some(route) = self.route(to) else {
             // The ship is no longer listed. A connection made while it was is closed, not left
             // open with nothing to use it.
             if let Some(made) = kept.take() {
@@ -1376,22 +1552,34 @@ impl Shared {
             // when the connection was made may since have lapsed and been read afresh, as
             // the key of a ship that has proved nothing: the connection is the proof, and
             // counts again here, if there is room.
-            let stands = made.connection.close_reason().is_none() && Some(made.peer.key) == reach.key && made.peer.addr == reach.addr && made.shown == shown;
-            if stands && self.directory.prove(to, &made.peer.key) {
+            let stands = made.connection.close_reason().is_none() && route.fits(&made) && made.shown == shown;
+            // Proved again in one step with the directory: for a connection found through a
+            // lookup point, that includes that no address has been set by hand meanwhile.
+            if stands && self.directory.prove_as(to, &made.peer.key, made.found) {
                 let (connection, proved) = (made.connection.clone(), made.peer.key);
                 *kept = Some(made);
                 return Ok((connection, proved));
             }
             made.connection.close(VarInt::from_u32(2), b"the directory changed");
+            // A connection found through a point that the directory would not prove again:
+            // the directory has changed since the route was read (most likely an address set
+            // by hand). This call ends here; the next goes by what the directory says then.
+            if stands && made.found {
+                return Err(NetError::Unreachable("the directory changed while connecting".into()));
+            }
         }
 
         let unreachable = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
+        let held = match route {
+            Route::Placed(reach) => reach.key,
+            Route::Found(key) => key,
+        };
         // This side shows the calling ship's key, and accepts only the key listed for the ship
         // being called.
         let shows = proof(&key, &self.provider).map_err(|e| unreachable(&e))?;
         // A moon may have been given a new key since it was last met, which only the moon
         // can show. So any key is let through here for a moon, and looked at below.
-        let expected = if ob::moon_number(to).is_some() { None } else { reach.key };
+        let expected = if ob::moon_number(to).is_some() { None } else { held };
         let expects = ListedKey { expected: expected.as_ref().map(wrapped), supported: self.provider.signature_verification_algorithms };
         let mut calling = rustls::ClientConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -1406,7 +1594,36 @@ impl Shared {
         // start any of its own on it.
         client.transport_config(Arc::new(transport(&self.cfg, 0).map_err(|e| unreachable(&e))?));
 
-        let connecting = self.endpoint.connect_with(client, reach.addr, to).map_err(|e| unreachable(&e))?;
+        let (connection, peer, found) = match route {
+            Route::Placed(reach) => {
+                let (connection, proved) = self.dial(&client, from, to, held, reach.addr, false).await?;
+                let peer = Peer { key: proved, addr: reach.addr };
+                // Connecting took time. If the directory changed meanwhile, what was just
+                // proved is already out of date.
+                if self.directory.lookup(to) != Some(peer) {
+                    connection.close(VarInt::from_u32(2), b"the directory changed");
+                    return Err(NetError::Unreachable("the directory changed while connecting".into()));
+                }
+                (connection, peer, false)
+            }
+            Route::Found(_) => {
+                let (connection, peer) = self.dial_found(&client, from, to, held, deadline).await?;
+                (connection, peer, true)
+            }
+        };
+        *kept = Some(Made { connection: connection.clone(), peer, shown, found });
+        Ok((connection, peer.key))
+    }
+
+    /// Connect to a ship at one address, say which ship is calling, and see that what
+    /// answered is the ship called: it proved it holds the key held for the ship (`held`),
+    /// or for a moon, a key its parent has given its word for. The connection, and the key
+    /// proved.
+    /// `found` says the address came from a lookup point: then the proof is refused if an
+    /// address has been set by hand for the ship meanwhile.
+    async fn dial(&self, client: &quinn::ClientConfig, from: &str, to: &str, held: Option<[u8; 32]>, addr: SocketAddr, found: bool) -> Result<(Connection, [u8; 32]), NetError> {
+        let unreachable = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
+        let connecting = self.endpoint.connect_with(client.clone(), addr, to).map_err(|e| unreachable(&e))?;
         let connection = match connecting.await {
             Ok(connection) => connection,
             Err(e) => {
@@ -1433,7 +1650,7 @@ impl Shared {
         // was seen latest is what holds earlier ones off.
         let word = welcome.proof.as_ref().and_then(proof_read).ok_or("the moon did not show its parent's word for its key");
         let vouched = word.and_then(|proof| self.directory.vouched(to, proved, &proof));
-        if reach.key != Some(proved) {
+        if held != Some(proved) {
             // Only a moon gets this far having shown a key other than the one held for it:
             // one never met, or one that has been given a new key. It has proved it holds
             // the key it showed, and that key is the moon's if the moon's parent has given
@@ -1445,19 +1662,80 @@ impl Shared {
         }
         // The ship has proved it holds the key held for it. From now on it is among the
         // ships that are kept; if there is no room for it there, it cannot be called.
-        if !self.directory.prove(to, &proved) {
+        if !self.directory.prove_as(to, &proved, found) {
             connection.close(VarInt::from_u32(2), b"the directory changed");
             return Err(NetError::Unreachable("the key the ship proved is no longer the one held for it, or there is no room to keep it".into()));
         }
-        let peer = Peer { key: proved, addr: reach.addr };
-        // Connecting took time. If the directory changed meanwhile, what was just proved is
-        // already out of date.
-        if self.directory.lookup(to) != Some(peer) {
-            connection.close(VarInt::from_u32(2), b"the directory changed");
-            return Err(NetError::Unreachable("the directory changed while connecting".into()));
+        Ok((connection, proved))
+    }
+
+    /// Call a ship that has no address set here, at the addresses of its record: first the
+    /// record already held, if it is still good, then one asked afresh of the lookup point
+    /// for its galaxy. Each address is tried in turn, each for part of the time left, and a
+    /// record none of whose addresses answer as the ship is not tried again. Whatever
+    /// answers must prove the ship's key, as at any address.
+    ///
+    /// Immediately before each address is tried, the directory is read again, in one step.
+    /// If the re-read sees an address set by hand, or a key held that is not the one the call
+    /// began with, nothing more from the record is tried. (For a moon the key may have come
+    /// to be held meanwhile, from the very record being tried: a moon is let show any key,
+    /// and its parent's word decides.) The same is read again before a new question to the
+    /// point. These are best-effort checks: a call already under way when an address is set
+    /// by hand stops at its next check that sees it, and may begin one more attempt or
+    /// question after the address is set, following its last check. An attempt already
+    /// begun cannot be called back; what
+    /// it makes is refused by its proof, which settles in one step with the directory that no
+    /// address is set by hand, so no connection made through a record is kept or used once
+    /// one is. A record that has been replaced while its addresses were being tried goes on
+    /// being tried to its end (its few addresses are each time-limited, and whatever answers
+    /// must prove the key); the newer record is used by the next round of this call, if there
+    /// is one, or by the next call. Only the record that was tried is marked failed.
+    async fn dial_found(
+        self: &Arc<Self>,
+        client: &quinn::ClientConfig,
+        from: &str,
+        to: &str,
+        held: Option<[u8; 32]>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(Connection, Peer), NetError> {
+        let finder = self.finder.as_ref().ok_or_else(|| NetError::Unlisted(to.to_string()))?;
+        let moon = ob::moon_number(to).is_some();
+        let changed = || NetError::Unreachable("the directory changed while looking for the ship".into());
+        let mut why = NetError::Unreachable(format!("nowhere is known to reach ~{to}"));
+        for asking in [false, true] {
+            // Before a new question, the directory is read again: if the re-read sees an
+            // address set by hand, the point is not asked.
+            if asking && !matches!(self.route(to), Some(Route::Found(key)) if moon || key == held) {
+                return Err(changed());
+            }
+            // The record the addresses come from, by the number it was kept under, so that
+            // only that one is marked failed.
+            let (kept_as, addresses) = if asking { finder.ask(&self.directory, to, deadline).await? } else { finder.cached(to).unwrap_or_default() };
+            for &addr in &addresses {
+                // The last thing read before an attempt: nothing waits after it.
+                let now_held = match self.route(to) {
+                    Some(Route::Found(key)) if moon || key == held => key,
+                    _ => return Err(changed()),
+                };
+                match tokio::time::timeout(lookup::try_limit(deadline), self.dial(client, from, to, now_held, addr, true)).await {
+                    Ok(Ok((connection, proved))) => {
+                        // Connecting took time. If an address has been set by hand meanwhile,
+                        // or the ship's key has changed, what was just proved is out of date.
+                        if !matches!(self.route(to), Some(Route::Found(Some(key))) if key == proved) {
+                            connection.close(VarInt::from_u32(2), b"the directory changed");
+                            return Err(changed());
+                        }
+                        return Ok((connection, Peer { key: proved, addr }));
+                    }
+                    Ok(Err(failed)) => why = failed,
+                    Err(_) => why = NetError::Unreachable(format!("nothing answered as ~{to} at {addr} in time")),
+                }
+            }
+            if !addresses.is_empty() {
+                finder.failed(to, kept_as);
+            }
         }
-        *kept = Some(Made { connection: connection.clone(), peer, shown });
-        Ok((connection, peer.key))
+        Err(why)
     }
 
     /// The first thing said on a connection this runtime has made: which ship is calling,
@@ -1591,6 +1869,11 @@ impl Shared {
     }
 }
 
+/// The protocol agreed on a connection, if one was.
+fn protocol_of(connection: &Connection) -> Option<Vec<u8>> {
+    connection.handshake_data()?.downcast::<HandshakeData>().ok()?.protocol
+}
+
 /// The key the other end of a connection proved it holds.
 fn shown_key(connection: &Connection) -> Option<[u8; 32]> {
     let shown = connection.peer_identity()?.downcast::<Vec<CertificateDer<'static>>>().ok()?;
@@ -1668,9 +1951,21 @@ fn newest_from(shared: &Shared, pair: &Pair, id: usize) -> bool {
 
 /// One connection from another ship: learn who is calling and which ship they called, then
 /// answer their requests until the connection closes.
-async fn answer_caller(shared: Arc<Shared>, incoming: Incoming, _place: Place, admission: u64) {
+async fn answer_caller(shared: Arc<Shared>, incoming: Incoming, place: Place, admission: u64) {
     let Ok(connecting) = incoming.accept() else { return };
     let Ok(Ok(connection)) = tokio::time::timeout(shared.cfg.request_timeout, connecting).await else { return };
+    // A connection under the lookup protocol is no ship's. It gives up its place among the
+    // ships' connections, and the point counts it among its own. Only a runtime that is a
+    // lookup point agrees to the protocol at all.
+    if protocol_of(&connection).as_deref() == Some(lookup::WHERE_PROTOCOL) {
+        drop(place);
+        match &shared.point {
+            Some(point) => lookup::serve(point.clone(), connection, shared.cfg.request_timeout).await,
+            None => connection.close(VarInt::from_u32(1), b"not a lookup point"),
+        }
+        return;
+    }
+    let _place = place;
     // The caller has proved it holds a key. It now says which ship it is, and is believed
     // if that key is the one listed for the name.
     let greeted = tokio::time::timeout(shared.cfg.request_timeout, greet(&shared, &connection)).await;
@@ -1756,7 +2051,7 @@ async fn answer_request(shared: Arc<Shared>, connection: Connection, pair: Pair,
 /// What arrives is copied straight into one buffer that never holds more than `max`. Keeping
 /// the pieces as they arrive would not do: each piece can keep alive the whole packet it came
 /// in, so a message sent a byte at a time could hold many times its own size in memory.
-async fn read_whole(receive: &mut RecvStream, max: usize) -> Option<Vec<u8>> {
+pub(crate) async fn read_whole(receive: &mut RecvStream, max: usize) -> Option<Vec<u8>> {
     let (mut whole, mut piece) = (Vec::new(), [0u8; 8192]);
     loop {
         match receive.read(&mut piece).await.ok()? {
@@ -1932,7 +2227,7 @@ async fn answer(shared: &Arc<Shared>, connection: &Connection, caller: &str, cal
 /// messages in a delivery, the logs in a piece of news, the entries in an answer. This reads
 /// only the sizes written there and keeps nothing, so it costs nothing to run on something
 /// that is all padding.
-fn repeats_within(request: &[u8], outer: u64, inner: u64, most: usize) -> bool {
+pub(crate) fn repeats_within(request: &[u8], outer: u64, inner: u64, most: usize) -> bool {
     /// Walk the fields of one encoded message, handing each length-delimited one to `each`.
     /// False if the bytes are not fields from end to end, or `each` says to stop.
     fn walk<'a>(mut bytes: &'a [u8], mut each: impl FnMut(u64, &'a [u8]) -> bool) -> bool {
@@ -2843,6 +3138,132 @@ mod tests {
         assert_eq!(full.vouched(&other_name, key(1), &moon::vouch(&parents[2], other, 1, &key(1))), Err("there is no room to keep the key of the moon's parent"));
         assert_eq!(full.proved_key_of(&name(planets[2])), None);
         assert_eq!(full.proved_key_of(&name(0x3000_0000)), Some(key_of_number(0x3000_0000)));
+    }
+
+    #[test]
+    fn a_moons_word_from_a_record_is_the_one_memory_of_its_keys() {
+        let told = Arc::new(Told::default());
+        let directory = small(&told, HOUR);
+        let planet = 0x4100_0000u32;
+        let parent = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        told.say(planet, Some((Some(parent.verifying_key().to_bytes()), 1)));
+        directory.read(&name(planet));
+        let (moon, moon_name) = moon_of(planet, 1);
+        let (first, second) = ([1; 32], [2; 32]);
+        // The moon was met at its first key, and proved it.
+        directory.vouched(&moon_name, first, &moon::vouch(&parent, moon, 1, &first)).unwrap();
+        assert_eq!(directory.proved_key_of(&moon_name), Some(first));
+        // A record shows the parent's word for a second key, at revision two. It holds at
+        // once: the first key is no longer the moon's for any connection, made or taken, and
+        // the moon is still among the ships kept.
+        directory.recorded_word(&moon_name, second, &moon::vouch(&parent, moon, 2, &second), &|| true).unwrap();
+        assert_eq!(directory.key_of(&moon_name), Some(second));
+        assert_eq!(directory.proved_key_of(&moon_name), Some(second));
+        assert_eq!(directory.moon_seen(&moon_name), Some((2, second)));
+        assert!(directory.vouched(&moon_name, first, &moon::vouch(&parent, moon, 1, &first)).is_err());
+        assert!(directory.recorded_word(&moon_name, first, &moon::vouch(&parent, moon, 1, &first), &|| true).is_err());
+        assert!(directory.recorded_word(&moon_name, first, &moon::vouch(&parent, moon, 2, &first), &|| true).is_err());
+        // A word not the parent's is not taken.
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        assert!(directory.recorded_word(&moon_name, [3; 32], &moon::vouch(&stranger, moon, 3, &[3; 32]), &|| true).is_err());
+
+        // A moon never met, known only from a record: its key is held, it has proved nothing,
+        // and its parent is kept. Neither is dropped for any number of names said after.
+        let (other, other_name) = moon_of(planet, 2);
+        directory.recorded_word(&other_name, [4; 32], &moon::vouch(&parent, other, 1, &[4; 32]), &|| true).unwrap();
+        assert_eq!(directory.key_of(&other_name), Some([4; 32]));
+        assert_eq!(directory.proved_key_of(&other_name), None);
+        crowd(&directory, 0x1500_0000, 40);
+        assert_eq!(directory.key_of(&other_name), Some([4; 32]));
+        assert_eq!(directory.proved_key_of(&name(planet)), Some(parent.verifying_key().to_bytes()));
+        // Moons from records count against the moons of one ship: three here.
+        let (third, third_name) = moon_of(planet, 3);
+        directory.recorded_word(&third_name, [5; 32], &moon::vouch(&parent, third, 1, &[5; 32]), &|| true).unwrap();
+        let (fourth, fourth_name) = moon_of(planet, 4);
+        assert_eq!(directory.recorded_word(&fourth_name, [6; 32], &moon::vouch(&parent, fourth, 1, &[6; 32]), &|| true), Err("there is no room to keep another moon's key"));
+        // A key set here by hand is never changed by a record.
+        directory.set(&fourth_name, [9; 32], "127.0.0.1:9".parse().unwrap()).unwrap();
+        assert!(directory.recorded_word(&fourth_name, [6; 32], &moon::vouch(&parent, fourth, 2, &[6; 32]), &|| true).is_err());
+        assert_eq!(directory.key_of(&fourth_name), Some([9; 32]));
+        // It goes only when the parent's key it stands on is no longer believed.
+        told.say(planet, Some((Some([0x77; 32]), 2)));
+        reread(&directory, planet);
+        assert_eq!(directory.key_of(&other_name), None);
+    }
+
+    #[test]
+    fn a_moon_known_from_a_record_takes_a_place_when_it_proves_its_key() {
+        let told = Arc::new(Told::default());
+        let bounds = Bounds { proved: 2, unproved: 8, moons: 5, moons_each: 3 };
+        let directory = Directory::made(Some(told.clone()), Duration::from_millis(1), HOUR, bounds);
+        let planet = 0x4200_0000u32;
+        let parent = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        told.say(planet, Some((Some(parent.verifying_key().to_bytes()), 1)));
+        directory.read(&name(planet));
+        let (moon, moon_name) = moon_of(planet, 1);
+        let key = [1; 32];
+        let word = moon::vouch(&parent, moon, 1, &key);
+        // The moon is remembered from a record: its parent takes one of the two places.
+        directory.recorded_word(&moon_name, key, &word, &|| true).unwrap();
+        // Another ship takes the other.
+        let other = 0x4300_0000u32;
+        directory.read(&name(other));
+        assert!(directory.prove(&name(other), &key_of_number(other)));
+        // The moon now proves its key on a connection. Its word stands, but there is no room
+        // to keep it as proved, and the connection is refused as any other would be.
+        assert!(directory.vouched(&moon_name, key, &word).is_ok());
+        assert!(!directory.prove(&moon_name, &key));
+        assert_eq!(directory.proved_key_of(&moon_name), None);
+        assert_eq!(directory.key_of(&moon_name), Some(key));
+        let kept = directory.listed.read().unwrap().keys.values().filter(|entry| entry.proved && !matches!(entry.from, From::Set)).count();
+        assert_eq!(kept, 2);
+        // With room, it is taken.
+        let roomy = Directory::made(Some(told.clone()), Duration::from_millis(1), HOUR, Bounds { proved: 3, ..bounds });
+        roomy.read(&name(planet));
+        roomy.recorded_word(&moon_name, key, &word, &|| true).unwrap();
+        roomy.read(&name(other));
+        assert!(roomy.prove(&name(other), &key_of_number(other)));
+        assert!(roomy.vouched(&moon_name, key, &word).is_ok());
+        assert!(roomy.prove(&moon_name, &key));
+        assert_eq!(roomy.proved_key_of(&moon_name), Some(key));
+    }
+
+    #[test]
+    fn a_connection_found_through_a_point_is_not_proved_once_an_address_is_set_by_hand() {
+        let told = Arc::new(Told::default());
+        let directory = small(&told, HOUR);
+        let ship = 0x4400_0000u32;
+        directory.read(&name(ship));
+        let key = key_of_number(ship);
+        // With no address set by hand, a connection found through a point is proved.
+        assert!(directory.prove_as(&name(ship), &key, true));
+        // Once one is set, it is refused in the same step, though the key is the one held and
+        // the ship is kept; a connection to the address set by hand is proved as ever.
+        directory.place(&name(ship), "127.0.0.1:9".parse().unwrap()).unwrap();
+        assert!(!directory.prove_as(&name(ship), &key, true));
+        assert!(directory.prove_as(&name(ship), &key, false));
+        assert!(directory.prove(&name(ship), &key));
+    }
+
+    #[test]
+    fn a_moons_word_from_a_record_no_longer_good_is_not_taken() {
+        let told = Arc::new(Told::default());
+        let directory = small(&told, HOUR);
+        let planet = 0x4500_0000u32;
+        let parent = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        told.say(planet, Some((Some(parent.verifying_key().to_bytes()), 1)));
+        directory.read(&name(planet));
+        let (moon, moon_name) = moon_of(planet, 1);
+        let word = moon::vouch(&parent, moon, 2, &[2; 32]);
+        // Asked with the directory held, the record is found no longer good: nothing changes,
+        // neither the moon nor its parent.
+        assert!(directory.recorded_word(&moon_name, [2; 32], &word, &|| false).is_err());
+        assert_eq!(directory.key_of(&moon_name), None);
+        assert_eq!(directory.moon_seen(&moon_name), None);
+        assert_eq!(directory.proved_key_of(&name(planet)), None);
+        // Still good, it is taken.
+        assert!(directory.recorded_word(&moon_name, [2; 32], &word, &|| true).is_ok());
+        assert_eq!(directory.moon_seen(&moon_name), Some((2, [2; 32])));
     }
 
     fn messages_within(request: &[u8], most: usize) -> bool {

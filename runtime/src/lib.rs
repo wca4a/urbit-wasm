@@ -4,6 +4,8 @@
 
 mod host;
 pub mod net;
+pub mod lookup;
+pub mod whereabouts;
 pub mod azimuth;
 pub mod chain;
 pub mod replica;
@@ -1206,6 +1208,13 @@ impl Runtime {
         // disk or on another thread's lock would hold up the whole network.
         let identities = self.inner.identities.read().unwrap_or_else(PoisonError::into_inner);
         identities.as_ref().and_then(|held| held.get(&name).map(|held| held.key.clone())).ok_or(Error::UnknownShip(name))
+    }
+
+    /// The ships this runtime holds keys for in memory, by name: every ship it holds, once
+    /// the network has started.
+    pub(crate) fn held_ships(&self) -> Vec<String> {
+        let identities = self.inner.identities.read().unwrap_or_else(PoisonError::into_inner);
+        identities.as_ref().map_or(Vec::new(), |held| held.keys().cloned().collect())
     }
 
     /// For a moon this runtime holds: its parent's word for its key, to show other ships.
