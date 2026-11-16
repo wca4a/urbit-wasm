@@ -61,6 +61,19 @@
 //! introduce it first, and gives the attempt the time a lost first packet takes to be sent
 //! again; a connection made that way sends a packet every `keep_alive`, so that the routers
 //! keep the way open while it is idle.
+//!
+//! When that fails too (a router that gives each destination a port of its own cannot be
+//! opened that way), a caller with a record of its own asks the ship's point to relay, within
+//! a share of its time kept for that, and dials the ship through the session it is given (see
+//! `crate::relay`). With lookup settings the socket handed to QUIC is the relay's wrapper, and
+//! QUIC is told not to grease the fixed bit; with none, both are exactly as before. A
+//! connection through a relay is an ordinary one, proved as any other; it is marked as relayed
+//! where it is kept, holds its session, and while it is used the direct way is tried again now
+//! and then: a direct connection takes its place, with the pair's slot held and proved as any
+//! kept connection is, and it is closed (the ship called closes it from its end as soon as it
+//! takes the direct one, which replaces the older connection there); a request under way on it
+//! then fails, and commands are delivered exactly once by the redelivery that exists. A
+//! made-up address set by hand for a ship is refused before anything is sent.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -72,7 +85,7 @@ use std::time::{Duration, Instant};
 
 use quinn::crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig};
 use quinn::udp::Transmit;
-use quinn::{AsyncUdpSocket, Connection, Endpoint, EndpointConfig, IdleTimeout, Incoming, RecvStream, Runtime as _, SendStream, TokioRuntime, TransportConfig, VarInt};
+use quinn::{AsyncUdpSocket, Connection, Endpoint, EndpointConfig, IdleTimeout, Incoming, MtuDiscoveryConfig, RecvStream, Runtime as _, SendStream, TokioRuntime, TransportConfig, VarInt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::AlwaysResolvesClientRawPublicKeys;
 use rustls::crypto::{verify_tls13_signature_with_raw_key, CryptoProvider, WebPkiSupportedAlgorithms};
@@ -92,6 +105,7 @@ use urbit_id::ob;
 use crate::azimuth::{Keys, Listing};
 use crate::lookup::{self, Bucket, Finder, Lead, Lookup, Point, PointStatus};
 use crate::moon;
+use crate::relay::{self, Leg, RelayStatus, Relayed, SessionId};
 use crate::whereabouts;
 use crate::ship::Taken;
 use crate::store::{PeerWork, Stand, MAX_BATCH_MESSAGES, MAX_FETCH_ENTRIES, MAX_NEWS_LOGS};
@@ -176,6 +190,15 @@ const MOST_PUNCHED_FOR: usize = 1024;
 
 /// The longest one introduction is worked on, a question to Urbit ID included.
 const INTRODUCTION_LIMIT: Duration = Duration::from_secs(5);
+
+/// How many tries at going direct again, for pairs whose connections go through a relay, may
+/// be under way at once, all pairs together. Each pair has at most one under way.
+const MOST_DIRECT_TRIES: usize = 16;
+
+/// The largest QUIC packet sent through a relay: the most QUIC sends on an IPv6 path with the
+/// usual 1,500 bytes of room (1,452), less the relay's header, so that the datagram with its
+/// header still fits.
+const MOST_RELAYED_PACKET: u16 = 1452 - relay::HEADER as u16;
 
 /// The smallest a ship's file may be allowed to grow to, for a runtime that goes on the
 /// network. A ship refuses outright any command larger than a quarter of its file, and takes
@@ -937,6 +960,68 @@ struct Made {
     /// The address was not set by hand but found through a lookup point. Such a connection
     /// is never used once an address is set by hand.
     found: bool,
+    /// The connection goes through the relay of the called ship's point: its session, held for
+    /// as long as this is, and when the direct way is next to be tried.
+    relayed: Option<Relaying>,
+    /// A number given to this entry when it was made, from one counter of 64 bits (it would come
+    /// round only after 2^64 entries): what a try at going direct names the entry it began from by. (QUIC's
+    /// `stable_id` will not do: it is an allocation's address, and can be given to a newer
+    /// connection once the old one is dropped.)
+    generation: u64,
+}
+
+/// What a kept connection through a relay goes with.
+struct Relaying {
+    /// The session: let go of when this is. Held for that alone.
+    #[allow(dead_code)]
+    leg: Leg,
+    /// Not before this moment, the direct way is tried again.
+    next_try: tokio::time::Instant,
+}
+
+/// For tests: holds one Deliver request, written and with its reply not yet read, until released;
+/// and says whether it is still held, and on which connection, and whether it has ended.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DeliverGate {
+    pub(crate) armed: std::sync::atomic::AtomicBool,
+    /// The connection the held request was written on, by QUIC's number for it, while held.
+    pub(crate) holding: Mutex<Option<usize>>,
+    pub(crate) release: tokio::sync::Notify,
+    /// Set when the held request ends, however it ends (its reply read, its time run out).
+    pub(crate) ended: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+pub(crate) struct Ended<'a>(&'a DeliverGate);
+
+#[cfg(test)]
+impl Drop for Ended<'_> {
+    fn drop(&mut self) {
+        *lock(&self.0.holding) = None;
+        self.0.ended.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl DeliverGate {
+    /// Hold here until released; the guard marks the request ended when the request does.
+    async fn hold(&self, connection: usize) -> Ended<'_> {
+        *lock(&self.holding) = Some(connection);
+        let ended = Ended(self);
+        self.release.notified().await;
+        ended
+    }
+}
+
+/// A pair's place among those trying to go direct again, given up when the try ends, however
+/// it ends.
+struct Trying(Arc<Shared>, Pair);
+
+impl Drop for Trying {
+    fn drop(&mut self) {
+        lock(&self.0.going_direct).remove(&self.1);
+    }
 }
 
 /// How a ship is to be called, as things stand.
@@ -1006,6 +1091,28 @@ struct Shared {
     point: Option<Arc<Point>>,
     /// The UDP socket QUIC runs on, kept to send the packets an introduction calls for.
     socket: Arc<dyn AsyncUdpSocket>,
+    /// The same socket as the relay's wrapper, with its sessions, when the runtime has lookup
+    /// settings; `None` otherwise, and then the socket is the bare one.
+    relayed: Option<Arc<Relayed>>,
+    /// Whether QUIC was left to grease the fixed bit, as by default: only with no lookup
+    /// settings. Read by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    greases: bool,
+    /// Pairs trying to go direct again now, and places among the tries under way, and how
+    /// many tries have begun.
+    going_direct: Mutex<HashSet<Pair>>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    direct_tried: AtomicU64,
+    /// Candidates tries at going direct have made (connections proved), for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    direct_made: AtomicU64,
+    /// The generation the next kept entry is given.
+    generations: AtomicU64,
+    /// A gate that, when armed, holds the next Deliver request after it is written and before its
+    /// reply is read. For tests.
+    #[cfg(test)]
+    pub(crate) deliver_gate: DeliverGate,
+    direct_tries: Arc<Semaphore>,
     /// What introductions this runtime's ships have been given, and what came of them.
     punching: Punching,
 }
@@ -1020,11 +1127,12 @@ struct Punching {
     /// Places among the introductions being acted on.
     under_way: Arc<Semaphore>,
     /// Introductions heard, those let past the weighing allowance, those acted on, and packets
-    /// sent because of them.
+    /// sent because of them; and sessions registered for them.
     heard: AtomicU64,
     weighed: AtomicU64,
     acted: AtomicU64,
     sent: Arc<AtomicU64>,
+    sessions: AtomicU64,
 }
 
 impl Punching {
@@ -1038,6 +1146,7 @@ impl Punching {
             weighed: AtomicU64::new(0),
             acted: AtomicU64::new(0),
             sent: Arc::new(AtomicU64::new(0)),
+            sessions: AtomicU64::new(0),
         }
     }
 
@@ -1065,6 +1174,9 @@ pub struct Introductions {
     pub acted: u64,
     /// Packets sent toward callers because of them.
     pub sent: u64,
+    /// Introductions that carried a session and were believed: sessions registered, through
+    /// which the caller then calls.
+    pub sessions: u64,
 }
 
 /// A stand-in for the UDP socket a network makes for itself, for tests to put something
@@ -1231,14 +1343,29 @@ impl Network {
         server.max_incoming(256);
 
         // The socket is this runtime's own, handed to QUIC, so that the packets an introduction
-        // calls for go out from the very port the ships are reached at.
-        let (endpoint, socket) = {
+        // calls for go out from the very port the ships are reached at. With lookup settings it
+        // is wrapped, for relay sessions (see `crate::relay`), and QUIC is told not to grease
+        // the fixed bit, so that no packet it takes can be taken for a relayed one. With none,
+        // the socket and QUIC's settings are exactly as they were.
+        let wraps = cfg.lookup.finds() || cfg.lookup.serve.is_some();
+        let (endpoint, socket, relayed, greases) = {
             let _entered = tokio.enter();
             let socket = match socket {
                 Some(make) => make()?,
                 None => TokioRuntime.wrap_udp_socket(std::net::UdpSocket::bind(addr)?)?,
             };
-            (Endpoint::new_with_abstract_socket(EndpointConfig::default(), Some(server), socket.clone(), Arc::new(TokioRuntime))?, socket)
+            let mut endpoint_config = EndpointConfig::default();
+            let (socket, relayed) = if wraps {
+                endpoint_config.grease_quic_bit(false);
+                let relaying = point.clone().filter(|point| point.relays());
+                let relayed = Arc::new(Relayed::new(socket, relaying, cfg.idle_timeout)?);
+                (relayed.clone() as Arc<dyn AsyncUdpSocket>, Some(relayed))
+            } else {
+                (socket, None)
+            };
+            // What QUIC was given, as it says it of itself.
+            let greases = format!("{endpoint_config:?}").contains("grease_quic_bit: true");
+            (Endpoint::new_with_abstract_socket(endpoint_config, Some(server), socket.clone(), Arc::new(TokioRuntime))?, socket, relayed, greases)
         };
         let bound = endpoint.local_addr()?;
         let reading = Arc::new(Semaphore::new(cfg.max_reading_bytes));
@@ -1255,7 +1382,7 @@ impl Network {
             false => (None, None),
         };
         let finder = match cfg.lookup.finds() {
-            true => Some(Arc::new(Finder::new(cfg.lookup.clone(), &cfg, endpoint.clone(), &provider, bound, pushed)?)),
+            true => Some(Arc::new(Finder::new(cfg.lookup.clone(), &cfg, endpoint.clone(), &provider, bound, pushed, relayed.clone())?)),
             false => None,
         };
         // Taken last of the things that can fail, so that a start that fails gives it back.
@@ -1282,6 +1409,15 @@ impl Network {
             finder,
             point,
             socket,
+            relayed,
+            greases,
+            direct_tried: AtomicU64::new(0),
+            direct_made: AtomicU64::new(0),
+            generations: AtomicU64::new(0),
+            #[cfg(test)]
+            deliver_gate: DeliverGate::default(),
+            going_direct: Mutex::default(),
+            direct_tries: Arc::new(Semaphore::new(MOST_DIRECT_TRIES)),
             punching: Punching::new(),
         });
         tokio.spawn(answer_calls(shared.clone()));
@@ -1354,7 +1490,14 @@ impl Network {
             weighed: punching.weighed.load(Ordering::SeqCst),
             acted: punching.acted.load(Ordering::SeqCst),
             sent: punching.sent.load(Ordering::SeqCst),
+            sessions: punching.sessions.load(Ordering::SeqCst),
         }
+    }
+
+    /// This runtime's relay sessions, and what has passed through them; all nought for a
+    /// runtime with no lookup settings.
+    pub fn relay_status(&self) -> RelayStatus {
+        self.shared.relayed.as_ref().map(|relayed| relayed.status()).unwrap_or_default()
     }
 
     /// What one of this runtime's ships was last announced as, if a point took its record:
@@ -1636,6 +1779,11 @@ impl Shared {
         let exchanged = tokio::time::timeout_at(deadline, async {
             send.write_all(&request.encode_to_vec()).await.map_err(|e| lost(&e))?;
             send.finish().map_err(|e| lost(&e))?;
+            #[cfg(test)]
+            let _held = match matches!(request.body, Some(peer_request::Body::Deliver(_))) && self.deliver_gate.armed.swap(false, Ordering::SeqCst) {
+                true => Some(self.deliver_gate.hold(connection.stable_id()).await),
+                false => None,
+            };
             read_whole(&mut receive, self.cfg.max_message_bytes).await.ok_or_else(|| lost(&"the reply could not be read, or was too large"))
         })
         .await;
@@ -1702,8 +1850,11 @@ impl Shared {
     }
 
     /// The connection from one of this runtime's ships to another ship, made if there is
-    /// none, and the key the other ship proved it holds when it was made. `deadline` is when
-    /// the request it is for runs out of time.
+    /// none, and the key the other ship proved it holds when it was made. `deadline` is when the
+    /// request it is for runs out of time.
+    ///
+    /// A kept connection that goes through a relay starts a try at going direct again when it
+    /// is used, if one is due (`Lookup::direct_again`) and none is under way for the pair.
     async fn connection(self: &Arc<Self>, from: &str, to: &str, deadline: tokio::time::Instant) -> Result<(Connection, [u8; 32]), NetError> {
         let key = self.runtime.signing_key(from).map_err(|_| NetError::NotHere(from.to_string()))?;
         let shown = key.verifying_key().to_bytes();
@@ -1747,7 +1898,12 @@ impl Shared {
             // Proved again in one step with the directory: for a connection found through a
             // lookup point, that includes that no address has been set by hand meanwhile.
             if stands && self.directory.prove_as(to, &made.peer.key, made.found) {
+                let mut made = made;
                 let (connection, proved) = (made.connection.clone(), made.peer.key);
+                let generation = made.generation;
+                if let Some(relaying) = made.relayed.as_mut() {
+                    self.direct_due(&pair, relaying, generation);
+                }
                 *kept = Some(made);
                 return Ok((connection, proved));
             }
@@ -1760,14 +1916,49 @@ impl Shared {
             }
         }
 
-        let unreachable = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
         let held = match route {
             Route::Placed(reach) => reach.key,
             Route::Found(key) => key,
         };
+        let client = self.calling(&key, to, held)?;
+
+        let (connection, peer, found, leg) = match route {
+            // Where the socket is wrapped for relaying, a made-up address is a session's, and a
+            // call to an address set by hand never goes through a session: no ship can be at
+            // such an address. (With no lookup settings the bare socket is as it was.)
+            Route::Placed(reach) if self.relayed.is_some() && relay::is_made_up(&reach.addr) => {
+                return Err(NetError::Unreachable(format!("~{to} is set by hand at {}, an address no ship can be at", reach.addr)));
+            }
+            Route::Placed(reach) => {
+                let (connection, proved) = self.dial(&client, from, to, held, reach.addr, false, true).await?;
+                let peer = Peer { key: proved, addr: reach.addr };
+                // Connecting took time. If the directory changed meanwhile, what was just
+                // proved is already out of date.
+                if self.directory.lookup(to) != Some(peer) {
+                    connection.close(VarInt::from_u32(2), b"the directory changed");
+                    return Err(NetError::Unreachable("the directory changed while connecting".into()));
+                }
+                (connection, peer, false, None)
+            }
+            Route::Found(_) => {
+                let (connection, peer, leg) = self.dial_found(&client, from, to, held, deadline).await?;
+                (connection, peer, true, leg)
+            }
+        };
+        // A connection through a relay is marked so where it is kept, with its session.
+        let relayed = leg.map(|leg| Relaying { leg, next_try: tokio::time::Instant::now() + self.cfg.lookup.direct_again });
+        *kept = Some(Made { connection: connection.clone(), peer, shown, found, relayed, generation: self.generation() });
+        Ok((connection, peer.key))
+    }
+
+    /// How a ship of this runtime (with `key`) calls `to`: showing its key, and accepting only
+    /// `held`, the key listed for `to` (for a moon, any key, which is then checked against its
+    /// parent's word).
+    fn calling(&self, key: &ed25519_dalek::SigningKey, to: &str, held: Option<[u8; 32]>) -> Result<quinn::ClientConfig, NetError> {
+        let unreachable = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
         // This side shows the calling ship's key, and accepts only the key listed for the ship
         // being called.
-        let shows = proof(&key, &self.provider).map_err(|e| unreachable(&e))?;
+        let shows = proof(key, &self.provider).map_err(|e| unreachable(&e))?;
         // A moon may have been given a new key since it was last met, which only the moon
         // can show. So any key is let through here for a moon, and looked at below.
         let expected = if ob::moon_number(to).is_some() { None } else { held };
@@ -1784,26 +1975,33 @@ impl Shared {
         // Requests go one way on a connection this runtime made. The ship called may not
         // start any of its own on it.
         client.transport_config(Arc::new(transport(&self.cfg, 0).map_err(|e| unreachable(&e))?));
+        Ok(client)
+    }
 
-        let (connection, peer, found) = match route {
-            Route::Placed(reach) => {
-                let (connection, proved) = self.dial(&client, from, to, held, reach.addr, false).await?;
-                let peer = Peer { key: proved, addr: reach.addr };
-                // Connecting took time. If the directory changed meanwhile, what was just
-                // proved is already out of date.
-                if self.directory.lookup(to) != Some(peer) {
-                    connection.close(VarInt::from_u32(2), b"the directory changed");
-                    return Err(NetError::Unreachable("the directory changed while connecting".into()));
-                }
-                (connection, peer, false)
-            }
-            Route::Found(_) => {
-                let (connection, peer) = self.dial_found(&client, from, to, held, deadline).await?;
-                (connection, peer, true)
-            }
-        };
-        *kept = Some(Made { connection: connection.clone(), peer, shown, found });
-        Ok((connection, peer.key))
+    /// The generation for a kept entry being made now: not given before. (A counter of 64 bits
+    /// taken one at a time would come round only after 2^64 entries, which does not happen in
+    /// practice; nothing checks for it.)
+    fn generation(&self) -> u64 {
+        self.generations.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// For a kept connection through a relay (the entry of generation `relayed`), just used: if a
+    /// try at the direct way is due, and none is under way for the pair, and there is a place
+    /// among the tries, start one, and set when the next is due. Weighed with the pair's slot
+    /// held.
+    fn direct_due(self: &Arc<Self>, pair: &Pair, relaying: &mut Relaying, relayed: u64) {
+        let now = tokio::time::Instant::now();
+        if now < relaying.next_try {
+            return;
+        }
+        relaying.next_try = now + self.cfg.lookup.direct_again;
+        if !lock(&self.going_direct).insert(pair.clone()) {
+            return;
+        }
+        let trying = Trying(self.clone(), pair.clone());
+        let Ok(turn) = self.direct_tries.clone().try_acquire_owned() else { return };
+        self.direct_tried.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(self.clone().go_direct(pair.clone(), relayed, trying, turn));
     }
 
     /// Connect to a ship at one address, say which ship is calling, and see that what
@@ -1811,15 +2009,20 @@ impl Shared {
     /// or for a moon, a key its parent has given its word for. The connection, and the key
     /// proved.
     /// `found` says the address came from a lookup point: then the proof is refused if an
-    /// address has been set by hand for the ship meanwhile.
-    async fn dial(&self, client: &quinn::ClientConfig, from: &str, to: &str, held: Option<[u8; 32]>, addr: SocketAddr, found: bool) -> Result<(Connection, [u8; 32]), NetError> {
+    /// address has been set by hand for the ship meanwhile. `doubts` says a failure to connect
+    /// makes the key held for the ship be read again; a try at going direct again, which may
+    /// fail for reasons of routers alone, changes nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn dial(&self, client: &quinn::ClientConfig, from: &str, to: &str, held: Option<[u8; 32]>, addr: SocketAddr, found: bool, doubts: bool) -> Result<(Connection, [u8; 32]), NetError> {
         let unreachable = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
         let connecting = self.endpoint.connect_with(client.clone(), addr, to).map_err(|e| unreachable(&e))?;
         let connection = match connecting.await {
             Ok(connection) => connection,
             Err(e) => {
                 // It may be that the ship has a new key, and the one held for it is old.
-                self.directory.doubt(to);
+                if doubts {
+                    self.directory.doubt(to);
+                }
                 return Err(unreachable(&e));
             }
         };
@@ -1863,32 +2066,42 @@ impl Shared {
     /// Call a ship that has no address set here, at the addresses of its record: first the
     /// record already held, if it is still good, then one asked afresh of the lookup point
     /// for its galaxy. Each address is tried in turn, each for part of the time left, and a
-    /// record none of whose addresses answer as the ship is not tried again. Whatever
-    /// answers must prove the ship's key, as at any address.
+    /// record none of whose addresses answer as the ship (and whose ship its point's relay did
+    /// not reach either) is not tried again. Whatever answers must prove the ship's key, as at
+    /// any address.
     ///
     /// Immediately before each address is tried, the directory is read again, in one step.
     /// If the re-read sees an address set by hand, or a key held that is not the one the call
     /// began with, nothing more from the record is tried. (For a moon the key may have come
     /// to be held meanwhile, from the very record being tried: a moon is let show any key,
     /// and its parent's word decides.) The same is read again before a new question to the
-    /// point. These are best-effort checks: a call already under way when an address is set
-    /// by hand stops at its next check that sees it, and may begin one more attempt or
-    /// question after the address is set, following its last check. An attempt already
-    /// begun cannot be called back; what
-    /// it makes is refused by its proof, which settles in one step with the directory that no
-    /// address is set by hand, so no connection made through a record is kept or used once
-    /// one is. A record that has been replaced while its addresses were being tried goes on
-    /// being tried to its end (its few addresses are each time-limited, and whatever answers
-    /// must prove the key); the newer record is used by the next round of this call, if there
-    /// is one, or by the next call. Only the record that was tried is marked failed.
+    /// point, before an introduction or a relay is asked for, and before a session is dialed.
+    /// These are best-effort checks: a call already under way when an address is set by hand
+    /// stops at its next check that sees it, and may begin one more attempt, question or
+    /// request after the address is set, following its last check. An attempt already begun
+    /// cannot be called back; what it makes is refused by its proof, which settles in one step
+    /// with the directory that no address is set by hand, so no connection made through a
+    /// record or a relay is kept or used once one is. A record that has been replaced while its
+    /// addresses were being tried goes on being tried to its end (its few addresses are each
+    /// time-limited, and whatever answers must prove the key); the newer record is used by the
+    /// next round of this call, if there is one, or by the next call. Only the record that was
+    /// tried is marked failed.
     ///
-    /// A record that asks callers to be introduced: before its addresses are tried, the
-    /// directory is read again as before a question, and the ship's point is asked to
-    /// introduce this ship, waiting at most `INTRODUCE_WAIT` (or a quarter of the time left)
-    /// for it to say so; whatever it says, or if it says nothing, the addresses are then tried
-    /// as for any record, each for longer (`TRY_INTRODUCED`, or three quarters of the time
-    /// left), on a connection that keeps itself alive. A ship that announces no record of its
-    /// own cannot be introduced, and tries the addresses without.
+    /// A record that asks callers to be introduced: before its addresses are tried, the ship's
+    /// point is asked to introduce this ship, waiting at most `INTRODUCE_WAIT` (or a quarter of
+    /// the time left) for it to say so; whatever it says, or if it says nothing, the addresses
+    /// are then tried as for any record, each for longer (`TRY_INTRODUCED`, or three quarters of
+    /// the time left), on a connection that keeps itself alive. If the calling ship has a record
+    /// of its own to show, a relay may follow: then all of that direct work, in this call,
+    /// ends by `lookup::direct_by` (five seconds, or half the call), and if no address answered,
+    /// the point is asked to relay (waiting at most `RELAY_WAIT`, or a quarter of the time
+    /// left), and on a session the ship is dialed through it with the rest of the time. A
+    /// record the direct way failed for and the relay worked for is remembered, and the next
+    /// call on it goes straight to the relay. A ship that announces no record of its own
+    /// cannot be introduced or relayed, and tries the addresses without.
+    ///
+    /// The connection, what it was proved against (for one through a relay, its address is
+    /// the session's made-up one), and the session, if it goes through one.
     async fn dial_found(
         self: &Arc<Self>,
         client: &quinn::ClientConfig,
@@ -1896,10 +2109,14 @@ impl Shared {
         to: &str,
         held: Option<[u8; 32]>,
         deadline: tokio::time::Instant,
-    ) -> Result<(Connection, Peer), NetError> {
+    ) -> Result<(Connection, Peer, Option<Leg>), NetError> {
         let finder = self.finder.as_ref().ok_or_else(|| NetError::Unlisted(to.to_string()))?;
         let moon = ob::moon_number(to).is_some();
         let changed = || NetError::Unreachable("the directory changed while looking for the ship".into());
+        // Whether a relay may follow, and if so, when the direct work must be over by.
+        let relays = finder.may_relay(from);
+        let direct_by = lookup::direct_by(tokio::time::Instant::now(), deadline);
+        let direct_left = || direct_by.saturating_duration_since(tokio::time::Instant::now());
         let mut why = NetError::Unreachable(format!("nowhere is known to reach ~{to}"));
         for asking in [false, true] {
             // Before a new question, the directory is read again: if the re-read sees an
@@ -1910,12 +2127,19 @@ impl Shared {
             // The record the addresses come from, by the number it was kept under, so that
             // only that one is marked failed.
             let lead: Lead = if asking { finder.ask(&self.directory, to, deadline).await? } else { finder.cached(to).unwrap_or_default() };
-            if lead.introduce && !lead.addresses.is_empty() {
+            if lead.addresses.is_empty() {
+                continue;
+            }
+            let relaying = relays && lead.introduce;
+            // The direct way failed for this very record, and the relay worked: straight there.
+            let straight = relaying && finder.relay_worked(to, lead.kept_as);
+            if lead.introduce && !straight {
                 // Read again before the point is asked, as before a question.
                 if !matches!(self.route(to), Some(Route::Found(key)) if moon || key == held) {
                     return Err(changed());
                 }
-                if let Ok(Err(failed)) = tokio::time::timeout(lookup::introduce_wait(deadline), finder.introduce(&self.runtime, from, to, deadline)).await {
+                let wait = if relaying { lookup::introduce_wait(deadline).min(direct_left()) } else { lookup::introduce_wait(deadline) };
+                if let Ok(Err(failed)) = tokio::time::timeout(wait, finder.introduce(&self.runtime, from, to, deadline)).await {
                     finder.worried(format!("~{to}: {failed}"));
                 }
             }
@@ -1928,14 +2152,22 @@ impl Shared {
             } else {
                 client
             };
-            for &addr in &lead.addresses {
+            for &addr in lead.addresses.iter().filter(|_| !straight) {
                 // The last thing read before an attempt: nothing waits after it.
                 let now_held = match self.route(to) {
                     Some(Route::Found(key)) if moon || key == held => key,
                     _ => return Err(changed()),
                 };
-                let limit = if lead.introduce { lookup::introduced_limit(deadline) } else { lookup::try_limit(deadline) };
-                match tokio::time::timeout(limit, self.dial(client, from, to, now_held, addr, true)).await {
+                let mut limit = if lead.introduce { lookup::introduced_limit(deadline) } else { lookup::try_limit(deadline) };
+                if relaying {
+                    // The relay's share of the call is not spent here.
+                    limit = limit.min(direct_left());
+                    if limit.is_zero() {
+                        why = NetError::Unreachable(format!("the time for reaching ~{to} directly ran out"));
+                        break;
+                    }
+                }
+                match tokio::time::timeout(limit, self.dial(client, from, to, now_held, addr, true, true)).await {
                     Ok(Ok((connection, proved))) => {
                         // Connecting took time. If an address has been set by hand meanwhile,
                         // or the ship's key has changed, what was just proved is out of date.
@@ -1943,22 +2175,170 @@ impl Shared {
                             connection.close(VarInt::from_u32(2), b"the directory changed");
                             return Err(changed());
                         }
-                        return Ok((connection, Peer { key: proved, addr }));
+                        return Ok((connection, Peer { key: proved, addr }, None));
                     }
                     Ok(Err(failed)) => why = failed,
                     Err(_) => why = NetError::Unreachable(format!("nothing answered as ~{to} at {addr} in time")),
                 }
             }
-            if !lead.addresses.is_empty() {
-                finder.failed(to, lead.kept_as);
-                if lead.introduce {
-                    why = NetError::Unreachable(format!(
-                        "~{to} could not be reached directly: it asks to be introduced first, and nothing answered as it after that (its router, or this runtime's, lets nothing in this way; reaching it would need a relay, which is not built). Last: {why}"
-                    ));
+            if relaying {
+                // Read again before the point is asked to relay: by hand wins.
+                let now_held = match self.route(to) {
+                    Some(Route::Found(key)) if moon || key == held => key,
+                    _ => return Err(changed()),
+                };
+                match self.dial_relayed(finder, client, from, to, now_held, held, deadline).await? {
+                    Ok((connection, proved, leg)) => {
+                        // As after any attempt: the directory read again.
+                        if !matches!(self.route(to), Some(Route::Found(Some(key))) if key == proved) {
+                            connection.close(VarInt::from_u32(2), b"the directory changed");
+                            return Err(changed());
+                        }
+                        finder.relay_did(to, lead.kept_as);
+                        let addr = leg.addr;
+                        return Ok((connection, Peer { key: proved, addr }, Some(leg)));
+                    }
+                    Err(relay_failed) => {
+                        let tried = if straight { "it was reached through its point's relay last time, so that was tried first" } else { "it asks to be introduced first, and nothing answered as it after that (its router, or this runtime's, lets nothing in this way)" };
+                        why = NetError::Unreachable(format!("~{to} could not be reached directly: {tried}; and it was not relayed: {relay_failed}. Last: {why}"));
+                    }
                 }
+            } else if lead.introduce {
+                why = NetError::Unreachable(format!(
+                    "~{to} could not be reached directly: it asks to be introduced first, and nothing answered as it after that (its router, or this runtime's, lets nothing in this way; reaching it needs its point's relay, which this ship can ask for only once it announces a record of its own). Last: {why}"
+                ));
             }
+            finder.failed(to, lead.kept_as);
         }
         Err(why)
+    }
+
+    /// Ask `to`'s point to carry this ship's packets to `to`, and on a session, dial `to`
+    /// through it with the rest of the time: `held` is the key held now, `began` the key the
+    /// call began with. An error that ends the call (the directory changed), or why the relay
+    /// did not reach the ship: the point does not relay, refused for a limit, or did not answer,
+    /// or nothing answered through it.
+    #[allow(clippy::too_many_arguments)]
+    async fn dial_relayed(
+        &self,
+        finder: &Arc<Finder>,
+        client: &quinn::ClientConfig,
+        from: &str,
+        to: &str,
+        held: Option<[u8; 32]>,
+        began: Option<[u8; 32]>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Result<(Connection, [u8; 32], Leg), String>, NetError> {
+        let Some(relayed) = &self.relayed else { return Ok(Err("this runtime cannot relay".into())) };
+        let moon = ob::moon_number(to).is_some();
+        let (point, id) = match tokio::time::timeout(lookup::relay_wait(deadline), finder.relay(&self.runtime, from, to, deadline)).await {
+            Ok(Ok(answered)) => answered,
+            Ok(Err(refused)) => return Ok(Err(refused)),
+            Err(_) => return Ok(Err("its point did not answer the request to relay in time".into())),
+        };
+        // The last thing read before the attempt, as before any: by hand wins.
+        let now_held = match self.route(to) {
+            Some(Route::Found(key)) if moon || (key == held && key == began) => key,
+            _ => return Err(NetError::Unreachable("the directory changed while looking for the ship".into())),
+        };
+        let leg = match relayed.calling(point, id) {
+            Ok(leg) => leg,
+            Err(why) => return Ok(Err(format!("its point would relay, and no session could be registered here: {why}"))),
+        };
+        let client = self.through_relay(client)?;
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        Ok(match tokio::time::timeout(left, self.dial(&client, from, to, now_held, leg.addr, true, true)).await {
+            Ok(Ok((connection, proved))) => Ok((connection, proved, leg)),
+            Ok(Err(failed)) => Err(format!("its point took the session, and nothing answered as ~{to} through it: {failed}")),
+            Err(_) => Err(format!("its point took the session, and nothing answered as ~{to} through it in time")),
+        })
+    }
+
+    /// The way of calling a ship through a relay: as `client` (which keeps itself alive), with
+    /// packets small enough to take the relay's header and still fit.
+    fn through_relay(&self, client: &quinn::ClientConfig) -> Result<quinn::ClientConfig, NetError> {
+        let mut transport = transport(&self.cfg, 0).map_err(|e| NetError::Unreachable(e.to_string()))?;
+        transport.keep_alive_interval(Some(self.cfg.lookup.keep_alive));
+        let mut mtu = MtuDiscoveryConfig::default();
+        mtu.upper_bound(MOST_RELAYED_PACKET);
+        transport.mtu_discovery_config(Some(mtu));
+        let mut client = client.clone();
+        client.transport_config(Arc::new(transport));
+        Ok(client)
+    }
+
+    /// Try the direct way again for a pair whose kept connection goes through a relay (the entry
+    /// of generation `relayed`), by the path any call to a record takes: the record held (or one
+    /// asked of the point), an introduction if it asks for one, then each address. The
+    /// directory is read again before the introduction and before each attempt, and the try
+    /// stops if it sees an address set by hand or another key. A connection made takes the
+    /// relayed one's place only with the pair's slot held (waited for until the try's deadline
+    /// at most), and only if the entry kept is still the very one the try began from (by its
+    /// generation, whether or not it has since closed: the ship called closes it from its
+    /// end as soon as it takes the direct connection, the newest from a calling ship replacing
+    /// the older), the route still fits, and it is proved in one step with the directory
+    /// (`prove_as`), as any kept connection is. Otherwise the candidate is closed. On taking its
+    /// place the old entry is closed and dropped, and its session with it; a request under way
+    /// on it then fails as any request on a closed connection does, and commands are delivered
+    /// exactly once by the redelivery that already exists. A try that fails before the ship
+    /// called has taken its connection changes nothing (no record is marked failed, no key
+    /// doubted); one that fails after (its last proof fails, or the route changed under it)
+    /// leaves the pair with no working kept connection until the next call makes one.
+    async fn go_direct(self: Arc<Self>, pair: Pair, relayed: u64, _trying: Trying, _turn: tokio::sync::OwnedSemaphorePermit) {
+        let (from, to) = (pair.0.as_str(), pair.1.as_str());
+        let deadline = tokio::time::Instant::now() + self.cfg.request_timeout;
+        let Some(finder) = self.finder.clone() else { return };
+        let moon = ob::moon_number(to).is_some();
+        let Some(Route::Found(held)) = self.route(to) else { return };
+        let Ok(key) = self.runtime.signing_key(from) else { return };
+        let shown = key.verifying_key().to_bytes();
+        let Ok(lead) = finder.ask(&self.directory, to, deadline).await else { return };
+        let Ok(client) = self.calling(&key, to, held) else { return };
+        let client = match lead.introduce {
+            true => {
+                if !matches!(self.route(to), Some(Route::Found(key)) if moon || key == held) {
+                    return;
+                }
+                let _ = tokio::time::timeout(lookup::introduce_wait(deadline), finder.introduce(&self.runtime, from, to, deadline)).await;
+                let Ok(client) = self.kept_alive(&client) else { return };
+                client
+            }
+            false => client,
+        };
+        for &addr in &lead.addresses {
+            let now_held = match self.route(to) {
+                Some(Route::Found(key)) if moon || key == held => key,
+                _ => return,
+            };
+            let limit = if lead.introduce { lookup::introduced_limit(deadline) } else { lookup::try_limit(deadline) };
+            let Ok(Ok((connection, proved))) = tokio::time::timeout(limit, self.dial(&client, from, to, now_held, addr, true, false)).await else { continue };
+            self.direct_made.fetch_add(1, Ordering::SeqCst);
+            let Ok(slot) = self.slot(&pair) else {
+                connection.close(VarInt::from_u32(2), b"no longer wanted");
+                return;
+            };
+            // The slot is waited for no longer than the try's own deadline.
+            let Ok(mut kept) = tokio::time::timeout_at(deadline, slot.lock()).await else {
+                connection.close(VarInt::from_u32(2), b"no longer wanted");
+                return;
+            };
+            // Weighed with the pair's slot held: the entry kept is still the relayed one this try
+            // began from (closed or not), the ship is still found through its point with the key
+            // just proved, and the directory proves it again in one step.
+            let current = kept.as_ref().is_some_and(|made| made.relayed.is_some() && made.generation == relayed && made.shown == shown);
+            let fits = matches!(self.route(to), Some(Route::Found(Some(key))) if key == proved);
+            if current && fits && self.directory.prove_as(to, &proved, true) {
+                let direct = Made { connection, peer: Peer { key: proved, addr }, shown, found: true, relayed: None, generation: self.generation() };
+                if let Some(old) = kept.replace(direct) {
+                    old.connection.close(VarInt::from_u32(2), b"replaced by a direct connection");
+                }
+                drop(kept);
+                finder.direct_again(to);
+            } else {
+                connection.close(VarInt::from_u32(2), b"no longer wanted");
+            }
+            return;
+        }
     }
 
     /// The same way of calling, with a packet sent every `keep_alive`: for a connection made
@@ -1982,9 +2362,20 @@ impl Shared {
     /// of the introduction is kept:
     /// not the record, not a moon's word in it, not a route. The caller's key is read from
     /// Urbit ID into the directory as for any ship that says its name, under the same limits.
-    async fn introduced(self: &Arc<Self>, introduction: &[u8]) -> Result<(), &'static str> {
+    ///
+    /// An introduction that carries a session (the caller asked the point to relay) is weighed
+    /// by the very same steps and allowance (weighing is the same work), and then, instead of
+    /// any packet being sent, the session is registered with the relay's wrapper, bound to the
+    /// point at the other end of the connection it came on (`pushed_on`), within the wrapper's
+    /// own bounds on sessions. Nothing is sent for it. The caller's connection attempt then
+    /// arrives through it and is taken, checked and limited as any caller's is.
+    async fn introduced(self: &Arc<Self>, introduction: &[u8], pushed_on: Option<&Connection>) -> Result<(), &'static str> {
         let finder = self.finder.as_ref().ok_or("this runtime finds no ships through lookup points")?;
-        let Introduction { callee, record } = Introduction::decode(introduction).map_err(|_| "not an introduction")?;
+        let Introduction { callee, record, session } = Introduction::decode(introduction).map_err(|_| "not an introduction")?;
+        let session: Option<SessionId> = match session.len() {
+            0 => None,
+            _ => Some(session.as_slice().try_into().map_err(|_| "the introduction names a session that cannot be one")?),
+        };
         let callee = whereabouts::name_of(callee).ok_or("the introduction names no ship")?;
         // Only for a ship held here, and last announced asking for introductions.
         if self.runtime.signing_key(&callee).is_err() || !finder.introduces(&callee) {
@@ -2016,9 +2407,19 @@ impl Shared {
             self.directory.moon_word_stands(&caller, key, &proof)?;
         }
         // Finding the caller's key may have waited: whether the ship still asks to be
-        // introduced is read again before anything is sent.
+        // introduced is read again before anything is sent or registered.
         if !finder.introduces(&callee) {
             return Err("the ship no longer asks for introductions");
+        }
+        if let Some(id) = session {
+            let relayed = self.relayed.as_ref().ok_or("this runtime cannot be relayed to")?;
+            let pushed_on = pushed_on.ok_or("a session came on no connection to a point")?;
+            // The point that carries the session is the one the push came from.
+            // A moon caller counts as its planet against the bound for any one caller.
+            let owner = parent_of(&caller).unwrap_or_else(|| caller.clone());
+            relayed.called(pushed_on.remote_address(), id, &owner, pushed_on.stable_id())?;
+            self.punching.sessions.fetch_add(1, Ordering::SeqCst);
+            return Ok(());
         }
         // A place among those under way first, then the allowances; a refusal after the place is
         // taken gives it back at once. Introductions are weighed one at a time, so no other can
@@ -2219,13 +2620,15 @@ impl Drop for Place {
 }
 
 /// Weigh the introductions lookup points pass to this runtime's ships, one at a time, each
-/// within `INTRODUCTION_LIMIT`, for as long as the network runs.
-async fn weigh_introductions(shared: Arc<Shared>, mut introductions: tokio::sync::mpsc::Receiver<Vec<u8>>) {
-    while let Some(introduction) = introductions.recv().await {
+/// within `INTRODUCTION_LIMIT`, for as long as the network runs. Each comes with the
+/// connection to the point it came on.
+async fn weigh_introductions(shared: Arc<Shared>, mut introductions: tokio::sync::mpsc::Receiver<(Vec<u8>, Connection)>) {
+    while let Some((introduction, pushed_on)) = introductions.recv().await {
         shared.punching.heard.fetch_add(1, Ordering::SeqCst);
-        let _ = tokio::time::timeout(INTRODUCTION_LIMIT, shared.introduced(&introduction)).await;
+        let _ = tokio::time::timeout(INTRODUCTION_LIMIT, shared.introduced(&introduction, Some(&pushed_on))).await;
     }
 }
+
 
 /// Take connections from other ships for as long as the network runs.
 async fn answer_calls(shared: Arc<Shared>) {
@@ -2280,6 +2683,9 @@ async fn answer_caller(shared: Arc<Shared>, incoming: Incoming, place: Place, ad
     if protocol_of(&connection).as_deref() == Some(lookup::WHERE_PROTOCOL) {
         drop(place);
         match &shared.point {
+            // Through a relay session, nobody is a point's to answer (`lookup::serve` refuses it
+            // too): nothing may be sent toward a made-up address but through the session.
+            Some(_) if relay::is_made_up(&connection.remote_address()) => connection.close(VarInt::from_u32(1), b"not through a relay"),
             Some(point) => lookup::serve(point.clone(), connection, shared.cfg.request_timeout).await,
             None => connection.close(VarInt::from_u32(1), b"not a lookup point"),
         }
@@ -2483,8 +2889,12 @@ async fn answer(shared: &Arc<Shared>, connection: &Connection, caller: &str, cal
             // ship when the ship here comes to act on it. If that ship has since come back
             // as an earlier copy of itself, it has connected afresh, and this account is of
             // a ship that is no longer there.
-            let (callers, pair, id) = (shared.clone(), (caller.to_string(), called.to_string()), connection.stable_id());
-            let current = move || newest_from(&callers, &pair, id);
+            // The closure owns a handle to the connection, and reads its number from it when it
+            // runs. The job may outlive this request (which can time out and let go of its own
+            // handle): while the closure holds one, the connection's allocation cannot be given to
+            // a newer connection, so its number cannot be mistaken for the newer one's.
+            let (callers, pair, held) = (shared.clone(), (caller.to_string(), called.to_string()), connection.clone());
+            let current = move || newest_from(&callers, &pair, held.stable_id());
             match work(shared, move || runtime.resync(&ship, &peer, &theirs, most, current)).await {
                 Some(Ok(None)) => refused("that account is no longer the newest; try again"),
                 Some(Ok(Some((ours, _, queued)))) => {
@@ -2509,8 +2919,10 @@ async fn answer(shared: &Arc<Shared>, connection: &Connection, caller: &str, cal
             let (runtime, ship, peer) = (shared.runtime.clone(), called.to_string(), caller.to_string());
             // Taken only if this is still the newest connection from that ship when the
             // ship here comes to take them: see the same check on comparing notes, below.
-            let (callers, pair, id) = (shared.clone(), (caller.to_string(), called.to_string()), connection.stable_id());
-            let current = move || newest_from(&callers, &pair, id);
+            // The closure owns a handle to the connection, as on comparing notes below, so that a
+            // job that outlives this request cannot take a newer connection's number for its own.
+            let (callers, pair, held) = (shared.clone(), (caller.to_string(), called.to_string()), connection.clone());
+            let current = move || newest_from(&callers, &pair, held.stable_id());
             let taken = work(shared, move || runtime.accept_commands(&ship, &peer, &messages, current)).await;
             let Some(Ok(last)) = taken else { return refused("the commands could not be taken; try again") };
             // They are saved. Running them is the ship's own business and is not waited for:

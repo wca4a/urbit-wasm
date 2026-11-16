@@ -568,6 +568,7 @@ message WhereRequest {
     Where ask = 2;
     Seen seen = 3;
     Introduce introduce = 4;
+    Relay relay = 5;
   }
 }
 
@@ -594,6 +595,16 @@ message Introduce {
   bytes presence = 3;
 }
 
+// A caller that could not reach a ship directly asks that ship's point to carry the two
+// ships' packets between them. As in an introduction: the ship wanted, the caller's own record,
+// signed now, and its presence for this connection. The point answers with the session the
+// packets are to name, or refuses, saying why.
+message Relay {
+  uint64 callee = 1;
+  bytes record = 2;
+  bytes presence = 3;
+}
+
 // Anyone asks the point where a ship is, by number.
 message Where {
   uint64 ship = 1;
@@ -605,6 +616,7 @@ message WhereReply {
     Found found = 2;
     Saw saw = 3;
     Introduced introduced = 4;
+    Relaying relaying = 5;
   }
   // Set, with no body, when the request was not one the point would answer.
   string refused = 15;
@@ -632,10 +644,22 @@ message Saw {
 message Introduced {
 }
 
+// The point will carry packets between the caller and the ship it asked for: each is sent to
+// the point's port with a short header naming this session (sixteen bytes), and the point sends
+// it on, unchanged, to the other ship. The caller's record has been passed to that ship with
+// the same session. The point does not wait for that ship.
+message Relaying {
+  bytes session = 1;
+}
+
 // From a lookup point to a ship, on a stream the point opens on the connection the ship
 // proved it is on: a caller's record, for the ship named, to send a few packets toward.
-// Nothing in it is taken on the point's word: the record is checked as any record is.
+// Nothing in it is taken on the point's word: the record is checked as any record is. With a
+// session (sixteen bytes), the caller has asked the point to carry its packets to the ship, and
+// the ship, if it believes the record, takes packets naming that session from that point as
+// coming from the caller, and sends nothing for it.
 message Introduction {
   uint64 callee = 1;
   bytes record = 2;
+  bytes session = 3;
 }

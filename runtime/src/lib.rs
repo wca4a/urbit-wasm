@@ -4,6 +4,7 @@
 
 mod host;
 pub mod net;
+pub mod relay;
 pub mod lookup;
 pub mod whereabouts;
 pub mod azimuth;

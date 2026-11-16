@@ -8,6 +8,10 @@
 //! - `Strict`: a different outside port for each address the inside sends to, and each lets in
 //!   only that address. Introductions cannot get through two of these.
 //! An opening is forgotten once nothing has gone out through it for `forget_after`.
+//!
+//! Phase 3's tests are here too: two ships behind strict routers reach each other through their
+//! point's relay; a relayed pair goes direct when it can; and the point's and the ships' rules
+//! for relayed packets, counted at the routers.
 
 use std::collections::HashMap;
 use std::fs;
@@ -26,7 +30,8 @@ use quinn::{AsyncUdpSocket, UdpPoller};
 
 use crate::azimuth::{Keys, Listing};
 use crate::lookup::{Lookup, PointBounds, PointConfig};
-use crate::net::{Directory, MakeSocket, NetConfig, Network};
+use crate::net::{Directory, MakeSocket, NetConfig, Network, MOST_DIRECT_TRIES};
+use crate::relay::RelayBounds;
 use crate::{lock, Config, Durability, Manifest, Provide, Runtime, Use};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +57,12 @@ struct Router {
     waiting: Mutex<Option<Waker>>,
     /// Packets from outside that were not let in.
     dropped: AtomicUsize,
+    /// Relayed datagrams (see `crate::relay`) that were let in.
+    relayed_in: AtomicUsize,
+    /// Times the runtime inside asked to send to a made-up address. It never should.
+    made_up_seen: AtomicUsize,
+    /// The largest relayed datagram the runtime inside has sent.
+    largest_relayed_out: AtomicUsize,
 }
 
 impl std::fmt::Debug for Router {
@@ -72,7 +83,18 @@ impl Router {
             forget_after,
             waiting: Mutex::default(),
             dropped: AtomicUsize::new(0),
+            relayed_in: AtomicUsize::new(0),
+            made_up_seen: AtomicUsize::new(0),
+            largest_relayed_out: AtomicUsize::new(0),
         }
+    }
+
+    /// Send a datagram from the outside port that packets to `to` go out from, as if the
+    /// runtime inside had: for tests to speak from an address a point has pinned.
+    fn send_from(&self, to: SocketAddr, datagram: &[u8]) {
+        let (index, port) = self.port_for(to).unwrap();
+        self.sent.lock().unwrap().insert((index, to), Instant::now());
+        port.try_send_to(datagram, to).unwrap();
     }
 
     /// A new outside port, inside the network's own threads.
@@ -124,13 +146,26 @@ impl UdpPoller for AlwaysReady {
 }
 
 impl AsyncUdpSocket for Router {
+    /// A router does not fragment: QUIC searches for the path's size through it, as through a
+    /// real socket that sets "don't fragment".
+    fn may_fragment(&self) -> bool {
+        false
+    }
+
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         Box::pin(AlwaysReady)
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        if crate::relay::is_made_up(&transmit.destination) {
+            self.made_up_seen.fetch_add(1, Ordering::SeqCst);
+            return Ok(());
+        }
         let (index, port) = self.port_for(transmit.destination)?;
         self.sent.lock().unwrap().insert((index, transmit.destination), Instant::now());
+        if crate::relay::session_of(transmit.contents).is_some() {
+            self.largest_relayed_out.fetch_max(transmit.contents.len(), Ordering::SeqCst);
+        }
         port.try_send_to(transmit.contents, transmit.destination).map(drop)
     }
 
@@ -144,6 +179,9 @@ impl AsyncUdpSocket for Router {
                     Poll::Ready(Ok(from)) => {
                         let len = read.filled().len();
                         if self.lets_in(index, *dest, from) {
+                            if crate::relay::session_of(read.filled()).is_some() {
+                                self.relayed_in.fetch_add(1, Ordering::SeqCst);
+                            }
                             let mut taken = RecvMeta::default();
                             taken.addr = from;
                             taken.len = len;
@@ -219,9 +257,10 @@ impl Drop for TempDir {
     }
 }
 
-/// A stand-in for Urbit ID: the keys the test has listed, each at revision one.
+/// A stand-in for Urbit ID: the keys the test has listed, each at revision one. While the flag
+/// is set every question waits (for half a minute at most); the count is of questions asked.
 #[derive(Default)]
-struct Listings(Mutex<HashMap<u32, [u8; 32]>>);
+struct Listings(Mutex<HashMap<u32, [u8; 32]>>, std::sync::atomic::AtomicBool, AtomicUsize);
 
 impl Listings {
     fn list(&self, ship: &str, key: [u8; 32]) {
@@ -231,6 +270,11 @@ impl Listings {
 
 impl Keys for Listings {
     fn listing(&self, ship: u32) -> Result<Option<Listing>, String> {
+        self.2.fetch_add(1, Ordering::SeqCst);
+        let started = Instant::now();
+        while self.1.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         Ok(self.0.lock().unwrap().get(&ship).map(|key| Listing { key: Some(*key), revision: 1, continuity: 0, sponsor: None }))
     }
 }
@@ -254,8 +298,13 @@ fn settings(point: Option<SocketAddr>) -> NetConfig {
 
 /// A runtime that holds no ships and is a lookup point for every galaxy, at a public address.
 fn point_on(dir: &TempDir, urbit: &Arc<Listings>) -> (Arc<Runtime>, Network) {
+    point_relaying(dir, urbit, None)
+}
+
+/// The same, relaying within these bounds, if any are given.
+fn point_relaying(dir: &TempDir, urbit: &Arc<Listings>, relay: Option<RelayBounds>) -> (Arc<Runtime>, Network) {
     let rt = Arc::new(Runtime::open(&dir.0, Config { durability: Durability::Normal, ..Config::default() }).unwrap());
-    let lookup = Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies: None, bounds: PointBounds::default() }), ..Lookup::default() };
+    let lookup = Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies: None, bounds: PointBounds::default(), relay }), ..Lookup::default() };
     let net = Network::start(rt.clone(), Directory::new(), NetConfig { lookup, ..settings(None) }).unwrap();
     (rt, net)
 }
@@ -268,16 +317,23 @@ fn crew(dir: &TempDir, ship: &str, urbit: &Arc<Listings>, point: SocketAddr, soc
 
 /// The same, with these settings.
 fn crew_with(dir: &TempDir, ship: &str, urbit: &Arc<Listings>, cfg: NetConfig, socket: Option<MakeSocket>) -> (Arc<Runtime>, Network) {
+    crew_of(dir, &[ship], urbit, cfg, socket)
+}
+
+/// The same, for several ships on the one runtime.
+fn crew_of(dir: &TempDir, ships: &[&str], urbit: &Arc<Listings>, cfg: NetConfig, socket: Option<MakeSocket>) -> (Arc<Runtime>, Network) {
     let open_counter = Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true }], uses: vec![] };
     let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
     let far_tally = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true }], uses: vec![to("counter"), to("tally")] };
     let rt = Arc::new(Runtime::open(&dir.0, Config { durability: Durability::Normal, ..Config::default() }).unwrap());
     let kernel = rt.add_module(&wasm("kernel")).unwrap();
     let (counter, tally) = (rt.add_module(&wasm("counter")).unwrap(), rt.add_module(&wasm("tally")).unwrap());
-    rt.create_ship(ship, &kernel).unwrap();
-    rt.install(ship, "counter", &counter, &open_counter).unwrap();
-    rt.install(ship, "tally", &tally, &far_tally).unwrap();
-    urbit.list(ship, rt.public_key(ship).unwrap());
+    for ship in ships {
+        rt.create_ship(ship, &kernel).unwrap();
+        rt.install(ship, "counter", &counter, &open_counter).unwrap();
+        rt.install(ship, "tally", &tally, &far_tally).unwrap();
+        urbit.list(ship, rt.public_key(ship).unwrap());
+    }
     let net = Network::start_on(rt.clone(), Directory::reading(urbit.clone()), cfg, socket).unwrap();
     (rt, net)
 }
@@ -376,22 +432,30 @@ fn without_the_introduction_a_ship_behind_a_home_router_cannot_be_called() {
 }
 
 #[test]
-fn two_ships_behind_strict_routers_fail_in_time_and_say_they_could_not_reach_directly() {
-    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("strict-{n}"))).collect();
+fn with_a_point_that_does_not_relay_a_ship_behind_a_strict_router_cannot_be_called_and_the_call_says_so() {
+    let dirs: Vec<TempDir> = (0..4).map(|n| TempDir::new(&format!("strict-{n}"))).collect();
     let urbit = Arc::new(Listings::default());
     let (_point_rt, point) = point_on(&dirs[0], &urbit);
     let (_zod_router, zod_socket) = behind(Kind::Strict, Duration::from_secs(30));
     let (_zod, zod_net) = crew(&dirs[1], "~zod", &urbit, point.addr(), Some(zod_socket));
     let (_nec_router, nec_socket) = behind(Kind::Strict, Duration::from_secs(30));
     let (_nec, _nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), Some(nec_socket));
-    eventually("both are announced", || point.point_status().unwrap().attending == 2);
+    let (_bud, bud_net) = crew(&dirs[3], "~bud", &urbit, point.addr(), None);
+    eventually("all three are announced", || point.point_status().unwrap().attending == 3);
     // The introduction is passed on and ~nec sends its packets, but each router gives each
-    // destination a port of its own, so neither the packets nor the call find the way open.
-    let started = Instant::now();
-    let why = zod_net.ping("~zod", "~nec").unwrap_err().to_string();
-    assert!(started.elapsed() < Duration::from_secs(9), "{:?}", started.elapsed());
-    assert!(why.contains("could not be reached directly"), "{why}");
-    assert!(point.point_status().unwrap().introduced >= 1);
+    // destination a port of its own, so neither the packets nor the call find the way open; and
+    // the point, asked to relay, says it does not. From behind a strict router of its own, and
+    // from a public address, alike.
+    for net in [&zod_net, &bud_net] {
+        let started = Instant::now();
+        let why = net.ping(if std::ptr::eq(net, &zod_net) { "~zod" } else { "~bud" }, "~nec").unwrap_err().to_string();
+        assert!(started.elapsed() < Duration::from_secs(9), "{:?}", started.elapsed());
+        assert!(why.contains("could not be reached directly") && why.contains("does not relay"), "{why}");
+    }
+    let status = point.point_status().unwrap();
+    assert!(status.introduced >= 2 && status.relay_asked >= 2, "{status:?}");
+    assert_eq!((status.relays_made, status.sessions), (0, 0));
+    assert_eq!(zod_net.relay_status().calling, 0);
 }
 
 #[test]
@@ -486,8 +550,8 @@ fn callers(first: u32, count: u32) -> Vec<(String, ed25519_dalek::SigningKey)> {
 /// came of it.
 fn introduce(net: &Network, caller: &(String, ed25519_dalek::SigningKey)) -> Result<(), &'static str> {
     let record = crate::whereabouts::sign(&caller.0, &["127.0.0.1:9".parse().unwrap()], crate::store::now_ms(), &caller.1, None).unwrap();
-    let introduction = ship_proto::Message::encode_to_vec(&ship_proto::Introduction { callee: 1, record });
-    net.threads.get().block_on(net.shared.introduced(&introduction))
+    let introduction = ship_proto::Message::encode_to_vec(&ship_proto::Introduction { callee: 1, record, session: Vec::new() });
+    net.threads.get().block_on(net.shared.introduced(&introduction, None))
 }
 
 #[test]
@@ -564,4 +628,677 @@ fn introductions_of_one_caller_ship_are_acted_on_only_within_its_own_allowance()
     let holds = lock(&nec_net.shared.punching.each).get(caller[0].0.trim_start_matches('~')).map(|bucket| bucket.holds());
     assert!(holds.is_some_and(|holds| holds < 1.0), "inconclusive: the caller's allowance holds {holds:?}");
     assert_eq!(introduce(&nec_net, &caller[0]), Err("too many introductions of that caller just now"));
+}
+
+
+// Relaying through the point (phase 3).
+
+/// Whether the connection kept from one ship to another goes through a relay; `None` if none
+/// is kept (or some call holds it just now).
+fn relayed(net: &Network, from: &str, to: &str) -> Option<bool> {
+    let pair = (from.trim_start_matches('~').to_string(), to.trim_start_matches('~').to_string());
+    let slot = lock(&net.shared.made).get(&pair)?.clone();
+    let held = slot.try_lock().ok()?;
+    held.as_ref().map(|made| made.relayed.is_some())
+}
+
+/// Close and let go of the connection kept from one ship to another, as if it had been lost.
+fn forget_connection(net: &Network, from: &str, to: &str) {
+    let pair = (from.trim_start_matches('~').to_string(), to.trim_start_matches('~').to_string());
+    let slot = lock(&net.shared.made).get(&pair).cloned().expect("a connection is kept");
+    let made = slot.try_lock().expect("nobody holds it").take().expect("a connection is kept");
+    made.connection.close(quinn::VarInt::from_u32(0), b"forgotten by the test");
+}
+
+#[test]
+fn two_ships_behind_strict_routers_call_each_other_through_their_point_and_stop_promptly() {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("relay-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    let (zod_router, zod_socket) = behind(Kind::Strict, Duration::from_secs(30));
+    let (zod, zod_net) = crew(&dirs[1], "~zod", &urbit, point.addr(), Some(zod_socket));
+    let (nec_router, nec_socket) = behind(Kind::Strict, Duration::from_secs(30));
+    let (nec, nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), Some(nec_socket));
+    eventually("both are announced", || point.point_status().unwrap().attending == 2);
+    // Each calls the other by name, and each direction is relayed: the direct way cannot get
+    // through two strict routers.
+    let started = Instant::now();
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+    assert!(reaches(&nec_net, "~nec", "~zod"));
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
+    assert_eq!(relayed(&nec_net, "~nec", "~zod"), Some(true));
+    assert_eq!((zod_net.relay_status().calling, zod_net.relay_status().called), (1, 1));
+    assert_eq!((nec_net.relay_status().calling, nec_net.relay_status().called), (1, 1));
+    // Commands and their receipts flow both ways through it.
+    trade(&zod, "~zod", &nec, "~nec", 3);
+    trade(&nec, "~nec", &zod, "~zod", 2);
+    let status = point.point_status().unwrap();
+    assert_eq!((status.relays_made, status.sessions), (2, 2), "{status:?}");
+    assert!(status.carried_for.len() == 2 && status.carried_for.iter().all(|(_, bytes)| *bytes > 0), "{status:?}");
+    // The ships' own connections to that very point, whose packets come from its address too,
+    // still work while the sessions carry traffic: both go on being announced over them.
+    let announced = status.announced;
+    trade(&zod, "~zod", &nec, "~nec", 1);
+    eventually("the ships are announced again", || point.point_status().unwrap().announced >= announced + 2);
+    // The direct way failed for ~nec's record and the relay worked: the next call on the same
+    // record goes straight to the relay, asking for no introduction.
+    let introduced = point.point_status().unwrap().introduced;
+    forget_connection(&zod_net, "~zod", "~nec");
+    let started = Instant::now();
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    let status = point.point_status().unwrap();
+    assert_eq!(status.introduced, introduced);
+    assert_eq!(status.relays_made, 3);
+    // No made-up address ever reached a router.
+    assert_eq!(zod_router.made_up_seen.load(Ordering::SeqCst) + nec_router.made_up_seen.load(Ordering::SeqCst), 0);
+    // Stopping is prompt at each of the three, with sessions live.
+    for net in [zod_net, nec_net, point] {
+        let started = Instant::now();
+        drop(net);
+        assert!(started.elapsed() < Duration::from_secs(2), "stopping took {:?}", started.elapsed());
+    }
+}
+
+#[test]
+fn a_ship_at_a_public_address_and_one_behind_a_strict_router_call_each_other() {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("halfrelay-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    // ~zod gives a call six seconds: the direct way gets half, three, though one attempt alone
+    // would be given four.
+    let mut cfg = settings(Some(point.addr()));
+    cfg.request_timeout = Duration::from_secs(6);
+    let (zod, zod_net) = crew_with(&dirs[1], "~zod", &urbit, cfg, None);
+    let (_nec_router, nec_socket) = behind(Kind::Strict, Duration::from_secs(30));
+    let (nec, nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), Some(nec_socket));
+    eventually("both are announced", || point.point_status().unwrap().attending == 2);
+    // ~zod calls ~nec: the router lets in only the point, so it is relayed, and the point is
+    // asked to relay when the direct share is spent. ~nec calls ~zod, which can be reached
+    // directly, and does so.
+    let started = Instant::now();
+    let asked_at = std::thread::scope(|scope| {
+        let calling = scope.spawn(|| reaches(&zod_net, "~zod", "~nec"));
+        while point.point_status().unwrap().relay_asked == 0 && started.elapsed() < Duration::from_secs(6) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let asked_at = started.elapsed();
+        assert!(calling.join().unwrap());
+        asked_at
+    });
+    assert!(asked_at > Duration::from_millis(2500) && asked_at < Duration::from_millis(3600), "the point was asked to relay {asked_at:?} into the call");
+    assert!(reaches(&nec_net, "~nec", "~zod"));
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
+    assert_eq!(relayed(&nec_net, "~nec", "~zod"), Some(false));
+    trade(&zod, "~zod", &nec, "~nec", 2);
+    trade(&nec, "~nec", &zod, "~zod", 2);
+    assert_eq!(point.point_status().unwrap().relays_made, 1);
+}
+
+#[test]
+fn a_relayed_pair_goes_direct_when_it_can_and_nothing_is_lost_or_delivered_twice() {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("godirect-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    // Both behind routers of the usual kind, which an introduction gets through; ~zod tries the
+    // direct way again every two seconds while relayed.
+    let mut cfg = settings(Some(point.addr()));
+    cfg.lookup.direct_again = Duration::from_secs(2);
+    let (_zod_router, zod_socket) = behind(Kind::Cone, Duration::from_secs(30));
+    let (zod, zod_net) = crew_with(&dirs[1], "~zod", &urbit, cfg, Some(zod_socket));
+    let (_nec_router, nec_socket) = behind(Kind::Cone, Duration::from_secs(30));
+    let (nec, nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), Some(nec_socket));
+    eventually("both are announced", || point.point_status().unwrap().attending == 2);
+    // With the introduction made to fail, the direct way cannot get in, and the call is
+    // relayed. (At both ends: the receipts go back from ~nec to ~zod, and an introduction that
+    // way would open both routers.)
+    let introducing = &zod_net.shared.finder.as_ref().unwrap().introducing;
+    let nec_introducing = &nec_net.shared.finder.as_ref().unwrap().introducing;
+    introducing.store(false, Ordering::SeqCst);
+    nec_introducing.store(false, Ordering::SeqCst);
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
+    assert!(zod_net.shared.finder.as_ref().unwrap().remembers_relay("nec"));
+    // Tries at the direct way (only pings meanwhile, which go one way: a call back from ~nec
+    // would open both routers by itself, as calls both ways do): none before two seconds of use; then one, which fails (the
+    // introduction still fails) and runs for its four seconds; two seconds on, another use
+    // would be due, but one is still under way for the pair, so none begins.
+    let tried = || zod_net.shared.direct_tried.load(Ordering::SeqCst);
+    for _ in 0..5 {
+        assert!(reaches(&zod_net, "~zod", "~nec"));
+    }
+    assert_eq!(tried(), 0, "a try began before it was due");
+    // Due, but every place among the tries in all is taken: none begins, and the pair is not
+    // left marked as trying.
+    let all_places = zod_net.shared.direct_tries.clone().try_acquire_many_owned(MOST_DIRECT_TRIES as u32).unwrap();
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert_eq!(tried(), 0, "a try began with no place for it");
+    assert!(lock(&zod_net.shared.going_direct).is_empty());
+    drop(all_places);
+    std::thread::sleep(Duration::from_millis(2100));
+    for _ in 0..5 {
+        assert!(reaches(&zod_net, "~zod", "~nec"));
+    }
+    assert_eq!(tried(), 1);
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert_eq!(tried(), 1, "a second try began while one was under way for the pair");
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true), "a failed try changed the connection");
+    // The try under way ends (failing, before the ship called took anything) before the direct
+    // way is let work, so that only the tries below can get through.
+    eventually("the try under way ends", || lock(&zod_net.shared.going_direct).is_empty());
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true), "a failed try changed the connection");
+    // Later the direct way works: the pair moves to it while commands keep going.
+    introducing.store(true, Ordering::SeqCst);
+    nec_introducing.store(true, Ordering::SeqCst);
+    // First, a try that began from some other kept connection (by QUIC's number for it) makes a
+    // direct connection, and must not take the place of the one kept now.
+    let opened = zod_net.open_connections();
+    let made = zod_net.shared.direct_made.load(Ordering::SeqCst);
+    zod_net.threads.get().block_on(try_direct(&zod_net, "zod", "nec", u64::MAX)).unwrap();
+    assert_eq!(zod_net.shared.direct_made.load(Ordering::SeqCst), made + 1, "the try made no candidate");
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true), "a try replaced a connection it did not begin from");
+    eventually("the try's own connection is closed", || zod_net.open_connections() <= opened);
+    // And the kept connection still carries what is asked of it.
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
+    let started = Instant::now();
+    while relayed(&zod_net, "~zod", "~nec") != Some(false) {
+        assert!(started.elapsed() < Duration::from_secs(30), "the pair never went direct");
+        trade(&zod, "~zod", &nec, "~nec", 1);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // New requests go direct: nothing more is carried. Every command arrived exactly once, and
+    // its receipt came back (each `trade` counts them).
+    eventually("the relayed connection is closed, and its session let go of", || zod_net.relay_status().calling == 0);
+    let carried = point.point_status().unwrap().relayed.carried;
+    trade(&zod, "~zod", &nec, "~nec", 3);
+    trade(&nec, "~nec", &zod, "~zod", 1);
+    assert_eq!(point.point_status().unwrap().relayed.carried, carried);
+    // The session ends at the point and at ~nec once nothing passes for the idle time.
+    point.shared.point.as_ref().unwrap().step_relay(crate::relay::IDLE);
+    assert_eq!(point.point_status().unwrap().sessions, 0);
+    nec_net.shared.relayed.as_ref().unwrap().step(crate::relay::IDLE);
+    assert_eq!(nec_net.relay_status().called, 0);
+    // The direct way worked: no record of ~nec is remembered as one for the relay any more.
+    assert!(!zod_net.shared.finder.as_ref().unwrap().remembers_relay("nec"));
+}
+
+#[test]
+fn with_an_address_set_by_hand_no_relay_is_asked_for_or_used() {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("relayhand-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    let (_zod_router, zod_socket) = behind(Kind::Strict, Duration::from_secs(30));
+    let (_zod, zod_net) = crew(&dirs[1], "~zod", &urbit, point.addr(), Some(zod_socket));
+    let (_nec_router, nec_socket) = behind(Kind::Strict, Duration::from_secs(30));
+    let (_nec, nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), Some(nec_socket));
+    eventually("both are announced", || point.point_status().unwrap().attending == 2);
+    zod_net.shared.finder.as_ref().unwrap().introducing.store(false, Ordering::SeqCst);
+    // Set while a relayed call is under way: the point holds the request to relay (its source
+    // of keys waits); the address is set by hand; the point answers. The call reads the
+    // directory again before it uses the session, and stops.
+    // ~zod's directory reads ~nec's key now, from the same stand-in, so that holding it below
+    // holds only the point.
+    zod_net.shared.directory.read("nec");
+    assert!(zod_net.shared.directory.key_of("~nec").is_some());
+    urbit.1.store(true, Ordering::SeqCst);
+    let asked = point.point_status().unwrap().relay_asked;
+    let why = std::thread::scope(|scope| {
+        let calling = scope.spawn(|| zod_net.ping("~zod", "~nec"));
+        eventually("the point holds the request to relay", || point.point_status().unwrap().relay_asked > asked);
+        zod_net.shared.directory.place("~nec", nec_net.addr()).unwrap();
+        urbit.1.store(false, Ordering::SeqCst);
+        calling.join().unwrap().unwrap_err().to_string()
+    });
+    assert!(why.contains("the directory changed"), "{why}");
+    assert_eq!(zod_net.relay_status().calling, 0);
+    assert_eq!(point.point_status().unwrap().relayed.carried, 0);
+    // With the address set, a call goes there and nowhere else: no relay is asked for.
+    let (asked, introduced) = (point.point_status().unwrap().relay_asked, point.point_status().unwrap().introduced);
+    assert!(zod_net.ping("~zod", "~nec").is_err());
+    let status = point.point_status().unwrap();
+    assert_eq!((status.relay_asked, status.introduced), (asked, introduced));
+    assert_eq!(zod_net.relay_status().calling, 0);
+}
+
+#[test]
+fn a_runtime_with_no_lookup_settings_has_its_socket_and_quic_as_they_were() {
+    let dirs: Vec<TempDir> = (0..2).map(|n| TempDir::new(&format!("plain-{n}"))).collect();
+    let rt = Arc::new(Runtime::open(&dirs[0].0, Config { durability: Durability::Normal, ..Config::default() }).unwrap());
+    let plain = Network::start(rt, Directory::new(), settings(None)).unwrap();
+    assert!(plain.shared.relayed.is_none());
+    assert!(plain.shared.greases);
+    assert_eq!(plain.relay_status(), crate::relay::RelayStatus::default());
+    // With lookup settings, the socket is wrapped and the fixed bit is not greased.
+    let urbit = Arc::new(Listings::default());
+    let (_zod, zod_net) = crew(&dirs[1], "~zod", &urbit, "127.0.0.1:9".parse().unwrap(), None);
+    assert!(zod_net.shared.relayed.is_some());
+    assert!(!zod_net.shared.greases);
+}
+
+#[test]
+fn a_relayed_connection_idle_past_its_routers_memory_still_works_and_no_made_up_address_reaches_them() {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("relayidle-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    // Both routers forget an opening two seconds after anything last went out through it.
+    let (zod_router, zod_socket) = behind(Kind::Strict, Duration::from_secs(2));
+    let (_zod, zod_net) = crew(&dirs[1], "~zod", &urbit, point.addr(), Some(zod_socket));
+    let (nec_router, nec_socket) = behind(Kind::Strict, Duration::from_secs(2));
+    let (_nec, _nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), Some(nec_socket));
+    eventually("both are announced", || point.point_status().unwrap().attending == 2);
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
+    let made = point.point_status().unwrap().relays_made;
+    // Nothing is asked of it for five seconds. (This test waits on the clock, as it must.)
+    std::thread::sleep(Duration::from_secs(5));
+    // The next request goes over the same connection, at once: it kept itself alive, through the
+    // session, so the routers kept the way to the point open.
+    let started = Instant::now();
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    assert_eq!(point.point_status().unwrap().relays_made, made, "the connection was made again");
+    // ~zod's session is let go of while QUIC still sends on the connection (a packet every
+    // second keeps it alive): QUIC's packets for the made-up address go nowhere, and none
+    // reaches the router.
+    // ~zod only calls through its session here, and its connection holds its packets to what
+    // fits with the header. QUIC's search for the path's size reaches that bound (1,452 with
+    // the header); it must not go past it while traffic goes on.
+    let largest = || zod_router.largest_relayed_out.load(Ordering::SeqCst);
+    let searching = Instant::now();
+    while largest() < 1452 {
+        assert!(searching.elapsed() < Duration::from_secs(20), "inconclusive: QUIC's size search reached only {} bytes", largest());
+        assert!(reaches(&zod_net, "~zod", "~nec"));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for _ in 0..20 {
+        assert!(reaches(&zod_net, "~zod", "~nec"));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(largest(), 1452, "a relayed datagram of {} bytes", largest());
+    let unsent = zod_net.relay_status().unsent;
+    zod_net.shared.relayed.as_ref().unwrap().release_all();
+    eventually("QUIC sends to the made-up address", || zod_net.relay_status().unsent > unsent);
+    assert_eq!(zod_router.made_up_seen.load(Ordering::SeqCst) + nec_router.made_up_seen.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_point_carries_a_sessions_packets_only_from_its_two_addresses_and_only_while_the_ship_called_attends() {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("carry-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    let (zod_router, zod_socket) = behind(Kind::Cone, Duration::from_secs(30));
+    let (zod, zod_net) = crew(&dirs[1], "~zod", &urbit, point.addr(), Some(zod_socket));
+    let (nec_router, nec_socket) = behind(Kind::Cone, Duration::from_secs(30));
+    let (_nec, nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), Some(nec_socket));
+    eventually("both are announced", || point.point_status().unwrap().attending == 2);
+    // A session is made as a call makes one, and nothing dials through it: the test speaks on
+    // it itself, from the routers' own outside ports, which are what the point pinned.
+    let finder = zod_net.shared.finder.clone().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (at, id) = zod_net.threads.get().block_on(finder.relay(&zod, "zod", "nec", deadline)).unwrap();
+    assert_eq!(at, point.addr());
+    eventually("~nec registers the session", || nec_net.relay_status().called == 1);
+    let counts = || point.point_status().unwrap().relayed;
+    let carried_in = || nec_router.relayed_in.load(Ordering::SeqCst);
+    // A packet of noughts, which QUIC drops without a word.
+    let packet = crate::relay::wrapped(&id, &[0; 40]);
+    // From ~zod's pinned address: carried to ~nec, as it came.
+    let before = carried_in();
+    zod_router.send_from(point.addr(), &packet);
+    eventually("it is carried to ~nec", || carried_in() == before + 1);
+    // From a stranger, and naming no session from ~zod's own address: neither is carried, and
+    // nothing comes back to the stranger.
+    let stranger = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (stranger_before, unknown_before) = (counts().stranger, counts().unknown);
+    stranger.send_to(&packet, point.addr()).unwrap();
+    zod_router.send_from(point.addr(), &crate::relay::wrapped(&[9; 16], &[0; 40]));
+    eventually("the point drops both", || counts().stranger > stranger_before && counts().unknown > unknown_before);
+    // ~nec's connection to the point closes: its session ends at the point and at ~nec, and a
+    // packet on it from ~zod's own address is not carried.
+    nec_net.shared.finder.as_ref().unwrap().drop_lanes();
+    eventually("the session ends at the point", || point.point_status().unwrap().sessions == 0);
+    eventually("and at ~nec", || nec_net.relay_status().called == 0);
+    let unknown_before = counts().unknown;
+    zod_router.send_from(point.addr(), &packet);
+    eventually("the point drops it", || counts().unknown > unknown_before);
+    assert_eq!(carried_in(), before + 1);
+    stranger.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    assert!(stranger.recv_from(&mut [0u8; 2048]).is_err(), "the stranger was answered");
+}
+
+#[test]
+fn a_flood_of_relayed_packets_and_requests_to_relay_leaves_ordinary_lookups_and_calls_working() {
+    let dirs: Vec<TempDir> = (0..4).map(|n| TempDir::new(&format!("relayflood-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    let (_zod, zod_net) = crew(&dirs[1], "~zod", &urbit, point.addr(), None);
+    // ~nec is behind a strict router: ~zod's calls to it go through the point, and keep going
+    // through it while the floods are on.
+    let (_nec_router, nec_socket) = behind(Kind::Strict, Duration::from_secs(30));
+    let (_nec, nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), Some(nec_socket));
+    let (bud, bud_net) = crew(&dirs[3], "~bud", &urbit, point.addr(), None);
+    eventually("all three are announced", || point.point_status().unwrap().attending == 3);
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (packets, requests) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        // Relayed packets naming sessions nobody has, at the point and at ~nec, as fast as one
+        // thread sends them with a breath every fifty.
+        scope.spawn(|| {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut n = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                n += 1;
+                let mut id = [0u8; 16];
+                id[..8].copy_from_slice(&n.to_be_bytes());
+                let packet = crate::relay::wrapped(&id, &[0x41; 1200]);
+                let _ = socket.send_to(&packet, point.addr());
+                let _ = socket.send_to(&packet, zod_net.addr());
+                if packets.fetch_add(1, Ordering::SeqCst) % 50 == 0 {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            }
+        });
+        // Requests to relay, from ~bud, over and over: each refused (~nec asks for no
+        // introductions, and soon the rates refuse them first).
+        scope.spawn(|| {
+            let finder = bud_net.shared.finder.clone().unwrap();
+            while !stop.load(Ordering::SeqCst) {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                let _ = bud_net.threads.get().block_on(finder.relay(&bud, "bud", "nec", deadline));
+                requests.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // The floods stop however this ends, a failed assertion included.
+        struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _stop = Stop(&stop);
+        // Meanwhile, calls that each need a lookup and a new connection first: each completes,
+        // and both floods went on while it did (counted before and after). (~bud's own
+        // questions share its connection with its flood, which its connection's allowance
+        // meters, so ~bud does not call.)
+        eventually("both floods are under way", || packets.load(Ordering::SeqCst) > 100 && requests.load(Ordering::SeqCst) > 5);
+        // Live sessions carry traffic meanwhile: ~zod calls ~nec through the point, over and
+        // over, and the point carries it.
+        let carried = point.point_status().unwrap().relayed.carried;
+        let p = packets.load(Ordering::SeqCst);
+        for _ in 0..20 {
+            let started = Instant::now();
+            assert!(reaches(&zod_net, "~zod", "~nec"), "the relayed call failed during the flood");
+            assert!(started.elapsed() < Duration::from_secs(3), "a relayed call took {:?}", started.elapsed());
+        }
+        assert!(packets.load(Ordering::SeqCst) > p, "inconclusive: no packet was sent during the relayed calls");
+        assert!(point.point_status().unwrap().relayed.carried > carried);
+        assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
+        for (net, from, to) in [(&nec_net, "~nec", "~zod"), (&zod_net, "~zod", "~bud"), (&nec_net, "~nec", "~bud")] {
+            let (p, r) = (packets.load(Ordering::SeqCst), requests.load(Ordering::SeqCst));
+            let started = Instant::now();
+            assert!(reaches(net, from, to), "{from} could not reach {to} during the flood");
+            assert!(started.elapsed() < Duration::from_secs(3), "{from} to {to} took {:?}", started.elapsed());
+            assert!(packets.load(Ordering::SeqCst) > p, "inconclusive: no packet was sent during the call");
+            assert!(requests.load(Ordering::SeqCst) > r || started.elapsed() < Duration::from_millis(50), "inconclusive: no request was made during the call");
+        }
+    });
+    let status = point.point_status().unwrap();
+    assert!(status.relayed.unknown > 0 && status.relay_asked > 0 && status.relays_made >= 1, "{status:?}");
+    assert!(zod_net.relay_status().dropped > 0);
+}
+
+#[test]
+fn a_relay_is_asked_for_only_for_a_record_that_asks_for_introductions() {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("onlyflagged-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    let (_zod, zod_net) = crew(&dirs[1], "~zod", &urbit, point.addr(), None);
+    let (nec, nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), None);
+    eventually("both are announced", || point.point_status().unwrap().attending == 2);
+    // ~nec, at a public address, asks for no introduction, and then goes away. Its record is
+    // still handed out; nothing answers at its address; and no relay is asked for.
+    assert_eq!(nec_net.announced_as("~nec").map(|(_, introduce)| introduce), Some(false));
+    drop(nec_net);
+    drop(nec);
+    let why = zod_net.ping("~zod", "~nec").unwrap_err().to_string();
+    assert!(!why.contains("relay"), "{why}");
+    let status = point.point_status().unwrap();
+    assert_eq!((status.relay_asked, status.introduced), (0, 0), "{status:?}");
+}
+
+/// Start a try at going direct for a pair, as the kept connection's use would, from the kept
+/// entry of generation `relayed`, on the network's own threads.
+fn try_direct(net: &Network, from: &str, to: &str, relayed: u64) -> tokio::task::JoinHandle<()> {
+    let pair = (from.to_string(), to.to_string());
+    let shared = net.shared.clone();
+    let turn = shared.direct_tries.clone().try_acquire_owned().unwrap();
+    lock(&shared.going_direct).insert(pair.clone());
+    let trying = crate::net::Trying(shared.clone(), pair.clone());
+    net.threads.get().spawn(shared.go_direct(pair, relayed, trying, turn))
+}
+
+/// The generation of the entry kept from one ship to another.
+fn kept_id(net: &Network, from: &str, to: &str) -> u64 {
+    let pair = (from.trim_start_matches('~').to_string(), to.trim_start_matches('~').to_string());
+    let slot = lock(&net.shared.made).get(&pair).cloned().expect("a connection is kept");
+    let held = slot.try_lock().expect("nobody holds it");
+    held.as_ref().expect("a connection is kept").generation
+}
+
+/// QUIC's number for the connection kept from one ship to another (held by the entry while it
+/// is kept, so the number names that connection meanwhile).
+fn kept_connection(net: &Network, from: &str, to: &str) -> usize {
+    let pair = (from.trim_start_matches('~').to_string(), to.trim_start_matches('~').to_string());
+    let slot = lock(&net.shared.made).get(&pair).cloned().expect("a connection is kept");
+    let held = slot.try_lock().expect("nobody holds it");
+    held.as_ref().expect("a connection is kept").connection.stable_id()
+}
+
+/// The place where the connection from one ship to another is kept.
+fn slot_of(net: &Network, from: &str, to: &str) -> Arc<tokio::sync::Mutex<Option<crate::net::Made>>> {
+    let pair = (from.trim_start_matches('~').to_string(), to.trim_start_matches('~').to_string());
+    lock(&net.shared.made).get(&pair).cloned().expect("a connection is kept")
+}
+
+struct ConePair {
+    _dirs: Vec<TempDir>,
+    urbit: Arc<Listings>,
+    point: Network,
+    zod: Arc<Runtime>,
+    zod_net: Network,
+    nec: Arc<Runtime>,
+    nec_net: Network,
+    _routers: (Arc<Router>, Arc<Router>),
+    _point_rt: Arc<Runtime>,
+}
+
+/// Two ships behind routers of the usual kind, ~zod's call to ~nec relayed (introductions made
+/// to fail at both ends), and then introductions working again: a try at going direct will get
+/// through.
+fn relayed_cone_pair(label: &str) -> ConePair {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("{label}-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    let (zod_router, zod_socket) = behind(Kind::Cone, Duration::from_secs(30));
+    let (zod, zod_net) = crew(&dirs[1], "~zod", &urbit, point.addr(), Some(zod_socket));
+    let (nec_router, nec_socket) = behind(Kind::Cone, Duration::from_secs(30));
+    let (nec, nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), Some(nec_socket));
+    eventually("both are announced", || point.point_status().unwrap().attending == 2);
+    let introducing = |net: &Network, on: bool| net.shared.finder.as_ref().unwrap().introducing.store(on, Ordering::SeqCst);
+    introducing(&zod_net, false);
+    introducing(&nec_net, false);
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
+    introducing(&zod_net, true);
+    introducing(&nec_net, true);
+    ConePair { _dirs: dirs, urbit, point, zod, zod_net, nec, nec_net, _routers: (zod_router, nec_router), _point_rt: point_rt }
+}
+
+#[test]
+fn a_try_at_going_direct_is_weighed_where_it_commits_and_waits_for_the_slot_no_longer_than_its_deadline() {
+    let pair = relayed_cone_pair("commit");
+    let net = &pair.zod_net;
+    let made = || net.shared.direct_made.load(Ordering::SeqCst);
+    let slot = slot_of(net, "~zod", "~nec");
+    let relayed_id = kept_id(net, "~zod", "~nec");
+    // An address set by hand between the try's candidate and its commit: the candidate is closed
+    // and the kept entry untouched. (The test holds the pair's slot: the try waits for it.)
+    let opened = net.open_connections();
+    let held = slot.try_lock().unwrap();
+    let trying = try_direct(net, "zod", "nec", relayed_id);
+    eventually("the try has made its candidate", || made() == 1);
+    net.shared.directory.place("~nec", pair.nec_net.addr()).unwrap();
+    drop(held);
+    net.threads.get().block_on(trying).unwrap();
+    assert_eq!(kept_id(net, "~zod", "~nec"), relayed_id);
+    assert_eq!(relayed(net, "~zod", "~nec"), Some(true));
+    eventually("the candidate is closed", || net.open_connections() <= opened);
+    net.shared.directory.listed.write().unwrap().places.remove("nec");
+    // The ship's key changes in the same gap: the same.
+    let held = slot.try_lock().unwrap();
+    let trying = try_direct(net, "zod", "nec", relayed_id);
+    eventually("the try has made its candidate", || made() == 2);
+    let real = {
+        let mut listed = net.shared.directory.listed.write().unwrap();
+        let entry = listed.keys.get_mut("nec").unwrap();
+        std::mem::replace(&mut entry.key, [7; 32])
+    };
+    drop(held);
+    net.threads.get().block_on(trying).unwrap();
+    assert_eq!(kept_id(net, "~zod", "~nec"), relayed_id);
+    eventually("the candidate is closed", || net.open_connections() <= opened);
+    net.shared.directory.listed.write().unwrap().keys.get_mut("nec").unwrap().key = real;
+    // The kept entry is replaced, in the gap, by another for the same pair: the same relayed
+    // connection, session and calling key, so the same by every field but its generation (and
+    // by QUIC's number for the connection, which the check used to compare). The try's commit
+    // refuses it.
+    let held = slot.try_lock().unwrap();
+    let trying = try_direct(net, "zod", "nec", relayed_id);
+    eventually("the try has made its candidate", || made() == 3);
+    let mut held = held;
+    let renewed = net.shared.generations.fetch_add(1, Ordering::SeqCst);
+    held.as_mut().unwrap().generation = renewed;
+    drop(held);
+    net.threads.get().block_on(trying).unwrap();
+    assert_eq!(kept_id(net, "~zod", "~nec"), renewed);
+    assert_eq!(relayed(net, "~zod", "~nec"), Some(true));
+    eventually("the candidate is closed", || net.open_connections() <= opened);
+    let relayed_id = renewed;
+    // In the gap, the ship called is dropped from the directory, the room for proved keys is
+    // filled with other ships, and the same key is read afresh for it, not yet proved. The route
+    // is still found with the same key; the proof finds no room, and refuses.
+    let held = slot.try_lock().unwrap();
+    let trying = try_direct(net, "zod", "nec", relayed_id);
+    eventually("the try has made its candidate", || made() == 4);
+    let proved_room = net.shared.directory.bounds.proved;
+    {
+        let mut listed = net.shared.directory.listed.write().unwrap();
+        let entry = listed.keys.remove("nec").unwrap();
+        for n in 0..proved_room {
+            listed.keys.insert(format!("filler-{n}"), crate::net::Entry { key: [1; 32], from: crate::net::From::Read { at: std::time::Instant::now(), revision: 1, doubted: false }, proved: true });
+        }
+        listed.keys.insert("nec".into(), crate::net::Entry { key: entry.key, from: crate::net::From::Read { at: std::time::Instant::now(), revision: 1, doubted: false }, proved: false });
+    }
+    drop(held);
+    net.threads.get().block_on(trying).unwrap();
+    assert_eq!(kept_id(net, "~zod", "~nec"), relayed_id);
+    assert_eq!(relayed(net, "~zod", "~nec"), Some(true));
+    eventually("the candidate is closed", || net.open_connections() <= opened);
+    {
+        let mut listed = net.shared.directory.listed.write().unwrap();
+        listed.keys.retain(|name, _| !name.starts_with("filler-"));
+        listed.keys.get_mut("nec").unwrap().proved = true;
+    }
+    // The slot held past the try's deadline: the try gives up then, closes its candidate, and
+    // gives back its place.
+    let held = slot.try_lock().unwrap();
+    let started = Instant::now();
+    let trying = try_direct(net, "zod", "nec", relayed_id);
+    let ended = net.threads.get().block_on(async { tokio::time::timeout(Duration::from_secs(12), trying).await });
+    assert!(ended.is_ok(), "the try waited for the slot past its deadline");
+    assert!(started.elapsed() >= Duration::from_secs(7), "{:?}", started.elapsed());
+    assert_eq!(made(), 5);
+    assert_eq!(net.shared.direct_tries.available_permits(), MOST_DIRECT_TRIES);
+    drop(held);
+    assert_eq!(kept_id(net, "~zod", "~nec"), relayed_id);
+    eventually("the candidate is closed", || net.open_connections() <= opened);
+    // The relayed connection closed (as the ship called closes it when it takes a direct one)
+    // before the commit: the candidate still takes its place.
+    slot.try_lock().unwrap().as_ref().unwrap().connection.close(quinn::VarInt::from_u32(0), b"closed by the test");
+    net.threads.get().block_on(try_direct(net, "zod", "nec", relayed_id)).unwrap();
+    assert_eq!(relayed(net, "~zod", "~nec"), Some(false), "a good candidate was thrown away");
+    assert!(reaches(net, "~zod", "~nec"));
+    assert_eq!(relayed(net, "~zod", "~nec"), Some(false));
+}
+
+#[test]
+fn a_command_under_way_on_a_relayed_connection_when_the_pair_goes_direct_arrives_exactly_once() {
+    let pair = relayed_cone_pair("handoff");
+    let net = &pair.zod_net;
+    let relayed_id = kept_id(net, "~zod", "~nec");
+    // ~zod's packets for its sessions are held back: a command sent now is under way on the
+    // relayed connection, and does not arrive.
+    let wrapper = net.shared.relayed.clone().unwrap();
+    *lock(&wrapper.holding) = Some(Vec::new());
+    let before = pair.nec.log_head("~nec", "counter", "counter").unwrap().map_or(0, |(seq, _)| seq);
+    // The gate: the next Deliver request is held once it has been written, before its reply is
+    // read, until the test lets it go.
+    let gate = &net.shared.deliver_gate;
+    gate.armed.store(true, Ordering::SeqCst);
+    assert_eq!(String::from_utf8(pair.zod.deliver("~zod", "tally", b"tell nec log hits").unwrap().reply).unwrap(), "sent");
+    let relayed_connection = kept_connection(net, "~zod", "~nec");
+    eventually("a Deliver is written on the relayed connection and held", || *lock(&gate.holding) == Some(relayed_connection));
+    assert_eq!(pair.nec.log_head("~nec", "counter", "counter").unwrap().map_or(0, |(seq, _)| seq), before, "the command got through the hold");
+    // The pair goes direct while that request is still under way.
+    net.threads.get().block_on(try_direct(net, "zod", "nec", relayed_id)).unwrap();
+    assert_eq!(relayed(net, "~zod", "~nec"), Some(false));
+    assert!(!gate.ended.load(Ordering::SeqCst) && lock(&gate.holding).is_some(), "inconclusive: the held Deliver ended before the pair went direct");
+    // It is let go: its connection has closed, so it fails, and the command is delivered again.
+    gate.release.notify_one();
+    eventually("the held Deliver ends", || gate.ended.load(Ordering::SeqCst));
+    *lock(&wrapper.holding) = None;
+    // The command arrives, once, and its receipt comes back; the next goes too, on the direct
+    // connection, and is counted exactly.
+    eventually("the command arrives", || pair.nec.log_head("~nec", "counter", "counter").unwrap().is_some_and(|(seq, _)| seq >= before + 1));
+    eventually("its receipt comes back", || pair.zod.outbound_pending("~zod").unwrap() == 0);
+    trade(&pair.zod, "~zod", &pair.nec, "~nec", 1);
+    assert_eq!(pair.nec.log_head("~nec", "counter", "counter").unwrap().map(|(seq, _)| seq), Some(before + 2));
+    assert_eq!(relayed(net, "~zod", "~nec"), Some(false));
+    let _ = (&pair.urbit, &pair.point, &pair.nec_net);
+}
+
+#[test]
+fn a_ship_set_by_hand_at_a_made_up_address_is_not_called_through_anyones_session() {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("placedmadeup-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (_point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    // ~zod and ~marzod on one runtime; ~nec behind a strict router.
+    let (_zod, zod_net) = crew_of(&dirs[1], &["~zod", "~marzod"], &urbit, settings(Some(point.addr())), None);
+    let (_nec_router, nec_socket) = behind(Kind::Strict, Duration::from_secs(30));
+    let (_nec, nec_net) = crew(&dirs[2], "~nec", &urbit, point.addr(), Some(nec_socket));
+    eventually("all three are announced", || point.point_status().unwrap().attending == 3);
+    assert!(reaches(&zod_net, "~zod", "~nec"));
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
+    // ~nec is set by hand at the very made-up address of ~zod's live session to it.
+    let session = {
+        let slot = slot_of(&zod_net, "~zod", "~nec");
+        let held = slot.try_lock().unwrap();
+        held.as_ref().unwrap().peer.addr
+    };
+    assert!(crate::relay::is_made_up(&session));
+    zod_net.shared.directory.place("~nec", session).unwrap();
+    // ~marzod's call is refused before anything is sent, saying why: no connection from it
+    // reaches ~nec through the session (~nec counts each calling pair it has taken).
+    let callers = nec_net.callers_remembered();
+    let why = zod_net.ping("~marzod", "~nec").unwrap_err().to_string();
+    assert!(why.contains("an address no ship can be at"), "{why}");
+    assert_eq!(nec_net.callers_remembered(), callers);
+    // ~zod's relayed connection is undisturbed.
+    assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
 }

@@ -233,6 +233,7 @@ source rather than something the tests prove.
 | `runtime/src/net.rs` | QUIC transport, the directory of keys and addresses, identity checks against it, carrying commands and log entries between ships |
 | `runtime/src/whereabouts.rs` | A ship's signed record of where it is, and the one check of such a record |
 | `runtime/src/lookup.rs` | Lookup points: being one, finding the one for a galaxy, asking it where a ship is, and announcing this runtime's ships to it |
+| `runtime/src/relay.rs` | The relay: the framing of relayed packets, the socket wrapper (sessions and made-up addresses at a ship, carrying at a point), and the point's sessions and byte allowances |
 | `runtime/src/server.rs` | The HTTP server for apps and browsers |
 | `runtime/src/bin/serve.rs` | Command-line wrapper around the HTTP server, with a demo ship |
 | `runtime/src/bin/loadtest.rs` | Load test |
@@ -1298,7 +1299,7 @@ lists for it, the same key the ship must prove when it is called.
   each record it holds, the connection the ship itself is on: where the ship
   attends. That stops when the connection closes, when the record runs out, or
   when a newer record of the ship is kept, which names its own connection.
-- A point answers four requests. `Announce` carries up to 16 records, each with
+- A point answers five requests. `Announce` carries up to 16 records, each with
   its presence; each is
   checked against the point's own source of keys (in `serve`, the copy of
   Azimuth, which `--lookup-point` needs), read on threads that may wait (8 at
@@ -1308,7 +1309,8 @@ lists for it, the same key the ship must prove when it is called.
   meanwhile, is not kept. The reply says, for each, kept or why not. `Where` names a ship by number; the reply is
   its record if one is held and still good, or nothing. `Seen` is answered
   with the address the point sees the connection coming from. `Introduce`
-  asks the point to pass the caller's record to a ship (see Home routers). The
+  asks the point to pass the caller's record to a ship (see Home routers), and
+  `Relay` to carry the caller's packets to a ship (see The relay). The
   point keeps records, and who attends where, in memory only, for all
   galaxies or a list, and refuses records of ships of other galaxies.
 - A point's bounds (`PointBounds`): 65,536 records, 16,384 moons, 64 moons of
@@ -1496,13 +1498,217 @@ lists for it, the same key the ship must prove when it is called.
   whoever it sends to. Routers of a stricter kind give a different outside
   port for each destination: the port the point saw is not the one the ship's
   packets toward the caller leave from, and the caller's packets arrive at a
-  port that lets in only the point. Calls to a ship behind such a router fail
-  in their time, saying the ship could not be reached directly. Reaching it
-  needs a relay, which is not built.
+  port that lets in only the point. No amount of sending at the same moment
+  opens such a router to a caller, because the caller can never learn the port
+  that would be opened. Such a ship is reached through its point's relay,
+  below, where the point relays; where it does not, the call fails in its
+  time, saying the ship could not be reached directly and that its point does
+  not relay.
+- The relay. What every ship can always reach is its own point: it keeps a
+  connection open to it, which its router keeps open. So when the direct way
+  fails, the point can carry the two ships' packets between them. The
+  connection between the two ships is still an ordinary ship-to-ship QUIC
+  connection, end to end, with every key check there is (the key the ship
+  called proves, the caller's `Hello`, a moon's word, the checks against the
+  directory). The point sees only encrypted packets: it can drop, delay,
+  repeat or misdeliver them, and nothing more. Nothing it says about a session
+  is believed about who anyone is (`runtime/src/relay.rs`).
+
+  On the wire a relayed packet is one UDP datagram to or from the point's
+  ordinary port: one byte, `0x15`, the 16 bytes that name the session, then the
+  ships' QUIC packet as it is. The first byte has neither of its two top bits
+  set. A QUIC packet's first byte always has one of them (the long-header bit,
+  or the "fixed bit"), unless the fixed bit has been cleared as a "grease",
+  which QUIC does only toward a peer that has said it takes such packets. A
+  runtime with lookup settings tells QUIC not to grease: it then never says it
+  takes them, no peer clears the bit toward it, and its endpoint refuses any
+  packet with the bit clear. So nothing its QUIC endpoint would take can be
+  taken for a relayed packet, by construction and not by odds. (The four-byte
+  packet that opens a router begins with a nought, which `0x15` is not.) A
+  runtime with no lookup settings keeps QUIC's settings and its socket exactly
+  as they were.
+
+  The work is done by a wrapper around the runtime's UDP socket, there
+  whenever the runtime has lookup settings. At a ship, each session has a
+  made-up address: QUIC is told to dial it, or sees the other ship's packets
+  come from it. A packet QUIC sends there is wrapped and sent to the session's
+  point; with no session for it, it goes nowhere. A made-up address is never
+  handed to the real socket. A datagram that carries the first byte and a
+  session this ship registered, from that session's point, is unwrapped and
+  shown to QUIC as from the made-up address; one that names no session here,
+  or comes from anywhere but its point, goes no further, and nothing is sent
+  in answer. A datagram that says it comes from a made-up address is dropped
+  too: none can arrive from a real network, and it must not pass for a
+  session's. Everything else passes as it always did, the ship's own
+  connection to that same point included. The made-up addresses are the IPv4
+  limited broadcast address, `255.255.255.255`, for a socket on IPv4, and
+  `ff00::1` (a multicast address of the reserved scope nought, which nodes
+  must not send to) for one on IPv6, each with a port that tells one session
+  from another: no record may carry either (records refuse broadcast and
+  multicast), routers never pass either on, and a socket that has not asked
+  for broadcast cannot even send to the first. QUIC will not dial an IPv6
+  address on an IPv4 socket, which is why the family follows the socket's. A
+  made-up address is never handed to the real socket, whatever asks for it (a
+  packet for one is dropped at the one place anything is sent), is never taken
+  as a session's point, never connected to as a lookup point, and never dialed
+  for a ship whose address is set by hand ("an address no ship can be at"). An
+  address let go of is not given to another session while the handle of the
+  session that had it lives, and then not until nothing has been sent to it or
+  come from it for the idle time and a minute more (a send by QUIC counts).
+  That is all it establishes: QUIC's closing and draining take three probe
+  timeouts, which depend on the path. A stale packet that did cross a reuse
+  would be another connection's packet to the far ship, which cannot decrypt
+  it, and no check of who anyone is depends on it.
+- How a relayed call goes:
+  1. The caller tries as above: the introduction, then the record's addresses.
+     When a relay may follow (the record asks for introductions, and the
+     caller has a record of its own to show), all of that direct work ends five
+     seconds into the call, or half way through it, whichever is sooner, so
+     that the relay always has room. A hole that opens does so within about one
+     Retry round trip and one resending of the first packet, about a second;
+     five seconds leaves room for real distances.
+  2. If nothing answered, the directory is read again (an address set by hand
+     wins, as before every question), and the caller asks the ship's point to
+     relay (`Relay`): the ship's name, its own record signed just then, and its
+     presence on that connection, exactly as for an introduction. It waits at
+     most a second, and at most a quarter of the time left.
+  3. The point refuses, saying so, if it does not relay. Otherwise it checks
+     the record and presence as it checks an introduction (the same admission,
+     threads and rates, keeping nothing), and with its table held makes a
+     session: sixteen bytes from the system's randomness, and two addresses
+     pinned then and never changed: the remote address of the connection the
+     ship called attends on, and the remote address of the connection the
+     request came on. It refuses unless the ship attends there at that moment
+     and its own record asks callers to be introduced: a ship that says it can
+     be reached directly is not relayed for. It passes the caller's record and
+     the session to the ship over the connection it attends on (the same way,
+     and within the same bounds, as an introduction), and answers the caller
+     with the session. It does not wait for the ship.
+  4. The ship called weighs the caller's record exactly as it weighs an
+     introduction (its own directory and clock, what it already believes of
+     the caller, a moon's word by its own rules, nothing kept), under the same
+     allowance for weighing, and only for a ship of its own last announced
+     asking for introductions. Then it registers the session, bound to the
+     point at the other end of the connection the push came on: at most 8 for
+     any one caller ship and 64 in all, dropped when nothing has passed for 30
+     seconds and when that connection closes. It sends nothing.
+  5. The caller reads the directory again, registers the session (at most 256
+     of its own), and dials its made-up address with the rest of the time, on
+     a connection that keeps itself alive and keeps its packets small enough
+     for the header. The ship called answers it as any caller: with a Retry,
+     the handshake, the `Hello`, every limit on callers. Whatever answers must
+     prove the ship's key. A connection made this way is marked as relayed
+     where it is kept, and holds its session for as long as it is kept.
+  6. If the point refuses or says nothing, or nothing answers through it, the
+     call fails in its time, saying what was tried and why (the point does not
+     relay, refused for a limit, did not answer, or nothing answered through
+     it).
+
+  A record whose addresses did not answer and whose ship the relay did reach
+  is remembered (by the number it was kept under, for 1,024 records), and the
+  next call on it goes straight to the relay, asking for no introduction; when
+  the record is replaced, the next call tries the direct way first again.
+- At the point, a relayed datagram whose session is live, from exactly one of
+  its two pinned addresses, is sent on to the other unchanged, and only if
+  that side is still there: toward the ship called only while it still
+  attends on the connection the session was made toward (weighed as passing
+  an introduction weighs it); toward the caller only if the caller has itself
+  sent on the session from its pinned address in the last 30 seconds (or the
+  session was made in the last 5). A session nothing has been carried on for
+  30 seconds is dropped, and so are the sessions toward a ship whose
+  connection closes or whose newer record names another connection. Anything
+  else is dropped, and none of it reaches the point's QUIC. This is done where
+  the datagram is received, with a send that never waits: nothing is queued,
+  and nothing waits; the work is a look in the table and a few counts, with
+  the table held, so no packet is carried on a session after the point has let
+  it go. What goes out is exactly what came in. So nobody can aim a point at
+  an address: it sends only to the two addresses of a session, each the remote
+  address of a connection to the point that has answered from there (the point
+  sends a Retry to every new caller), the caller's the one it asked from, and
+  only while whoever is there is still asking for it.
+- A point relays only if whoever runs it says so (`PointConfig::relay`,
+  `serve --relay`), and only within bounds (`RelayBounds`), which are what
+  bound the bill. A packet over an allowance is dropped, and the ships' QUIC
+  slows down as it does for any loss.
+  - Bytes carried for any one ship called, in both directions of all its
+    sessions together: 256 KiB at a stroke, and 128 KiB earned back each
+    second, up to 256 KiB again (`serve --relay-ship-rate`, with a burst of
+    twice that).
+  - Bytes carried in all: 8 MiB at a stroke, and 4 MiB earned back each
+    second, up to 8 MiB again (`serve --relay-point-rate`, the same way).
+  - Sessions live: 16 for any one ship called, 16 for any one caller, 2 for
+    any one caller and ship called together (so that a caller that lost its
+    session can make another before the old one idles out), 1,024 in all.
+    Sessions made: 4 for any one caller at a stroke and 4 earned back each
+    `rate_period`, and 512 at a stroke and 512 each `rate_period` in all. For
+    the caller's counts and allowance, a moon counts as its planet: moons are
+    free to whoever has a planet. A moon called is its own ship.
+
+  So in any span of T seconds the point sends at most 8 MiB + 4 MiB x T in
+  all, and at most 256 KiB + 128 KiB x T on behalf of any one ship called. A
+  packet is sent only once both allowances have been charged with it, and
+  after the send, with the table still held, the clock is read again and both
+  allowances' refill stamps are moved up to it, so nothing is earned for the
+  time the send took. Then for a span [a, a + T]: an allowance holds at most
+  its burst B when the span begins and earns at most its rate r times T within
+  it; a packet charged before a and sent after it was paid for out of what the
+  allowance held when it was charged, with nothing earned between its charge
+  and its send, so it and what follows come to at most B + r x T. Toward any one pinned address, what goes out is at
+  most what the session's other address sent in, and at most 256 KiB + 128
+  KiB x T for each ship called that has a session pinning that address; since
+  several ships may sit behind one address, the overall figure is the only
+  bound for an address as such. A request to relay is weighed cheapest and
+  narrowest first: whether the point relays; the connection's allowance of
+  questions; whether the ship attends; the record rates; the point's
+  allowance of sessions made; then, on a thread, the record and presence, the
+  caller's own allowance, and with the table held the rest. A refusal says
+  which limit it met. The allowances of sessions made are charged as requests
+  are admitted, before the checking work, which is what they are there to
+  bound; so the sessions actually made in any span of T seconds are at most
+  the burst plus the refill times T plus those admitted and not yet made. In
+  all, those are the requests in hand, at most `MOST_IN_HAND` (64): at most
+  512 + 512 x T/`rate_period` + 64. For one caller, its own allowance is
+  charged on a checking thread, after its presence is checked, so those not
+  yet made are at most the 8 checking threads: at most 4 + 4 x
+  T/`rate_period` + 8. The caps on sessions live are what bound the bill;
+  these bound how fast sessions come and go. `PointStatus` shows the sessions live, the requests to
+  relay heard and the sessions made, the bytes carried and dropped for each
+  reason (no such session, from a stranger, toward a side that is not there,
+  over the ship's allowance, over the point's), and the bytes carried for each
+  ship called while it has a session.
+- What it costs a call: a ship behind a strict router, or two such ships, is
+  reached after the direct share (five seconds, or half the call) and one more
+  trip to the point, through which the connection then runs, by way of the
+  point, at every packet. The next call on the same record goes straight to
+  the relay.
+- Going direct again. While a kept connection goes through a relay and is in
+  use, the caller tries the direct way again every `direct_again` (60
+  seconds, at least 2), by the path any call takes (the record, an
+  introduction, each address, the directory read again before each), at most
+  one try for a pair at a time and 16 in all. The ship called takes the
+  direct connection as it takes any newer connection from the same calling
+  ship: it replaces the older at once, so the relayed connection is closed
+  from that end as soon as the direct one is taken. So a connection a try
+  makes takes the relayed one's place, with the pair's slot held (waited for
+  no longer than the try's own deadline), if the entry kept is still the very
+  one the try began from (whether or not it has closed since), the route still
+  fits, and it is proved again in one step with the directory, as any kept
+  connection is; the relayed connection is then closed here too, and its
+  session let go of. A request under way on the relayed connection at that
+  moment fails as any request on a closed connection does; commands are
+  delivered exactly once all the same, by the redelivery that already exists.
+  A try that fails before the ship called has taken its connection changes
+  nothing (no record is marked failed, no key doubted) and costs only its
+  packets. One that fails after (its last proof fails because an address was
+  set by hand or the key changed meanwhile, or someone else remade the kept
+  connection meanwhile) closes its candidate, and if the ship called had
+  already closed the relayed connection, the pair has no working kept
+  connection until the next call makes one. The point's and the ship called's
+  ends of the session go idle and are dropped after 30 seconds.
 - A ship that announces no record of its own (on a runtime that announces
-  nothing, or whose point has not taken its record) cannot be introduced: it
-  tries the addresses anyway, which works only if the ship it calls can be
-  reached without.
+  nothing, or whose point has not taken its record) cannot be introduced or
+  relayed: it tries the addresses anyway, which works only if the ship it calls
+  can be reached without.
 - Bounds on introductions, at the point (`PointBounds`): `introductions`
   (512) passed on at a stroke and 512 earned back each `rate_period`, in all,
   and `introductions_each` (4 at a stroke, 4 each `rate_period`) for any one
@@ -1581,10 +1787,15 @@ and the `WhereReply` the matching answer, or only `refused` with a reason.
 | `Where { ship }` | `Found { record }` | The ship's record as the point holds it, or empty if it holds none still good |
 | `Seen {}` | `Saw { address }` | The address the point sees this connection coming from |
 | `Introduce { callee, record, presence }` | `Introduced {}` | Pass the caller's record, with its presence on this connection, to the ship named, over the connection it attends on |
+| `Relay { callee, record, presence }` | `Relaying { session }` | Carry the caller's packets to the ship named and back, under a session of 16 bytes; the caller's record and the session are passed to the ship |
 
 From a point to a ship, on a stream the point opens on the connection the ship
-attends on: `Introduction { callee, record }`, the caller's record for the
-ship named. Nothing in it is taken on the point's word.
+attends on: `Introduction { callee, record, session }`, the caller's record for
+the ship named, and for a relay the session. Nothing in it is taken on the
+point's word.
+
+A relayed packet is not a message: it is a UDP datagram of the byte `0x15`, the
+16 bytes of the session, and the ships' QUIC packet (see The relay).
 
 ### Commands between ships, exactly once
 
@@ -1810,7 +2021,7 @@ and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `serve` | none | Be a lookup point: `PointConfig { keys, galaxies, bounds }` |
+| `serve` | none | Be a lookup point: `PointConfig { keys, galaxies, bounds, relay }` |
 | `at` | none | Lookup points' addresses, each for one galaxy or (`None`) for all |
 | `domain` | none | `(domain, port)`: the point for `~zod` is `zod.<domain>` |
 | `resolver` | the system's | What names are looked up through |
@@ -1820,11 +2031,17 @@ and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 | `announce_every` | 120 s | How often each ship is announced again; at most 5 minutes |
 | `ask_again` | 3 s | Least time between questions about one ship, and how long a failed name lookup is remembered |
 | `resolved_for` | 300 s | How long an answer from the resolver is used |
+| `direct_again` | 60 s | While a connection goes through a relay and is in use, how often the direct way is tried again; 2 seconds to a day |
 
-`PointBounds` (in `PointConfig`): `records` 65,536, `moons` 16,384,
-`moons_each` 64, `connections` 256, `per_connection` 256 and `in_all` 2,048
-records each `rate_period` (1 s), and `introductions` 512 and
-`introductions_each` 4 introductions passed on each `rate_period`.
+`PointConfig { keys, galaxies, bounds, relay }`. `PointBounds`: `records`
+65,536, `moons` 16,384, `moons_each` 64, `connections` 256, `per_connection`
+256 and `in_all` 2,048 records each `rate_period` (1 s), and `introductions`
+512 and `introductions_each` 4 introductions passed on each `rate_period`.
+`relay` is `None` (the point relays nothing, and says so) unless given
+`RelayBounds` (`runtime/src/relay.rs`): `ship_rate` 128 KiB and `ship_burst`
+256 KiB a ship, `point_rate` 4 MiB and `point_burst` 8 MiB in all, bytes a
+second and at a stroke; `sessions_each` 16, `sessions_from` 16,
+`sessions_pair` 2, `sessions` 1,024 live; `made_each` 4 and `made` 512 sessions made each `rate_period`.
 
 `Network::start` refuses settings that could wedge a ship: `max_ship_bytes`
 below 256 KiB, a `max_message_bytes` without room for the largest command or
@@ -2127,9 +2344,59 @@ lately, and one with a port for each destination. With real runtimes and a
 real point: a ship behind the first kind called by name from a public address
 and from behind a router of its own, with commands and receipts both ways; the
 same call failing without the introduction; two ships behind the second kind
-failing in time, saying they could not reach each other directly; and a
-connection through a router that forgets idle openings after two seconds still
-answering at once after five idle seconds.
+failing in time, saying they could not reach each other directly, where the
+point does not relay; and a connection through a router that forgets idle
+openings after two seconds still answering at once after five idle seconds.
+
+For the relay, `router_tests.rs` also has, with real runtimes and a real
+point that relays: two ships behind strict routers calling each other by name,
+each direction relayed, commands and receipts both ways, the ships' own
+connections to the point working meanwhile, the next call on the same record
+going straight to the relay, and all three stopping promptly with sessions
+live; a ship at a public address and one behind a strict router calling each
+other (relayed one way, direct the other); a pair behind ordinary routers
+relayed with the introduction made to fail, tries at the direct way counted
+(none before one is due, none while one is under way for the pair), a try begun
+from another kept connection not taking its place, then moving to the direct
+way while commands keep going, with nothing lost or delivered twice, nothing
+more carried, and the session ending at all three; a try held at the pair's
+slot while an address is set by hand or the key changes (its candidate closed,
+the kept entry untouched), held past its deadline (it gives up then), and
+committing though the relayed connection has closed meanwhile; a command held
+under way on the relayed connection as the pair goes direct, delivered exactly
+once; a ship set by hand at a live session's made-up address, refused without
+anything sent; an address set by hand while
+the point holds a request to relay (the call stops before it uses the
+session), and with one set, no relay asked for; no lookup settings meaning no
+wrapper and QUIC's settings as they were; a relayed connection idle past its
+routers' memory still answering at once, and QUIC's packets for a made-up
+address whose session is gone reaching no router; a point's rules counted at
+the routers (from a pinned address carried, from a stranger or naming no
+session not, and nothing after the ship called's connection closes); and
+ordinary lookups and calls completing while relayed packets and requests to
+relay flood a point and a ship. Unit tests in `relay.rs` cover the first byte
+against QUIC's and the punch's, segmented sends split each with its header,
+received batches split and rebuilt, a relayed datagram reaching QUIC only for
+a session here from its point (and nothing sent in answer, nor for a session
+gone idle), a made-up destination never reaching the real socket whatever asks
+for it, a stale session handle releasing only its own session and its address
+not given again while it lives, nothing earned for the time a send takes, a flood of relayed datagrams letting the endpoint go on with its
+other work after so many rounds, the bounds on a
+ship's sessions and their end with the connection they came on, and a made-up
+address not given again while anything may remember it; in `lookup.rs`, the
+point carrying only between a live session's two pinned addresses, toward a
+caller only while it has sent lately (by a clock the test moves), dropping a
+session left idle and one whose ship called closes, moves or runs out,
+refusing requests to relay for each reason and bound (a session made only with
+room for its push), two sessions at most for a pair with a moon counted as its
+planet, a session whose every send fails going idle all the same, a lookup
+point at a made-up address never connected to, holding both byte
+allowances over every measured interval at a load that would break them, one
+ship at its allowance not stopping another, and sending out exactly what came
+in; and in `tests/lookup.rs`, a point refusing requests to relay saying why
+and answering a genuine one with a session passed to the ship, and a lying
+point registering no session at a ship beyond what the ship believes and
+allows, with stray relayed packets drawing no answer.
 
 The load test (`runtime/src/bin/loadtest.rs`) takes `--ships` (500),
 `--active` (50), `--events` (20,000), `--threads` (8), `--max-awake` (64),
@@ -2219,10 +2486,49 @@ These are stated in the source.
   as a ship naming any address in its own record already could, within the
   same bounds. An address given by hand is never replaced or added to by what
   a point says.
-- A ship behind a router that gives each destination a port of its own cannot
-  be reached, from home or from a public address, and two such ships cannot
-  reach each other: carrying traffic for ships that cannot be reached
-  directly (a relay) is not built. Such calls fail in their time and say so.
+- A ship behind a router that gives each destination a port of its own is
+  reached only where its point relays. Where it does not, calls to it fail in
+  their time and say so.
+- The relay is the lookup point of the galaxy at the top of a ship's name,
+  and nothing else relays: stars do not relay for their planets. It is not the
+  ship's sponsor in Urbit ID; the two differ for a ship that has changed
+  sponsors.
+- With the defaults, eight ships of different owners (or one owner of eight
+  planets) can hold all sixteen of a ship's sessions at its point, two each,
+  which stops other relayed calls to that ship and nothing else. A moon counts
+  as its planet, so moons do not add to that. The numbers are settings.
+- A point that relays learns who talks to whom, when, and how much. It cannot
+  read or forge what is carried, but it can drop, delay, repeat or misdeliver
+  it, and refuse to relay at all.
+- A point at its overall allowance slows every relayed pair it carries; one at
+  a ship's allowance slows every pair calling that ship. Rubbish requests to
+  relay, past their own connection's allowances and naming a ship that
+  attends, spend the point's allowance of sessions made, as rubbish
+  introductions spend the allowance of introductions; and a caller's own
+  allowance is charged once its presence checks, even if the table then
+  refuses (as for introductions).
+- A relayed pair whose ship called remakes its connection to the point loses
+  its sessions, and the caller's connection through it goes quiet until it is
+  found dead (its idle time); the next call is relayed afresh.
+- The relay costs every call to a ship behind a strict router the direct
+  share (five seconds, or half the call) first; the next call on the same
+  record goes straight to the relay. Going direct again costs a try every
+  `direct_again` while relayed, which for a pair behind strict routers never
+  succeeds.
+- At a ship, a point the ship attends on can push sessions for any genuine
+  record still good that it has seen, within the ship's bounds (8 per caller
+  ship, a moon counted as its planet, 64 in all, for 30 idle seconds each);
+  filling them stops relayed calls to that ship, which that point could stop
+  anyway by not relaying. The 65,535 made-up addresses of a runtime are kept
+  from reuse while a handle to their session lives and for the idle time and a
+  minute more after; a runtime that made sessions faster than that could run
+  out, and is then refused new ones until some are free.
+- When a relayed pair goes direct, a request under way on the relayed
+  connection at that moment fails (the ship called closes it as it takes the
+  direct one), and commands on it are delivered by the usual redelivery.
+- Relayed packets are 17 bytes larger. A caller keeps its packets small enough
+  for that; the ship called finds the size by QUIC's own search, which treats
+  a packet too large as lost.
 - An introduction names the caller, and the caller's addresses, to the
   ship's point and to the ship, which a question (`Where`) does not. That is
   why only records that ask for it cost their callers one.
@@ -2237,9 +2543,10 @@ These are stated in the source.
   ship send them for any genuine record still good that it has seen and that
   is newer than any that ship already holds of the caller, within the same
   limits.
-- Two ships behind the same router are not helped: each is announced at the
-  router's outside address, and whether a router passes packets from inside
-  back inside through its own outside address varies. Local network addresses
+- Two ships behind the same router are not helped by the direct way or an
+  introduction: each is announced at the router's outside address, and whether
+  a router passes packets from inside back inside through its own outside
+  address varies. A point that relays does reach them, through itself. Local network addresses
   are not found or announced. An address given by hand, or the one a point
   sees, may itself be a private or loopback address, and is announced as it
   is.
@@ -2256,8 +2563,9 @@ These are stated in the source.
   forgets an idle opening in less than `keep_alive` (15 seconds) loses it; the
   connection is then noticed dead only at the idle timeout.
 - The stand-in router is a program in the tests. No real home router has been
-  tried, nor hole punching over IPv6. `--behind-router` has had no run from
-  end to end.
+  tried, nor hole punching or relaying over IPv6. `--behind-router`, `--relay`
+  and its rates have had no run from end to end. The relay's timing (the
+  direct share, the wait for the point's answer) was judged on loopback only.
 - A point keeps a moon's latest revision only while it holds that moon's
   record, and builds no history of its own beyond that. The point is not
   trusted and its table is in memory only, so nothing it remembered could be a

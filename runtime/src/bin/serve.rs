@@ -12,7 +12,8 @@
 //! lookup point for its galaxy, and a ship with no `--peer` address is looked for there.
 //! Unless `--announce` says where the runtime is reached, it announces the address the point
 //! sees it at, which works behind a home router too. `--lookup-point` makes this runtime a
-//! lookup point itself.
+//! lookup point itself, and `--relay` has it carry the packets of the ships it serves that
+//! cannot be reached directly, within byte allowances that bound what that costs.
 //!
 //! With `--azimuth-copy` those keys come from a copy of Azimuth kept in a file and worked
 //! out from Ethereum alone, in place of asking the roller about ships on layer 2. The copy
@@ -28,6 +29,7 @@ use runtime::lookup::{Lookup, PointBounds, PointConfig};
 use runtime::replica::snapshot::{self, Summary};
 use runtime::replica::{Replica, ReplicaConfig, Restored, TroubleWatch};
 use runtime::net::{Directory, NetConfig, Network};
+use runtime::relay::RelayBounds;
 use runtime::server::{Server, ServerConfig};
 use runtime::urbit_id::ob;
 use runtime::{Config, Error, Manifest, Provide, Runtime, StorageKey};
@@ -41,6 +43,7 @@ const USAGE: &str = "usage: serve --dir <data directory> [--addr 127.0.0.1:8080]
              [--peer <ship>=<address>]...
              [--lookup-at [<galaxy>=]<address>]... [--lookup-domain <domain>:<port>]
              [--announce <address>]... [--behind-router] [--lookup-point <all | galaxy,galaxy,...>]
+             [--relay [--relay-ship-rate <bytes>] [--relay-point-rate <bytes>]]
              [--keyfile <file>] [--lookup <ship>]...
 
   --storage-key-file <file>
@@ -96,6 +99,17 @@ const USAGE: &str = "usage: serve --dir <data directory> [--addr 127.0.0.1:8080]
                          list such as ~zod,~nec): keep the signed records of where they are
                          that are given here, checked against the copy of Azimuth, and hand
                          them to whoever asks. Needs --net and --azimuth-copy
+  --relay                carry the packets of a ship this point serves and a ship calling it,
+                         when the two cannot reach each other directly (a router that gives a
+                         different outside port for each destination defeats sending at the
+                         same moment). The point sees only encrypted packets. Needs
+                         --lookup-point
+  --relay-ship-rate <bytes>
+                         bytes a second carried for any one ship called, both ways, all its
+                         sessions together, with a burst of twice that; 131072 if not given
+  --relay-point-rate <bytes>
+                         bytes a second carried in all, with a burst of twice that; 4194304 if
+                         not given. These two bound what relaying costs whoever runs the point
   --keyfile <file>       start the ship this keyfile is for, if it is not here already
   --lookup <ship>        print what Urbit ID lists for a ship, and stop. Needs --ethereum";
 
@@ -183,7 +197,7 @@ fn galaxy(written: &str) -> Option<u8> {
 
 /// The settings for finding ships through lookup points, announcing to them, and being one,
 /// from what was given on the command line.
-fn lookup_settings(at: &[String], domain: Option<&str>, announce: &[String], behind_router: bool, point: Option<&str>, keys: &Arc<dyn Keys>) -> Lookup {
+fn lookup_settings(at: &[String], domain: Option<&str>, announce: &[String], behind_router: bool, point: Option<&str>, relay: Option<RelayBounds>, keys: &Arc<dyn Keys>) -> Lookup {
     let at = at
         .iter()
         .map(|given| {
@@ -206,7 +220,7 @@ fn lookup_settings(at: &[String], domain: Option<&str>, announce: &[String], beh
             "all" => None,
             list => Some(list.split(',').map(|written| galaxy(written).unwrap_or_else(|| fail(&format!("--lookup-point {given}: {written} is not a galaxy")))).collect()),
         };
-        PointConfig { keys: keys.clone(), galaxies, bounds: PointBounds::default() }
+        PointConfig { keys: keys.clone(), galaxies, bounds: PointBounds::default(), relay }
     });
     Lookup { serve, at, domain, announce, behind_router, ..Lookup::default() }
 }
@@ -220,6 +234,7 @@ fn main() {
     let mut azimuth_copy = None;
     let (mut lookup_at, mut lookup_domain, mut announce, mut lookup_point) = (Vec::new(), None, Vec::new(), None);
     let mut behind_router = false;
+    let (mut relay, mut relay_ship_rate, mut relay_point_rate) = (false, None, None);
     let (mut azimuth_snapshot, mut snapshot_sha256, mut azimuth_until, mut write_snapshot) = (None, None, None, None);
     let mut kernel = PathBuf::from("target/wasm/wasm32-unknown-unknown/release/kernel.wasm");
     let mut counter = PathBuf::from("target/wasm/wasm32-unknown-unknown/release/counter.wasm");
@@ -258,6 +273,9 @@ fn main() {
             "--announce" => announce.push(value()),
             "--behind-router" => behind_router = true,
             "--lookup-point" => lookup_point = Some(value()),
+            "--relay" => relay = true,
+            "--relay-ship-rate" => relay_ship_rate = Some(value()),
+            "--relay-point-rate" => relay_point_rate = Some(value()),
             "--keyfile" => keyfile = Some(PathBuf::from(value())),
             "--lookup" => lookups.push(value()),
             _ => fail(&format!("unknown flag {flag}")),
@@ -276,6 +294,23 @@ fn main() {
     if lookup_point.is_some() && azimuth_copy.is_none() {
         fail("--lookup-point needs --azimuth-copy, to check records against a copy of Azimuth kept here");
     }
+    if (relay || relay_ship_rate.is_some() || relay_point_rate.is_some()) && lookup_point.is_none() {
+        fail("--relay, --relay-ship-rate and --relay-point-rate need --lookup-point: a point relays only for the ships that attend on it");
+    }
+    if (relay_ship_rate.is_some() || relay_point_rate.is_some()) && !relay {
+        fail("--relay-ship-rate and --relay-point-rate need --relay");
+    }
+    // A rate given in bytes a second, with a burst of twice that.
+    let rate = |flag: &str, given: Option<String>, otherwise: u64| -> (u64, u64) {
+        let rate = given.map_or(otherwise, |given| given.parse::<u64>().ok().filter(|rate| *rate >= 1024 && *rate <= 1 << 40).unwrap_or_else(|| fail(&format!("{flag} {given}: not a number of bytes a second from 1024 to 2^40"))));
+        (rate, rate.saturating_mul(2))
+    };
+    let relay = relay.then(|| {
+        let defaults = RelayBounds::default();
+        let (ship_rate, ship_burst) = rate("--relay-ship-rate", relay_ship_rate, defaults.ship_rate);
+        let (point_rate, point_burst) = rate("--relay-point-rate", relay_point_rate, defaults.point_rate);
+        RelayBounds { ship_rate, ship_burst, point_rate, point_burst, ..defaults }
+    });
     if azimuth_copy.is_some() && roller.is_some() {
         fail("--azimuth-copy needs no roller");
     }
@@ -420,11 +455,14 @@ fn main() {
             let Some((ship, addr)) = placed else { fail(&format!("--peer {peer}: not <ship>=<address>")) };
             directory.place(ship, addr).unwrap_or_else(|e| fail(&format!("--peer {peer}: {e}")));
         }
-        let lookup = lookup_settings(&lookup_at, lookup_domain.as_deref(), &announce, behind_router, lookup_point.as_deref(), &azimuth);
+        let lookup = lookup_settings(&lookup_at, lookup_domain.as_deref(), &announce, behind_router, lookup_point.as_deref(), relay, &azimuth);
         let network = Network::start(runtime.clone(), directory, NetConfig { addr, lookup, ..NetConfig::default() }).unwrap_or_else(|e| fail(&format!("cannot start the network: {e}")));
         println!("Talking to other ships at {} (UDP), with keys from Urbit ID.", network.addr());
         if let Some(galaxies) = &lookup_point {
             println!("Answering as the lookup point for the ships of {galaxies} galaxies, on the same address.");
+            if let Some(relay) = &relay {
+                println!("Carrying the packets of those ships and their callers where they cannot reach each other directly: {} bytes a second for any one ship, {} in all.", relay.ship_rate, relay.point_rate);
+            }
         }
         if let Some(why) = network.lookup_trouble() {
             eprintln!("{why}");

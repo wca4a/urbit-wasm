@@ -108,7 +108,7 @@ fn with(lookup: Lookup) -> NetConfig {
 /// none), checking records against `urbit`.
 fn point_on(dir: &TempDir, urbit: &Arc<Listings>, galaxies: Option<Vec<u8>>, bounds: PointBounds, addr: &str) -> (Arc<Runtime>, Network) {
     let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
-    let lookup = Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies, bounds }), ..Lookup::default() };
+    let lookup = Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies, bounds, relay: None }), ..Lookup::default() };
     let net = Network::start(rt.clone(), Directory::new(), NetConfig { addr: addr.into(), lookup, ..eager() }).unwrap();
     (rt, net)
 }
@@ -438,6 +438,9 @@ struct Liar {
     garble_short: Arc<AtomicBool>,
     /// Introductions it has begun to pass on.
     pushes: AtomicUsize,
+    /// Requests to relay asked of it; each is answered, with a refusal, only after this long.
+    relays: Arc<AtomicUsize>,
+    relay_after: Arc<Mutex<Duration>>,
     tokio: tokio::runtime::Runtime,
 }
 
@@ -526,16 +529,18 @@ fn liar() -> Liar {
     let introduce_after = Arc::new(Mutex::new(Duration::ZERO));
     let announcers = Arc::new(Mutex::new(Vec::new()));
     let (refuse, hold, garble_short) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (relays, relay_after) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(Duration::ZERO)));
+    let relaying = (relays.clone(), relay_after.clone());
     let (lying, counting) = (lie.clone(), asked.clone());
     let doubles = (seen.clone(), seens.clone(), announced.clone(), introductions.clone(), introduce_after.clone(), announcers.clone(), refuse.clone(), hold.clone(), garble_short.clone());
     tokio.spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            let (lying, counting, doubles) = (lying.clone(), counting.clone(), doubles.clone());
+            let (lying, counting, doubles, relaying) = (lying.clone(), counting.clone(), doubles.clone(), relaying.clone());
             tokio::spawn(async move {
                 let Ok(connection) = incoming.await else { return };
                 let from = connection.remote_address();
                 while let Ok((mut send, mut receive)) = connection.accept_bi().await {
-                    let (lying, counting, doubles, connection) = (lying.clone(), counting.clone(), doubles.clone(), connection.clone());
+                    let (lying, counting, doubles, connection, relaying) = (lying.clone(), counting.clone(), doubles.clone(), connection.clone(), relaying.clone());
                     tokio::spawn(async move {
                         let (seen, seens, announced, introductions, introduce_after, announcers, refuse, hold, garble_short) = doubles;
                         let Ok(bytes) = receive.read_to_end(1 << 16).await else { return };
@@ -562,6 +567,12 @@ fn liar() -> Liar {
                                 let after = *introduce_after.lock().unwrap();
                                 tokio::time::sleep(after).await;
                                 ship_proto::WhereReply { body: Some(ship_proto::where_reply::Body::Introduced(ship_proto::Introduced {})), refused: String::new() }.encode_to_vec()
+                            }
+                            Some(ship_proto::where_request::Body::Relay(_)) => {
+                                relaying.0.fetch_add(1, Ordering::SeqCst);
+                                let after = *relaying.1.lock().unwrap();
+                                tokio::time::sleep(after).await;
+                                ship_proto::WhereReply { body: None, refused: "not relaying, after all".into() }.encode_to_vec()
                             }
                             Some(ship_proto::where_request::Body::Announce(announce)) if garble_short.load(Ordering::SeqCst) && announce.records.len() < 16 => vec![0xff; 10],
                             Some(ship_proto::where_request::Body::Announce(announce)) => {
@@ -605,7 +616,7 @@ fn liar() -> Liar {
             });
         }
     });
-    Liar { addr, lie, asked, seen, seens, announced, introductions, introduce_after, announcers, refuse, hold, garble_short, pushes: AtomicUsize::new(0), tokio }
+    Liar { addr, lie, asked, seen, seens, announced, introductions, introduce_after, announcers, refuse, hold, garble_short, pushes: AtomicUsize::new(0), relays, relay_after, tokio }
 }
 
 /// An address as it travels in a record: four or sixteen bytes, then the port.
@@ -771,7 +782,19 @@ fn a_record_that_has_run_out_is_not_used_even_where_it_would_still_do() {
     // would still do. The point has nothing more to say, and the record runs out.
     liar.say(Lie::Rubbish(vec![0xff; 10]));
     drop(nec_net);
-    let nec_net = Network::start(nec.clone(), Directory::reading(urbit.clone()), here).unwrap();
+    // The old socket is let go of as the network's threads wind down, which may take a moment:
+    // the new one is bound as soon as the port is free. (This retry sleeps.)
+    let restarted = Instant::now();
+    let nec_net = loop {
+        match Network::start(nec.clone(), Directory::reading(urbit.clone()), here.clone()) {
+            Ok(net) => break net,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                assert!(restarted.elapsed() < Duration::from_secs(5), "the port did not come free: {e}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
     let waiting = Instant::now();
     while now_ms() < issued + whereabouts::LIFETIME_MS + 200 {
         assert!(waiting.elapsed() < Duration::from_secs(30), "the wall clock went back while waiting");
@@ -965,7 +988,7 @@ fn a_runtime_that_is_no_lookup_point_does_not_answer_as_one() {
     let urbit = Arc::new(Listings::default());
     let (_zod, zod_net, _) = ship_on(&a, "~zod", &urbit, eager());
     // And a runtime that is one still answers ships as ever, on the same port.
-    let (_nec, nec_net, nec_dir) = ship_on(&b, "~nec", &urbit, NetConfig { lookup: Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies: None, bounds: PointBounds::default() }), ..Lookup::default() }, ..eager() });
+    let (_nec, nec_net, nec_dir) = ship_on(&b, "~nec", &urbit, NetConfig { lookup: Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies: None, bounds: PointBounds::default(), relay: None }), ..Lookup::default() }, ..eager() });
     let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     tokio.block_on(async {
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -1274,7 +1297,7 @@ fn a_point_holds_only_so_many_requests_and_lets_go_of_what_a_closed_connection_l
     let urbit = Arc::new(Listings::default());
     // A point that would let a request wait a long time.
     let rt = Arc::new(Runtime::open(&p.0, fast()).unwrap());
-    let lookup = Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies: None, bounds: PointBounds::default() }), ..Lookup::default() };
+    let lookup = Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies: None, bounds: PointBounds::default(), relay: None }), ..Lookup::default() };
     let point = Network::start(rt.clone(), Directory::new(), NetConfig { request_timeout: Duration::from_secs(20), lookup, ..eager() }).unwrap();
     let keys: Vec<SigningKey> = (0..4u8).map(|n| SigningKey::from_bytes(&[80 + n; 32])).collect();
     let ships: Vec<String> = (0..4u32).map(|n| ob::ship_name(0x1234_0100 + (n << 16))).collect();
@@ -1402,7 +1425,7 @@ fn a_connection_made_to_an_address_set_by_hand_is_not_used_once_the_ship_is_look
 fn a_caller_offering_both_protocols_is_a_ship_and_one_offering_neither_is_nobody() {
     let a = TempDir::new("alpn-a");
     let urbit = Arc::new(Listings::default());
-    let serve = PointConfig { keys: urbit.clone(), galaxies: None, bounds: PointBounds::default() };
+    let serve = PointConfig { keys: urbit.clone(), galaxies: None, bounds: PointBounds::default(), relay: None };
     let (nec, nec_net, _) = ship_on(&a, "~nec", &urbit, NetConfig { lookup: Lookup { serve: Some(serve), ..Lookup::default() }, ..eager() });
     let nec_key = nec.public_key("~nec").unwrap();
     let shown = |connection: &quinn::Connection| -> [u8; 32] {
@@ -1474,7 +1497,7 @@ fn a_moons_record_is_not_believed_when_there_is_no_room_to_remember_the_moon() {
 /// A point that would let a request wait a long time, checking against `urbit`.
 fn patient_point(dir: &TempDir, urbit: &Arc<Listings>, bounds: PointBounds) -> (Arc<Runtime>, Network) {
     let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
-    let lookup = Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies: None, bounds }), ..Lookup::default() };
+    let lookup = Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies: None, bounds, relay: None }), ..Lookup::default() };
     let net = Network::start(rt.clone(), Directory::new(), NetConfig { request_timeout: Duration::from_secs(20), lookup, ..eager() }).unwrap();
     (rt, net)
 }
@@ -2084,7 +2107,7 @@ fn packets(socket: &std::net::UdpSocket, wait: Duration) -> Vec<(Vec<u8>, Socket
 
 /// An introduction of `caller`'s record to `callee`, as a point passes it on.
 fn introduction(callee: &str, record: Vec<u8>) -> Vec<u8> {
-    ship_proto::Introduction { callee: ob::any_number(callee).unwrap(), record }.encode_to_vec()
+    ship_proto::Introduction { callee: ob::any_number(callee).unwrap(), record, session: Vec::new() }.encode_to_vec()
 }
 
 #[test]
@@ -2948,4 +2971,246 @@ fn what_an_earlier_chunk_of_a_round_achieved_survives_a_later_chunks_failure() {
     liar.push(introduction(&first, whereabouts::sign("~bus", &[watch.local_addr().unwrap()], now_ms(), &bus, None).unwrap()), false);
     eventually("it is heard", || net.introductions().heard > heard);
     assert!(packets(&watch, Duration::from_millis(800)).is_empty());
+}
+
+// Relaying (phase 3).
+
+/// A runtime that holds no ships and is a lookup point for every galaxy, relaying within
+/// `relay`, counting by `bounds`.
+fn relaying_point_on(dir: &TempDir, urbit: &Arc<Listings>, bounds: PointBounds, relay: runtime::relay::RelayBounds) -> (Arc<Runtime>, Network) {
+    let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
+    let lookup = Lookup { serve: Some(PointConfig { keys: urbit.clone(), galaxies: None, bounds, relay: Some(relay) }), ..Lookup::default() };
+    let net = Network::start(rt.clone(), Directory::new(), NetConfig { lookup, ..eager() }).unwrap();
+    (rt, net)
+}
+
+/// A request over `connection` to relay for `caller` (with `key`, at `at`, its record made at
+/// `issued`) to `callee`, with the caller's presence on that connection.
+fn relay_on(connection: &quinn::Connection, callee: &str, caller: &str, key: &SigningKey, issued: u64, at: SocketAddr) -> Vec<u8> {
+    let record = whereabouts::sign(caller, &[at], issued, key, None).unwrap();
+    let presence = presence_on(connection, &record, key);
+    let callee = ob::any_number(callee).unwrap();
+    ship_proto::WhereRequest { body: Some(ship_proto::where_request::Body::Relay(ship_proto::Relay { callee, record, presence })) }.encode_to_vec()
+}
+
+/// The session a point answered with, or why it refused.
+fn session(reply: Option<ship_proto::WhereReply>) -> Result<Vec<u8>, String> {
+    match reply {
+        Some(ship_proto::WhereReply { body: Some(ship_proto::where_reply::Body::Relaying(ship_proto::Relaying { session })), .. }) => Ok(session),
+        other => Err(refusal(other)),
+    }
+}
+
+#[test]
+fn requests_to_relay_are_refused_saying_why_and_answered_with_a_session_passed_to_the_ship() {
+    let (p, q) = (TempDir::new("relayask-p"), TempDir::new("relayask-q"));
+    let urbit = Arc::new(Listings::default());
+    let (_qr, quiet) = point_on(&q, &urbit, None, PointBounds::default(), "127.0.0.1:0");
+    // Sessions made counted by the hour, so nothing is earned back: two for any one caller and
+    // eight in all.
+    let relay = runtime::relay::RelayBounds { made_each: 2, made: 8, ..runtime::relay::RelayBounds::default() };
+    let (_pr, point) = relaying_point_on(&p, &urbit, PointBounds { rate_period: Duration::from_secs(3600), ..PointBounds::default() }, relay);
+    let keys: Vec<SigningKey> = (0..4u8).map(|n| SigningKey::from_bytes(&[170 + n; 32])).collect();
+    let ships: Vec<String> = (0..4u32).map(|n| ob::ship_name(0x1234_0100 + (n << 16))).collect();
+    for (ship, key) in ships.iter().zip(&keys) {
+        urbit.list(ship, key.verifying_key().to_bytes());
+    }
+    let (callee, callee_key) = (&ships[0], &keys[0]);
+    let at: SocketAddr = "198.51.100.4:4433".parse().unwrap();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        // A point that does not relay says so, whatever is asked.
+        let to_quiet = endpoint.connect_with(where_client(), quiet.addr(), "lookup").await_connected().await;
+        assert_eq!(session(ask_point(&to_quiet, &relay_on(&to_quiet, callee, &ships[1], &keys[1], now_ms(), at)).await), Err("this lookup point does not relay".into()));
+        let connect = || endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected();
+        // The callee is at an address of its own: the point carries nothing between one address
+        // and itself.
+        let callee_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let own = callee_endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        let (asker, other) = (connect().await, connect().await);
+        let ask = |connection: quinn::Connection, request: Vec<u8>| async move { session(ask_point(&connection, &request).await) };
+        // Not attending: nobody has announced the callee.
+        assert_eq!(ask(asker.clone(), relay_on(&asker, callee, &ships[1], &keys[1], now_ms(), at)).await, Err("that ship is not attending this lookup point".into()));
+        // Attending, and saying it can be reached directly: not relayed for.
+        let direct = whereabouts::sign(callee, &[at], now_ms(), callee_key, None).unwrap();
+        assert_eq!(outcomes(ask_point(&own, &announce_with(vec![direct.clone()], vec![presence_on(&own, &direct, callee_key)])).await), [String::new()]);
+        // (Asked by ~ships[3]: a request whose caller's presence checks is charged to that
+        // caller's own allowance before the table is weighed, as an introduction is.)
+        assert_eq!(ask(asker.clone(), relay_on(&asker, callee, &ships[3], &keys[3], now_ms(), at)).await, Err("that ship says it can be reached directly, and is not relayed for".into()));
+        // Asking to be introduced: relayed for, to a caller whose record is believed.
+        let flagged = whereabouts::sign_flagged(callee, &[at], now_ms() + 1, true, callee_key, None).unwrap();
+        assert_eq!(outcomes(ask_point(&own, &announce_with(vec![flagged.clone()], vec![presence_on(&own, &flagged, callee_key)])).await), [String::new()]);
+        let forged = relay_on(&asker, callee, &ships[1], &keys[2], now_ms(), at);
+        assert_eq!(ask(asker.clone(), forged).await, Err("the record is not signed by the ship's key".into()));
+        let stale = relay_on(&asker, callee, &ships[1], &keys[1], now_ms() - whereabouts::LIFETIME_MS - 1000, at);
+        assert_eq!(ask(asker.clone(), stale).await, Err("the record has run out".into()));
+        let replayed = relay_on(&other, callee, &ships[1], &keys[1], now_ms(), at);
+        assert_eq!(ask(asker.clone(), replayed).await, Err("the ship's presence is not for this connection".into()));
+        assert!(passed(&own).await.is_none(), "something was passed for a request not believed");
+        // A genuine one: answered with a session, and the caller's record passed to the callee,
+        // over its own connection, with the same session.
+        let made = ask(asker.clone(), relay_on(&asker, callee, &ships[1], &keys[1], now_ms(), at)).await.unwrap();
+        assert_eq!(made.len(), 16);
+        let pushed = passed(&own).await.expect("the session was not passed to the ship");
+        assert_eq!(pushed.session, made);
+        assert_eq!(whereabouts::ship_of(&pushed.record), ob::any_number(&ships[1]));
+        assert!(passed(&other).await.is_none());
+        // Two for one caller; the third is refused for that reason, while another caller is
+        // served.
+        let second = ask(asker.clone(), relay_on(&asker, callee, &ships[1], &keys[1], now_ms(), at)).await;
+        assert!(second.is_ok(), "{second:?}");
+        assert_eq!(ask(asker.clone(), relay_on(&asker, callee, &ships[1], &keys[1], now_ms(), at)).await, Err("too many sessions made for that ship just now; try again later".into()));
+        assert!(ask(other.clone(), relay_on(&other, callee, &ships[2], &keys[2], now_ms(), at)).await.is_ok());
+        // Eight in all, the refused ones that got that far counted: the next is refused for it.
+        assert_eq!(ask(other.clone(), relay_on(&other, callee, &ships[3], &keys[3], now_ms(), at)).await, Err("too many sessions made at this point just now; try again later".into()));
+        // None of that stops ordinary questions.
+        assert_eq!(found(ask_point(&other, &question(callee)).await), Some(flagged));
+        let status = point.point_status().unwrap();
+        assert_eq!((status.relays_made, status.sessions), (3, 3), "{status:?}");
+    });
+}
+
+/// An introduction of `caller`'s record to `callee`, carrying a session, as a point passes it.
+fn relayed_introduction(callee: &str, record: Vec<u8>, session: &[u8]) -> Vec<u8> {
+    ship_proto::Introduction { callee: ob::any_number(callee).unwrap(), record, session: session.to_vec() }.encode_to_vec()
+}
+
+#[test]
+fn a_lying_point_registers_no_session_at_a_ship_beyond_what_the_ship_believes_and_allows() {
+    let a = TempDir::new("relaylie-a");
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    let lookup = Lookup { ask_again: Duration::from_millis(100), ..finding(liar.addr) };
+    let (_nec, nec_net, _) = ship_on(&a, "~nec", &urbit, with(lookup));
+    eventually("~nec is announced, asking for no introduction", || liar.records().last().is_some_and(|record| !record.introduce));
+    let bus = SigningKey::from_bytes(&[180; 32]);
+    let wes = SigningKey::from_bytes(&[181; 32]);
+    urbit.list("~bus", bus.verifying_key().to_bytes());
+    urbit.list("~wes", wes.verifying_key().to_bytes());
+    let here: SocketAddr = "198.51.100.4:4433".parse().unwrap();
+    let registered = || (nec_net.introductions().sessions, nec_net.relay_status().called);
+    let push = |bytes: Vec<u8>| {
+        let heard = nec_net.introductions().heard;
+        liar.push(bytes, false);
+        eventually("it is heard", || nec_net.introductions().heard > heard);
+    };
+    // A genuine record, for a ship that asks for no introductions: nothing is registered.
+    push(relayed_introduction("~nec", whereabouts::sign("~bus", &[here], now_ms(), &bus, None).unwrap(), &[1; 16]));
+    // ~nec comes to ask to be introduced.
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    eventually("~nec is announced, asking to be introduced", || liar.records().last().is_some_and(|record| record.introduce));
+    // ~nec looks ~bus up, the ordinary way, and believes R2 (whose address does not answer).
+    let (_quiet, nowhere) = silent();
+    let now = now_ms();
+    liar.say(Lie::Record(whereabouts::sign("~bus", &[nowhere], now, &bus, None).unwrap()));
+    assert!(nec_net.ping("~nec", "~bus").is_err());
+    // A forged record, one run out, an older one than R2, one for a ship not here, and one whose
+    // session is not sixteen bytes: none is registered.
+    push(relayed_introduction("~nec", whereabouts::sign("~bus", &[here], now + 5, &SigningKey::from_bytes(&[182; 32]), None).unwrap(), &[2; 16]));
+    push(relayed_introduction("~nec", whereabouts::sign("~bus", &[here], now - whereabouts::LIFETIME_MS - 1, &bus, None).unwrap(), &[3; 16]));
+    push(relayed_introduction("~nec", whereabouts::sign("~bus", &[here], now - 1000, &bus, None).unwrap(), &[4; 16]));
+    push(relayed_introduction("~bud", whereabouts::sign("~bus", &[here], now + 5, &bus, None).unwrap(), &[5; 16]));
+    push(relayed_introduction("~nec", whereabouts::sign("~bus", &[here], now + 5, &bus, None).unwrap(), &[6; 15]));
+    // A genuine newer one is registered; weighed in order, so the ones before were weighed and
+    // refused first. Nothing is sent for it.
+    push(relayed_introduction("~nec", whereabouts::sign("~bus", &[here], now + 10, &bus, None).unwrap(), &[7; 16]));
+    eventually("the genuine one is registered", || registered() == (1, 1));
+    assert_eq!(nec_net.introductions().sent, 0);
+    // Far too many from ~bus: no more than eight are registered for one caller ship. Then one
+    // from ~wes, which is, so all of ~bus's were weighed.
+    for n in 0..10u8 {
+        push(relayed_introduction("~nec", whereabouts::sign("~bus", &[here], now + 20 + u64::from(n), &bus, None).unwrap(), &[10 + n; 16]));
+    }
+    push(relayed_introduction("~nec", whereabouts::sign("~wes", &[here], now_ms(), &wes, None).unwrap(), &[30; 16]));
+    eventually("~wes's is registered", || registered().1 == runtime::relay::MOST_CALLED_EACH + 1);
+    assert_eq!(registered(), (runtime::relay::MOST_CALLED_EACH as u64 + 1, runtime::relay::MOST_CALLED_EACH + 1));
+    // A moon of ~bus counts as ~bus: its session is refused, ~bus having eight already.
+    let moon = ob::any_name((3u64 << 32) | u64::from(ob::ship_number("~bus").unwrap()));
+    let moon_key = SigningKey::from_bytes(&[183; 32]);
+    let word = runtime::moon::vouch(&bus, ob::any_number(&moon).unwrap(), 1, &moon_key.verifying_key().to_bytes());
+    push(relayed_introduction("~nec", whereabouts::sign(&moon, &[here], now_ms(), &moon_key, Some(word)).unwrap(), &[31; 16]));
+    push(relayed_introduction("~nec", whereabouts::sign("~wes", &[here], now_ms() + 1, &wes, None).unwrap(), &[32; 16]));
+    eventually("~wes's second is registered", || registered().1 == runtime::relay::MOST_CALLED_EACH + 2);
+    assert_eq!(registered(), (runtime::relay::MOST_CALLED_EACH as u64 + 2, runtime::relay::MOST_CALLED_EACH + 2), "a moon of ~bus was not counted as ~bus");
+    // Relayed packets for one of those sessions from anywhere but its point, or naming no
+    // session here, go no further, and nothing answers them.
+    let stranger = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let delivered = nec_net.relay_status().delivered;
+    let dropped = nec_net.relay_status().dropped;
+    stranger.send_to(&runtime::relay::wrapped(&[7; 16], &[0x41; 100]), nec_net.addr()).unwrap();
+    stranger.send_to(&runtime::relay::wrapped(&[99; 16], &[0x41; 100]), nec_net.addr()).unwrap();
+    eventually("both are dropped", || nec_net.relay_status().dropped >= dropped + 2);
+    assert_eq!(nec_net.relay_status().delivered, delivered);
+    stranger.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    assert!(stranger.recv_from(&mut [0u8; 2048]).is_err(), "the stranger was answered");
+    // The connection the sessions came on closes: they end.
+    liar.announcers.lock().unwrap().iter().for_each(|connection| connection.close(0u32.into(), b"gone"));
+    eventually("the sessions end with the connection they came on", || nec_net.relay_status().called == 0);
+}
+
+#[test]
+fn a_point_that_says_nothing_of_a_request_to_relay_does_not_hold_the_call_past_its_time() {
+    let (a, b) = (TempDir::new("relaysilent-a"), TempDir::new("relaysilent-b"));
+    let urbit = Arc::new(Listings::default());
+    let liar = liar();
+    // The point says each ship is seen where it does not listen, so each asks to be introduced,
+    // and takes ~zod's record, so ~zod has one of its own to show.
+    liar.see(SeenLie::Address(address_bytes("127.0.0.1:9".parse().unwrap())));
+    let (_zod, zod_net, _) = ship_on(&a, "~zod", &urbit, with(finding(liar.addr)));
+    let (_nec, _nec_net, _) = ship_on(&b, "~nec", &urbit, with(finding(liar.addr)));
+    let nec_number = ob::ship_number("~nec").unwrap() as u64;
+    eventually("both are announced", || liar.records().iter().any(|record| record.ship == nec_number) && zod_net.announced_as("~zod").is_some());
+    let nec_record = liar.records().into_iter().rev().find(|record| record.ship == nec_number).unwrap();
+    assert!(nec_record.introduce);
+    liar.say(Lie::Record(nec_record.encode_to_vec()));
+    // Introductions are answered at once; a request to relay, only after a minute.
+    *liar.relay_after.lock().unwrap() = Duration::from_secs(60);
+    let started = Instant::now();
+    let why = zod_net.ping("~zod", "~nec").unwrap_err().to_string();
+    assert!(started.elapsed() < Duration::from_millis(1500) + NOW_SLACK / 4, "{:?}", started.elapsed());
+    assert!(why.contains("did not answer the request to relay in time"), "{why}");
+    assert_eq!(liar.relays.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_request_to_relay_is_charged_to_its_connections_questions_and_record_rates_first() {
+    let p = TempDir::new("relayrates-p");
+    let urbit = Arc::new(Listings::default());
+    // Two records on any one connection by the hour.
+    let (_pr, point) = relaying_point_on(&p, &urbit, PointBounds { per_connection: 2, rate_period: Duration::from_secs(3600), ..PointBounds::default() }, runtime::relay::RelayBounds::default());
+    let (callee, callee_key) = (ob::ship_name(0x1234_0100), SigningKey::from_bytes(&[190; 32]));
+    let (caller, caller_key) = (ob::ship_name(0x1235_0100), SigningKey::from_bytes(&[191; 32]));
+    urbit.list(&callee, callee_key.verifying_key().to_bytes());
+    urbit.list(&caller, caller_key.verifying_key().to_bytes());
+    let at: SocketAddr = "198.51.100.4:4433".parse().unwrap();
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let callee_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let own = callee_endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        let flagged = whereabouts::sign_flagged(&callee, &[at], now_ms(), true, &callee_key, None).unwrap();
+        assert_eq!(outcomes(ask_point(&own, &announce_with(vec![flagged.clone()], vec![presence_on(&own, &flagged, &callee_key)])).await), [String::new()]);
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        // The record rates: two on this connection, then refused for that, before anything is
+        // checked or made.
+        let asker = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        for _ in 0..2 {
+            assert!(session(ask_point(&asker, &relay_on(&asker, &callee, &caller, &caller_key, now_ms(), at)).await).is_ok());
+        }
+        assert_eq!(session(ask_point(&asker, &relay_on(&asker, &callee, &caller, &caller_key, now_ms(), at)).await), Err("too many records on this connection just now; try again later".into()));
+        // The questions of a connection: a stranger asking for a ship that is not here is held
+        // to them before the point looks at its table.
+        let stranger = endpoint.connect_with(where_client(), point.addr(), "lookup").await_connected().await;
+        let started = Instant::now();
+        let mut refused = Vec::new();
+        for _ in 0..140 {
+            refused.push(session(ask_point(&stranger, &relay_on(&stranger, &ob::ship_name(0x1236_0100), &caller, &caller_key, now_ms(), at)).await).unwrap_err());
+        }
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "inconclusive: 140 requests took {took:?}");
+        let metered = refused.iter().filter(|why| *why == "too many questions just now; try again later").count();
+        let let_through = 140 - metered;
+        assert!(let_through as f64 <= 64.0 + 64.0 * took.as_secs_f64() + 1.0, "{let_through} got past the connection's questions in {took:?}");
+        assert!(refused.iter().all(|why| why == "too many questions just now; try again later" || why == "that ship is not attending this lookup point"), "{refused:?}");
+    });
 }

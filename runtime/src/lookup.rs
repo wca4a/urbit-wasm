@@ -73,9 +73,14 @@
 //! its router then lets the caller's ordinary connection attempt in. Nothing on this path is
 //! believed about who anyone is; the connection that follows is proved as any other is.
 //!
-//! What this does not do: carry traffic for ships that cannot be reached directly. Two ships
-//! behind routers of the strict kind, which give each destination a port of its own, cannot
-//! reach each other; the call fails in its time and says so.
+//! Relaying. A ship behind a router of the strict kind, which gives each destination a port of
+//! its own, cannot be opened by an introduction. A point set to relay (`PointConfig::relay`)
+//! answers `Relay`, checked as `Introduce` is, by making a session between two addresses it has
+//! itself seen (the remote addresses of the ship's attending connection and of the caller's),
+//! with its table held, and passing the caller's record and the session to the ship as an
+//! introduction is passed. The packets themselves are carried by the socket's wrapper, which
+//! asks the point (`Point::carry`) with the table held; see `crate::relay`. A point not set to
+//! relay refuses, and says so.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -93,13 +98,15 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use ship_proto::{
-    where_reply, where_request, Announce, Announced, Found, Introduce, Introduced, Introduction, Message, Saw, Seen, Where, WhereReply, WhereRequest,
+    where_reply, where_request, Announce, Announced, Found, Introduce, Introduced, Introduction, Message, Relay, Relaying, Saw, Seen, Where, WhereReply,
+    WhereRequest,
 };
 use tokio::sync::{Notify, Semaphore};
 use urbit_id::ob;
 
 use crate::azimuth::Keys;
 use crate::net::{self, Directory, NetConfig, NetError};
+use crate::relay::{self, Carry, RelayBounds, SessionId, Sessions, NO_RELAY};
 use crate::store::now_ms;
 use crate::whereabouts::{self, Believed, Binding, Known};
 use crate::{lock, Runtime};
@@ -240,6 +247,26 @@ const TRY_INTRODUCED: Duration = Duration::from_secs(4);
 /// call: the ship is tried anyway.
 const INTRODUCE_WAIT: Duration = Duration::from_secs(1);
 
+/// When a relay may follow, the longest all the direct work on records that ask for
+/// introductions may take in one call (the introductions and the attempts together), and never
+/// more than half the time the call has when it begins: the rest is the relay's. A hole that
+/// opens does so within about one Retry round trip and one retransmission of the first packet
+/// (about a second, see `TRY_INTRODUCED`); five seconds is that with room for a slow first
+/// answer from the point and real distances, and half the call leaves the relay as much.
+const DIRECT_SHARE: Duration = Duration::from_secs(5);
+
+/// The longest a caller waits for a point to answer a request to relay, never more than a
+/// quarter of the time left. The point answers without waiting for the ship called.
+const RELAY_WAIT: Duration = Duration::from_secs(1);
+
+/// The shortest `direct_again` may be. Each try costs an introduction at the point, a few
+/// packets from the ship called, and a connection attempt.
+const MIN_DIRECT_AGAIN: Duration = Duration::from_secs(2);
+
+/// How many records a runtime remembers that its direct attempts failed for and the relay
+/// worked for, so that the next call on the same record goes straight to the relay.
+const MOST_RELAY_REMEMBERED: usize = 1024;
+
 /// The value both ends of a connection work out from its handshake, for a ship's presence on
 /// it. `None` if the TLS library cannot give it, and then no presence can be made
 /// or checked on the connection.
@@ -322,11 +349,14 @@ pub struct PointConfig {
     /// The galaxies whose ships this point keeps records for, by number. `None` for all.
     pub galaxies: Option<Vec<u8>>,
     pub bounds: PointBounds,
+    /// Carry the packets of ships that cannot reach each other directly, within these bounds
+    /// (see `crate::relay`). `None`, as by default, carries nothing, and says so.
+    pub relay: Option<RelayBounds>,
 }
 
 impl fmt::Debug for PointConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PointConfig").field("galaxies", &self.galaxies).field("bounds", &self.bounds).finish()
+        f.debug_struct("PointConfig").field("galaxies", &self.galaxies).field("bounds", &self.bounds).field("relay", &self.relay).finish()
     }
 }
 
@@ -365,6 +395,9 @@ pub struct Lookup {
     pub ask_again: Duration,
     /// How long an answer from the resolver is used before the name is looked up again.
     pub resolved_for: Duration,
+    /// While a connection to a ship goes through its point's relay and is in use, how often
+    /// the direct way is tried again. Two seconds to a day.
+    pub direct_again: Duration,
 }
 
 impl Default for Lookup {
@@ -380,6 +413,7 @@ impl Default for Lookup {
             announce_every: Duration::from_secs(120),
             ask_again: Duration::from_secs(3),
             resolved_for: Duration::from_secs(300),
+            direct_again: Duration::from_secs(60),
         }
     }
 }
@@ -397,6 +431,7 @@ impl fmt::Debug for Lookup {
             .field("announce_every", &self.announce_every)
             .field("ask_again", &self.ask_again)
             .field("resolved_for", &self.resolved_for)
+            .field("direct_again", &self.direct_again)
             .finish()
     }
 }
@@ -420,6 +455,9 @@ impl Lookup {
         }
         if self.keep_alive < MIN_KEEP_ALIVE || self.keep_alive > MAX_KEEP_ALIVE {
             return Err("keep_alive must be from one second to twenty-five".into());
+        }
+        if self.direct_again < MIN_DIRECT_AGAIN || self.direct_again > MAX_SETTING {
+            return Err("direct_again must be from two seconds to a day".into());
         }
         if self.behind_router && !self.finds() {
             return Err("behind_router needs somewhere to announce: a lookup point's address or domain".into());
@@ -449,6 +487,9 @@ impl Lookup {
             }
             if point.galaxies.as_ref().is_some_and(Vec::is_empty) {
                 return Err("a lookup point must serve some galaxy".into());
+            }
+            if let Some(relay) = &point.relay {
+                relay.sound()?;
             }
         }
         Ok(())
@@ -487,6 +528,24 @@ pub(crate) fn introduce_wait(deadline: tokio::time::Instant) -> Duration {
 /// The same, with the clock read already (`now`).
 fn introduce_wait_at(deadline: tokio::time::Instant, now: tokio::time::Instant) -> Duration {
     INTRODUCE_WAIT.min(deadline.saturating_duration_since(now) / 4)
+}
+
+/// When a relay may follow, when all direct work on records that ask for introductions must be
+/// over, for a call that began at `started` and must end by `deadline`: `DIRECT_SHARE` after
+/// it began, or half way, whichever is sooner.
+pub(crate) fn direct_by(started: tokio::time::Instant, deadline: tokio::time::Instant) -> tokio::time::Instant {
+    started + DIRECT_SHARE.min(deadline.saturating_duration_since(started) / 2)
+}
+
+/// How long to wait for a point to answer a request to relay: `RELAY_WAIT`, or a quarter of
+/// what is left if that is less.
+pub(crate) fn relay_wait(deadline: tokio::time::Instant) -> Duration {
+    relay_wait_at(deadline, tokio::time::Instant::now())
+}
+
+/// The same, with the clock read already (`now`).
+fn relay_wait_at(deadline: tokio::time::Instant, now: tokio::time::Instant) -> Duration {
+    RELAY_WAIT.min(deadline.saturating_duration_since(now) / 4)
 }
 
 /// So many things allowed in a second, topped up as time passes, up to a second's worth.
@@ -542,6 +601,9 @@ struct Held {
     record: Vec<u8>,
     issued: u64,
     moon: Option<(u32, [u8; 32])>,
+    /// The ship's word, under its signature, that callers should ask to be introduced: only
+    /// such a ship is relayed for.
+    introduce: bool,
     /// The connection the ship proved it is on when this record was kept, by the number the
     /// point gave the connection, while that connection is open: where the ship attends.
     attends: Option<u64>,
@@ -554,13 +616,18 @@ struct Present {
     waiting: VecDeque<Push>,
     /// Rung when an introduction is put in `waiting`.
     wake: Arc<Notify>,
+    /// The connection's remote address, as the point sees it: where a session's packets go
+    /// toward a ship that attends on it.
+    from: SocketAddr,
 }
 
-/// An introduction waiting to be passed to a ship: the caller's record, and when it was taken.
+/// An introduction waiting to be passed to a ship: the caller's record, when it was taken, and
+/// for a relay, the session it is for.
 struct Push {
     callee: u64,
     record: Vec<u8>,
     at: Instant,
+    session: Option<SessionId>,
 }
 
 /// Why an introduction is refused when the ship is not where it can be passed to.
@@ -575,17 +642,22 @@ struct Table {
     moons_of: HashMap<u32, usize>,
     swept: Option<Instant>,
     present: HashMap<u64, Present>,
+    /// The sessions this point carries packets for, if it relays. Under this same lock, so
+    /// that a session is made, and a packet carried, only toward a ship that attends at that
+    /// moment.
+    sessions: Sessions,
 }
 
 impl Table {
-    /// A connection under the lookup protocol has opened. Records may be kept from it from now
-    /// on, and introductions passed over it.
-    fn open(&mut self, connection: u64, wake: Arc<Notify>) {
-        self.present.insert(connection, Present { ships: HashSet::new(), waiting: VecDeque::new(), wake });
+    /// A connection under the lookup protocol has opened, from `from`. Records may be kept from
+    /// it from now on, and introductions passed over it.
+    fn open(&mut self, connection: u64, wake: Arc<Notify>, from: SocketAddr) {
+        self.present.insert(connection, Present { ships: HashSet::new(), waiting: VecDeque::new(), wake, from: plain(from) });
     }
 
-    /// A connection has closed. No ship attends on it any more, and what was waiting to be
-    /// passed over it is dropped. Its records stay, and are handed out until they run out.
+    /// A connection has closed. No ship attends on it any more, what was waiting to be passed
+    /// over it is dropped, and the sessions made toward a ship that attended on it end. Its
+    /// records stay, and are handed out until they run out.
     fn close(&mut self, connection: u64) {
         if let Some(present) = self.present.remove(&connection) {
             for ship in present.ships {
@@ -594,6 +666,7 @@ impl Table {
                 }
             }
         }
+        self.sessions.callee_gone(connection);
     }
 
     /// The connection a ship attends on, if its record is still good and the connection open.
@@ -604,6 +677,11 @@ impl Table {
     /// Put an introduction in the way of being passed to a ship, over the connection it attends
     /// on, if it attends anywhere and there is room. Weighed with the table held, at `now`.
     fn pass(&mut self, callee: u64, record: Vec<u8>, now: u64) -> Result<(), &'static str> {
+        self.push(callee, record, None, now)
+    }
+
+    /// The same, for an introduction that carries a session.
+    fn push(&mut self, callee: u64, record: Vec<u8>, session: Option<SessionId>, now: u64) -> Result<(), &'static str> {
         let connection = self.attending(callee, now).ok_or(NOT_ATTENDING)?;
         let present = self.present.get_mut(&connection).ok_or(NOT_ATTENDING)?;
         present.waiting.retain(|push| push.at.elapsed() < PUSH_WAIT);
@@ -613,7 +691,7 @@ impl Table {
         if present.waiting.len() >= MOST_WAITING {
             return Err("as many introductions are waiting for that ship's connection as may be; try again later");
         }
-        present.waiting.push_back(Push { callee, record, at: Instant::now() });
+        present.waiting.push_back(Push { callee, record, at: Instant::now(), session });
         present.wake.notify_one();
         Ok(())
     }
@@ -637,6 +715,7 @@ impl Table {
     }
 
     fn remove(&mut self, ship: u64) {
+        self.sessions.callee_dropped(ship);
         let Some(held) = self.held.remove(&ship) else { return };
         if let Some(present) = held.attends.and_then(|connection| self.present.get_mut(&connection)) {
             present.ships.remove(&ship);
@@ -726,20 +805,49 @@ impl Table {
                 *self.moons_of.entry(ob::moon_parent(believed.number)).or_default() += 1;
             }
         }
-        let before = self.held.insert(believed.number, Held { record, issued: believed.issued, moon: believed.moon, attends: Some(connection) });
-        // The newer record names its own connection: the ship no longer attends on the old one.
+        let before = self.held.insert(believed.number, Held { record, issued: believed.issued, moon: believed.moon, introduce: believed.introduce, attends: Some(connection) });
+        // The newer record names its own connection: the ship no longer attends on the old one,
+        // and the sessions made toward it there end.
         if let Some(present) = before.and_then(|held| held.attends).filter(|&old| old != connection).and_then(|old| self.present.get_mut(&old)) {
             present.ships.remove(&believed.number);
         }
+        self.sessions.callee_moved(believed.number, connection);
         if let Some(present) = self.present.get_mut(&connection) {
             present.ships.insert(believed.number);
         }
         Ok(())
     }
+
+    /// Make a session for `caller`, at `caller_at`, to call `callee`, named `id`, and put the
+    /// caller's record, with the session, in the way of being passed to `callee` over the
+    /// connection it attends on. All weighed with the table held, at `now` (by the clock
+    /// records are weighed by) and `at` (by the relay's): the ship must attend at this moment,
+    /// on an open connection, and its record must ask for introductions; there must be room for
+    /// the session and for the push. The session's two addresses are pinned here, from the two
+    /// connections, and nothing changes them after.
+    #[allow(clippy::too_many_arguments)]
+    fn relay(&mut self, callee: u64, caller: u64, record: Vec<u8>, id: SessionId, caller_at: SocketAddr, now: u64, at: Instant) -> Result<(), &'static str> {
+        if !self.sessions.relays() {
+            return Err(NO_RELAY);
+        }
+        let connection = self.attending(callee, now).ok_or(NOT_ATTENDING)?;
+        if !self.held.get(&callee).is_some_and(|held| held.introduce) {
+            return Err("that ship says it can be reached directly, and is not relayed for");
+        }
+        let callee_at = self.present.get(&connection).ok_or(NOT_ATTENDING)?.from;
+        if callee_at == plain(caller_at) {
+            return Err("the caller is at the very address of the ship it wants; there is nothing to carry");
+        }
+        self.sessions.room(&id, callee, caller, at)?;
+        // The push first: if there is no room for it, no session is made. Once it is in the
+        // way, there is room for the session, weighed in this same hold.
+        self.push(callee, record, Some(id), now)?;
+        self.sessions.make(id, callee, caller, connection, callee_at, caller_at, at)
+    }
 }
 
 /// How a lookup point is doing, for whoever runs it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PointStatus {
     /// Records held, moons' included, whether or not they have run out yet.
     pub records: usize,
@@ -763,6 +871,16 @@ pub struct PointStatus {
     pub pushed: u64,
     /// Connections refused because every number for one has been given.
     pub unnumbered: u64,
+    /// Requests to relay heard (each counted as it arrives, before anything else), and
+    /// sessions made, since it started.
+    pub relay_asked: u64,
+    pub relays_made: u64,
+    /// Sessions live now (any that have gone idle are let go of first).
+    pub sessions: usize,
+    /// Bytes carried, and dropped for each reason, since it started.
+    pub relayed: relay::RelayCounts,
+    /// Bytes carried for each ship called that has a session now, by number.
+    pub carried_for: Vec<(u64, u64)>,
 }
 
 /// A runtime's role as a lookup point.
@@ -794,6 +912,16 @@ pub(crate) struct Point {
     introduced: AtomicU64,
     pushed: AtomicU64,
     unnumbered: AtomicU64,
+    /// How much it carries for ships that cannot reach each other directly, if it relays.
+    relay: Option<RelayBounds>,
+    /// Sessions that may still be made just now, in all, and for each caller.
+    relays: Mutex<Bucket>,
+    relayers: Mutex<HashMap<u64, Bucket>>,
+    /// How far the relay's clock is set ahead of the machine's, in milliseconds. Nothing but a
+    /// test sets it.
+    relay_skew: AtomicU64,
+    relay_asked: AtomicU64,
+    relays_made: AtomicU64,
 }
 
 /// A place among the connections to a lookup point, given up when the connection ends.
@@ -824,7 +952,7 @@ impl Point {
             galaxies: cfg.galaxies.map(|galaxies| galaxies.into_iter().collect()),
             bounds: cfg.bounds,
             shown,
-            table: Mutex::default(),
+            table: Mutex::new(Table { sessions: Sessions::new(cfg.relay, Instant::now()), ..Table::default() }),
             connections: AtomicUsize::new(0),
             reading: Arc::new(Semaphore::new(MOST_POINT_READING)),
             in_hand: Arc::new(Semaphore::new(MOST_IN_HAND)),
@@ -840,11 +968,24 @@ impl Point {
             introduced: AtomicU64::new(0),
             pushed: AtomicU64::new(0),
             unnumbered: AtomicU64::new(0),
+            relay: cfg.relay,
+            relays: Mutex::new(Bucket::per(cfg.relay.map_or(1, |relay| relay.made), cfg.bounds.rate_period)),
+            relayers: Mutex::default(),
+            relay_skew: AtomicU64::new(0),
+            relay_asked: AtomicU64::new(0),
+            relays_made: AtomicU64::new(0),
         })
     }
 
+    /// Whether this point carries packets for ships that cannot reach each other directly.
+    pub(crate) fn relays(&self) -> bool {
+        self.relay.is_some()
+    }
+
     pub(crate) fn status(&self) -> PointStatus {
-        let table = lock(&self.table);
+        let mut table = lock(&self.table);
+        let at = self.relay_now();
+        table.sessions.sweep(at);
         PointStatus {
             records: table.held.len(),
             moons: table.moons,
@@ -858,7 +999,101 @@ impl Point {
             introduced: self.introduced.load(Ordering::SeqCst),
             pushed: self.pushed.load(Ordering::SeqCst),
             unnumbered: self.unnumbered.load(Ordering::SeqCst),
+            relay_asked: self.relay_asked.load(Ordering::SeqCst),
+            relays_made: self.relays_made.load(Ordering::SeqCst),
+            sessions: table.sessions.len(),
+            relayed: table.sessions.counts,
+            carried_for: table.sessions.carried_for(),
         }
+    }
+
+    /// The relay's clock: the machine's own steady clock, unless a test has set it ahead.
+    fn relay_now(&self) -> Instant {
+        Instant::now() + Duration::from_millis(self.relay_skew.load(Ordering::SeqCst))
+    }
+
+    /// Set the relay's clock ahead by `by`, for tests.
+    #[cfg(test)]
+    pub(crate) fn step_relay(&self, by: Duration) {
+        self.relay_skew.fetch_add(by.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// A relayed datagram naming `id` has arrived from `from`: carry it on to the other side of
+    /// its session with `send`, or drop it, and count which. Weighed, and sent, with the table
+    /// held: the session must be live, `from` one of its two pinned addresses, the side it goes
+    /// toward still there (the ship called attending on the connection the session was made
+    /// toward, judged as passing an introduction judges it; the caller having sent lately), and
+    /// the byte allowances must let it. Nothing here waits: `send` never does.
+    pub(crate) fn carry(&self, id: &SessionId, from: SocketAddr, datagram: &[u8], send: &mut dyn FnMut(SocketAddr) -> bool) -> Carry {
+        let mut table = lock(&self.table);
+        let now = self.now();
+        let at = self.relay_now();
+        let Table { held, sessions, .. } = &mut *table;
+        let attends = |ship: u64, connection: u64| held.get(&ship).is_some_and(|held| whereabouts::fresh(held.issued, now) && held.attends == Some(connection));
+        sessions.carry(id, from, datagram.len(), at, &|| self.relay_now(), &attends, send)
+    }
+
+    /// The sessions live, each with its ship called, caller, and two pinned addresses. For tests.
+    #[cfg(test)]
+    pub(crate) fn sessions(&self) -> Vec<(SessionId, u64, u64, SocketAddr, SocketAddr)> {
+        lock(&self.table).sessions.list()
+    }
+
+    /// Count one session made for a caller against its allowance, if it has one left. Only so
+    /// many callers are counted; past that, those whose allowance is whole are forgotten.
+    fn relayer(&self, caller: u64) -> Result<(), &'static str> {
+        let made_each = self.relay.ok_or(NO_RELAY)?.made_each;
+        // A moon is counted as its planet.
+        let caller = relay::owner(caller);
+        let mut relayers = lock(&self.relayers);
+        if !relayers.contains_key(&caller) && relayers.len() >= MOST_INTRODUCERS {
+            relayers.retain(|_, bucket| !bucket.whole());
+            if relayers.len() >= MOST_INTRODUCERS {
+                return Err("this lookup point is counting as many callers as it may; try again later");
+            }
+        }
+        let bucket = relayers.entry(caller).or_insert_with(|| Bucket::per(made_each, self.bounds.rate_period));
+        if bucket.take() { Ok(()) } else { Err("too many sessions made for that ship just now; try again later") }
+    }
+
+    /// Check a caller's record and its presence on the connection the request came on (from
+    /// `caller_at`), as an introduction is checked, keep nothing of it, and make a session named
+    /// `id` for it to call `callee`, passing its record and the session to `callee` over the
+    /// connection `callee` attends on. This waits on the source of keys, so it is for a thread
+    /// that may wait. Nothing is made for a caller that has gone (`gone`).
+    #[allow(clippy::too_many_arguments)]
+    fn relay_one(&self, callee: u64, record: Vec<u8>, presence: &[u8], binding: Option<&Binding>, caller_at: SocketAddr, id: SessionId, gone: &Mutex<bool>) -> Result<(), &'static str> {
+        let caller = whereabouts::ship_of(&record).ok_or("not a record")?;
+        let (known, now) = {
+            let table = lock(&self.table);
+            let now = self.now();
+            (table.known(caller, now), now)
+        };
+        if *lock(gone) {
+            return Err(GONE);
+        }
+        let believed = whereabouts::check(&record, &|name: &str| self.key_of(name), known, now)?;
+        // Nobody else can name a ship as a caller, or spend its allowance: its presence on
+        // this very connection says the caller is here.
+        whereabouts::present(&believed, binding.ok_or(NO_BINDING)?, presence)?;
+        self.relayer(caller)?;
+        // Made only with the table and the mark both held, in that order, with both clocks read
+        // then: the ship must attend on an open connection at this moment.
+        let mut table = lock(&self.table);
+        let gone = lock(gone);
+        if *gone {
+            return Err(GONE);
+        }
+        let now = self.now();
+        if !whereabouts::fresh(believed.issued, now) {
+            return Err("the record ran out, or this clock went back, while it was being checked");
+        }
+        // What is held of the caller may have moved on while its key was asked about.
+        table.weighs_against_held(&believed, now)?;
+        let at = self.relay_now();
+        table.relay(callee, caller, record, id, caller_at, now, at)?;
+        self.relays_made.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// The key Urbit ID lists for a galaxy, star or planet, by name, read from this point's
@@ -1071,8 +1306,8 @@ struct Asker {
 struct Attendance(Arc<Point>, u64);
 
 impl Attendance {
-    fn open(point: &Arc<Point>, connection: u64, wake: Arc<Notify>) -> Attendance {
-        lock(&point.table).open(connection, wake);
+    fn open(point: &Arc<Point>, connection: u64, wake: Arc<Notify>, from: SocketAddr) -> Attendance {
+        lock(&point.table).open(connection, wake, from);
         Attendance(point.clone(), connection)
     }
 }
@@ -1094,6 +1329,14 @@ impl Drop for Attendance {
 /// The point opens streams of its own on the connection only to pass introductions to ships
 /// that attend on it, one at a time, each within `PUSH_LIMIT`.
 pub(crate) async fn serve(point: Arc<Point>, connection: Connection, limit: Duration) {
+    // Read once, before any lock: where the connection comes from, as this point sees it.
+    let from = plain(connection.remote_address());
+    // A connection under this protocol through a relay session is nobody's to answer: its
+    // address is made up, and nothing may be sent toward it but through the session.
+    if relay::is_made_up(&from) {
+        connection.close(VarInt::from_u32(1), b"not through a relay");
+        return;
+    }
     let Some(_place) = PointPlace::take(&point) else {
         connection.close(VarInt::from_u32(4), b"this lookup point has as many connections as it may");
         return;
@@ -1110,13 +1353,13 @@ pub(crate) async fn serve(point: Arc<Point>, connection: Connection, limit: Dura
         return;
     };
     let wake = Arc::new(Notify::new());
-    let _attendance = Attendance::open(&point, number, wake.clone());
+    let _attendance = Attendance::open(&point, number, wake.clone(), from);
     let asker = Arc::new(Asker {
         each: Arc::new(Mutex::new(Bucket::per(point.bounds.per_connection, point.bounds.rate_period))),
         questions: Arc::new(Mutex::new(Bucket::new(MOST_QUESTIONS_EACH))),
         connection: number,
         binding: binding_of(&connection),
-        from: plain(connection.remote_address()),
+        from,
     });
     // The requests of this connection, so that what they leave waiting stops when it closes,
     // and what passes introductions over it.
@@ -1154,7 +1397,7 @@ async fn pass_on(point: Arc<Point>, number: u64, connection: Connection, wake: A
                 table.next_push(number, now)
             };
             let Some(push) = next else { break };
-            let message = Introduction { callee: push.callee, record: push.record }.encode_to_vec();
+            let message = Introduction { callee: push.callee, record: push.record, session: push.session.map_or(Vec::new(), |id| id.to_vec()) }.encode_to_vec();
             let deadline = tokio::time::Instant::now() + PUSH_LIMIT;
             let Ok(Ok(mut stream)) = tokio::time::timeout_at(deadline, connection.open_uni()).await else { continue };
             match tokio::time::timeout_at(deadline, stream.write_all(&message)).await {
@@ -1230,6 +1473,7 @@ async fn answer(point: Arc<Point>, asker: Arc<Asker>, mut send: SendStream, mut 
                 }
             }
             Ok(Some(where_request::Body::Introduce(Introduce { callee, record, presence }))) => introduce(&point, &asker, callee, record, presence).await,
+            Ok(Some(where_request::Body::Relay(Relay { callee, record, presence }))) => relay_for(&point, &asker, callee, record, presence).await,
             _ => refused("not a request this lookup point answers"),
         };
         send_back(&mut send, &reply).await;
@@ -1281,6 +1525,52 @@ async fn introduce(point: &Arc<Point>, asker: &Asker, callee: u64, record: Vec<u
         Ok(Ok(())) => WhereReply { body: Some(where_reply::Body::Introduced(Introduced {})), refused: String::new() },
         Ok(Err(why)) => refused(why),
         Err(_) => refused("the introduction could not be checked; try again"),
+    }
+}
+
+/// A caller asks the point to carry its packets to `callee`. In order: refused at once if this
+/// point does not relay; the connection's allowance of questions; refused at once if the ship
+/// does not attend here; the record counted against the record rates, the connection's and then
+/// the point's; the point's allowance of sessions made; then checked on a thread that may wait,
+/// as an introduction is, and the session made (the caller's own allowance of sessions charged
+/// once its presence is checked) and passed to the ship with the table held. The answer names
+/// the session and does not wait for the ship.
+async fn relay_for(point: &Arc<Point>, asker: &Asker, callee: u64, record: Vec<u8>, presence: Vec<u8>) -> WhereReply {
+    let refused = |why: &str| WhereReply { body: None, refused: why.to_string() };
+    point.relay_asked.fetch_add(1, Ordering::SeqCst);
+    if !point.relays() {
+        return refused(NO_RELAY);
+    }
+    if !lock(&asker.questions).take() {
+        return refused("too many questions just now; try again later");
+    }
+    // An early reading, only to refuse: making the session weighs it again.
+    if !point.attends(callee) {
+        return refused(NOT_ATTENDING);
+    }
+    let record = match point.admit(vec![record], &asker.each).pop() {
+        Some(Ok(record)) => record,
+        Some(Err(why)) => return refused(why),
+        None => return refused("not a record"),
+    };
+    if !lock(&point.relays).take() {
+        return refused("too many sessions made at this point just now; try again later");
+    }
+    // The name, from the system's randomness, read before any lock is taken.
+    let Ok(id) = crate::random_bytes::<16>() else { return refused("this lookup point could not make a session just now; try again") };
+    let gone = Arc::new(Mutex::new(false));
+    let _going = Going(gone.clone());
+    let Ok(turn) = point.reading.clone().acquire_owned().await else { return refused("this lookup point is stopping") };
+    let (checking, binding, caller_at) = (point.clone(), asker.binding, asker.from);
+    let made = tokio::task::spawn_blocking(move || {
+        let made = checking.relay_one(callee, record, &presence, binding.as_ref(), caller_at, id, &gone);
+        drop(turn);
+        made
+    });
+    match made.await {
+        Ok(Ok(())) => WhereReply { body: Some(where_reply::Body::Relaying(Relaying { session: id.to_vec() })), refused: String::new() },
+        Ok(Err(why)) => refused(why),
+        Err(_) => refused("the request to relay could not be checked; try again"),
     }
 }
 
@@ -1446,9 +1736,16 @@ pub(crate) struct Finder {
     announcing: quinn::ClientConfig,
     /// The address this runtime listens on.
     bound: SocketAddr,
-    /// Where introductions points pass to this runtime's ships go, to be weighed. Only so many
-    /// wait there; past that they are dropped.
-    pushed: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// Where introductions points pass to this runtime's ships go, to be weighed, each with the
+    /// connection it came on. Only so many wait there; past that they are dropped.
+    pushed: Option<tokio::sync::mpsc::Sender<(Vec<u8>, Connection)>>,
+    /// The runtime's socket, with its sessions: told which connections to points sessions may
+    /// come on, and when each closes.
+    relayed: Option<Arc<relay::Relayed>>,
+    /// Records (by ship, and the number each was kept under) whose addresses did not answer and
+    /// whose ship the relay did reach, newest last: a call on one of them goes straight to the
+    /// relay.
+    relay_worked: Mutex<VecDeque<(String, u64)>>,
     /// Whether this runtime asks to be introduced to ships whose records ask for it. Nothing
     /// but a test turns it off, to show what happens without.
     pub(crate) introducing: std::sync::atomic::AtomicBool,
@@ -1489,7 +1786,8 @@ impl Finder {
         endpoint: Endpoint,
         provider: &Arc<CryptoProvider>,
         bound: SocketAddr,
-        pushed: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+        pushed: Option<tokio::sync::mpsc::Sender<(Vec<u8>, Connection)>>,
+        relayed: Option<Arc<relay::Relayed>>,
     ) -> std::io::Result<Finder> {
         // A caller shows a key of its own, made now, which names nobody: the point needs no
         // proof of who is asking, and the ship protocol, on the same port, needs every caller
@@ -1524,6 +1822,8 @@ impl Finder {
             announcing,
             bound,
             pushed,
+            relayed,
+            relay_worked: Mutex::default(),
             introducing: std::sync::atomic::AtomicBool::new(true),
             resolver,
             limit: cfg.request_timeout,
@@ -1667,6 +1967,11 @@ impl Finder {
     /// Send one request to the point at one address and read its reply. The request is made
     /// once the connection is in hand, by `make`, since it may have to be bound to it.
     async fn over(&self, addr: SocketAddr, make: &(dyn Fn(&Connection) -> Result<Vec<u8>, String> + Send + Sync)) -> Result<WhereReply, String> {
+        // A lookup point is never at an address made up for a relay session: that is never
+        // connected to, and counts as this point failing.
+        if relay::is_made_up(&addr) {
+            return Err(format!("a lookup point cannot be at {addr}, an address made up for relay sessions"));
+        }
         let slot = self.point_slot(addr)?;
         let connection = {
             let mut kept = slot.lock().await;
@@ -1693,10 +1998,15 @@ impl Finder {
 
     /// The same, with the request made by `make` once a connection is in hand.
     async fn exchange_with(&self, galaxy: u8, make: &(dyn Fn(&Connection) -> Result<Vec<u8>, String> + Send + Sync), deadline: tokio::time::Instant) -> Result<WhereReply, String> {
+        self.exchange_from(galaxy, make, deadline).await.map(|(reply, _)| reply)
+    }
+
+    /// The same, with the address of the point that answered.
+    async fn exchange_from(&self, galaxy: u8, make: &(dyn Fn(&Connection) -> Result<Vec<u8>, String> + Send + Sync), deadline: tokio::time::Instant) -> Result<(WhereReply, SocketAddr), String> {
         let mut why = format!("no lookup point is known for ~{}", galaxy_name(galaxy));
         for addr in self.points_for(galaxy, deadline).await? {
             match tokio::time::timeout(try_limit(deadline), self.over(addr, make)).await {
-                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Ok(reply)) => return Ok((reply, addr)),
                 Ok(Err(failed)) => why = failed,
                 Err(_) => why = format!("the lookup point at {addr} did not answer in time"),
             }
@@ -1952,6 +2262,9 @@ impl Finder {
     /// The connection ships are announced over to the point at `addr`: the one kept, if it is
     /// still open, or a new one, whose introductions are heard from then on.
     async fn kept_connection(self: &Arc<Self>, addr: SocketAddr) -> Result<Connection, String> {
+        if relay::is_made_up(&addr) {
+            return Err(format!("a lookup point cannot be at {addr}, an address made up for relay sessions"));
+        }
         let slot = self.kept_slot(addr)?;
         let mut kept = slot.lock().await;
         if let Some(connection) = kept.as_ref().filter(|connection| connection.close_reason().is_none()) {
@@ -2042,18 +2355,27 @@ impl Finder {
     /// as long as it is open, and hand each on to be weighed. Each is read within
     /// `PUSH_READ_LIMIT`, and no more than `MOST_PUSH_BYTES` of it; what will not fit where
     /// introductions wait to be weighed is dropped.
+    ///
+    /// Sessions may be pushed on the connection while this hears it, and those pushed on it end
+    /// when it closes.
     async fn hear(self: Arc<Self>, connection: Connection) {
+        if let Some(relayed) = &self.relayed {
+            relayed.heard_on(connection.stable_id());
+        }
         while let Ok(mut receive) = connection.accept_uni().await {
             match tokio::time::timeout(PUSH_READ_LIMIT, net::read_whole(&mut receive, MOST_PUSH_BYTES)).await {
                 Ok(Some(introduction)) => {
                     if let Some(pushed) = &self.pushed {
-                        let _ = pushed.try_send(introduction);
+                        let _ = pushed.try_send((introduction, connection.clone()));
                     }
                 }
                 _ => {
                     let _ = receive.stop(VarInt::from_u32(4));
                 }
             }
+        }
+        if let Some(relayed) = &self.relayed {
+            relayed.no_longer_heard_on(connection.stable_id());
         }
     }
 
@@ -2068,6 +2390,84 @@ impl Finder {
     /// for such a ship does an introduction make this runtime send anything.
     pub(crate) fn introduces(&self, ship: &str) -> bool {
         self.shown_as(ship).is_some_and(|(_, introduce)| introduce)
+    }
+
+    /// Close the connections this runtime's ships are announced over, as if each had dropped.
+    /// For tests.
+    #[cfg(test)]
+    pub(crate) fn drop_lanes(&self) {
+        for lane in lock(&self.lanes).values() {
+            if let Some(connection) = &lane.connection {
+                connection.close(VarInt::from_u32(0), b"dropped by the test");
+            }
+        }
+    }
+
+    /// Whether a call from `from` may be relayed: this runtime has the socket for it, and `from`
+    /// has a record of its own to show (it is announced, and its point took its record).
+    pub(crate) fn may_relay(&self, from: &str) -> bool {
+        self.relayed.is_some() && self.shown_as(from).is_some()
+    }
+
+    /// Whether the record of `ship` kept under `kept_as` is one whose addresses did not answer
+    /// and through whose point's relay the ship was reached.
+    pub(crate) fn relay_worked(&self, ship: &str, kept_as: u64) -> bool {
+        lock(&self.relay_worked).iter().any(|(held, number)| held == ship && *number == kept_as)
+    }
+
+    /// Whether any record of `ship` is remembered as one the relay worked for. For tests.
+    #[cfg(test)]
+    pub(crate) fn remembers_relay(&self, ship: &str) -> bool {
+        lock(&self.relay_worked).iter().any(|(held, _)| held == ship)
+    }
+
+    /// Remember that the record of `ship` kept under `kept_as` was reached through the relay
+    /// after its addresses did not answer, so that the next call on it goes straight there.
+    pub(crate) fn relay_did(&self, ship: &str, kept_as: u64) {
+        let mut worked = lock(&self.relay_worked);
+        worked.retain(|(held, _)| held != ship);
+        if worked.len() >= MOST_RELAY_REMEMBERED {
+            worked.pop_front();
+        }
+        worked.push_back((ship.to_string(), kept_as));
+    }
+
+    /// Forget that the relay was needed for `ship`: the direct way has worked again.
+    pub(crate) fn direct_again(&self, ship: &str) {
+        lock(&self.relay_worked).retain(|(held, _)| held != ship);
+    }
+
+    /// Ask the point for `to`'s galaxy to carry `from`'s packets to `to`: `from`'s record, signed
+    /// now at the addresses it is announced at, with its presence on the connection the request
+    /// goes over. The address of the point that answered (which is what carries the session)
+    /// and the session's name; or why not, in words that say whether the point does not relay,
+    /// refused for a limit, or could not be asked.
+    pub(crate) async fn relay(&self, runtime: &Runtime, from: &str, to: &str, deadline: tokio::time::Instant) -> Result<(SocketAddr, SessionId), String> {
+        let (Some(number), Some(callee)) = (ob::any_number(from), ob::any_number(to)) else { return Err("not the name of a ship".into()) };
+        let no_record = "this ship announces no record of its own, so it cannot be relayed";
+        self.shown_as(from).ok_or(no_record)?;
+        let key = runtime.signing_key(from).map_err(|e| e.to_string())?;
+        let proof = runtime.moon_proof(from);
+        // Made once the connection is in hand, which may have waited: what the ship is
+        // announced as is read then.
+        let make = |connection: &Connection| -> Result<Vec<u8>, String> {
+            let (addresses, introduce) = self.shown_as(from).ok_or(no_record)?;
+            let binding = binding_of(connection).ok_or_else(|| NO_BINDING.to_string())?;
+            let issued = self.next_issued();
+            let record = whereabouts::sign_flagged(from, &addresses, issued, introduce, &key, proof)?;
+            let presence = whereabouts::presence(number, issued, &binding, &key);
+            Ok(WhereRequest { body: Some(where_request::Body::Relay(Relay { callee, record, presence })) }.encode_to_vec())
+        };
+        match self.exchange_from(whereabouts::galaxy_of(callee), &make, deadline).await {
+            Ok((WhereReply { body: Some(where_reply::Body::Relaying(Relaying { session })), .. }, point)) => {
+                let id = SessionId::try_from(session.as_slice()).map_err(|_| "its point answered with something that names no session".to_string())?;
+                Ok((point, id))
+            }
+            Ok((WhereReply { refused, body: None }, _)) if refused == NO_RELAY => Err("its point does not relay".into()),
+            Ok((WhereReply { refused, body: None }, _)) => Err(format!("its point refused to relay: {}", refused.chars().take(200).collect::<String>())),
+            Ok(_) => Err("its point's answer made no sense".into()),
+            Err(why) => Err(format!("its point could not be asked to relay: {why}")),
+        }
     }
 
     /// Ask the point for `to`'s galaxy to introduce `from` to it: `from`'s record, signed now at
@@ -2177,12 +2577,12 @@ mod tests {
     }
 
     fn point(bounds: PointBounds, galaxies: Option<Vec<u8>>) -> Point {
-        testing(Point::new(PointConfig { keys: Arc::new(Everyone), galaxies, bounds }, &rustls::crypto::ring::default_provider()).unwrap())
+        testing(Point::new(PointConfig { keys: Arc::new(Everyone), galaxies, bounds, relay: None }, &rustls::crypto::ring::default_provider()).unwrap())
     }
 
     /// A point with the connection the tests announce on open.
     fn testing(point: Point) -> Point {
-        lock(&point.table).open(TESTING.0, Arc::new(Notify::new()));
+        lock(&point.table).open(TESTING.0, Arc::new(Notify::new()), test_from());
         point
     }
 
@@ -2207,6 +2607,11 @@ mod tests {
         let key = SigningKey::from_bytes(&[(moon >> 32) as u8; 32]);
         let proof = crate::moon::vouch(&key_of(u64::from(ob::moon_parent(moon))), moon, 1, &key.verifying_key().to_bytes());
         whereabouts::sign(&name(moon), &[addr], issued, &key, Some(proof)).unwrap()
+    }
+
+    /// Where the tests' connections to a point come from.
+    fn test_from() -> SocketAddr {
+        "198.51.100.1:4433".parse().unwrap()
     }
 
     fn plenty() -> Mutex<Bucket> {
@@ -2362,7 +2767,7 @@ mod tests {
         let ahead = now + whereabouts::LIFETIME_MS;
         let bounds = PointBounds { records: 1, ..PointBounds::default() };
         let mut table = Table::default();
-        table.open(TESTING.0, Arc::new(Notify::new()));
+        table.open(TESTING.0, Arc::new(Notify::new()), test_from());
         table.keep(&believed(PLANET, ahead), record(PLANET, ahead), &bounds, ahead, TESTING.0).unwrap();
         // An older record, good by the clock as it is now, does not take its place.
         assert_eq!(table.keep(&believed(PLANET, now), record(PLANET, now), &bounds, now, TESTING.0), Err("a record of the ship as new or newer is already held"));
@@ -2412,7 +2817,7 @@ mod tests {
     }
 
     fn gated_point(gate: &Arc<Gate>) -> Arc<Point> {
-        Arc::new(testing(Point::new(PointConfig { keys: gate.clone(), galaxies: None, bounds: PointBounds::default() }, &rustls::crypto::ring::default_provider()).unwrap()))
+        Arc::new(testing(Point::new(PointConfig { keys: gate.clone(), galaxies: None, bounds: PointBounds::default(), relay: None }, &rustls::crypto::ring::default_provider()).unwrap()))
     }
 
     /// Wait, briefly, for something another thread does.
@@ -2608,7 +3013,7 @@ mod tests {
             Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap()
         };
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut finder = Finder::new(lookup, &NetConfig::default(), endpoint, &provider, "127.0.0.1:9".parse().unwrap(), None).unwrap();
+        let mut finder = Finder::new(lookup, &NetConfig::default(), endpoint, &provider, "127.0.0.1:9".parse().unwrap(), None, None).unwrap();
         let readings = AtomicUsize::new(0);
         finder.clock = Box::new(move || if readings.fetch_add(1, Ordering::SeqCst) == 0 { first } else { first.saturating_add_signed(step) });
         (tokio, finder)
@@ -2659,7 +3064,7 @@ mod tests {
 
     fn slow_point(delay: Duration) -> Arc<Point> {
         let keys = Arc::new(SlowOnce(std::sync::atomic::AtomicBool::new(true), delay));
-        Arc::new(testing(Point::new(PointConfig { keys, galaxies: None, bounds: PointBounds::default() }, &rustls::crypto::ring::default_provider()).unwrap()))
+        Arc::new(testing(Point::new(PointConfig { keys, galaxies: None, bounds: PointBounds::default(), relay: None }, &rustls::crypto::ring::default_provider()).unwrap()))
     }
 
     #[test]
@@ -2708,8 +3113,8 @@ mod tests {
         let bounds = PointBounds::default();
         let mut table = Table::default();
         let (first, second) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-        table.open(1, first.clone());
-        table.open(2, second.clone());
+        table.open(1, first.clone(), test_from());
+        table.open(2, second.clone(), test_from());
         // Kept from connection one: the ship attends there, and an introduction waits there.
         table.keep(&believed(now - 10), record(PLANET, now - 10), &bounds, now, 1).unwrap();
         assert_eq!(table.attending(PLANET, now), Some(1));
@@ -2848,8 +3253,8 @@ mod tests {
         };
         {
             let mut table = lock(&point.table);
-            table.open(1, Arc::new(Notify::new()));
-            table.open(2, Arc::new(Notify::new()));
+            table.open(1, Arc::new(Notify::new()), test_from());
+            table.open(2, Arc::new(Notify::new()), test_from());
             keep(&mut table, callee, now - 100, 1);
         }
         let first = record(PLANET, now - 50);
@@ -2874,17 +3279,17 @@ mod tests {
     fn an_introduction_that_waited_too_long_is_dropped_when_taken_and_makes_room_when_more_come() {
         let now = now_ms();
         let mut table = Table::default();
-        table.open(1, Arc::new(Notify::new()));
+        table.open(1, Arc::new(Notify::new()), test_from());
         let believed = whereabouts::check(&record(PLANET, now), &listed, Known::default(), now).unwrap();
         table.keep(&believed, record(PLANET, now), &PointBounds::default(), now, 1).unwrap();
         let long_ago = Instant::now().checked_sub(PUSH_WAIT + Duration::from_millis(100)).unwrap();
         // One that has waited past its time, and nothing after it: when it is come to, it is
         // dropped, not passed on.
-        table.present.get_mut(&1).unwrap().waiting.push_back(Push { callee: PLANET, record: vec![1], at: long_ago });
+        table.present.get_mut(&1).unwrap().waiting.push_back(Push { callee: PLANET, record: vec![1], at: long_ago, session: None });
         assert!(table.next_push(1, now).is_none());
         // As many as may wait for the ship, all past their time: a new one finds room.
         for _ in 0..MOST_WAITING_EACH {
-            table.present.get_mut(&1).unwrap().waiting.push_back(Push { callee: PLANET, record: vec![2], at: long_ago });
+            table.present.get_mut(&1).unwrap().waiting.push_back(Push { callee: PLANET, record: vec![2], at: long_ago, session: None });
         }
         assert_eq!(table.pass(PLANET, vec![3], now), Ok(()));
         assert_eq!(table.next_push(1, now).map(|push| push.record), Some(vec![3]));
@@ -2915,7 +3320,7 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(&dir).unwrap();
                 let runtime = Arc::new(crate::Runtime::open(&dir, crate::Config { durability: crate::Durability::Normal, ..crate::Config::default() }).unwrap());
-                let lookup = Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds::default() }), ..Lookup::default() };
+                let lookup = Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds::default(), relay: None }), ..Lookup::default() };
                 let net = crate::net::Network::start(runtime.clone(), Directory::new(), NetConfig { lookup, ..NetConfig::default() }).unwrap();
                 (runtime, net)
             })
@@ -3022,16 +3427,515 @@ mod tests {
             Lookup { domain: Some(("points.example".into(), 0)), ..Lookup::default() },
             Lookup { domain: Some(("a b".into(), 4433)), ..Lookup::default() },
             Lookup { at: vec![(Some(1), "0.0.0.0:4433".parse().unwrap())], ..Lookup::default() },
-            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: Some(vec![]), bounds: PointBounds::default() }), ..Lookup::default() },
-            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { in_all: 0, ..PointBounds::default() } }), ..Lookup::default() },
-            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { rate_period: Duration::ZERO, ..PointBounds::default() } }), ..Lookup::default() },
-            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { introductions: 0, ..PointBounds::default() } }), ..Lookup::default() },
-            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { introductions_each: 0, ..PointBounds::default() } }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: Some(vec![]), bounds: PointBounds::default(), relay: None }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { in_all: 0, ..PointBounds::default() }, relay: None }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { rate_period: Duration::ZERO, ..PointBounds::default() }, relay: None }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { introductions: 0, ..PointBounds::default() }, relay: None }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds { introductions_each: 0, ..PointBounds::default() }, relay: None }), ..Lookup::default() },
             Lookup { keep_alive: Duration::from_millis(999), ..finds.clone() },
             Lookup { keep_alive: Duration::from_millis(25_001), ..finds.clone() },
             Lookup { behind_router: true, ..Lookup::default() },
+            Lookup { direct_again: Duration::from_millis(1999), ..finds.clone() },
+            Lookup { direct_again: Duration::from_secs(90_000), ..finds.clone() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds::default(), relay: Some(RelayBounds { ship_rate: 0, ..RelayBounds::default() }) }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds::default(), relay: Some(RelayBounds { point_burst: 2047, ..RelayBounds::default() }) }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds::default(), relay: Some(RelayBounds { sessions_from: 0, ..RelayBounds::default() }) }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds::default(), relay: Some(RelayBounds { sessions_pair: 0, ..RelayBounds::default() }) }), ..Lookup::default() },
+            Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds::default(), relay: Some(RelayBounds { made: 0, ..RelayBounds::default() }) }), ..Lookup::default() },
         ] {
             assert!(bad.sound().is_err(), "{bad:?}");
         }
+        let relaying = Lookup { serve: Some(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds: PointBounds::default(), relay: Some(RelayBounds::default()) }), ..Lookup::default() };
+        assert!(relaying.sound().is_ok());
+    }
+
+    // Relaying, at the point.
+
+    /// Where the tests' callers' requests to relay come from.
+    const CALLER_AT: &str = "203.0.113.50:1000";
+
+    /// A point that relays within `relay`, counting by `bounds`, with the connection the tests
+    /// announce on open (from `test_from`).
+    fn relaying_within(bounds: PointBounds, relay: RelayBounds) -> Arc<Point> {
+        Arc::new(testing(Point::new(PointConfig { keys: Arc::new(Everyone), galaxies: None, bounds, relay: Some(relay) }, &rustls::crypto::ring::default_provider()).unwrap()))
+    }
+
+    fn relaying(relay: RelayBounds) -> Arc<Point> {
+        relaying_within(PointBounds::default(), relay)
+    }
+
+    /// A ship's record asking callers to be introduced, made now.
+    fn flagged(ship: u64) -> Vec<u8> {
+        whereabouts::sign_flagged(&name(ship), &["203.0.113.7:4433".parse().unwrap()], now_ms(), true, &key_of(ship), None).unwrap()
+    }
+
+    /// `callee` announces itself, asking to be introduced, on the connection the tests announce
+    /// on, and attends there.
+    fn attend(point: &Point, callee: u64) {
+        assert_eq!(point.take(vec![flagged(callee)], &plenty()), vec![String::new()]);
+    }
+
+    /// Ask the point to relay for `caller`, from `from`, to `callee`, as a request on the
+    /// connection the tests announce on would: the session's name, or why not.
+    fn relay_from(point: &Point, caller: u64, callee: u64, from: &str) -> Result<SessionId, &'static str> {
+        let record = record(caller, now_ms());
+        let presence = presence_for(&record);
+        let id = crate::random_bytes::<16>().unwrap();
+        point.relay_one(callee, record, &presence, Some(&TESTING.1), from.parse().unwrap(), id, &Mutex::new(false)).map(|()| id)
+    }
+
+    /// Hand the point a relayed datagram of `len` bytes naming `id`, from `from`: where it was
+    /// carried, if it was. What reaches the socket is counted by the stand-in sender.
+    fn carry(point: &Point, id: &SessionId, from: &str, len: usize) -> Option<SocketAddr> {
+        let datagram = vec![relay::KIND; len];
+        let mut sent = Vec::new();
+        let carried = point.carry(id, from.parse().unwrap(), &datagram, &mut |to| {
+            sent.push(to);
+            true
+        });
+        match carried {
+            Carry::To(to) => {
+                assert_eq!(sent, vec![to]);
+                Some(to)
+            }
+            Carry::Dropped(_) => {
+                assert!(sent.is_empty(), "something was sent for a datagram that was dropped");
+                None
+            }
+        }
+    }
+
+    const CALLEE: u64 = PLANET;
+    const CALLER: u64 = PLANET + (1 << 16);
+    const STRANGER: &str = "198.51.100.77:5000";
+
+    #[test]
+    fn a_point_carries_only_between_the_two_pinned_addresses_of_a_live_session() {
+        let point = relaying(RelayBounds::default());
+        attend(&point, CALLEE);
+        let id = relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        let (callee_at, caller_at): (SocketAddr, SocketAddr) = (test_from(), CALLER_AT.parse().unwrap());
+        // The callee's record and the session went over the connection it attends on, together.
+        {
+            let table = lock(&point.table);
+            let waiting = &table.present[&TESTING.0].waiting;
+            assert_eq!(waiting.len(), 1);
+            assert_eq!(waiting[0].session, Some(id));
+            assert_eq!(whereabouts::ship_of(&waiting[0].record), Some(CALLER));
+        }
+        assert_eq!(point.sessions(), vec![(id, CALLEE, CALLER, callee_at, caller_at)]);
+        // Each way between the two pinned addresses, and nowhere else.
+        assert_eq!(carry(&point, &id, CALLER_AT, 100), Some(callee_at));
+        assert_eq!(carry(&point, &id, "198.51.100.1:4433", 120), Some(caller_at));
+        // From anyone else, or naming no session: nothing is sent, and the session is untouched.
+        assert_eq!(carry(&point, &id, STRANGER, 50), None);
+        assert_eq!(carry(&point, &[0; 16], CALLER_AT, 60), None);
+        // An IPv4 address written as IPv6 is the same address.
+        assert_eq!(carry(&point, &id, "[::ffff:203.0.113.50]:1000", 10), Some(callee_at));
+        let status = point.status();
+        assert_eq!(status.sessions, 1);
+        assert_eq!(status.relayed.carried, 230);
+        assert_eq!(status.relayed.stranger, 50);
+        assert_eq!(status.relayed.unknown, 60);
+        assert_eq!(status.carried_for, vec![(CALLEE, 230)]);
+        assert_eq!(status.relays_made, 1);
+    }
+
+    #[test]
+    fn a_point_carries_toward_a_caller_only_while_it_has_sent_lately() {
+        let point = relaying(RelayBounds::default());
+        attend(&point, CALLEE);
+        let callee_at = "198.51.100.1:4433";
+        let id = relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        // In the grace after making, the callee may answer first.
+        assert!(carry(&point, &id, callee_at, 10).is_some());
+        // The caller sends; twenty seconds later the callee answers, and it is carried; eleven
+        // more (the caller silent for thirty-one) and it is not, though the session is live:
+        // something was carried eleven seconds ago.
+        assert!(carry(&point, &id, CALLER_AT, 10).is_some());
+        point.step_relay(Duration::from_secs(20));
+        assert!(carry(&point, &id, callee_at, 10).is_some());
+        point.step_relay(Duration::from_secs(11));
+        assert_eq!(carry(&point, &id, callee_at, 10), None);
+        assert_eq!(point.status().relayed.absent, 10);
+        assert_eq!(point.status().sessions, 1);
+        // The caller is heard from again: both ways go again.
+        assert!(carry(&point, &id, CALLER_AT, 10).is_some());
+        assert!(carry(&point, &id, callee_at, 10).is_some());
+        // A session past its grace whose caller has sent nothing: nothing goes toward it.
+        let other = relay_from(&point, CALLER + (1 << 16), CALLEE, "203.0.113.51:1000").unwrap();
+        point.step_relay(relay::GRACE);
+        assert_eq!(carry(&point, &other, callee_at, 10), None);
+    }
+
+    #[test]
+    fn a_session_nothing_is_carried_on_for_the_idle_time_is_dropped_and_carries_nothing_after() {
+        let point = relaying(RelayBounds::default());
+        attend(&point, CALLEE);
+        let id = relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        assert!(carry(&point, &id, CALLER_AT, 10).is_some());
+        point.step_relay(relay::IDLE - Duration::from_secs(1));
+        assert!(carry(&point, &id, CALLER_AT, 10).is_some());
+        point.step_relay(relay::IDLE);
+        assert_eq!(carry(&point, &id, CALLER_AT, 10), None);
+        assert_eq!(carry(&point, &id, "198.51.100.1:4433", 10), None);
+        assert_eq!(point.status().sessions, 0);
+        assert_eq!(point.status().relayed.unknown, 20);
+    }
+
+    #[test]
+    fn a_session_ends_when_the_ship_called_stops_attending_where_it_was_made() {
+        // The connection the callee attends on closes.
+        let point = relaying(RelayBounds::default());
+        attend(&point, CALLEE);
+        let id = relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        assert!(carry(&point, &id, CALLER_AT, 10).is_some());
+        lock(&point.table).close(TESTING.0);
+        // Gone at once, with the table, before any packet comes to show it.
+        assert_eq!(point.status().sessions, 0);
+        assert_eq!(carry(&point, &id, CALLER_AT, 10), None);
+        assert_eq!(carry(&point, &id, "198.51.100.1:4433", 10), None);
+        assert_eq!(point.status().sessions, 0);
+        // A newer record of the callee is kept on another connection: it has moved.
+        let point = relaying(RelayBounds::default());
+        attend(&point, CALLEE);
+        let id = relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        lock(&point.table).open(7, Arc::new(Notify::new()), "198.51.100.2:4433".parse().unwrap());
+        let newer = whereabouts::sign_flagged(&name(CALLEE), &["203.0.113.7:4433".parse().unwrap()], now_ms() + 1, true, &key_of(CALLEE), None).unwrap();
+        let believed = whereabouts::check(&newer, &listed, Known::default(), now_ms()).unwrap();
+        lock(&point.table).keep(&believed, newer, &PointBounds::default(), now_ms(), 7).unwrap();
+        assert_eq!(point.status().sessions, 0);
+        assert_eq!(carry(&point, &id, CALLER_AT, 10), None);
+        // And the record running out ends attendance too: weighed as passing an introduction
+        // weighs it, per packet.
+        let point = relaying(RelayBounds::default());
+        let old = whereabouts::sign_flagged(&name(CALLEE), &["203.0.113.7:4433".parse().unwrap()], now_ms() - whereabouts::LIFETIME_MS + 300, true, &key_of(CALLEE), None).unwrap();
+        assert_eq!(point.take(vec![old], &plenty()), vec![String::new()]);
+        let id = relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(carry(&point, &id, CALLER_AT, 10), None);
+        assert_eq!(point.status().relayed.absent, 10);
+        // A record the point lets go of (swept when it has run out) takes its ship's sessions
+        // with it.
+        let point = relaying(RelayBounds::default());
+        attend(&point, CALLEE);
+        relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        lock(&point.table).remove(CALLEE);
+        assert_eq!(point.status().sessions, 0);
+    }
+
+    /// A point that relays, its source of keys gated, with `CALLEE` attending on the connection
+    /// the tests announce on and asking for introductions; and a caller's record with presence.
+    fn relaying_gated(gate: &Arc<Gate>) -> (Arc<Point>, Vec<u8>, Vec<u8>) {
+        let point = Arc::new(testing(Point::new(PointConfig { keys: gate.clone(), galaxies: None, bounds: PointBounds::default(), relay: Some(RelayBounds::default()) }, &rustls::crypto::ring::default_provider()).unwrap()));
+        let now = now_ms();
+        let believed = whereabouts::check(&flagged(CALLEE), &listed, Known::default(), now).unwrap();
+        lock(&point.table).keep(&believed, flagged(CALLEE), &PointBounds::default(), now, TESTING.0).unwrap();
+        let caller = record(CALLER, now);
+        let presence = tests::presence_for(&caller);
+        (point, caller, presence)
+    }
+
+    fn relay_worker(point: &Arc<Point>, caller: Vec<u8>, presence: Vec<u8>, gone: &Arc<Mutex<bool>>) -> std::thread::JoinHandle<Result<(), &'static str>> {
+        let (point, gone) = (point.clone(), gone.clone());
+        std::thread::spawn(move || point.relay_one(CALLEE, caller, &presence, Some(&TESTING.1), CALLER_AT.parse().unwrap(), [8; 16], &gone))
+    }
+
+    #[test]
+    fn no_session_is_made_for_a_caller_that_goes_while_its_request_waits_for_the_table() {
+        let gate = Arc::new(Gate::default());
+        let (point, caller, presence) = relaying_gated(&gate);
+        let gone = Arc::new(Mutex::new(false));
+        let worker = relay_worker(&point, caller, presence, &gone);
+        until(|| gate.asked.load(Ordering::SeqCst) >= 1);
+        let table = lock(&point.table);
+        gate.open.store(true, Ordering::SeqCst);
+        until(|| gate.answered.load(Ordering::SeqCst));
+        // The few instructions from the answer to the wait for the table.
+        std::thread::sleep(Duration::from_millis(50));
+        *lock(&gone) = true;
+        drop(table);
+        assert_eq!(worker.join().unwrap(), Err(GONE));
+        assert_eq!(point.status().sessions, 0);
+        assert!(lock(&point.table).next_push(TESTING.0, point.now()).is_none());
+    }
+
+    #[test]
+    fn nothing_is_asked_for_a_request_to_relay_whose_caller_goes_while_it_waits_for_the_table() {
+        let gate = Arc::new(Gate::default());
+        gate.open.store(true, Ordering::SeqCst);
+        let (point, caller, presence) = relaying_gated(&gate);
+        let asked = gate.asked.load(Ordering::SeqCst);
+        let gone = Arc::new(Mutex::new(false));
+        let table = lock(&point.table);
+        let worker = relay_worker(&point, caller, presence, &gone);
+        // The worker's few instructions up to the wait for the table.
+        std::thread::sleep(Duration::from_millis(50));
+        *lock(&gone) = true;
+        drop(table);
+        assert_eq!(worker.join().unwrap(), Err(GONE));
+        assert_eq!(gate.asked.load(Ordering::SeqCst), asked, "the source of keys was asked for a caller that had gone");
+    }
+
+    #[test]
+    fn a_session_is_weighed_where_it_is_made_against_the_ship_called_and_the_callers_history() {
+        // The callee's connection closes while the caller's key is asked about: when the answer
+        // comes, no session is made toward the connection the table has seen close.
+        let gate = Arc::new(Gate::default());
+        let (point, caller, presence) = relaying_gated(&gate);
+        let worker = relay_worker(&point, caller, presence, &Arc::new(Mutex::new(false)));
+        until(|| gate.asked.load(Ordering::SeqCst) >= 1);
+        lock(&point.table).close(TESTING.0);
+        gate.open.store(true, Ordering::SeqCst);
+        assert_eq!(worker.join().unwrap(), Err(NOT_ATTENDING));
+        assert_eq!(point.status().sessions, 0);
+        // A newer record of the caller is kept while its older one is checked: the older one is
+        // refused where the session would be made.
+        let gate = Arc::new(Gate::default());
+        let (point, caller, presence) = relaying_gated(&gate);
+        let worker = relay_worker(&point, caller, presence, &Arc::new(Mutex::new(false)));
+        until(|| gate.asked.load(Ordering::SeqCst) >= 1);
+        let now = now_ms();
+        let newer = record(CALLER, now + 1000);
+        let believed = whereabouts::check(&newer, &listed, Known::default(), now).unwrap();
+        lock(&point.table).keep(&believed, newer, &PointBounds::default(), now, TESTING.0).unwrap();
+        gate.open.store(true, Ordering::SeqCst);
+        assert_eq!(worker.join().unwrap(), Err("a record of the ship as new or newer is already held"));
+        assert_eq!(point.status().sessions, 0);
+        // And a caller's record that runs out while it is checked is refused there too.
+        let gate = Arc::new(Gate::default());
+        let (point, _, _) = relaying_gated(&gate);
+        let old = record(CALLER, now_ms() - whereabouts::LIFETIME_MS + 300);
+        let presence = tests::presence_for(&old);
+        let worker = relay_worker(&point, old, presence, &Arc::new(Mutex::new(false)));
+        until(|| gate.asked.load(Ordering::SeqCst) >= 1);
+        std::thread::sleep(Duration::from_millis(400));
+        gate.open.store(true, Ordering::SeqCst);
+        assert_eq!(worker.join().unwrap(), Err("the record ran out, or this clock went back, while it was being checked"));
+        assert_eq!(point.status().sessions, 0);
+    }
+
+    #[test]
+    fn a_request_to_relay_is_refused_saying_why_and_within_each_bound() {
+        // A point that does not relay says so.
+        let quiet = self::point(PointBounds::default(), None);
+        assert_eq!(quiet.take(vec![flagged(CALLEE)], &plenty()), vec![String::new()]);
+        let record = record(CALLER, now_ms());
+        assert_eq!(quiet.relay_one(CALLEE, record.clone(), &presence_for(&record), Some(&TESTING.1), CALLER_AT.parse().unwrap(), [1; 16], &Mutex::new(false)), Err(NO_RELAY));
+        let bounds = RelayBounds { sessions_each: 2, sessions_from: 2, sessions: 3, made_each: 100, ..RelayBounds::default() };
+        let point = relaying(bounds);
+        // Not attending; attending but saying it can be reached directly.
+        assert_eq!(relay_from(&point, CALLER, CALLEE, CALLER_AT), Err(NOT_ATTENDING));
+        assert_eq!(point.take(vec![self::record(CALLEE, now_ms())], &plenty()), vec![String::new()]);
+        assert_eq!(relay_from(&point, CALLER, CALLEE, CALLER_AT), Err("that ship says it can be reached directly, and is not relayed for"));
+        attend(&point, CALLEE);
+        // A forged caller's record; one with no presence; a caller at the callee's own address.
+        let forged = whereabouts::sign(&name(CALLER), &["203.0.113.9:1".parse().unwrap()], now_ms(), &key_of(CALLER + 1), None).unwrap();
+        assert_eq!(point.relay_one(CALLEE, forged.clone(), &presence_for(&forged), Some(&TESTING.1), CALLER_AT.parse().unwrap(), [2; 16], &Mutex::new(false)), Err("the record is not signed by the ship's key"));
+        let genuine = self::record(CALLER, now_ms());
+        assert!(point.relay_one(CALLEE, genuine, &[], Some(&TESTING.1), CALLER_AT.parse().unwrap(), [3; 16], &Mutex::new(false)).unwrap_err().contains("presence"));
+        assert_eq!(relay_from(&point, CALLER, CALLEE, "198.51.100.1:4433"), Err("the caller is at the very address of the ship it wants; there is nothing to carry"));
+        assert_eq!(point.status().sessions, 0);
+        // Two for the callee, and the third (from another caller) is refused for that reason.
+        let other_callee = CALLEE + (2 << 16);
+        attend(&point, other_callee);
+        relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        relay_from(&point, CALLER + (3 << 16), CALLEE, CALLER_AT).unwrap();
+        assert_eq!(relay_from(&point, CALLER + (4 << 16), CALLEE, CALLER_AT), Err("this lookup point carries as many sessions for that ship as it may; try again later"));
+        // Two from one caller: the third, to another callee, is refused for that reason.
+        relay_from(&point, CALLER, other_callee, CALLER_AT).unwrap();
+        // Three in all.
+        assert_eq!(relay_from(&point, CALLER + (5 << 16), other_callee, CALLER_AT), Err("this lookup point carries as many sessions as it may; try again later"));
+        assert_eq!(point.status().sessions, 3);
+        let point = relaying(RelayBounds { sessions_from: 1, ..RelayBounds::default() });
+        attend(&point, CALLEE);
+        attend(&point, other_callee);
+        relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        assert_eq!(relay_from(&point, CALLER, other_callee, CALLER_AT), Err("this lookup point carries as many sessions from that ship as it may; try again later"));
+        // Sessions made for one caller, counted by the hour so nothing is earned back: two, then
+        // refused for that reason, while another caller is still served.
+        let point = relaying_within(PointBounds { rate_period: Duration::from_secs(3600), ..PointBounds::default() }, RelayBounds { made_each: 2, ..RelayBounds::default() });
+        attend(&point, CALLEE);
+        relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        assert_eq!(relay_from(&point, CALLER, CALLEE, CALLER_AT), Err("too many sessions made for that ship just now; try again later"));
+        relay_from(&point, CALLER + (6 << 16), CALLEE, CALLER_AT).unwrap();
+        // None of it stopped ordinary questions.
+        assert!(point.find(CALLEE).is_some());
+        // A callee whose record has run out does not attend, though its connection is open.
+        let point = relaying(RelayBounds::default());
+        let old = whereabouts::sign_flagged(&name(CALLEE), &["203.0.113.7:4433".parse().unwrap()], now_ms() - whereabouts::LIFETIME_MS + 300, true, &key_of(CALLEE), None).unwrap();
+        assert_eq!(point.take(vec![old], &plenty()), vec![String::new()]);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(relay_from(&point, CALLER, CALLEE, CALLER_AT), Err(NOT_ATTENDING));
+        // No session without room for its push: four pushes wait for the callee (nobody takes
+        // them here), and the fifth request is refused for that, with no session made.
+        let point = relaying(RelayBounds::default());
+        attend(&point, CALLEE);
+        for n in 0..MOST_WAITING_EACH as u64 {
+            relay_from(&point, CALLER + ((n + 1) << 16), CALLEE, CALLER_AT).unwrap();
+        }
+        assert_eq!(relay_from(&point, CALLER + (9 << 16), CALLEE, CALLER_AT), Err("that ship has as many introductions waiting as it may; try again later"));
+        assert_eq!(point.status().sessions, MOST_WAITING_EACH);
+    }
+
+    /// Ask the point to relay for the ship of `record` (its presence made here), from `from`,
+    /// to `callee`.
+    fn relay_record(point: &Point, record: Vec<u8>, callee: u64, from: &str) -> Result<SessionId, &'static str> {
+        let presence = presence_for(&record);
+        let id = crate::random_bytes::<16>().unwrap();
+        point.relay_one(callee, record, &presence, Some(&TESTING.1), from.parse().unwrap(), id, &Mutex::new(false)).map(|()| id)
+    }
+
+    #[test]
+    fn a_lookup_point_at_a_made_up_address_is_never_connected_to_and_the_walk_goes_on() {
+        let made_up: SocketAddr = "255.255.255.255:4433".parse().unwrap();
+        let (tokio, finder) = finder_with(Lookup { at: vec![(None, made_up)], ..Lookup::default() }, now_ms(), 0);
+        let finder = Arc::new(finder);
+        let seen = WhereRequest { body: Some(where_request::Body::Seen(Seen {})) };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let why = tokio.block_on(finder.exchange(0, seen.clone(), deadline)).unwrap_err();
+        assert!(why.contains("made up for relay sessions"), "{why}");
+        let why = tokio.block_on(finder.kept_connection(made_up)).unwrap_err();
+        assert!(why.contains("made up for relay sessions"), "{why}");
+        // A made-up address first, then one where nothing answers: the second is still tried.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (tokio, finder) = finder_with(Lookup { at: vec![(None, made_up), (None, silent.local_addr().unwrap())], ..Lookup::default() }, now_ms(), 0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let why = tokio.block_on(Arc::new(finder).exchange(0, seen, deadline)).unwrap_err();
+        assert!(why.contains(&silent.local_addr().unwrap().to_string()), "{why}");
+    }
+
+    #[test]
+    fn a_pair_of_ships_holds_at_most_two_sessions_and_a_moon_counts_as_its_planet() {
+        let point = relaying(RelayBounds { made_each: 100, ..RelayBounds::default() });
+        attend(&point, CALLEE);
+        let pair_full = Err("this lookup point carries as many sessions between those two ships as it may; try again later");
+        // Two for one caller and callee; the third is refused for that reason.
+        relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        let second = relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        assert_eq!(relay_from(&point, CALLER, CALLEE, CALLER_AT), pair_full);
+        // Another caller still gets one to that callee meanwhile.
+        relay_from(&point, CALLER + (3 << 16), CALLEE, CALLER_AT).unwrap();
+        // One of the two ends (its callee's... here, it goes idle while the other is kept busy):
+        // there is room for the pair again.
+        carry(&point, &second, CALLER_AT, 10).unwrap();
+        point.step_relay(relay::IDLE - Duration::from_secs(1));
+        carry(&point, &second, CALLER_AT, 10).unwrap();
+        point.step_relay(Duration::from_secs(2));
+        relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        assert_eq!(relay_from(&point, CALLER, CALLEE, CALLER_AT), pair_full);
+        // Two moons of one planet share the pair's count with each other (and with the planet).
+        let point = relaying(RelayBounds { made_each: 100, ..RelayBounds::default() });
+        attend(&point, CALLEE);
+        let (first_moon, second_moon) = ((1u64 << 32) | CALLER, (2u64 << 32) | CALLER);
+        relay_record(&point, moon_record(first_moon, now_ms()), CALLEE, CALLER_AT).unwrap();
+        relay_record(&point, moon_record(second_moon, now_ms()), CALLEE, CALLER_AT).unwrap();
+        assert_eq!(relay_record(&point, moon_record(first_moon, now_ms() + 1), CALLEE, CALLER_AT), pair_full);
+        assert_eq!(relay_from(&point, CALLER, CALLEE, CALLER_AT), pair_full);
+        // And the caller's count: one session from a planet's moons in all.
+        let point = relaying(RelayBounds { sessions_from: 1, made_each: 100, ..RelayBounds::default() });
+        attend(&point, CALLEE);
+        attend(&point, CALLEE + (2 << 16));
+        relay_record(&point, moon_record(first_moon, now_ms()), CALLEE, CALLER_AT).unwrap();
+        assert_eq!(relay_record(&point, moon_record(second_moon, now_ms()), CALLEE + (2 << 16), CALLER_AT), Err("this lookup point carries as many sessions from that ship as it may; try again later"));
+        // And the caller's allowance of sessions made, counted by the hour: one for the planet
+        // and its moons together.
+        let point = relaying_within(PointBounds { rate_period: Duration::from_secs(3600), ..PointBounds::default() }, RelayBounds { made_each: 1, ..RelayBounds::default() });
+        attend(&point, CALLEE);
+        relay_record(&point, moon_record(first_moon, now_ms()), CALLEE, CALLER_AT).unwrap();
+        assert_eq!(relay_record(&point, moon_record(second_moon, now_ms()), CALLEE, CALLER_AT), Err("too many sessions made for that ship just now; try again later"));
+    }
+
+    #[test]
+    fn a_session_whose_every_send_fails_goes_idle_all_the_same() {
+        let point = relaying(RelayBounds::default());
+        attend(&point, CALLEE);
+        let id = relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        // A socket whose every send would block.
+        let stand = relay::tests::Stand::at("203.0.113.1:4433");
+        stand.blocks.store(true, Ordering::SeqCst);
+        let wrapper = relay::Relayed::new(stand.clone(), Some(point.clone()), Duration::from_secs(30)).unwrap();
+        let from_caller = relay::wrapped(&id, &[0x41; 100]);
+        // Attempts ten seconds apart, none delivered.
+        for _ in 0..3 {
+            stand.arrive(vec![(CALLER_AT.parse().unwrap(), from_caller.clone(), 0)]);
+            assert!(relay::tests::received(&wrapper).is_empty());
+            point.step_relay(Duration::from_secs(10));
+        }
+        assert_eq!(point.status().relayed.carried, 0);
+        assert_eq!(point.status().relayed.unsent, 3 * from_caller.len() as u64);
+        // Thirty seconds after it was made, nothing having gone, it is gone.
+        assert_eq!(point.status().sessions, 0);
+    }
+
+    #[test]
+    fn the_byte_allowances_hold_over_every_interval_and_one_ship_at_its_allowance_does_not_stop_another() {
+        // A small allowance for each ship, and a large one in all.
+        let bounds = RelayBounds { ship_rate: 20_000, ship_burst: 40_000, point_rate: 1 << 30, point_burst: 1 << 30, ..RelayBounds::default() };
+        let point = relaying(bounds);
+        let other_callee = CALLEE + (2 << 16);
+        attend(&point, CALLEE);
+        attend(&point, other_callee);
+        let id = relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        let other = relay_from(&point, CALLER, other_callee, CALLER_AT).unwrap();
+        // Offer far more than the bound, as fast as it can be offered, for half a second.
+        let started = Instant::now();
+        let (mut offered, mut carried) = (0u64, 0u64);
+        while started.elapsed() < Duration::from_millis(500) {
+            offered += 1000;
+            if carry(&point, &id, CALLER_AT, 1000).is_some() {
+                carried += 1000;
+            }
+        }
+        let took = started.elapsed().as_secs_f64();
+        let bound = 40_000.0 + 20_000.0 * took;
+        assert!(offered as f64 >= 4.0 * bound, "inconclusive: only {offered} bytes were offered against a bound of {bound}");
+        assert!(carried as f64 <= bound, "{carried} carried in {took} s, more than {bound}");
+        assert!(carried >= 40_000, "the burst was not carried: {carried}");
+        assert_eq!(point.status().relayed.over_ship, offered - carried);
+        // The other ship's session still carries, from the same caller.
+        assert!(carry(&point, &other, CALLER_AT, 1000).is_some());
+        // And over the point's own allowance, every ship is held.
+        let bounds = RelayBounds { ship_rate: 1 << 30, ship_burst: 1 << 30, point_rate: 10_000, point_burst: 20_000, ..RelayBounds::default() };
+        let point = relaying(bounds);
+        attend(&point, CALLEE);
+        attend(&point, other_callee);
+        let ids = [relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap(), relay_from(&point, CALLER, other_callee, CALLER_AT).unwrap()];
+        let started = Instant::now();
+        let (mut offered, mut carried) = (0u64, 0u64);
+        while started.elapsed() < Duration::from_millis(500) {
+            for id in &ids {
+                offered += 1000;
+                if carry(&point, id, CALLER_AT, 1000).is_some() {
+                    carried += 1000;
+                }
+            }
+        }
+        let took = started.elapsed().as_secs_f64();
+        let bound = 20_000.0 + 10_000.0 * took;
+        assert!(offered as f64 >= 4.0 * bound, "inconclusive: only {offered} bytes were offered against a bound of {bound}");
+        assert!(carried as f64 <= bound && carried >= 20_000, "{carried} carried in {took} s against {bound}");
+        assert_eq!(point.status().relayed.over_point, offered - carried);
+    }
+
+    #[test]
+    fn what_a_point_carries_goes_out_as_it_came_in_and_never_reaches_quic() {
+        let point = relaying(RelayBounds::default());
+        attend(&point, CALLEE);
+        let id = relay_from(&point, CALLER, CALLEE, CALLER_AT).unwrap();
+        let stand = relay::tests::Stand::at("203.0.113.1:4433");
+        let wrapper = relay::Relayed::new(stand.clone(), Some(point.clone()), Duration::from_secs(30)).unwrap();
+        let from_caller = relay::wrapped(&id, &[0x41; 300]);
+        let from_callee = relay::wrapped(&id, &[0x42; 200]);
+        let unknown = relay::wrapped(&[5; 16], &[0x43; 100]);
+        stand.arrive(vec![(CALLER_AT.parse().unwrap(), from_caller.clone(), 0), ("198.51.100.1:4433".parse().unwrap(), from_callee.clone(), 0), (STRANGER.parse().unwrap(), from_caller.clone(), 0), (CALLER_AT.parse().unwrap(), unknown, 0)]);
+        // Nothing reaches QUIC, and exactly what came in from each pinned side went to the
+        // other, byte for byte, and nothing else went anywhere.
+        assert!(relay::tests::received(&wrapper).is_empty());
+        let sent = stand.sent();
+        assert_eq!(sent, vec![(test_from(), from_caller, None), (CALLER_AT.parse().unwrap(), from_callee, None)]);
+        let status = point.status();
+        assert_eq!(status.relayed.carried, (2 * relay::HEADER + 500) as u64);
     }
 }
