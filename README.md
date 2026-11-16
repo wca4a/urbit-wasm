@@ -5,8 +5,9 @@ process. Each ship is one SQLite file, a kernel, and agents, all WASM modules
 written in Rust.
 
 Experimental. There is a runtime, a kernel, logs that agents can follow, an
-HTTP server that lets an app or a browser sign in to a ship, and an encrypted
-link over which ships send each other commands and follow each other's logs.
+HTTP server that lets an app or a browser sign in to a ship, a store of files
+of any size on each ship for the owner's devices, and an encrypted link over
+which ships send each other commands and follow each other's logs.
 A ship's file is encrypted on disk. A ship's keys can be derived from its Urbit
 ID master ticket, but ships do not yet look each other up in Azimuth, and there
 is no update mechanism yet.
@@ -22,8 +23,20 @@ is no update mechanism yet.
   whoever runs the runtime.
 - A ship can be made from its Urbit ID master ticket or its keyfile, and then
   runs with the networking key Urbit's own wallet derives for it.
-- A ship can be exported as one sealed file and imported into another runtime.
-  Only the owner opens the file, with the master ticket.
+- A ship can be exported as one sealed file (and, if it holds files, a second
+  sealed file beside it with them) and imported into another runtime. Only the
+  owner opens these, with the master ticket.
+- A ship keeps files of any size beside its own file, up to an allowance the
+  operator sets (10 GiB by default). The owner's signed-in devices upload a
+  file a chunk at a time, can stop and carry on where they left off, and
+  download it whole or in part. Each file belongs to the agents that claim it,
+  and only a device asking through one of those agents sees it. An agent keeps
+  only a reference to a file, never its bytes.
+- A file is known by a hash over its contents, checked chunk by chunk, so
+  every byte served is checked against what was stored, and identical files
+  are kept once. Files are encrypted on disk like everything else, and go
+  with an exported copy in a second sealed file; an import keeps only files
+  that arrive whole and unchanged.
 - The kernel is itself a WASM module. It keeps the list of installed agents and
   decides what each may do; the runtime enforces it.
 - Agents declare what they offer and what they use in a manifest. Without a
@@ -224,7 +237,8 @@ source rather than something the tests prove.
 | `runtime/src/ship.rs` | An awake ship: runs one event as one transaction, calls the kernel, runs handlers in fresh instances, takes commands and log entries from other ships, settles a ship that has fallen out of step |
 | `runtime/src/host.rs` | The host functions agents import, and the fuel each costs |
 | `runtime/src/store.rs` | The SQLite schema and every query; import validation |
-| `runtime/src/seal.rs` | Keys: the storage key, the keys derived from it, the recovery key, and sealing and opening an exported copy |
+| `runtime/src/seal.rs` | Keys: the storage key, the keys derived from it, the recovery key, and sealing and opening an exported copy and its stream of files |
+| `runtime/src/files.rs` | Files on the ship: the file id format, uploads and downloads, reading chunks back checked, clearing leftovers, and the stream of files beside an exported copy |
 | `urbit-id/src/` | Urbit ID's keys as Urbit derives them: `wallet.rs` (master ticket to networking keys, UP 8), `argon2.rs` (Urbit's Argon2 variant), `ob.rs` (ship and moon names, tickets), `keyfile.rs` (reading and writing keyfiles), `naive.rs` (Azimuth's state worked out from its logs and layer 2 batches: a port of Urbit's `naive.hoon`) |
 | `runtime/src/azimuth.rs` | Reading Urbit ID: a ship's key from the Azimuth contract on Ethereum, or from the roller for a ship on layer 2 |
 | `runtime/src/chain.rs` | Reading Ethereum's history over JSON-RPC: logs over a range of blocks, transaction inputs, the finalised block |
@@ -238,6 +252,7 @@ source rather than something the tests prove.
 | `runtime/src/bin/serve.rs` | Command-line wrapper around the HTTP server, with a demo ship |
 | `runtime/src/bin/loadtest.rs` | Load test |
 | `runtime/tests/runtime.rs` | Integration tests |
+| `runtime/tests/files.rs` | Integration tests of files on the ship |
 | `runtime/tests/lookup.rs` | Integration tests of finding ships through lookup points |
 | `kernel/src/lib.rs` | The default kernel: agent registry and routing policy |
 | `proto/ship.proto` | Every message: runtime and kernel, runtime and agent, client and ship, ship and ship |
@@ -259,6 +274,7 @@ The workspace's default members are `runtime` and `urbit-id`, so a plain
 | `storage.key` | The storage key as 64 hexadecimal digits, mode 0600. Only there if the runtime was not handed a key and made its own |
 | `storage.check` | A value derived from the storage key, by which the directory tells its own key. It is not the key and opens nothing |
 | `blobs/<sha256>.wasm` | Module bytes, named by content hash and re-verified against that hash on every load. Not encrypted: they are code, shared between ships |
+| `files/<ship>/<dir>/<n>.<gen>` | The ship's files: one directory per upload, kept under the same name when the upload becomes a file, named with 16 random bytes in hex that are never used again; in each, copy `gen` (16 random bytes in hex) of chunk `n`, encrypted. Nothing here is named by a hash of what it holds (see Files on the ship) |
 | `tmp/` | Scratch files. New and imported ships are built here and then hard-linked into `ships/`, so a failure never leaves a half-made ship under its real name |
 | `runtime.lock` | Held with an exclusive `flock` for the life of the runtime. A second runtime on the same directory fails with `Error::DataDirInUse` |
 
@@ -441,6 +457,7 @@ bigger buffer.
 | `log_unfollow(req, req_len)` | Stop following. No permission needed |
 | `log_share(req, req_len)` | `ShareRequest`. Let a named ship, or `*`, follow one of this agent's logs, or stop |
 | `log_next(req, req_len, buf, cap) -> i64` | `NextRequest`. Take entries after this agent's position, at most 256 entries or 256 KiB per call |
+| `file_info(id, id_len, buf, cap) -> i64` | `FileInfo` of a file this agent claims on this ship, by its 32-byte id. `-1` for any other id, whether the ship holds it or not. Read-only, and no grant is needed: it is the agent's own data. No host function reads or writes a file's bytes |
 
 The calls that change something are refused during a read or a checkpoint.
 
@@ -456,6 +473,8 @@ The calls that change something are refused during a read or a checkpoint.
   replace local state with, and an optional `stopped` reason for a log on
   another ship.
 - `Receipt` and `Verdict`, re-exported from the protocol.
+- `files::info(id)`, and `FileRef` and `FileInfo` from the protocol. A
+  `FileRef` (ship, id, length) is plain data an agent keeps in place of a file.
 - `agent!(handle, read = f, notify = f, checkpoint = f, receipt = f)` exports
   `alloc`, `handle`, and whichever roles are named. Command, read, and notify
   handlers are `fn(&[u8]) -> Vec<u8>`; a checkpoint handler is
@@ -464,8 +483,9 @@ The calls that change something are refused during a read or a checkpoint.
 ## Storage
 
 Each ship is one SQLite file, and the file is the ship's source of truth. The
-schema version is `9`, stored in the `meta` table; a file with any other
-version is refused.
+schema version is `10`, stored in the `meta` table; a file with any other
+version is refused. There is no migration: ship files and exports made before
+version 10 (before files on the ship) do not open.
 
 | Table | Purpose |
 | --- | --- |
@@ -487,6 +507,11 @@ version is refused.
 | `audit` | Recent events and runtime notes, with time, agent, payload, and success. Trimmed to the newest `audit_rows` |
 | `devices` | Signed-in devices: a hash of each token, a label, and when it signed in |
 | `signin_codes` | Hashes of one-time codes and of the reusable access code, with expiry |
+| `uploads` | Open uploads: directory, agent, length, media type, and when last sent to |
+| `files` | Files held: id, directory, length, media type, when added. `meta.file_bytes` is the sum of their lengths |
+| `file_claims` | Which agents claim which files |
+| `file_chunks` | The copy and hash of each chunk held, for uploads and files alike, by directory and chunk number |
+| `file_trash` | What no row names any more and is still to be removed from disk: whole directories and single chunk copies, with the bytes each holds |
 
 Files are opened with `journal_mode = WAL` and `trusted_schema = OFF`. With
 `Durability::Full` (the default), SQLite uses `synchronous = FULL` and
@@ -1154,6 +1179,313 @@ and the state).
 The runtime cannot check that the state an agent returns is true. The SDK
 documentation says an agent must only change the state behind a log in the
 same event that appends the entry describing the change.
+
+## Files on the ship
+
+A ship's own file holds nothing larger than 1 MiB. Files of any size are kept
+beside it, in `files/<ship>/`, and the ship's file holds the truth about them:
+which files there are, which agents claim each, and the hash of every chunk.
+The owner's signed-in devices put files in and take them out over HTTP, under
+an agent. An agent keeps only a reference (`FileRef`: ship, id, length) and
+never loads a file; no host function reads or writes file bytes. Fetching a
+file from another ship, a cache, and "save a copy" are not built yet; the id
+is made so that another ship can check a file chunk by chunk in messages of at
+most 1 MiB.
+
+### The file id (format 1)
+
+- A file of `length` bytes is cut into chunks of `CHUNK = 1 MiB`: every chunk
+  is exactly 1 MiB but the last, which holds the rest (1 byte to 1 MiB). An
+  empty file has no chunks.
+- `leaf(i) = SHA-256("ship.v1.chunk\n" || chunk i)`.
+- `FANOUT = 32768`. While the list of hashes has more than one, each run of up
+  to 32,768 is replaced by `SHA-256("ship.v1.index\n" || the hashes in it)`.
+  The one left is the root. One chunk's root is its own leaf; no chunks' root
+  is `SHA-256("ship.v1.chunk\n")`.
+- `id = SHA-256("ship.v1.stored\n" || length as 8 bytes, low byte first ||
+  root)`, written as 64 lower-case hex digits in addresses.
+
+`runtime::files` has `leaf`, `root`, `file_id`, and `id_of(contents)` for
+clients. Its tests hold numbers worked out apart from this code, for 0 bytes,
+1 byte, exactly 1 MiB, 1 MiB and a byte, and 32,769 made-up hashes, which take
+two rounds to come down to one.
+
+### On disk
+
+Each upload gets a directory named with 16 random bytes in hex, made when the
+upload starts and never used again; when the upload becomes a file it keeps
+that directory. Each copy of chunk `n` is the file `<dir>/<n>.<gen>`, where
+`gen` is 16 more random bytes chosen when that copy is written, and recorded in
+the chunk's row: sending a chunk again writes a new copy beside the old one,
+never over it. The one exception is an import, which writes each chunk once
+into a fresh directory and gives every copy the same all-zero `gen`. A copy is a random 12-byte nonce, then the chunk sealed with
+ChaCha20-Poly1305 under a key derived from the storage key with the label
+`ship.v1.files\n`, the ship's name, and the directory, with the ship's name,
+the directory, `n` and `gen` bound in as associated data. A chunk copied to
+another number, copy, directory, or ship does not open. Nothing on disk is
+named by a hash, and no content, media type, or hash appears unencrypted.
+
+The ship's file and the directory are two stores, and either can move without
+the other (a crash, a failed sync, a failed commit, a power cut). One rule,
+stated at the top of `files.rs`, keeps them in step:
+
+- Bytes are written and durable before any row names them: a chunk copy is
+  written and synced, and the directory it is in synced, before the
+  transaction that names it; a directory is made and the directory it is in
+  synced before the row that names it.
+- Bytes are removed only after the transaction that stopped naming them is
+  durable. Every transaction that stops naming bytes or records something to
+  remove (a chunk's commit, finish, abandon, expiry, delete) is committed with
+  the log synced, whatever `durability` says (under `Durability::Normal` the
+  connection switches to `synchronous = FULL` and `fullfsync` for that one
+  commit, so the commit record is on disk when it returns; in WAL mode that is
+  what makes a commit survive a power cut). The same transaction records what it
+  stopped naming in `file_trash`. Making an upload is not synced: losing that
+  commit loses only a directory no row names, which the first wake removes.
+- A name on disk is never used for other bytes: directories and chunk copies
+  are named with random bytes when they are made, and nothing is written over.
+- After a failure, only what can be shown never to be named, and never to come
+  to be named, is removed. A chunk upload refused or failing before its commit
+  is tried removes its own copy, which its own exclusive create made (a
+  generation already taken is an error that touches nothing). If the commit
+  itself reports an error, nothing is removed: SQLite may have written the
+  commit to its log before the error, and a crash would then bring it back,
+  naming the new copy. The leftover goes when the upload finishes, after a
+  synced commit has settled what is named, or with its directory. The same
+  holds for a new upload's directory.
+- If anything unwinds while the ship is held, the ship's connection is closed
+  before anything else can use it (`with_ship`), which rolls back whatever
+  transaction was open: nothing reads, or acts on, rows never committed.
+- Anything no row names is rubbish that a later step is sure to try again.
+  What is in `file_trash` is removed after every operation that puts something
+  there (a chunk's commit, finish, abandon, an upload start that expires
+  others, delete), at the start of upload start, finish and delete, and when
+  the ship first wakes in the life of a runtime, 16 things at a time. An entry
+  is struck off only after its removal is durable: the directory it was in is
+  synced first. A whole directory durably removed takes with it every record
+  of what was in it. Until then its bytes count against the allowance.
+- One mechanism covers chunk copies no row names in a file's directory (left
+  by a chunk upload whose commit failed, or that could not remove its own
+  copy). A copy's name is made under the ship's slot, and only while its
+  upload is open, so no name can appear in a directory after its upload
+  finishes. Finish records, in its own synced commit, that the directory is to
+  be swept; the drain sweeps it, and strikes the record off only after the
+  whole directory was listed without error, every copy no row names was
+  removed, and the directory was synced. A crash or a failure at any point
+  leaves the record, and the next drain tries again. An upload given up or
+  expired takes its directory with it. Copies swept this way are of unknown
+  size and are not counted against the allowance; they arise only from failed
+  disk operations, at most one chunk per failed operation. A directory no row
+  names goes when the ship first wakes, and the ship is looked through again
+  at its next wake unless every such removal worked. An entry a row names is
+  kept on its name alone, whatever else is odd about it; for any other entry,
+  an error reading the listing or the entry's type makes that look remove
+  nothing, and the ship is looked at again at its next wake. An entry no row
+  names, a name that does not parse included, is rubbish and is removed. No
+  error or failed lookup is ever taken as leave to remove something a row
+  names or a ship already here owns: an import that cannot tell whether a ship
+  of its name exists stops, rather than clear that name's files.
+
+Every chunk read is checked twice before any of it is served: it must open
+under its key for its place, and what opens must hash to the leaf the ship's
+file holds for it. Damaged or missing bytes are an error to the client
+(HTTP 500), never wrong bytes.
+
+### How a file gets in and out
+
+All routes are under the ship and an agent, need a signed-in device as every
+other route does, and the agent must be installed (the kernel must route an
+owner's command to it). Messages are in `proto/ship.proto`.
+
+| Method and path | Answer |
+| --- | --- |
+| `POST /agents/<a>/files/uploads` | `UploadRequest {length, media_type}` gets `UploadReply {upload, chunks}`. Expired uploads are swept first; the whole length is reserved |
+| `PUT /agents/<a>/files/uploads/<upload>/<n>` | The chunk as the body, exactly the size chunk `n` must be. Any order; sending `n` again replaces it until the upload is finished. 204 |
+| `GET /agents/<a>/files/uploads/<upload>?from=` | `UploadState`: the chunks held, as runs (first, count), at most 16,384 chunk numbers per answer, with `next` to carry on |
+| `POST /agents/<a>/files/uploads/<upload>/finish` | Optional `FinishRequest {id}`. Every chunk must be held (409). The id is worked out from the hashes held, without reading the bytes again; a stated id that differs is refused (422). Gets `FileInfo` |
+| `DELETE /agents/<a>/files/uploads/<upload>` | Gives the upload up, and its reservation. 204 |
+| `GET /agents/<a>/files?after=&max=` | `FileList` of the agent's files in order of id, at most 256 (100 by default) per page |
+| `GET /agents/<a>/files/<id>` | `FileInfo {id, length, chunks, media_type, added_ms}` |
+| `GET /agents/<a>/files/<id>/chunks/<n>` | One chunk |
+| `GET /agents/<a>/files/<id>/content` | The whole file, sent a chunk at a time with `Content-Length`. One `Range: bytes=a-b`, `a-` or `-n` gets 206 with `Content-Range`; one that is not in the file gets 416 with `Content-Range: bytes */<length>`; anything else in `Range` gets the whole file |
+| `DELETE /agents/<a>/files/<id>` | Takes back the agent's claim. When no claim is left, the file's rows go in that transaction, and its directory once that is durable. 204 |
+
+An agent sees only files it claims: an id it does not claim answers exactly as
+an id nobody holds (404). Upload names and ids must be exact lower-case hex,
+and become paths only as the ship's own directory names, never as given. When
+an upload finishes with an id the ship already holds, the agent's claim is
+added to that file and the upload's bytes go with its reservation: a ship
+keeps identical files once.
+
+Every file answer carries `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: sandbox; default-src 'none'`. Contents carry the
+stored media type and `Content-Disposition: attachment`, or `inline` for a
+fixed list of pictures, sound, and video (PNG, JPEG, GIF, WebP, AVIF; MPEG,
+Ogg, WAV, WebM, AAC, FLAC and MP4 audio; MP4, WebM and Ogg video). Nothing
+scriptable is shown inline: no SVG, HTML, or PDF. A single chunk is always
+`application/octet-stream` and an attachment. A media type is checked at
+upload: `type/subtype` of plain lower-case words, no parameters, at most 127
+bytes; none given is `application/octet-stream`.
+
+`Runtime` has the same operations for code that embeds it: `upload_start`,
+`upload_chunk` (or `prepare_chunk` then `PreparedChunk::commit`),
+`upload_state`, `upload_finish`, `upload_abandon`, `files`, `file_info`,
+`file_chunk`, `file_delete`, `file_bytes` (held, reserved), and
+`files_to_remove` (bytes and things no row names yet still on disk).
+
+### What holds, and how
+
+HARD means decided under the ship's slot and in its transaction, so true
+however requests interleave. BEST EFFORT means decided by reading again
+elsewhere.
+
+- HARD. Held, reserved, and still-to-be-removed bytes together never pass
+  `max_file_bytes` (10 GiB; 0 turns the store off) because of a new upload,
+  and never pass it by more than one chunk (1 MiB) at all. An upload reserves
+  its whole length when it starts, and only if all three together leave room.
+  Finishing moves that from reserved to held, or to be removed when the file
+  was already held; abandoning, expiry, and deletion move bytes to be removed;
+  removal takes them off. The one thing that adds is sending a chunk again:
+  the copy it replaces is to be removed, and a replacement is refused while
+  the three together are already over the allowance, so concurrent
+  replacements, taken one at a time under the slot, pass it by one chunk at
+  most. Whether a file could ever fit is decided first, by a rule that does not
+  look at how full the ship is (longer than `max_file_bytes`, or rows needing
+  more than a quarter of `max_ship_bytes` at 128 bytes a chunk plus 1 KiB):
+  that is 413, and only then is "no room now" (507) considered.
+- HARD. A chunk's row names its bytes, and only bytes already durable. The
+  chunk is hashed and encrypted outside the slot; then, under the slot, if the
+  upload is still open, its copy's name `<n>.<gen>` is made by an exclusive
+  create (the one file operation done while the ship is held for a chunk);
+  the bytes are written and synced outside the slot. Then, under the slot and in
+  one synced transaction, the upload must still be there (looked up by its
+  directory, a value never used again, so an upload given up and another
+  started in between is never mistaken for it), and the row is made to name the
+  new copy, recording the copy it replaces to be removed. If it is refused or
+  fails before its commit is tried, that copy, and only that copy, is removed;
+  if the commit itself fails, nothing is removed (see above). No failure can
+  touch bytes another upload of the same chunk put there, whatever the order.
+- HARD. At most `max_uploads` (16) uploads open per ship, and at most
+  `max_files` (100,000) files.
+- HARD. Nothing about files takes the room a ship keeps in its own file to go
+  on working: every write is kept only if it leaves `room_to_take_one` free or
+  used no new room, the rule already kept for what is written on other ships'
+  behalf. Starting an upload also needs room for all its rows then (BEST
+  EFFORT: the room may be used by other things meanwhile, and each chunk's row
+  is checked again).
+- BEST EFFORT. The agent being installed is asked of the kernel at the start
+  of each request. Nothing uninstalls an agent, so there is nothing to race.
+- BEST EFFORT. A download looks the file up again for each batch of 4,096
+  chunks, by its id and its directory, and stops if the claim has gone. An
+  export looks each file up again the same way, and marks it given up if it
+  has gone.
+
+Bounds, with their working:
+
+- Disk. Held, reserved, and to-be-removed bytes are within `max_file_bytes`
+  plus one chunk. Beyond them: 28 bytes per chunk copy (280 KiB for 10 GiB);
+  one new chunk copy (1 MiB and 28 bytes) per chunk upload in progress, and
+  over HTTP each one holds a worker, so at most `workers` (16) per server,
+  about 16 MiB; and, after a crash or a failure that could not clean up after
+  itself, at most one copy no row names per chunk upload that was in progress,
+  until its upload finishes or its directory goes, and directories made for
+  uploads whose rows never committed, until the ship first wakes.
+- Memory per request is about one chunk, never a file: a chunk upload is read
+  whole (a `PUT` carries at most one chunk, 1 MiB, whatever `max_body_bytes`
+  says, and is refused before it is read if it says it is longer) and sealed
+  where it lies; a chunk read is opened where it lies; a download holds one
+  chunk and at most 4,096 hashes with their copies' generations (192 KiB);
+  import and export hold one 64 KiB segment and one chunk of file content.
+  Finishing holds the names of the file's chunk copies as a set of strings:
+  about 40 bytes of text a chunk, and with each string's and the set's own
+  overhead roughly 100 bytes a chunk (about 1 MiB for 10 GiB); an estimate, not
+  measured.
+- Per-file bookkeeping, apart from content. Import keeps about 160 bytes per
+  file while it checks the ship's file (a small record and two maps, by id and
+  by directory; the root over a file's hashes is worked out one file at a
+  time), then, only if a stream is given and opens, about 100 bytes per file
+  while it reads it, and the list of kept files: about 25 MB at the default
+  `max_files` of 100,000, in the worst case of 100,000 small files. An export
+  lists its files, 56 bytes each (5.6 MB at 100,000). These are estimates of the
+  data held, not measured allocations.
+- Downloads of contents are limited apart from the long polls, and neither
+  may take the threads kept for everything else. Of `workers` threads (at
+  least 2), half may wait for logs; of the other half, a quarter of all the
+  threads (at least one) are never taken by downloads, whatever
+  `max_downloads` says. With 16 workers: 8 may wait, 4 may download (the
+  default), and 4 are always left; with 4: 2, 1, and 1; with 2: 1, none, and 1,
+  and a file's contents are refused (503) while its chunks can still be
+  fetched one at a time. Past the limit, 503 with `Retry-After: 1`. A client
+  gets `io_timeout` (10 s) to take each chunk, not the whole file: a stalled
+  reader is cut off after 10 s; one that keeps taking a little holds its worker
+  for at most 10 s a chunk.
+- Rows per file: one per chunk (10,240 for 10 GiB), one for the file, one per
+  claim, and one per copy waiting to be removed.
+- How long a call holds the ship, for a 10 GiB file (10,240 chunks), on a Mac
+  laptop in an unoptimised build, with every commit synced (the default
+  durability): finishing took 38 ms in all and deleting 31 ms, each including
+  its kernel check and, for deleting, removing the empty directory afterwards.
+  The rows were written beside the runtime and there were no bytes on disk, so
+  this shows finishing reads no bytes and that the hold for 10,240 rows is tens
+  of milliseconds; it does not show the cost of listing and removing a full
+  directory (done outside the hold), a release build, or another machine.
+
+### Files and export
+
+`export_ship` writes, beside `<ship>.ship`, `<ship>.files`: the ship's files,
+read from disk outside the slot and checked as they are read, as a stream
+sealed to the same recovery key. It is `ship.v1.files\n`, a public key made for
+that stream, and then segments of 64 KiB each sealed with ChaCha20-Poly1305
+under a key agreed with the recovery key and bound to the hash of the sealed
+copy beside it. A segment's nonce is its number and whether it is the last, so
+a stream cut short, reordered, with a segment dropped or repeated, or made for
+another copy does not open past that point. Inside, each file is its id and
+length and then its chunks; a file deleted while the stream was written is
+marked given up. The bytes of open uploads are not exported; their rows are
+in the copy of the ship's file, as everything in it is, and an import leaves
+them out. A ship with no files gets no stream, and one left in the directory
+from an earlier export is removed. The stream is written before the copy, and
+the copy last, so a failure leaves at worst an older copy with a newer stream,
+which no longer matches it. One export of a ship runs at a time (a lock of its
+own, not the ship's slot, which is let go while files are read), so two
+exports into one place always leave a copy and a stream from the same export.
+
+`import_ship_counted` (and `import_ship`, which drops the count) looks first
+for `<ship>.files` beside the copy. Without it, no file can arrive: the ship
+comes in with none, its files are counted as dropped, and no limit on files
+(nor a runtime that keeps none) can refuse it. With it, the ship's file comes
+in with every file row checked against every other: each file's chunks are
+all there once, in order, as many as its length takes, and its id is the id of
+its length and their hashes; every claim is by a valid agent name on a file
+that is there; every file is claimed; media types are valid; and the files fit
+`max_file_bytes` and `max_files`, or the import is refused (the runtime does
+not choose which of the owner's files to lose). Each file is given a new
+directory, so nothing in a copy becomes a path; upload rows and their chunks,
+and what was waiting to be removed, are not brought in. Then, if the stream
+opens with the code beside this copy, each file in it is checked chunk by
+chunk against the hashes now in the new ship's file and stored under this
+runtime's key. A file is kept only if every chunk arrived and matched; reading
+stops at the first thing that is not as it should be, and what was kept by
+then stays. Every other file is struck off with its claims, and the count of
+kept and dropped files is returned. A copy without its stream is therefore
+still a copy, of the ship without its files.
+
+What a hostile stream can do is bounded: it can only name files the new
+ship's file lists, once each, at the length listed there, so what is read is
+bounded by those lengths, already held to `max_file_bytes`, and content in
+memory by a segment and a chunk. The files take as long as their bytes take to
+read; they are not under `max_import_millis`. The ship's appearance under
+`ships/` is still the moment an import is done. Its files are written to
+`files/<ship>/`, and every directory made there synced into the one above,
+before that; a `files/<ship>/` with no ship is left from an import that did
+not finish, and the next import of that name clears it first. From the hard
+link on the files are the ship's: an error after it (making `ships/` durable,
+say) is reported and removes nothing. Making or importing a ship takes its name
+for the duration, so two imports of one name run one after the other. An
+import reading a directory that something outside this runtime is exporting
+into at the same moment can find a copy and a stream from different exports;
+the stream then does not open beside the copy, and the ship comes in without
+its files, which the count says.
 
 ## Networking
 
@@ -1915,6 +2247,7 @@ starting at `/`).
 | `GET /logs/<agent>/<log>/entries?after=&max_bytes=&wait=` | device | `EntryList` with the current head. `max_bytes` defaults to 256 KiB, at most 1 MiB. `wait` (seconds) long-polls up to `max_wait`. Gone entries answer 410 with `Trimmed` |
 | `GET /logs/<agent>/<log>/checkpoint` | device | `SignedCheckpoint`, or 404 |
 | `POST /agents/<agent>/command` | device | Runs the body as an owner command; the agent's reply as the body |
+| `/agents/<agent>/files/...` | device | The agent's files (see Files on the ship) |
 
 - Codes. A one-time code is 128 random bits in hex, made by
   `new_signin_code` on the machine the ship runs on. The reusable access code
@@ -1990,6 +2323,10 @@ and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 | `max_signin_codes` | 32 | One-time codes waiting per ship |
 | `signin_max_failures` | 5 | Wrong codes in a row before sign-in locks |
 | `signin_lock_millis` | 60,000 | How long it stays locked |
+| `max_file_bytes` | 10 GiB | Files per ship, held and reserved together; 0 turns the file store off |
+| `max_files` | 100,000 | Files per ship |
+| `max_uploads` | 16 | Uploads open per ship |
+| `upload_keep_millis` | 86,400,000 (24 h) | An upload not sent to for this long is given up when the next one starts |
 | `durability` | `Full` | `Full` or `Normal` (see Storage) |
 | `storage_key` | none | The key everything kept on disk for ships is encrypted under. If none, one is made and kept in the data directory (see Encryption at rest) |
 | `limits.max_key_bytes` | 1,024 | Largest `kv` key |
@@ -2078,8 +2415,9 @@ twice over, and any time limit that is zero or over a day.
 | `workers` | 16 | Request threads (at least 2). Connections queue, four per worker, and past that are dropped |
 | `secure_cookies` | false | Mark the cookie `Secure` |
 | `max_wait` | 30 s | Longest long poll |
-| `max_body_bytes` | 1 MiB | Largest request body |
-| `io_timeout` | 10 s | Time to send the whole request, and again to take the whole answer |
+| `max_body_bytes` | 1 MiB | Largest request body. A `PUT` of a file's chunk is always allowed exactly 1 MiB, never more |
+| `io_timeout` | 10 s | Time to send the whole request, and again to take the whole answer; for a file's contents, to take each chunk |
+| `max_downloads` | 4 | Files' contents being sent at once, apart from long polls; never more than half the workers less a quarter of them (at least one), so some are always left |
 
 ## Tests
 
@@ -2092,7 +2430,7 @@ twice over, and any time limit that is zero or over a day.
   inline in WebAssembly text and compiled with the `wat` crate. Each test uses
   its own temporary data directory, and most use `Durability::Normal` to skip
   per-commit syncs.
-- Unit tests in `net.rs`, `seal.rs`, `server.rs`, `store.rs`, `moon.rs`,
+- Unit tests in `net.rs`, `seal.rs`, `files.rs`, `server.rs`, `store.rs`, `moon.rs`,
   `whereabouts.rs`, `lookup.rs`, and `azimuth.rs`. The Azimuth tests run against a stand-in JSON-RPC server on
   localhost that replays what Ethereum and the roller really answered for
   `~zod`, and answers like them for made-up ships. One more test asks the real
@@ -2269,6 +2607,54 @@ other ships; recovery after one ship is restored from a backup; encryption
 at rest and sealed copies; ships made from a master ticket or a keyfile; a
 directory that reads keys from a stand-in for Urbit ID (key changes, removed
 keys, outages, impostors, the limit on unknown callers); and moons.
+
+`runtime/tests/files.rs` covers files on the ship: a file put in a chunk at a
+time, out of order and sent again, and taken out whole, by chunk, and by range;
+the headers that keep a file from acting as a page; that only the owner's
+devices, through an agent that claims a file, see it, and that no name in a
+request becomes a path; identical files kept once and removed with their last
+claim; the allowance under eight uploads starting at once, and "never fits"
+told apart from "no room now" on a full ship; open uploads and files limited,
+and forgotten uploads swept; the room a ship keeps in its own file, filled from
+outside until chunk rows are refused; bytes changed, swapped, cut short, gone,
+or not matching their hash, never served; nothing on disk or in an export
+showing a file's contents, media type, hashes, or id; leftovers cleared when a
+ship first wakes, without following links; a slow reader holding no ship, and
+downloads limited apart; a chunk made ready while its upload was given up or
+finished landing nowhere; files carried by export and import; a copy without
+its stream, a stream cut short at many points, changed, reordered, with
+segments dropped or repeated, or from another copy; a stream sealed properly
+but made to mislead; every file row checked against every other on import;
+an import clearing what an earlier one left, and one import at a time per
+name; a copy without its stream never refused for its files, and one with it
+refused when they would not fit; downloads and long polls leaving a thread
+free with four workers, and contents refused with two; and finishing a 10 GiB
+upload from its hashes alone, timed with every commit synced.
+
+`files.rs` also has unit tests that make the file store fail at chosen points,
+through checks compiled only into the crate's own tests: a chunk's commit
+failing with the new copy on disk (the old copy stays served, the new one
+goes); such a failure racing a good upload of the same chunk, in both orders;
+a failure that cannot even remove its own copy, cleared when the upload
+finishes; a removal that fails, stays counted against the allowance, and goes
+at the next operation; a leftover whose removal fails, looked for again at the
+next wake; a failure after an import's hard link, which leaves the ship its
+files; two exports into one place, the first held between its stream and
+its copy, the second unable to get between them; a commit that fails, undone
+or kept, after which nothing is removed until finishing settles it; a
+generation already taken, which leaves the copy that has it; a directory sync
+that fails once and is done on the next try, for a ship's directory and at
+start; a panic inside a transaction, after which the next operation does not
+act on its rows; a removal kept on record until the sync after it works; a
+failed sweep at finish, kept and done at the next operation; a chunk upload
+made ready before finish and reaching its name after it, refused with no name
+made; a sweep cut off between finish's commit and the drain, or whose listing
+fails, done by a later drain; a directory removed taking the records of what
+was in it; a sweep entry for an open upload, written by hand, left alone; a named
+directory whose type cannot be read, kept, and a leftover whose type cannot be
+read, kept until the next look; an import that cannot tell whether its ship
+exists, stopped without clearing anything; and a relative data directory
+synced into the current one.
 
 `runtime/tests/lookup.rs` runs real runtimes on localhost with keys from a
 stand-in for Urbit ID and no address given by hand: ships finding each other
@@ -2625,7 +3011,39 @@ These are stated in the source.
   the original and an imported copy gives two writers of the same logs, which
   nothing prevents yet.
 - Data directories and exports from before encryption do not open. There is
-  no migration.
+  no migration. Nor do ship files and exports from before files on the ship
+  (schema 9 and earlier).
+- Files on the ship do not yet go between ships: no fetching a file from
+  another ship by reference, no cache, no "save a copy", no thumbnails. Agents
+  cannot read a file's bytes. Identical files are kept once per ship, not
+  across ships, and chunks are not shared between different files. The HTTP
+  server keeps no connection open between requests, so each chunk is its own
+  connection. An import that stops part way does not carry on where it left
+  off.
+- The files of an import are not under `max_import_millis`; they take as long
+  as their bytes take to read, bounded by the lengths in the ship's file.
+- When a files stream is supplied with a copy, a runtime with a smaller
+  `max_file_bytes` or `max_files` than the ship's files need refuses that
+  ship's import, rather than bringing it in without some files, and a runtime
+  with the store off refuses any ship that has files. Without a stream, the
+  ship comes in without its files, whatever those limits.
+- The runtime syncs its data directory, and the data directory's name into its
+  parent, every time it starts, and the names of any ancestors it made itself
+  in that start. If making a deeper ancestor was cut off before its sync, in an
+  earlier start, making that path durable is the operator's to do.
+- What happens to the files on a power cut is argued from the order of syncs
+  (bytes and their directory names synced before the commit that names them;
+  bytes removed only after a synced commit), not tested: a power cut cannot be
+  made to happen in the tests. Failures at chosen points are tested through
+  checks compiled only into the tests: a failure before a chunk's commit is
+  tried, a commit that fails (undone, or kept and then reporting an error), a
+  generation already taken, a directory sync that fails once, a panic inside a
+  transaction, a failed removal, a failed sync after removals, and a failure
+  after an import's hard link. A real `COMMIT` failing inside SQLite is not
+  made to happen; the code treats every error from it as of unknown outcome.
+- An exported copy and its stream of files are two files, not one atomic step:
+  a failure between them leaves an older copy beside a newer stream, and an
+  import of the two keeps the ship and drops its files.
 - Which modules a ship needs is known only to its kernel. A kernel that leaves
   one out of `ListModules` produces an export that imports cleanly and fails
   when that agent is first called.

@@ -21,6 +21,14 @@ fn handle(event: &[u8]) -> Vec<u8> {
             value.to_string()
         }
         (Some("get"), Some(key), None) => read(key).to_string(),
+        // What the ship holds of a file this agent claims, by its id in hexadecimal.
+        (Some("file"), Some(id), None) => {
+            let bytes: Vec<u8> = (0..id.len() / 2).filter_map(|i| id.get(2 * i..2 * i + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok())).collect();
+            match <[u8; 32]>::try_from(bytes).ok().and_then(|id| ship_sdk::files::info(&id)) {
+                Some(info) => format!("{} {} {}", info.length, info.chunks, info.media_type),
+                None => "none".to_string(),
+            }
+        }
         // Publish an entry and then fail, to check that the entry goes with everything else.
         (Some("log-then-crash"), Some(key), None) => {
             write(key, read(key) + 1);

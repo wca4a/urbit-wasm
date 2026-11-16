@@ -679,5 +679,28 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
         },
     )?;
 
+    // What the ship holds of a file this agent claims: its length and media type. Nothing for
+    // any other id, whether the ship holds it or not. No host function reads or writes a
+    // file's bytes: an agent keeps a reference, and the owner's devices move the bytes.
+    linker.func_wrap(
+        "host",
+        "file_info",
+        |mut caller: Caller<'_, Ctx>, id_ptr: u32, id_len: u32, buf_ptr: u32, buf_cap: u32| -> Result<i64> {
+            charge(&mut caller, id_len as u64)?;
+            let id = read_guest(&mut caller, id_ptr, id_len, 32, "file id")?;
+            let Ok(id) = <[u8; 32]>::try_from(id) else { return Ok(-1) };
+            let (conn, agent) = (caller.data().conn.clone(), caller.data().agent.clone());
+            let Some(file) = store::file_claimed(&lock(&conn), &agent, &id)? else { return Ok(-1) };
+            let info = ship_proto::FileInfo {
+                id: id.to_vec(),
+                length: file.length,
+                chunks: crate::files::chunk_count(file.length),
+                media_type: file.media_type,
+                added_ms: file.added,
+            };
+            fill(&mut caller, buf_ptr, buf_cap, &info.encode_to_vec())
+        },
+    )?;
+
     Ok(linker)
 }

@@ -17,7 +17,7 @@ use ship_proto::{CheckpointBody, Device, Kind, LogNews, Message, PeerMessage, Re
 use crate::moon::PROOF_BYTES;
 use crate::{signed_bytes, AuditEntry, ChainCheck, Config, Durability, Effect, Error, CHECKPOINT_DOMAIN};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 // The schema and one query name a command by its number, where SQLite needs to see it written out.
 const _: () = assert!(Kind::Command as i32 == 1);
@@ -243,6 +243,40 @@ CREATE TABLE signin_codes (
     code_hash BLOB PRIMARY KEY,
     expires_ms INTEGER NOT NULL,
     reusable INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE uploads (
+    dir BLOB PRIMARY KEY,
+    agent TEXT NOT NULL,
+    length INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    touched INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE files (
+    id BLOB PRIMARY KEY,
+    dir BLOB NOT NULL,
+    length INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    added INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE file_claims (
+    agent TEXT NOT NULL,
+    id BLOB NOT NULL,
+    PRIMARY KEY (agent, id)
+) WITHOUT ROWID;
+CREATE INDEX file_claims_id ON file_claims (id);
+CREATE TABLE file_chunks (
+    dir BLOB NOT NULL,
+    n INTEGER NOT NULL,
+    gen BLOB NOT NULL,
+    hash BLOB NOT NULL,
+    PRIMARY KEY (dir, n)
+) WITHOUT ROWID;
+CREATE TABLE file_trash (
+    dir BLOB NOT NULL,
+    n INTEGER NOT NULL,
+    gen BLOB NOT NULL,
+    bytes INTEGER NOT NULL,
+    PRIMARY KEY (dir, n, gen)
 ) WITHOUT ROWID;
 ";
 
@@ -2043,6 +2077,380 @@ pub fn audit_tail(conn: &Connection, limit: usize) -> Result<Vec<AuditEntry>, Er
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+// Files. The bytes live outside this file, in a directory per upload under the runtime's
+// `files/<ship>/`; these rows are the truth about them. A directory is sixteen random bytes,
+// made with its upload and never used again, and is how a row names its bytes. Chunk `n` of a
+// directory is the file `<n>.<gen>`, where `gen` is sixteen random bytes chosen when that
+// copy of the chunk was written: a name on disk is never used for other bytes. `file_chunks` holds
+// the generation and hash of each chunk held, for uploads and files alike. `file_trash` holds
+// what no row names any more and is still to be removed from disk: whole directories (an empty
+// generation) and single chunk copies, each with the bytes it takes, which stay counted
+// against the ship's allowance until they are gone; and directories to look through for
+// copies no row names (a one-byte generation), left where removing such a copy failed. Those
+// copies are of unknown size and are not counted. `meta.file_bytes` is the sum of the
+// lengths of the ship's files, kept in step with `files` in every transaction that changes it;
+// what open uploads reserve is the sum of their lengths.
+
+/// A file the ship holds, as its row has it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredFile {
+    pub dir: [u8; 16],
+    pub length: u64,
+    pub media_type: String,
+    pub added: u64,
+}
+
+/// Which copy of a chunk a row names: sixteen random bytes, part of its name on disk.
+pub type Gen = [u8; 16];
+
+/// What is to go in one directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Discard {
+    /// The whole directory.
+    All,
+    /// One copy of one chunk.
+    Chunk(u64, Gen),
+    /// Whatever copies in it no row names.
+    Unnamed,
+}
+
+/// Something to remove from disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trash {
+    pub dir: [u8; 16],
+    pub what: Discard,
+}
+
+/// How `file_trash` writes a sweep of a directory's unnamed copies: a generation of one byte.
+const SWEEP: &[u8] = &[0];
+
+fn dir_of(bytes: Vec<u8>) -> rusqlite::Result<[u8; 16]> {
+    <[u8; 16]>::try_from(bytes).map_err(|_| rusqlite::Error::InvalidColumnType(0, "dir".into(), rusqlite::types::Type::Blob))
+}
+
+fn hash_of(bytes: Vec<u8>) -> rusqlite::Result<[u8; 32]> {
+    <[u8; 32]>::try_from(bytes).map_err(|_| rusqlite::Error::InvalidColumnType(0, "hash".into(), rusqlite::types::Type::Blob))
+}
+
+fn gen_of(bytes: Vec<u8>) -> rusqlite::Result<Gen> {
+    <Gen>::try_from(bytes).map_err(|_| rusqlite::Error::InvalidColumnType(0, "gen".into(), rusqlite::types::Type::Blob))
+}
+
+/// The bytes the ship's files take, by their lengths.
+pub fn file_bytes(conn: &Connection) -> rusqlite::Result<u64> {
+    meta_number(conn, "file_bytes")
+}
+
+fn set_file_bytes(conn: &Connection, bytes: u64) -> rusqlite::Result<()> {
+    meta_set(conn, "file_bytes", bytes)
+}
+
+/// The bytes open uploads have reserved.
+pub fn reserved_bytes(conn: &Connection) -> rusqlite::Result<u64> {
+    conn.prepare_cached("SELECT COALESCE(SUM(length), 0) FROM uploads")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n.max(0) as u64)
+}
+
+/// The bytes still on disk that no row names, waiting to be removed.
+pub fn removing_bytes(conn: &Connection) -> rusqlite::Result<u64> {
+    conn.prepare_cached("SELECT COALESCE(SUM(bytes), 0) FROM file_trash")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n.max(0) as u64)
+}
+
+/// Held, reserved and still to be removed: what counts against the ship's allowance.
+pub fn counted_bytes(conn: &Connection) -> rusqlite::Result<u64> {
+    Ok(file_bytes(conn)?.saturating_add(reserved_bytes(conn)?).saturating_add(removing_bytes(conn)?))
+}
+
+pub fn upload_count(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM uploads")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+}
+
+pub fn file_count(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM files")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+}
+
+/// A whole directory to remove, with the bytes it holds.
+fn trash_dir(conn: &Connection, dir: &[u8; 16], bytes: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO file_trash VALUES (?1, 0, x'', ?2)")?.execute(params![&dir[..], bytes as i64]).map(drop)
+}
+
+/// One copy of one chunk to remove, with its length.
+fn trash_chunk(conn: &Connection, dir: &[u8; 16], n: u64, gen: &Gen, bytes: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO file_trash VALUES (?1, ?2, ?3, ?4)")?.execute(params![&dir[..], n as i64, &gen[..], bytes as i64]).map(drop)
+}
+
+/// A directory to look through for copies no row names, because removing one failed.
+pub fn trash_sweep(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO file_trash VALUES (?1, 0, ?2, 0)")?.execute(params![&dir[..], SWEEP]).map(drop)
+}
+
+/// Up to `max` things waiting to be removed.
+pub fn trash_batch(conn: &Connection, max: usize) -> rusqlite::Result<Vec<Trash>> {
+    conn.prepare_cached("SELECT dir, n, gen FROM file_trash LIMIT ?1")?
+        .query_map([max as i64], |r| {
+            let (dir, n, gen) = (dir_of(r.get(0)?)?, r.get::<_, i64>(1)? as u64, r.get::<_, Vec<u8>>(2)?);
+            let what = match gen.len() {
+                0 => Discard::All,
+                1 => Discard::Unnamed,
+                _ => Discard::Chunk(n, gen_of(gen)?),
+            };
+            Ok(Trash { dir, what })
+        })?
+        .collect()
+}
+
+/// It is gone from disk. A whole directory durably gone takes with it every other entry for
+/// what was inside it, and their bytes leave the count.
+pub fn trash_done(conn: &Connection, trash: &Trash) -> rusqlite::Result<()> {
+    if trash.what == Discard::All {
+        return conn.prepare_cached("DELETE FROM file_trash WHERE dir = ?1")?.execute([&trash.dir[..]]).map(drop);
+    }
+    let (n, gen) = match trash.what {
+        Discard::All => (0, Vec::new()),
+        Discard::Unnamed => (0, SWEEP.to_vec()),
+        Discard::Chunk(n, gen) => (n, gen.to_vec()),
+    };
+    conn.prepare_cached("DELETE FROM file_trash WHERE dir = ?1 AND n = ?2 AND gen = ?3")?.execute(params![&trash.dir[..], n as i64, gen]).map(drop)
+}
+
+/// Whose a directory is, as the rows have it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// A file's: the names (`<n>.<gen>`) of the chunk copies its rows name. They never change.
+    File(HashSet<String>),
+    /// An open upload's: copies may be on their way that no row names yet.
+    Upload,
+    /// No one's.
+    Nobody,
+}
+
+pub fn dir_owner(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<Owner> {
+    let upload: bool = conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM uploads WHERE dir = ?1)")?.query_row([&dir[..]], |r| r.get(0))?;
+    if upload {
+        return Ok(Owner::Upload);
+    }
+    let file: bool = conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM files WHERE dir = ?1)")?.query_row([&dir[..]], |r| r.get(0))?;
+    if !file {
+        return Ok(Owner::Nobody);
+    }
+    let names = conn
+        .prepare_cached("SELECT n, gen FROM file_chunks WHERE dir = ?1")?
+        .query_map([&dir[..]], |r| {
+            let (n, gen) = (r.get::<_, i64>(0)?, gen_of(r.get(1)?)?);
+            Ok(format!("{n}.{}", gen.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+        })?
+        .collect::<rusqlite::Result<HashSet<String>>>()?;
+    Ok(Owner::File(names))
+}
+
+/// Give up every upload last touched before `before`: its rows go, and its directory is
+/// marked to be removed. Returns how many.
+pub fn uploads_expire(conn: &Connection, before: u64) -> rusqlite::Result<usize> {
+    let dirs: Vec<Vec<u8>> = conn
+        .prepare_cached("SELECT dir FROM uploads WHERE touched < ?1")?
+        .query_map([before as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for dir in &dirs {
+        upload_drop(conn, &dir_of(dir.clone())?)?;
+    }
+    Ok(dirs.len())
+}
+
+pub fn upload_add(conn: &Connection, dir: &[u8; 16], agent: &str, length: u64, media_type: &str, now: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT INTO uploads VALUES (?1, ?2, ?3, ?4, ?5)")?
+        .execute(params![&dir[..], agent, length as i64, media_type, now as i64])
+        .map(drop)
+}
+
+/// An upload of this agent's: its length and media type.
+pub fn upload_of(conn: &Connection, dir: &[u8; 16], agent: &str) -> rusqlite::Result<Option<(u64, String)>> {
+    conn.prepare_cached("SELECT length, media_type FROM uploads WHERE dir = ?1 AND agent = ?2")?
+        .query_row(params![&dir[..], agent], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)))
+        .optional()
+}
+
+pub fn upload_touch(conn: &Connection, dir: &[u8; 16], now: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE uploads SET touched = ?2 WHERE dir = ?1")?.execute(params![&dir[..], now as i64]).map(drop)
+}
+
+/// Strike off an upload and its chunk rows, and mark its directory to be removed. What it
+/// reserved is counted as being removed until it is.
+pub fn upload_drop(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<()> {
+    let length: Option<i64> = conn.prepare_cached("SELECT length FROM uploads WHERE dir = ?1")?.query_row([&dir[..]], |r| r.get(0)).optional()?;
+    conn.prepare_cached("DELETE FROM uploads WHERE dir = ?1")?.execute([&dir[..]])?;
+    conn.prepare_cached("DELETE FROM file_chunks WHERE dir = ?1")?.execute([&dir[..]])?;
+    trash_dir(conn, dir, length.unwrap_or(0).max(0) as u64)
+}
+
+/// Which copy of chunk `n` of `dir` is held, if any.
+pub fn chunk_of(conn: &Connection, dir: &[u8; 16], n: u64) -> rusqlite::Result<Option<Gen>> {
+    let gen: Option<Vec<u8>> = conn.prepare_cached("SELECT gen FROM file_chunks WHERE dir = ?1 AND n = ?2")?.query_row(params![&dir[..], n as i64], |r| r.get(0)).optional()?;
+    gen.map(gen_of).transpose()
+}
+
+/// Record that copy `gen` of chunk `n` of `dir` is held, and its hash. A copy it replaces is
+/// marked to be removed, counted at `len` bytes until it is.
+pub fn chunk_put(conn: &Connection, dir: &[u8; 16], n: u64, gen: &Gen, hash: &[u8; 32], len: u64) -> rusqlite::Result<()> {
+    if let Some(old) = chunk_of(conn, dir, n)? {
+        trash_chunk(conn, dir, n, &old, len)?;
+    }
+    conn.prepare_cached("INSERT OR REPLACE INTO file_chunks VALUES (?1, ?2, ?3, ?4)")?
+        .execute(params![&dir[..], n as i64, &gen[..], &hash[..]])
+        .map(drop)
+}
+
+/// The numbers of the chunks held in `dir`, from `from` on, at most `max` of them.
+pub fn chunks_held(conn: &Connection, dir: &[u8; 16], from: u64, max: usize) -> rusqlite::Result<Vec<u64>> {
+    conn.prepare_cached("SELECT n FROM file_chunks WHERE dir = ?1 AND n >= ?2 ORDER BY n LIMIT ?3")?
+        .query_map(params![&dir[..], from.min(i64::MAX as u64) as i64, max as i64], |r| r.get::<_, i64>(0).map(|n| n as u64))?
+        .collect()
+}
+
+/// How many chunks are held in `dir`.
+pub fn chunk_total(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<u64> {
+    conn.prepare_cached("SELECT COUNT(*) FROM file_chunks WHERE dir = ?1")?.query_row([&dir[..]], |r| r.get::<_, i64>(0)).map(|n| n as u64)
+}
+
+/// The hashes and generations of chunks `from` to `from + count - 1` of `dir`, in order, if
+/// every one is held.
+pub fn chunks(conn: &Connection, dir: &[u8; 16], from: u64, count: u64) -> rusqlite::Result<Option<Vec<([u8; 32], Gen)>>> {
+    let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = conn
+        .prepare_cached("SELECT n, hash, gen FROM file_chunks WHERE dir = ?1 AND n >= ?2 ORDER BY n LIMIT ?3")?
+        .query_map(params![&dir[..], from as i64, count as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if rows.len() as u64 != count || rows.iter().enumerate().any(|(i, (n, _, _))| *n as u64 != from + i as u64) {
+        return Ok(None);
+    }
+    rows.into_iter().map(|(_, hash, gen)| Ok((hash_of(hash)?, gen_of(gen)?))).collect::<rusqlite::Result<Vec<_>>>().map(Some)
+}
+
+fn stored_file(r: &Row, at: usize) -> rusqlite::Result<StoredFile> {
+    Ok(StoredFile { dir: dir_of(r.get(at)?)?, length: r.get::<_, i64>(at + 1)? as u64, media_type: r.get(at + 2)?, added: r.get::<_, i64>(at + 3)? as u64 })
+}
+
+pub fn file_by_id(conn: &Connection, id: &[u8; 32]) -> rusqlite::Result<Option<StoredFile>> {
+    conn.prepare_cached("SELECT dir, length, media_type, added FROM files WHERE id = ?1")?.query_row([&id[..]], |r| stored_file(r, 0)).optional()
+}
+
+/// A file, if `agent` claims it.
+pub fn file_claimed(conn: &Connection, agent: &str, id: &[u8; 32]) -> rusqlite::Result<Option<StoredFile>> {
+    conn.prepare_cached(
+        "SELECT f.dir, f.length, f.media_type, f.added FROM file_claims c JOIN files f ON f.id = c.id WHERE c.agent = ?1 AND c.id = ?2",
+    )?
+    .query_row(params![agent, &id[..]], |r| stored_file(r, 0))
+    .optional()
+}
+
+/// The files `agent` claims, by id, after `after`, at most `max`.
+pub fn files_claimed(conn: &Connection, agent: &str, after: &[u8], max: usize) -> rusqlite::Result<Vec<([u8; 32], StoredFile)>> {
+    conn.prepare_cached(
+        "SELECT c.id, f.dir, f.length, f.media_type, f.added FROM file_claims c JOIN files f ON f.id = c.id
+         WHERE c.agent = ?1 AND c.id > ?2 ORDER BY c.id LIMIT ?3",
+    )?
+    .query_map(params![agent, after, max as i64], |r| Ok((hash_of(r.get(0)?)?, stored_file(r, 1)?)))?
+    .collect()
+}
+
+/// Make the upload in `dir` a file: its row, the agent's claim, and the count of bytes held.
+pub fn file_add(conn: &Connection, id: &[u8; 32], dir: &[u8; 16], length: u64, media_type: &str, agent: &str, now: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM uploads WHERE dir = ?1")?.execute([&dir[..]])?;
+    conn.prepare_cached("INSERT INTO files VALUES (?1, ?2, ?3, ?4, ?5)")?.execute(params![&id[..], &dir[..], length as i64, media_type, now as i64])?;
+    claim_add(conn, agent, id)?;
+    set_file_bytes(conn, file_bytes(conn)?.saturating_add(length))
+}
+
+/// Let `agent` claim a file the ship holds. Claiming it twice is claiming it once.
+pub fn claim_add(conn: &Connection, agent: &str, id: &[u8; 32]) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT OR IGNORE INTO file_claims VALUES (?1, ?2)")?.execute(params![agent, &id[..]]).map(drop)
+}
+
+/// Take back `agent`'s claim on a file: `None` if it had none, else whether the file went
+/// with it. When no claim is left, the file's rows go and its directory is marked to be
+/// removed, its bytes counted as being removed until they are.
+pub fn claim_remove(conn: &Connection, agent: &str, id: &[u8; 32]) -> rusqlite::Result<Option<bool>> {
+    if conn.prepare_cached("DELETE FROM file_claims WHERE agent = ?1 AND id = ?2")?.execute(params![agent, &id[..]])? == 0 {
+        return Ok(None);
+    }
+    let left: i64 = conn.prepare_cached("SELECT COUNT(*) FROM file_claims WHERE id = ?1")?.query_row([&id[..]], |r| r.get(0))?;
+    if left > 0 {
+        return Ok(Some(false));
+    }
+    let Some(file) = file_by_id(conn, id)? else { return Ok(Some(false)) };
+    conn.prepare_cached("DELETE FROM files WHERE id = ?1")?.execute([&id[..]])?;
+    conn.prepare_cached("DELETE FROM file_chunks WHERE dir = ?1")?.execute([&file.dir[..]])?;
+    set_file_bytes(conn, file_bytes(conn)?.saturating_sub(file.length))?;
+    trash_dir(conn, &file.dir, file.length)?;
+    Ok(Some(true))
+}
+
+/// Every directory a row names: those of open uploads, of files, and of what is still to be
+/// removed.
+pub fn named_dirs(conn: &Connection) -> rusqlite::Result<HashSet<[u8; 16]>> {
+    let mut named = HashSet::new();
+    for sql in ["SELECT dir FROM uploads", "SELECT dir FROM files", "SELECT DISTINCT dir FROM file_trash"] {
+        let mut stmt = conn.prepare(sql)?;
+        for dir in stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))? {
+            named.insert(dir_of(dir?)?);
+        }
+    }
+    Ok(named)
+}
+
+/// Every file the ship holds, by id: its directory and length.
+pub fn all_files(conn: &Connection) -> rusqlite::Result<Vec<([u8; 32], [u8; 16], u64)>> {
+    conn.prepare("SELECT id, dir, length FROM files ORDER BY id")?
+        .query_map([], |r| Ok((hash_of(r.get(0)?)?, dir_of(r.get(1)?)?, r.get::<_, i64>(2)? as u64)))?
+        .collect()
+}
+
+/// Open a ship file just built by `import`, before it is published, to finish it: it stays
+/// in the journal mode it was built in, so that a commit is in the one file that is published.
+pub fn open_staged(path: &Path, max_bytes: u64, file_key: &[u8; 32]) -> Result<Connection, Error> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    unlock(&conn, file_key)?;
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    let page = pragma_number(&conn, "page_size")?;
+    let pages = (max_bytes / page.max(1) as u64).clamp(1, u32::MAX as u64);
+    conn.query_row(&format!("PRAGMA max_page_count = {pages}"), [], |r| r.get::<_, i64>(0))?;
+    let mode: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "fullfsync", "ON")?;
+    if mode != "delete" {
+        return Err(Error::BadShipFile("could not finish the imported file".into()));
+    }
+    Ok(conn)
+}
+
+/// In a ship file just built by `import`: strike off every file not in `kept`, with its
+/// claims and chunk rows, and count what is left. Returns how many files were struck off.
+pub fn files_keep_only(conn: &Connection, kept: &HashSet<[u8; 32]>) -> Result<u64, Error> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let done = (|| -> Result<u64, Error> {
+        let (mut dropped, mut held) = (0u64, 0u64);
+        for (id, dir, length) in all_files(conn)? {
+            if kept.contains(&id) {
+                held += length;
+                continue;
+            }
+            conn.execute("DELETE FROM files WHERE id = ?1", [&id[..]])?;
+            conn.execute("DELETE FROM file_claims WHERE id = ?1", [&id[..]])?;
+            conn.execute("DELETE FROM file_chunks WHERE dir = ?1", [&dir[..]])?;
+            dropped += 1;
+        }
+        set_file_bytes(conn, held)?;
+        Ok(dropped)
+    })();
+    match done {
+        Ok(dropped) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(dropped)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// Write a consistent single-file copy, safe while the ship is live.
 ///
 /// The copy is the file's contents as they would be with nothing encrypted, and it is made
@@ -2210,7 +2618,8 @@ pub fn import(
     incarnation: &[u8; 16],
     file_key: &[u8; 32],
     recovery: &[u8; 32],
-) -> Result<String, Error> {
+    files_given: bool,
+) -> Result<(String, u64), Error> {
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA)?;
     let expected = schema_objects(&reference, usize::MAX)?;
@@ -2924,6 +3333,132 @@ pub fn import(
         to.execute("INSERT INTO signin_codes VALUES (?1, ?2, ?3)", params![hash, expires, reusable])?;
     }
 
+    // Files. Only the rows come in here: the bytes come from the stream beside the copy, and
+    // a file whose bytes do not all arrive and match is struck off afterwards. With no stream
+    // given, no file can arrive, so none comes in and no limit on files can refuse the ship:
+    // its files are counted, as dropped, and nothing else is read of them. With a stream, each
+    // file is given a new directory, so nothing the source says of its own directories is ever
+    // made into a path. Open uploads, their chunk rows, and what was waiting to be removed are
+    // not brought in. Everything else is checked against everything else: every chunk of
+    // every file is there once, in place, and the file's id is the id of its length and those
+    // chunks' hashes; every claim is an agent's on a file that is there; every file is
+    // claimed; and together they fit this runtime's limits.
+    let mut files_dropped = 0u64;
+    let mut total = 0u64;
+    if !files_given {
+        in_time()?;
+        files_dropped = from.query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))?.max(0) as u64;
+    } else {
+        // Kept small, since there is one per file: about 80 bytes here, and about 40 more for
+        // each of the two maps that find it by id and by its directory in the source.
+        struct Incoming {
+            id: [u8; 32],
+            new_dir: [u8; 16],
+            length: u64,
+            seen: u64,
+            claimed: bool,
+            done: bool,
+        }
+        let mut incoming: Vec<Incoming> = Vec::new();
+        let mut by_id: HashMap<[u8; 32], u32> = HashMap::new();
+        let mut by_dir: HashMap<[u8; 16], u32> = HashMap::new();
+        let mut stmt = from.prepare("SELECT id, dir, length, media_type, added FROM files")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            in_time()?;
+            let (id, dir, length) = (blob(row, 0, 32)?, blob(row, 1, 16)?, integer(row, 2)? as u64);
+            let (media_type, added) = (text(row, 3)?, integer(row, 4)?);
+            let (Ok(id), Ok(dir)) = (<[u8; 32]>::try_from(id), <[u8; 16]>::try_from(dir)) else {
+                return Err(bad_row("a file is recorded wrongly"));
+            };
+            // Counted before anything is kept, so a file listing millions is turned away after
+            // reading a bounded number of them.
+            if incoming.len() >= cfg.max_files {
+                return Err(bad_row("more files than this runtime allows"));
+            }
+            total = total.saturating_add(length);
+            // A runtime that keeps no files takes in none, not even an empty one.
+            if cfg.max_file_bytes == 0 || total > cfg.max_file_bytes || crate::files::media_type(&media_type).as_deref() != Some(media_type.as_str()) {
+                return Err(bad_row("files are larger than this runtime allows, or a media type is not one"));
+            }
+            let at = incoming.len() as u32;
+            if by_dir.insert(dir, at).is_some() || by_id.insert(id, at).is_some() {
+                return Err(bad_row("a file is recorded twice"));
+            }
+            let new_dir = crate::random_bytes::<16>()?;
+            incoming.push(Incoming { id, new_dir, length, seen: 0, claimed: false, done: false });
+            to.execute("INSERT INTO files VALUES (?1, ?2, ?3, ?4, ?5)", params![&id[..], &new_dir[..], length as i64, media_type, added])?;
+        }
+        // A chunk row is a file's, or an open upload's and passed over, or it is not a ship
+        // file. The rows come one directory at a time, so one root is worked out at a time.
+        let mut stmt = from.prepare("SELECT dir, n, hash FROM file_chunks ORDER BY dir, n")?;
+        let mut rows = stmt.query([])?;
+        let mut current: Option<(u32, crate::files::RootBuilder)> = None;
+        let finish = |run: Option<(u32, crate::files::RootBuilder)>, incoming: &mut Vec<Incoming>| -> Result<(), Error> {
+            let Some((at, root)) = run else { return Ok(()) };
+            let file = &mut incoming[at as usize];
+            if file.seen != crate::files::chunk_count(file.length) || crate::files::file_id(file.length, &root.finish()) != file.id {
+                return Err(bad_row("a file's chunks are not all there, or are not the chunks of that file"));
+            }
+            file.done = true;
+            Ok(())
+        };
+        // Every chunk of a file imported here is the first copy written in its new directory.
+        let gen = [0u8; 16];
+        while let Some(row) = rows.next()? {
+            in_time()?;
+            let (dir, n, hash) = (blob(row, 0, 16)?, integer(row, 1)? as u64, blob(row, 2, 32)?);
+            let (Ok(dir), Ok(hash)) = (<[u8; 16]>::try_from(dir), <[u8; 32]>::try_from(hash)) else {
+                return Err(bad_row("a file's chunk is recorded wrongly"));
+            };
+            let Some(at) = by_dir.get(&dir).copied() else {
+                let uploading: bool = from.query_row("SELECT EXISTS (SELECT 1 FROM uploads WHERE dir = ?1)", [&dir[..]], |r| r.get(0))?;
+                if !uploading {
+                    return Err(bad_row("a chunk belongs to no file and no upload"));
+                }
+                continue;
+            };
+            if current.as_ref().map(|(file, _)| *file) != Some(at) {
+                finish(current.take(), &mut incoming)?;
+                current = Some((at, crate::files::RootBuilder::new()));
+            }
+            let file = &mut incoming[at as usize];
+            if file.done || n != file.seen || n >= crate::files::chunk_count(file.length) {
+                return Err(bad_row("a file's chunks are numbered wrongly"));
+            }
+            file.seen += 1;
+            current.as_mut().expect("started above").1.push(&hash);
+            to.execute("INSERT INTO file_chunks VALUES (?1, ?2, ?3, ?4)", params![&file.new_dir[..], n as i64, &gen[..], &hash[..]])?;
+        }
+        finish(current.take(), &mut incoming)?;
+        // A file with no chunk rows at all must be an empty file, under the empty file's id.
+        let empty = crate::files::file_id(0, &crate::files::RootBuilder::new().finish());
+        for file in incoming.iter_mut().filter(|file| !file.done) {
+            if file.length != 0 || file.id != empty {
+                return Err(bad_row("a file's chunks are not all there, or are not the chunks of that file"));
+            }
+            file.done = true;
+        }
+        let mut stmt = from.prepare("SELECT agent, id FROM file_claims")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            in_time()?;
+            let (agent, id) = (text(row, 0)?, blob(row, 1, 32)?);
+            check_agent(&agent)?;
+            let Some(at) = <[u8; 32]>::try_from(id).ok().and_then(|id| by_id.get(&id).copied()) else {
+                return Err(bad_row("an agent claims a file the ship does not hold"));
+            };
+            let file = &mut incoming[at as usize];
+            file.claimed = true;
+            // A plain insert, so a claim that appears twice is an error, not one claim.
+            to.execute("INSERT INTO file_claims VALUES (?1, ?2)", params![agent, &file.id[..]])?;
+        }
+        if incoming.iter().any(|file| !file.claimed) {
+            return Err(bad_row("the ship holds a file no agent claims"));
+        }
+    }
+    meta_set(&to, "file_bytes", total)?;
+
     // Every record of another ship was written above with the mark 1. Marks handed out
     // from now on start after it.
     meta_set(&to, "resync_gen", 1)?;
@@ -2948,7 +3483,7 @@ pub fn import(
     }
 
     to.execute_batch("COMMIT")?;
-    Ok(kernel_hash)
+    Ok((kernel_hash, files_dropped))
 }
 
 #[cfg(test)]

@@ -22,8 +22,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ship_proto::{Device, DeviceList, EntryList, LogHead, Message, SignInReply, SignInRequest, Trimmed};
+use ship_proto::{
+    ChunkRun, Device, DeviceList, EntryList, FileList, FinishRequest, LogHead, Message, SignInReply, SignInRequest, Trimmed, UploadReply,
+    UploadRequest,
+};
 
+use crate::files::{self, FileError, CHUNK};
 use crate::{canonical_ship, lock, Error, Position, Rejection, Runtime};
 
 #[derive(Clone, Debug)]
@@ -47,7 +51,14 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     /// How long a client has to send its whole request, and to take the whole answer. A client
     /// that is slower is cut off, so that slow or silent connections cannot hold the threads.
+    /// A file's contents are sent a chunk at a time, and each chunk has this long.
     pub io_timeout: Duration,
+    /// How many files' contents may be on their way to clients at once. Each holds a thread
+    /// for as long as the client takes, a chunk at a time, so they have their own limit, apart
+    /// from the requests waiting for logs. Whatever this says, downloads never take the threads
+    /// kept for everything else: see `download_limit`. Past it a client is told to try again
+    /// shortly.
+    pub max_downloads: usize,
 }
 
 impl Default for ServerConfig {
@@ -60,6 +71,7 @@ impl Default for ServerConfig {
             max_wait: Duration::from_secs(30),
             max_body_bytes: 1 << 20,
             io_timeout: Duration::from_secs(10),
+            max_downloads: 4,
         }
     }
 }
@@ -81,6 +93,8 @@ struct Shared {
     stop: AtomicBool,
     /// Requests currently waiting for a log to grow.
     waiting: AtomicUsize,
+    /// Files' contents currently being sent.
+    downloading: AtomicUsize,
     /// The connections being handled, so that stopping the server can cut them off.
     open: Mutex<HashMap<usize, TcpStream>>,
     next: AtomicUsize,
@@ -101,6 +115,7 @@ impl Server {
             cfg,
             stop: AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
+            downloading: AtomicUsize::new(0),
             open: Mutex::new(HashMap::new()),
             next: AtomicUsize::new(0),
         });
@@ -252,9 +267,25 @@ impl Reply {
     /// The answer as it goes down the wire. The connection always closes after it. An answer
     /// to a HEAD request carries no body, whatever the answer is.
     fn encode(&self, head_only: bool) -> Vec<u8> {
+        // An answer that says there is no content does not also give a length for it.
+        if self.status == 204 {
+            return (self.head() + "Connection: close\r\n\r\n").into_bytes();
+        }
+        let out = self.head() + &format!("Content-Length: {}\r\nConnection: close\r\n\r\n", self.body.len());
+        let body: &[u8] = if head_only { &[] } else { &self.body };
+        [out.as_bytes(), body].concat()
+    }
+
+    /// The status line and headers, for an answer whose body of `length` bytes follows apart.
+    fn encode_head(&self, length: u64) -> Vec<u8> {
+        (self.head() + &format!("Content-Length: {length}\r\nConnection: close\r\n\r\n")).into_bytes()
+    }
+
+    fn head(&self) -> String {
         let reason = match self.status {
             200 => "OK",
             204 => "No Content",
+            206 => "Partial Content",
             303 => "See Other",
             400 => "Bad Request",
             401 => "Unauthorized",
@@ -266,10 +297,14 @@ impl Reply {
             410 => "Gone",
             411 => "Length Required",
             413 => "Content Too Large",
+            416 => "Range Not Satisfiable",
             422 => "Unprocessable Content",
             429 => "Too Many Requests",
             431 => "Request Header Fields Too Large",
+            500 => "Internal Server Error",
             501 => "Not Implemented",
+            503 => "Service Unavailable",
+            507 => "Insufficient Storage",
             _ => "Error",
         };
         let mut out = format!("HTTP/1.1 {} {reason}\r\n", self.status);
@@ -279,15 +314,27 @@ impl Reply {
                 out += &format!("{name}: {value}\r\n");
             }
         }
-        // An answer that says there is no content does not also give a length for it.
-        if self.status == 204 {
-            out += "Connection: close\r\n\r\n";
-            return out.into_bytes();
-        }
-        out += &format!("Content-Length: {}\r\nConnection: close\r\n\r\n", self.body.len());
-        let body: &[u8] = if head_only { &[] } else { &self.body };
-        [out.as_bytes(), body].concat()
+        out
     }
+}
+
+/// What goes back: an answer held whole, or a file's contents, sent a chunk at a time.
+enum Answer<'a> {
+    Whole(Reply),
+    Stream(Download<'a>),
+}
+
+/// A file's contents on their way to a client: bytes `start` to `end` (not including `end`).
+struct Download<'a> {
+    reply: Reply,
+    ship: String,
+    agent: String,
+    id: [u8; 32],
+    file: crate::store::StoredFile,
+    start: u64,
+    end: u64,
+    /// Its place among the downloads, given up however the download ends.
+    _place: Waiting<'a>,
 }
 
 /// Handle one connection: read one request, answer it, close.
@@ -299,9 +346,17 @@ fn serve(shared: &Shared, mut stream: TcpStream) {
     let Some(_listed) = Listed::new(shared, &stream) else { return };
     let deadline = Instant::now() + shared.cfg.io_timeout;
     let mut head_only = false;
-    let (reply, refused) = match read_request(shared, &mut stream, deadline, &mut head_only) {
-        Ok(request) => (Some(respond(shared, &request)), false),
-        Err(reply) => (reply, true),
+    let (answer, refused) = match read_request(shared, &mut stream, deadline, &mut head_only) {
+        Ok(mut request) => (Some(respond(shared, &mut request)), false),
+        Err(reply) => (reply.map(Answer::Whole), true),
+    };
+    let reply = match answer {
+        Some(Answer::Whole(reply)) => Some(reply),
+        Some(Answer::Stream(download)) => {
+            send_file(shared, &mut stream, download);
+            None
+        }
+        None => None,
     };
     if let Some(reply) = reply {
         // The client gets as long again to take the whole answer as it had to send the request.
@@ -452,8 +507,10 @@ fn read_request(shared: &Shared, stream: &mut TcpStream, deadline: Instant, head
     if expects == Some(false) {
         return refuse(417, "that expectation is not supported");
     }
-    // Refused on what it claims, before a byte of it is read or any room is made for it.
-    if length > shared.cfg.max_body_bytes as u64 {
+    // Refused on what it claims, before a byte of it is read or any room is made for it. A
+    // PUT carries one chunk of a file: it may always be one chunk long, and never longer.
+    let most = if method == "PUT" { CHUNK as usize } else { shared.cfg.max_body_bytes };
+    if length > most as u64 {
         return refuse(413, "the request is too large");
     }
     let length = length as usize;
@@ -581,6 +638,19 @@ fn failure(error: Error) -> Reply {
         Error::LogTrimmed(base) => Reply::proto(410, &Trimmed { base }),
         Error::InvalidName(_) => Reply::text(400, "not a valid name"),
         Error::UnknownAgent(_) => Reply::text(404, "no such agent"),
+        Error::File(why) => {
+            let status = match why {
+                FileError::Off => 403,
+                FileError::NotFound => 404,
+                FileError::TooLarge => 413,
+                FileError::NoRoom => 507,
+                FileError::Malformed(_) => 400,
+                FileError::Incomplete => 409,
+                FileError::WrongId => 422,
+                FileError::Damaged => 500,
+            };
+            Reply::text(status, &why.to_string())
+        }
         Error::Rejected(rejection) => {
             let why = match rejection {
                 Rejection::OutOfFuel => "the command used up its compute budget".to_string(),
@@ -595,7 +665,18 @@ fn failure(error: Error) -> Reply {
     }
 }
 
-fn respond(shared: &Shared, request: &Request) -> Reply {
+fn respond<'a>(shared: &'a Shared, request: &mut Request) -> Answer<'a> {
+    // A file's contents are the one answer sent a chunk at a time. That route is found, and
+    // the request signed in, by the same code as every other.
+    let mut streamed = None;
+    let reply = respond_whole(shared, request, &mut streamed);
+    match streamed {
+        Some(download) => Answer::Stream(download),
+        None => Answer::Whole(reply),
+    }
+}
+
+fn respond_whole<'a>(shared: &'a Shared, request: &mut Request, streamed: &mut Option<Download<'a>>) -> Reply {
     let (path, query) = request.url.split_once('?').unwrap_or((&request.url, ""));
     let Some((ship, root, rest)) = locate(&shared.cfg, request.header("Host"), path) else {
         return Reply::text(404, "not found");
@@ -687,9 +768,194 @@ fn respond(shared: &Shared, request: &Request) -> Reply {
         ("POST", ["agents", agent, "command"]) => {
             done(runtime.deliver(&ship, agent, &request.body).map(|outcome| Reply::new(200, "application/octet-stream", outcome.reply)))
         }
+        ("GET", ["agents", agent, "files", id, "content"]) => match file_content(shared, &ship, agent, id, request.header("Range")) {
+            Ok(download) => {
+                *streamed = Some(download);
+                Reply::text(200, "")
+            }
+            Err(reply) => reply.with("Content-Security-Policy", FILE_POLICY),
+        },
+        (_, ["agents", agent, "files", rest @ ..]) => {
+            let body = std::mem::take(&mut request.body);
+            done(file_route(runtime, &ship, agent, method, rest, query, body)).with("Content-Security-Policy", FILE_POLICY)
+        }
         _ => Reply::text(404, "not found"),
     }
 }
+
+/// The threads always left for answering at once: a quarter of them, and at least one.
+fn kept_for_others(workers: usize) -> usize {
+    (workers / 4).max(1)
+}
+
+/// How many files' contents may be on their way at once with `workers` threads. Half the
+/// threads may be waiting for logs (`entries`); of the other half, `kept_for_others` are never
+/// taken by downloads, whatever `max_downloads` says. So with 16 threads: 8 may wait, 4
+/// download (the default), and 4 are always left. With 4: 2, 1 and 1. With 2: 1, none, and 1,
+/// and a file's contents are refused (its chunks can still be fetched one at a time).
+fn download_limit(cfg: &ServerConfig) -> usize {
+    let workers = cfg.workers.max(2);
+    cfg.max_downloads.min((workers - workers / 2).saturating_sub(kept_for_others(workers)))
+}
+
+/// Every answer about a file says it is nothing for a browser to run or to show as a page.
+const FILE_POLICY: &str = "sandbox; default-src 'none'";
+
+/// The routes of an agent's files, but for a file's whole contents (`file_content`).
+fn file_route(runtime: &Runtime, ship: &str, agent: &str, method: &str, rest: &[&str], query: &str, body: Vec<u8>) -> Result<Reply, Error> {
+    let not_found = || Error::File(FileError::NotFound);
+    let upload = |name: &str| files::parse_dir(name).ok_or_else(not_found);
+    let file = |name: &str| files::parse_id(name).ok_or_else(not_found);
+    let number = |text: &str| text.parse::<u64>().ok().filter(|_| text.bytes().all(|b| b.is_ascii_digit()));
+    let chunk_number = |text: &str| number(text).ok_or(Error::File(FileError::Malformed("not a chunk number")));
+    match (method, rest) {
+        ("GET", []) => {
+            let after = match field(query, "after") {
+                Some(after) => Some(file(&after)?),
+                None => None,
+            };
+            let max = field(query, "max").and_then(|max| number(&max)).unwrap_or(100) as usize;
+            let listed = runtime.files(ship, agent, after, max)?;
+            Ok(Reply::proto(200, &FileList { files: listed.iter().map(file_info).collect() }))
+        }
+        ("POST", ["uploads"]) => {
+            let Ok(asked) = UploadRequest::decode(&*body) else { return Err(Error::File(FileError::Malformed("not an upload request"))) };
+            let (name, chunks) = runtime.upload_start(ship, agent, asked.length, &asked.media_type)?;
+            Ok(Reply::proto(200, &UploadReply { upload: crate::hex(&name), chunks }))
+        }
+        ("GET", ["uploads", name]) => {
+            let from = field(query, "from").and_then(|from| number(&from)).unwrap_or(0);
+            let state = runtime.upload_state(ship, agent, &upload(name)?, from)?;
+            let held = state.held.iter().map(|&(first, count)| ChunkRun { first, count }).collect();
+            let more = state.next.is_some();
+            Ok(Reply::proto(200, &ship_proto::UploadState { length: state.length, chunks: state.chunks, media_type: state.media_type, held, more, next: state.next.unwrap_or(0) }))
+        }
+        ("DELETE", ["uploads", name]) => runtime.upload_abandon(ship, agent, &upload(name)?).map(|()| Reply::text(204, "")),
+        ("POST", ["uploads", name, "finish"]) => {
+            let Ok(asked) = FinishRequest::decode(&*body) else { return Err(Error::File(FileError::Malformed("not a finish request"))) };
+            let stated = match asked.id.len() {
+                0 => None,
+                _ => Some(<[u8; 32]>::try_from(asked.id).map_err(|_| Error::File(FileError::Malformed("an id is 32 bytes")))?),
+            };
+            runtime.upload_finish(ship, agent, &upload(name)?, stated).map(|info| Reply::proto(200, &file_info(&info)))
+        }
+        ("PUT", ["uploads", name, n]) => runtime.upload_chunk(ship, agent, &upload(name)?, chunk_number(n)?, body).map(|()| Reply::text(204, "")),
+        ("GET", [id]) => runtime.file_info(ship, agent, &file(id)?).map(|info| Reply::proto(200, &file_info(&info))),
+        ("DELETE", [id]) => runtime.file_delete(ship, agent, &file(id)?).map(|()| Reply::text(204, "")),
+        ("GET", [id, "chunks", n]) => {
+            let chunk = runtime.file_chunk(ship, agent, &file(id)?, chunk_number(n)?)?;
+            Ok(Reply::new(200, "application/octet-stream", chunk).with("Content-Disposition", "attachment"))
+        }
+        _ => Err(not_found()),
+    }
+}
+
+fn file_info(info: &files::FileInfo) -> ship_proto::FileInfo {
+    ship_proto::FileInfo { id: info.id.to_vec(), length: info.length, chunks: info.chunks, media_type: info.media_type.clone(), added_ms: info.added_ms }
+}
+
+/// What part of a file a `Range` header asks for. Only one range of bytes is understood:
+/// `bytes=a-b`, `bytes=a-` or `bytes=-n`. Anything else is answered with the whole file.
+#[derive(Debug, PartialEq, Eq)]
+enum Wanted {
+    Whole,
+    /// From the first byte to the last, both included.
+    Part(u64, u64),
+    Unsatisfiable,
+}
+
+fn wanted(header: Option<&str>, length: u64) -> Wanted {
+    let Some(spec) = header.and_then(|value| value.strip_prefix("bytes=")) else { return Wanted::Whole };
+    let Some((first, last)) = spec.split_once('-') else { return Wanted::Whole };
+    let digits = |text: &str| text.bytes().all(|b| b.is_ascii_digit());
+    if !digits(first) || !digits(last) {
+        return Wanted::Whole;
+    }
+    // Too many digits to hold is further than any file goes.
+    let number = |text: &str| text.parse::<u64>().unwrap_or(u64::MAX);
+    match (first.is_empty(), last.is_empty()) {
+        (true, true) => Wanted::Whole,
+        (true, false) => match number(last) {
+            0 => Wanted::Unsatisfiable,
+            _ if length == 0 => Wanted::Unsatisfiable,
+            n => Wanted::Part(length.saturating_sub(n), length - 1),
+        },
+        (false, _) => {
+            let start = number(first);
+            let end = if last.is_empty() { u64::MAX } else { number(last) };
+            if end < start {
+                Wanted::Whole
+            } else if start >= length {
+                Wanted::Unsatisfiable
+            } else {
+                Wanted::Part(start, end.min(length - 1))
+            }
+        }
+    }
+}
+
+/// A file's whole contents, or the part a `Range` header asks for, ready to send.
+fn file_content<'a>(shared: &'a Shared, ship: &str, agent: &str, id: &str, range: Option<&str>) -> Result<Download<'a>, Reply> {
+    let id = files::parse_id(id).ok_or_else(|| failure(Error::File(FileError::NotFound)))?;
+    let file = shared.runtime.file_open(ship, agent, &id).map_err(failure)?;
+    let (start, end, status) = match wanted(range, file.length) {
+        Wanted::Whole => (0, file.length, 200),
+        Wanted::Part(first, last) => (first, last + 1, 206),
+        Wanted::Unsatisfiable => {
+            return Err(Reply::text(416, "that range is not in the file").with("Content-Range", format!("bytes */{}", file.length)));
+        }
+    };
+    // Its own limit, apart from requests waiting for logs, so downloads cannot take every thread.
+    let limit = download_limit(&shared.cfg);
+    if limit == 0 {
+        return Err(Reply::text(503, "this server has too few threads to send a file's contents; fetch its chunks one at a time"));
+    }
+    let place = Waiting(&shared.downloading);
+    if shared.downloading.fetch_add(1, Ordering::SeqCst) >= limit {
+        drop(place);
+        return Err(Reply::text(503, "too many downloads at once; try again shortly").with("Retry-After", "1"));
+    }
+    let disposition = if files::shown_inline(&file.media_type) { "inline" } else { "attachment" };
+    let mut reply = Reply::new(status, &file.media_type, Vec::new())
+        .with("Content-Security-Policy", FILE_POLICY)
+        .with("Content-Disposition", disposition)
+        .with("Accept-Ranges", "bytes");
+    if status == 206 {
+        reply = reply.with("Content-Range", format!("bytes {start}-{}/{}", end - 1, file.length));
+    }
+    Ok(Download { reply, ship: ship.to_string(), agent: agent.to_string(), id, file, start, end, _place: place })
+}
+
+/// Send a file's contents, a chunk at a time. Each chunk is read and checked against its hash
+/// outside the ship's slot, and the client has `io_timeout` to take each. A chunk that cannot
+/// be read whole and matching, or a client that is too slow, ends the answer short: the client
+/// sees fewer bytes than it was told, and never bytes that are not the file's.
+fn send_file(shared: &Shared, stream: &mut TcpStream, download: Download) {
+    let Download { reply, ship, agent, id, file, start, end, _place } = download;
+    if write_by(stream, &reply.encode_head(end - start), Instant::now() + shared.cfg.io_timeout).is_err() || start >= end {
+        return;
+    }
+    let (first, last) = (start / CHUNK, (end - 1) / CHUNK);
+    let mut n = first;
+    while n <= last {
+        if shared.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let count = files::LEAF_BATCH.min(last - n + 1);
+        let Ok(rows) = shared.runtime.file_chunks(&ship, &agent, &id, &file.dir, n, count) else { return };
+        for (hash, gen) in &rows {
+            let len = files::chunk_len(file.length, n).expect("a chunk of the file");
+            let Ok(chunk) = shared.runtime.read_chunk(&ship, &file.dir, n, gen, len, hash) else { return };
+            let from = if n == first { (start % CHUNK) as usize } else { 0 };
+            let to = if n == last { ((end - 1) % CHUNK) as usize + 1 } else { chunk.len() };
+            if write_by(stream, &chunk[from..to], Instant::now() + shared.cfg.io_timeout).is_err() {
+                return;
+            }
+            n += 1;
+        }
+    }
+}
+
 
 /// The methods an address takes, if it is one this server has.
 fn allowed(parts: &[&str]) -> Option<&'static str> {
@@ -698,6 +964,10 @@ fn allowed(parts: &[&str]) -> Option<&'static str> {
         [""] | ["devices"] | ["key"] | ["logs", _, _, "head" | "checkpoint" | "entries"] => Some("GET"),
         ["signout"] | ["devices", _, "revoke"] | ["agents", _, "command"] => Some("POST"),
         ["devices", _] => Some("DELETE"),
+        ["agents", _, "files"] | ["agents", _, "files", _, "chunks", _] | ["agents", _, "files", _, "content"] => Some("GET"),
+        ["agents", _, "files", "uploads"] | ["agents", _, "files", "uploads", _, "finish"] => Some("POST"),
+        ["agents", _, "files", "uploads", _] | ["agents", _, "files", _] => Some("GET, DELETE"),
+        ["agents", _, "files", "uploads", _, _] => Some("PUT"),
         _ => None,
     }
 }

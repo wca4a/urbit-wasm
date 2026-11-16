@@ -62,6 +62,10 @@ const SIGNING_LABEL: &[u8] = b"ship.v1.signing\n";
 const RECOVERY_LABEL: &[u8] = b"ship.v1.recovery\n";
 const EXPORT_LABEL: &[u8] = b"ship.v1.export\n";
 const CHECK_LABEL: &[u8] = b"ship.v1.check\n";
+/// For the chunks of the files a ship keeps on disk, one key per upload directory.
+const FILES_LABEL: &[u8] = b"ship.v1.files\n";
+/// For the stream of a ship's files that goes beside an exported copy.
+const FILES_EXPORT_LABEL: &[u8] = b"ship.v1.files-export\n";
 
 /// Thirty-two bytes derived from `secret` for the use `info` names.
 fn derive(secret: &[u8], info: &[&[u8]]) -> [u8; 32] {
@@ -199,6 +203,136 @@ pub fn open_export(code: &str, ship: &str, mut sealed: Vec<u8>) -> Option<([u8; 
     Some((seed, sealed))
 }
 
+/// What a chunk file holds besides the chunk: the nonce at its head and the tag at its end.
+pub const CHUNK_FILE_OVERHEAD: usize = 12 + TAG_BYTES;
+
+/// The key the chunks in one directory of a ship's file store are encrypted under, and what
+/// binds each chunk to its place: the ship, the directory, the chunk's number, and which copy
+/// of it this is. A chunk moved to another number, copy, directory or ship does not open.
+pub(crate) struct ChunkKey {
+    key: LessSafeKey,
+    /// The ship's name and then the directory's sixteen bytes. The name comes first and the
+    /// directory is of fixed length, so no two (ship, directory) pairs give the same bytes.
+    place: Vec<u8>,
+}
+
+pub(crate) fn chunk_key(storage: &StorageKey, ship: &str, dir: &[u8; 16]) -> ChunkKey {
+    ChunkKey { key: cipher(&derive(&storage.0, &[FILES_LABEL, ship.as_bytes(), dir])), place: [ship.as_bytes(), dir].concat() }
+}
+
+impl ChunkKey {
+    fn aad(&self, n: u64, gen: &[u8; 16]) -> Vec<u8> {
+        [&self.place[..], &n.to_le_bytes(), gen].concat()
+    }
+
+    /// Seal copy `gen` of chunk `n` where it lies, appending its tag. The file to write is
+    /// `nonce` and then `chunk`. A nonce is random and used once: the same key seals every
+    /// chunk of a directory.
+    pub fn seal(&self, n: u64, gen: &[u8; 16], nonce: [u8; 12], chunk: &mut Vec<u8>) {
+        self.key
+            .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(self.aad(n, gen)), chunk)
+            .expect("a chunk is far below what one key may seal");
+    }
+
+    /// Open a chunk file as written for copy `gen` of chunk `n`, where it lies. `None` if it
+    /// was not written for this place under this key, or has been changed since.
+    pub fn open<'a>(&self, n: u64, gen: &[u8; 16], file: &'a mut [u8]) -> Option<&'a [u8]> {
+        if file.len() < CHUNK_FILE_OVERHEAD {
+            return None;
+        }
+        let (nonce, sealed) = file.split_at_mut(12);
+        let nonce = Nonce::assume_unique_for_key(<[u8; 12]>::try_from(&*nonce).ok()?);
+        let opened = self.key.open_in_place(nonce, Aad::from(self.aad(n, gen)), sealed).ok()?;
+        Some(&*opened)
+    }
+}
+
+/// What a stream of a ship's files begins with: this, then the public key made for it.
+pub const FILES_MAGIC: &[u8] = b"ship.v1.files\n";
+pub const FILES_HEAD: usize = FILES_MAGIC.len() + 32;
+/// How much of the stream each sealed segment carries. Every segment but the last carries
+/// exactly this much; the last carries this much or less, and is marked as the last.
+pub const SEGMENT_BYTES: usize = 64 << 10;
+/// A sealed segment's tag.
+pub const SEGMENT_TAG_BYTES: usize = TAG_BYTES;
+
+/// The key one stream of files is sealed under: agreed, as for an exported copy, between a
+/// key pair made for this stream alone and the owner's recovery key pair, and bound to both
+/// public halves, to `binding` (the hash of the sealed copy the stream goes with), and to the
+/// ship's name. A stream is of use only beside the copy it was made with.
+fn files_key(shared: &[u8; 32], made_for_stream: &[u8; 32], recovery: &[u8; 32], binding: &[u8; 32], ship: &str) -> [u8; 32] {
+    derive(shared, &[FILES_EXPORT_LABEL, made_for_stream, recovery, binding, ship.as_bytes()])
+}
+
+/// The nonce for segment number `index`: the number, then whether it is the last. A segment
+/// opens only in its own place in its own stream, so a stream cut short, reordered, or with
+/// a segment dropped, repeated, or taken from another stream does not open.
+fn segment_nonce(index: u64, last: bool) -> Nonce {
+    let mut nonce = [0u8; 12];
+    nonce[..8].copy_from_slice(&index.to_le_bytes());
+    nonce[8] = u8::from(last);
+    Nonce::assume_unique_for_key(nonce)
+}
+
+/// Seals one stream of files, segment by segment, in order.
+pub struct StreamSeal {
+    key: LessSafeKey,
+    next: u64,
+}
+
+impl StreamSeal {
+    /// Seal the next segment where it lies, appending its tag. `last` marks the final one.
+    pub fn seal(&mut self, segment: &mut Vec<u8>, last: bool) {
+        let nonce = segment_nonce(self.next, last);
+        self.next += 1;
+        self.key.seal_in_place_append_tag(nonce, Aad::from(FILES_MAGIC), segment).expect("a segment is small");
+    }
+}
+
+/// Opens one stream of files, segment by segment, in order.
+pub struct StreamOpen {
+    key: LessSafeKey,
+    next: u64,
+}
+
+impl StreamOpen {
+    /// Open the next segment where it lies: its sealed bytes and tag. `last` says whether it is
+    /// the final one. `None` if it is not the next segment of this stream, or is not the last
+    /// when it is said to be, or the other way round.
+    pub fn open<'a>(&mut self, segment: &'a mut [u8], last: bool) -> Option<&'a [u8]> {
+        let opened = self.key.open_in_place(segment_nonce(self.next, last), Aad::from(FILES_MAGIC), segment).ok()?;
+        self.next += 1;
+        Some(&*opened)
+    }
+}
+
+/// Start sealing a stream of a ship's files to its owner's recovery key, beside the sealed
+/// copy whose hash is `binding`. Returns the head to write first. `fresh` is thirty-two random
+/// bytes, used for this stream and nothing else.
+pub fn seal_files_stream(recovery: &[u8; 32], ship: &str, binding: &[u8; 32], fresh: [u8; 32]) -> (Vec<u8>, StreamSeal) {
+    let for_stream = StaticSecret::from(fresh);
+    let made_for_stream = PublicKey::from(&for_stream).to_bytes();
+    let shared = for_stream.diffie_hellman(&PublicKey::from(*recovery)).to_bytes();
+    let key = cipher(&files_key(&shared, &made_for_stream, recovery, binding, ship));
+    ([FILES_MAGIC, &made_for_stream[..]].concat(), StreamSeal { key, next: 0 })
+}
+
+/// Start opening a stream of files with the recovery code, given its head and the hash of the
+/// sealed copy it should go with. `None` if the head is not one of a stream sealed to a code.
+pub fn open_files_stream(code: &str, ship: &str, binding: &[u8; 32], head: &[u8]) -> Option<StreamOpen> {
+    if head.len() != FILES_HEAD || !head.starts_with(FILES_MAGIC) {
+        return None;
+    }
+    let made_for_stream = <[u8; 32]>::try_from(&head[FILES_MAGIC.len()..]).ok()?;
+    let secret = recovery_secret(code);
+    let recovery = PublicKey::from(&secret).to_bytes();
+    let shared = secret.diffie_hellman(&PublicKey::from(made_for_stream));
+    if !shared.was_contributory() {
+        return None;
+    }
+    Some(StreamOpen { key: cipher(&files_key(&shared.to_bytes(), &made_for_stream, &recovery, binding, ship)), next: 0 })
+}
+
 /// Whether a public key is one a copy can safely be sealed to. A handful of values make
 /// every agreement come out the same whatever the other side brings, so a copy sealed to
 /// one of them could be opened by anyone.
@@ -298,6 +432,65 @@ mod tests {
         assert_ne!(recovery_public(code), recovery_public("abcde-fghjk-mnpqr-stvwy"));
         // Two copies of the same ship do not look alike.
         assert_ne!(sealed, seal_export(&public, "zod", &seed, &contents, [6; 32]));
+    }
+
+    const G: [u8; 16] = [5; 16];
+
+    #[test]
+    fn a_chunk_opens_only_in_its_own_place() {
+        let (storage, dir) = (StorageKey::new([1; 32]), [7u8; 16]);
+        let key = chunk_key(&storage, "zod", &dir);
+        let mut sealed = b"the chunk's bytes".to_vec();
+        key.seal(3, &G, [4; 12], &mut sealed);
+        let file = [&[4u8; 12][..], &sealed].concat();
+        assert_eq!(file.len(), 17 + CHUNK_FILE_OVERHEAD);
+        assert!(!file.windows(5).any(|window| window == b"chunk"), "the chunk is there to be read");
+        assert_eq!(key.open(3, &G, &mut file.clone()), Some(&b"the chunk's bytes"[..]));
+        // Another number, directory, ship or storage key; a changed byte; a short file.
+        assert_eq!(key.open(4, &G, &mut file.clone()), None);
+        assert_eq!(key.open(3, &[6; 16], &mut file.clone()), None);
+        assert_eq!(chunk_key(&storage, "zod", &[8; 16]).open(3, &G, &mut file.clone()), None);
+        assert_eq!(chunk_key(&storage, "nec", &dir).open(3, &G, &mut file.clone()), None);
+        assert_eq!(chunk_key(&StorageKey::new([2; 32]), "zod", &dir).open(3, &G, &mut file.clone()), None);
+        for index in [0, 11, 12, file.len() - 1] {
+            let mut changed = file.clone();
+            changed[index] ^= 1;
+            assert_eq!(key.open(3, &G, &mut changed), None, "byte {index}");
+        }
+        assert_eq!(key.open(3, &G, &mut file[..CHUNK_FILE_OVERHEAD - 1].to_vec()), None);
+        // The key itself is the directory's: with the same associated data, another
+        // directory's key does not open it.
+        let elsewhere = ChunkKey { key: chunk_key(&storage, "zod", &[8; 16]).key, place: key.place.clone() };
+        assert_eq!(elsewhere.open(3, &G, &mut file.clone()), None);
+        // The ship's name and the directory cannot be traded off against each other.
+        assert_eq!(chunk_key(&storage, "zo", &[b'd'; 16]).place.len(), 18);
+        assert_ne!(chunk_key(&storage, "zod", &[0; 16]).place, chunk_key(&storage, "zo", &[b'd', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).place[..]);
+    }
+
+    #[test]
+    fn a_stream_opens_only_whole_in_order_and_beside_its_copy() {
+        let (code, binding) = ("abcde-fghjk-mnpqr-stvwx", [3u8; 32]);
+        let (head, mut seal) = seal_files_stream(&recovery_public(code), "zod", &binding, [5; 32]);
+        let segments: Vec<Vec<u8>> = (0..3u8)
+            .map(|i| {
+                let mut segment = vec![i; 10];
+                seal.seal(&mut segment, i == 2);
+                segment
+            })
+            .collect();
+        let open = |order: &[usize], last_at: usize| -> bool {
+            let Some(mut opener) = open_files_stream(code, "zod", &binding, &head) else { return false };
+            order.iter().enumerate().all(|(at, i)| opener.open(&mut segments[*i].clone(), at == last_at).is_some())
+        };
+        assert!(open(&[0, 1, 2], 2));
+        // Reordered, one dropped, one repeated, cut short, or the last not said to be last.
+        assert!(!open(&[1, 0, 2], 2) && !open(&[0, 2], 1) && !open(&[0, 0, 1, 2], 3) && !open(&[0, 1], 1) && !open(&[0, 1, 2], 9));
+        // Beside another copy, for another ship, or with another code, nothing opens.
+        assert!(open_files_stream(code, "zod", &[4; 32], &head).is_some_and(|mut o| o.open(&mut segments[0].clone(), false).is_none()));
+        assert!(open_files_stream(code, "nec", &binding, &head).is_some_and(|mut o| o.open(&mut segments[0].clone(), false).is_none()));
+        assert!(open_files_stream("another code", "zod", &binding, &head).is_some_and(|mut o| o.open(&mut segments[0].clone(), false).is_none()));
+        assert!(open_files_stream(code, "zod", &binding, &head[..FILES_HEAD - 1]).is_none());
+        assert!(open_files_stream(code, "zod", &binding, &[FILES_MAGIC, &[0; 32][..]].concat()).is_none());
     }
 
     #[test]

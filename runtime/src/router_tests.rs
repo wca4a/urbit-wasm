@@ -224,8 +224,9 @@ fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
 
-/// Build the kernel and test agents once per test run, and return one of them by name.
-fn wasm(name: &str) -> Vec<u8> {
+/// Build the kernel and test agents once per test run, and return one of them by name. The
+/// crate's other tests use this too, so that only one build runs in this test binary.
+pub(crate) fn wasm(name: &str) -> Vec<u8> {
     static BUILT: OnceLock<()> = OnceLock::new();
     BUILT.get_or_init(|| {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());

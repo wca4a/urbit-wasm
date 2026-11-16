@@ -2,6 +2,7 @@
 //! what may run, and the WASM agents installed on it. A ship handles one event at a time, and
 //! each event is one transaction.
 
+pub mod files;
 mod host;
 pub mod net;
 pub mod relay;
@@ -16,7 +17,7 @@ pub mod server;
 mod ship;
 mod store;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -39,6 +40,7 @@ pub use seal::StorageKey;
 pub use urbit_id;
 use urbit_id::{Keyfile, NetworkKeys, Wallet};
 pub use store::RemoteFollow;
+pub use files::{FileError, FileInfo, FilesKept, PreparedChunk, UploadState};
 
 use host::Ctx;
 use ship::Ship;
@@ -141,6 +143,16 @@ pub struct Config {
     /// `signin_lock_millis`. Devices that are already signed in are not affected.
     pub signin_max_failures: u32,
     pub signin_lock_millis: u64,
+    /// The most a ship's files may take together, counting what open uploads have reserved:
+    /// the operator's setting. 0 turns the file store off.
+    pub max_file_bytes: u64,
+    /// How many files a ship may hold.
+    pub max_files: usize,
+    /// How many uploads may be open on a ship at once.
+    pub max_uploads: usize,
+    /// An upload nothing has been sent to for this long is given up, and its reservation
+    /// returned, when the next upload on the ship starts.
+    pub upload_keep_millis: u64,
     pub durability: Durability,
     pub limits: Limits,
     /// The key everything this runtime keeps on disk for its ships is encrypted under: each
@@ -187,6 +199,10 @@ impl Default for Config {
             max_signin_codes: 32,
             signin_max_failures: 5,
             signin_lock_millis: 60_000,
+            max_file_bytes: 10 << 30,
+            max_files: 100_000,
+            max_uploads: 16,
+            upload_keep_millis: 24 * 60 * 60 * 1000,
             durability: Durability::Full,
             limits: Limits {
                 max_key_bytes: 1024,
@@ -273,6 +289,8 @@ pub enum Error {
     /// The event was refused. It changed no state and queued no messages. The audit log records
     /// it on a best-effort basis.
     Rejected(Rejection),
+    /// Something about a file the ship keeps, or an upload.
+    File(FileError),
     Store(rusqlite::Error),
     Io(io::Error),
 }
@@ -303,6 +321,7 @@ impl fmt::Display for Error {
             Error::Rejected(Rejection::Denied(why)) => write!(f, "event rejected: not permitted: {why}"),
             Error::Rejected(Rejection::Limit(why)) => write!(f, "event rejected: limit exceeded: {why}"),
             Error::Rejected(Rejection::Trap(why)) => write!(f, "event rejected: {why}"),
+            Error::File(why) => write!(f, "file: {why}"),
             Error::Store(e) => write!(f, "store error: {e}"),
             Error::Io(e) => write!(f, "io error: {e}"),
         }
@@ -349,6 +368,21 @@ pub(crate) struct Inner {
     blobs_dir: PathBuf,
     keys_dir: PathBuf,
     tmp_dir: PathBuf,
+    /// Where ships' files are: `files/<ship>/<dir>/<n>`.
+    files_dir: PathBuf,
+    /// The ships whose `files/<ship>/` has been looked through for leftovers since the
+    /// runtime started. Nothing else is locked while this is held.
+    swept: Mutex<HashSet<String>>,
+    /// Names a ship is being made or brought in under. One at a time per name, so that an
+    /// import's files and a ship of that name never meet half made. Nothing else is locked
+    /// while this is held.
+    naming: Mutex<HashSet<String>>,
+    naming_done: Condvar,
+    /// Ships being exported. One export of a ship at a time, so that the stream of its files
+    /// and the copy it is bound to are always from the same export. Not the ship's slot,
+    /// which is let go while the files are read. Nothing else is locked while this is held.
+    exporting: Mutex<HashSet<String>>,
+    exporting_done: Condvar,
     modules: Mutex<HashMap<String, Arc<AgentModule>>>,
     slots: Mutex<HashMap<String, SlotRef>>,
     /// Ships that are open or being opened. Its size never exceeds `max_awake`.
@@ -828,6 +862,56 @@ fn check_storage_key(path: &Path, storage: &StorageKey, used: bool) -> Result<()
     }
 }
 
+/// Whether a ship's file is there. An error looking is an error, never "not there".
+fn ship_present(path: &Path) -> Result<bool, Error> {
+    if files::seams::hit("ship-lookup") {
+        return Err(Error::Io(io::Error::other("failure injected at ship-lookup")));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A directory removed, with everything in it, unless it is let go first.
+struct Cleared(Option<PathBuf>);
+
+impl Drop for Cleared {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// A name held in one of the sets of names something is being done to, until dropped. See
+/// `Inner::naming` and `Inner::exporting`.
+struct Naming<'a> {
+    held: &'a Mutex<HashSet<String>>,
+    done: &'a Condvar,
+    name: String,
+}
+
+impl<'a> Naming<'a> {
+    /// Hold `name` in `held`, waiting for whoever holds it now.
+    fn take(held: &'a Mutex<HashSet<String>>, done: &'a Condvar, name: &str) -> Naming<'a> {
+        let mut busy = lock(held);
+        while busy.contains(name) {
+            busy = done.wait(busy).unwrap_or_else(PoisonError::into_inner);
+        }
+        busy.insert(name.to_string());
+        Naming { held, done, name: name.to_string() }
+    }
+}
+
+impl Drop for Naming<'_> {
+    fn drop(&mut self) {
+        lock(self.held).remove(&self.name);
+        self.done.notify_all();
+    }
+}
+
 /// A scratch file that no other call can share, removed (with any SQLite side files) on drop.
 struct Scratch(PathBuf);
 
@@ -852,10 +936,38 @@ impl Runtime {
     pub fn open(data_dir: impl AsRef<Path>, mut cfg: Config) -> Result<Runtime, Error> {
         let data_dir = data_dir.as_ref();
         let (ships_dir, blobs_dir, tmp_dir) = (data_dir.join("ships"), data_dir.join("blobs"), data_dir.join("tmp"));
-        let keys_dir = data_dir.join("keys");
-        for dir in [&ships_dir, &blobs_dir, &keys_dir, &tmp_dir] {
+        let (keys_dir, files_dir) = (data_dir.join("keys"), data_dir.join("files"));
+        // The data directory and any of its ancestors that are not there yet are made below;
+        // each name made is then synced into the directory it is in.
+        let mut made = Vec::new();
+        let mut missing = data_dir;
+        while !missing.exists() {
+            made.push(missing.to_path_buf());
+            let Some(parent) = missing.parent() else { break };
+            missing = parent;
+        }
+        for dir in [&ships_dir, &blobs_dir, &keys_dir, &tmp_dir, &files_dir] {
             fs::create_dir_all(dir)?;
         }
+        // The data directory's own name is synced into its parent on every start, whether or
+        // not this start made it: one that is there may have been made by a start whose sync
+        // failed. Ancestors above that are synced only when this start made them; a deeper
+        // ancestor whose making was cut off before its sync is the operator's to make durable.
+        let parent_of = |dir: &Path| dir.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+        for dir in made.iter().rev().filter(|dir| dir.as_path() != data_dir) {
+            sync_dir(&parent_of(dir))?;
+        }
+        let parent = parent_of(data_dir);
+        sync_dir(&parent)?;
+        files::seams::synced(&parent);
+        // The names of the directories within it, `files/` among them, are durable before
+        // anything is put in them: synced every time, since one that is there may have been
+        // made by an earlier start whose sync failed.
+        if files::seams::hit("open-sync") {
+            return Err(Error::Io(io::Error::other("failure injected at open-sync")));
+        }
+        sync_dir(data_dir)?;
+        files::seams::synced(&data_dir.join("files"));
         cfg.max_awake = cfg.max_awake.max(1);
         let dir_lock = lock_data_dir(data_dir)?;
         // Taken out of the configuration, which is kept and can be read back and printed.
@@ -900,6 +1012,12 @@ impl Runtime {
                 blobs_dir,
                 keys_dir,
                 tmp_dir,
+                files_dir,
+                swept: Mutex::new(HashSet::new()),
+                naming: Mutex::new(HashSet::new()),
+                naming_done: Condvar::new(),
+                exporting: Mutex::new(HashSet::new()),
+                exporting_done: Condvar::new(),
                 modules: Mutex::new(HashMap::new()),
                 slots: Mutex::new(HashMap::new()),
                 awake: Mutex::new(HashMap::new()),
@@ -1022,6 +1140,7 @@ impl Runtime {
     fn create_ship_keyed(&self, name: &str, kernel_hash: &str, seed: &[u8; 32], recovery: Option<[u8; 32]>, proof: Option<moon::Proof>) -> Result<(), Error> {
         let name = canonical_ship(name)?;
         self.inner.kernel(kernel_hash)?;
+        let _naming = self.inner.naming(&name);
         if self.inner.ship_path(&name).exists() {
             return Err(Error::ShipExists(name));
         }
@@ -1032,7 +1151,7 @@ impl Runtime {
         let (file_key, incarnation) = (self.inner.file_key(&name), random_bytes::<16>()?);
         let kept = proof.map(|proof| proof.to_bytes());
         store::create(&fresh.0, &name, kernel_hash, self.inner.cfg.max_ship_bytes, &incarnation, &file_key, recovery.as_ref(), kept.as_ref())?;
-        self.inner.publish(&name, &fresh.0, &SigningKey::from_bytes(seed), proof)
+        self.inner.publish(&name, &fresh.0, &SigningKey::from_bytes(seed), proof)?
     }
 
     /// Install an agent, or replace it. The manifest says which interfaces it offers and which
@@ -1744,29 +1863,52 @@ impl Runtime {
             return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "a ship cannot be exported into the directory its runtime keeps ships in")));
         }
         fs::create_dir_all(dest.join("blobs"))?;
-        self.inner.with_ship(&name, |ship| {
+        // One export of a ship at a time, so that the stream and the copy written last are
+        // from the same export, however two exports into one place interleave.
+        let _exporting = self.inner.exporting(&name);
+        let (sealed, recovery, hashes, files) = self.inner.with_ship(&name, |ship| {
             let mut hashes = ship.modules(&self.inner)?;
             let conn = lock(&ship.conn);
             let Some(recovery) = store::recovery_public(&conn)? else { return Err(Error::NoRecoveryKey(name.clone())) };
             hashes.push(store::kernel(&conn)?);
+            // The ship's files as of the same moment as the copy.
+            let files = store::all_files(&conn)?;
             // A ship is its file plus its key, so the key travels with it, inside the seal.
             let sealed = {
                 let contents = store::snapshot(&conn)?;
                 seal::seal_export(&recovery, &name, &ship.key.to_bytes(), &contents, random_bytes::<32>()?)
             };
-            for hash in hashes {
-                // Read, verify, then rename into place: copying a file onto itself (an export into
-                // this runtime's own directory) would truncate it.
-                let bytes = self.inner.read_blob(&hash)?;
-                let scratch = Scratch::new(&dest.join("blobs"));
-                fs::write(&scratch.0, &bytes)?;
-                fs::rename(&scratch.0, dest.join("blobs").join(format!("{hash}.wasm")))?;
+            Ok((sealed, recovery, hashes, files))
+        })?;
+        for hash in hashes {
+            // Read, verify, then rename into place: copying a file onto itself (an export into
+            // this runtime's own directory) would truncate it.
+            let bytes = self.inner.read_blob(&hash)?;
+            let scratch = Scratch::new(&dest.join("blobs"));
+            fs::write(&scratch.0, &bytes)?;
+            fs::rename(&scratch.0, dest.join("blobs").join(format!("{hash}.wasm")))?;
+        }
+        // The ship's files go beside the copy, as a stream sealed to the same recovery key and
+        // bound to this copy, read from disk outside the ship's slot. A ship with no files has
+        // none, and one left from an earlier copy goes: it could only be dropped on import.
+        let stream = dest.join(format!("{name}.files"));
+        if files.is_empty() {
+            match fs::remove_file(&stream) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
             }
-            // The copy goes in last, and all at once. If anything before this failed, a copy
-            // that was already there is still there, whole, with the modules it needs: modules
-            // are only ever added.
-            Ok(write_private(&dest.join(format!("{name}.ship")), &sealed)?)
-        })
+        } else {
+            let scratch = Scratch::new(dest);
+            let out = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&scratch.0)?;
+            self.write_files_stream(&name, &recovery, &sha256(&sealed), &files, out)?;
+            fs::rename(&scratch.0, &stream)?;
+        }
+        files::seams::between_stream_and_copy(dest);
+        // The copy goes in last, and all at once. If anything before this failed, a copy
+        // that was already there is still there, whole, with the modules it needs: modules
+        // are only ever added. A stream that was replaced before a failure no longer matches
+        // the copy, and an import of the two keeps the ship and drops its files.
+        Ok(write_private(&dest.join(format!("{name}.ship")), &sealed)?)
     }
 
     /// Bring in a ship exported by `export_ship`, from this or another runtime, with the
@@ -1793,10 +1935,30 @@ impl Runtime {
     }
 
     pub fn import_ship(&self, src: impl AsRef<Path>, ship: &str, code: &str) -> Result<(), Error> {
+        self.import_ship_counted(src, ship, code).map(drop)
+    }
+
+    /// Bring in a ship as `import_ship` does, and say what became of its files.
+    ///
+    /// The ship's file comes in first, as for a ship without files. Then, if the stream of
+    /// its files is beside the copy (`<src>/<ship>.files`), each file in it is checked chunk
+    /// by chunk against the hashes in the ship's file and stored under this runtime's key. A
+    /// file is kept only if every chunk arrived and matched. Every other file the ship's file
+    /// names (no stream, or a stream cut short, damaged, made for another copy, or without
+    /// that file) is struck off, with its claims. So a copy without its stream is still a
+    /// copy, of the ship without its files. Open uploads are never brought in.
+    ///
+    /// The ship's appearance under `ships/` is still the moment it is in. Its files are
+    /// written to `files/<ship>/` before that; a `files/<ship>/` with no ship is what an
+    /// import that did not finish left, and the next import of that name clears it first.
+    pub fn import_ship_counted(&self, src: impl AsRef<Path>, ship: &str, code: &str) -> Result<FilesKept, Error> {
         let name = canonical_ship(ship)?;
         let src = src.as_ref();
+        let _naming = self.inner.naming(&name);
         let dest_file = self.inner.ship_path(&name);
-        if dest_file.exists() {
+        // Strictly: this decides that `files/<ship>` belongs to no ship and may be cleared, so
+        // an error looking for the ship's file is not taken for its absence.
+        if ship_present(&dest_file)? {
             return Err(Error::ShipExists(name));
         }
         // Timed from here, so the limit covers copying and checking the file as well as reading it.
@@ -1807,6 +1969,13 @@ impl Runtime {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::UnknownShip(name)),
             Err(e) => return Err(e.into()),
         };
+        // The stream of files beside the copy, if there is one. Whether it is there decides
+        // what the ship's files come to: with none given, none can arrive, and none is kept.
+        let stream = match open_regular(&src.join(format!("{name}.files"))) {
+            Ok(file) => Some(file),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
         let fresh = Scratch::new(&self.inner.tmp_dir);
         // Counted by bytes read, not by reported size, which a special file can misstate.
         let limit = self.inner.cfg.max_import_bytes;
@@ -1814,13 +1983,15 @@ impl Runtime {
         if source.take(limit + 1).read_to_end(&mut sealed)? as u64 > limit {
             return Err(Error::BadShipFile(format!("{name}: larger than this runtime will import")));
         }
+        // What the stream of files beside the copy is bound to.
+        let binding = sha256(&sealed);
         let Some((seed, contents)) = seal::open_export(code, &name, sealed) else {
             return Err(Error::BadShipFile(format!("{name}: not a copy of this ship that this recovery code opens")));
         };
         let key = SigningKey::from_bytes(&seed);
         let public = key.verifying_key();
         let file_key = self.inner.file_key(&name);
-        let kernel_hash = store::import(
+        let (kernel_hash, unimported) = store::import(
             contents,
             &fresh.0,
             &name,
@@ -1832,6 +2003,7 @@ impl Runtime {
             &random_bytes::<16>()?,
             &file_key,
             &seal::recovery_public(code),
+            stream.is_some(),
         )?;
         let fetch = |hash: &str| -> Result<(), Error> {
             // Check the bytes on disk, not the compiled cache, which could hide a damaged blob.
@@ -1866,12 +2038,35 @@ impl Runtime {
         if Instant::now() > deadline {
             return Err(Error::BadShipFile(format!("{name}: import took too long")));
         }
+        // No ship of this name exists, and none can be made or brought in while this runs, so
+        // whatever is in its files directory is left from an import that did not finish.
+        let files_root = self.inner.ship_files(&name);
+        match fs::remove_dir_all(&files_root) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        let mut cleared = Cleared(Some(files_root));
+        // The files take as long as their bytes take to read, not `max_import_millis`: what is
+        // read is bounded by the lengths in the ship's file, held to `max_file_bytes` above.
+        let files = match stream {
+            None => FilesKept { kept: 0, dropped: unimported },
+            Some(stream) => {
+                let staged = store::open_staged(&fresh.0, self.inner.cfg.max_ship_bytes, &file_key)?;
+                let kept = self.read_files_stream(&name, code, &binding, stream, &staged)?;
+                let dropped = store::files_keep_only(&staged, &kept)?;
+                FilesKept { kept: kept.len() as u64, dropped }
+            }
+        };
         let proof = self.inner.stored_proof(&fresh.0, &name);
-        self.inner.publish(&name, &fresh.0, &key, proof)?;
+        let published = self.inner.publish(&name, &fresh.0, &key, proof)?;
+        // The ship is in place from the hard link on, and its files are its own: nothing from
+        // here deletes them, whatever goes wrong.
+        cleared.0 = None;
+        published?;
         // The ship may have arrived with messages waiting to go to other ships, and with
         // events queued.
         self.inner.work_ready(&name);
-        Ok(())
+        Ok(files)
     }
 
     /// Put to sleep every ship that has been idle for at least `idle`. Returns how many slept.
@@ -1924,6 +2119,26 @@ impl Inner {
         self.logs_changed.notify_all();
     }
 
+    /// Hold `name` while a ship is made or brought in under it, waiting for any other doing so.
+    fn naming(&self, name: &str) -> Naming<'_> {
+        Naming::take(&self.naming, &self.naming_done, name)
+    }
+
+    /// Hold `name` while that ship is exported, waiting for any other export of it.
+    fn exporting(&self, name: &str) -> Naming<'_> {
+        Naming::take(&self.exporting, &self.exporting_done, name)
+    }
+
+    /// Until a ship's files directory has been looked through in the life of this runtime:
+    /// what in it no row names, for the caller to remove once it has let go of the ship. The
+    /// caller marks the ship as looked through only if every removal works.
+    fn first_look(&self, name: &str, ship: &Ship) -> Option<Vec<PathBuf>> {
+        if lock(&self.swept).contains(name) {
+            return None;
+        }
+        self.files_rubbish(name, &lock(&ship.conn)).ok()
+    }
+
     fn ship_path(&self, name: &str) -> PathBuf {
         self.ships_dir.join(format!("{name}.ship"))
     }
@@ -1940,7 +2155,11 @@ impl Inner {
         moon::Proof::from_bytes(&store::moon_proof(&conn).ok()??)
     }
 
-    fn publish(&self, name: &str, staged: &Path, key: &SigningKey, proof: Option<moon::Proof>) -> Result<(), Error> {
+    ///
+    /// The hard link is the moment the ship exists. An error before it means nothing was
+    /// published (`Err`); one after it (`Ok(Err(_))`) means the ship is in place, and that
+    /// making it durable failed: whatever belongs to the ship must then be left alone.
+    fn publish(&self, name: &str, staged: &Path, key: &SigningKey, proof: Option<moon::Proof>) -> Result<Result<(), Error>, Error> {
         let _together = lock(&self.lifecycle);
         let dest_file = self.ship_path(name);
         if dest_file.exists() {
@@ -1955,7 +2174,10 @@ impl Inner {
                 if let Some(held) = self.identities.write().unwrap_or_else(PoisonError::into_inner).as_mut() {
                     held.insert(name.to_string(), Held { key: Arc::new(key.clone()), proof });
                 }
-                Ok(sync_dir(&self.ships_dir)?)
+                if files::seams::hit("after-link") {
+                    return Ok(Err(Error::Io(io::Error::other("failure injected after the hard link"))));
+                }
+                Ok(sync_dir(&self.ships_dir).map_err(Error::from))
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::ShipExists(name.to_string())),
             Err(e) => Err(e.into()),
@@ -2086,12 +2308,16 @@ impl Inner {
     fn with_ship<R>(&self, name: &str, f: impl FnOnce(&mut Ship) -> Result<R, Error>) -> Result<R, Error> {
         let name = canonical_ship(name)?;
         let slot = self.slot(&name)?;
+        let mut rubbish = None;
         let result = {
             let mut guard = lock(&slot);
             if guard.ship.is_none() {
                 self.reserve(&name, &slot);
                 match self.wake(&name) {
-                    Ok(ship) => guard.ship = Some(ship),
+                    Ok(ship) => {
+                        rubbish = self.first_look(&name, &ship);
+                        guard.ship = Some(ship);
+                    }
                     Err(e) => {
                         lock(&self.awake).remove(&name);
                         self.awake_changed.notify_one();
@@ -2100,7 +2326,20 @@ impl Inner {
                 }
             }
             let ship = guard.ship.as_mut().expect("woken above");
-            let result = f(ship);
+            // If `f` unwinds with a transaction open, the connection is closed before anything
+            // else can use it, which rolls the transaction back: nothing may read, or act on,
+            // rows that were never committed.
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ship))) {
+                Ok(result) => result,
+                Err(unwound) => {
+                    drop(guard.ship.take());
+                    lock(&self.awake).remove(&name);
+                    drop(guard);
+                    self.awake_changed.notify_one();
+                    std::panic::resume_unwind(unwound);
+                }
+            };
+            let ship = guard.ship.as_mut().expect("woken above");
             // Every operation is meant to end with no transaction open. If one is still open,
             // the cleanup itself failed, so close the file and reopen it on the next call
             // rather than carry on with a connection in an unknown state.
@@ -2114,6 +2353,15 @@ impl Inner {
         };
         // This ship is idle again, so a thread waiting for a place can now evict it.
         self.awake_changed.notify_one();
+        if let Some(rubbish) = rubbish {
+            // Every attempt is made; the ship is looked through only once all have worked.
+            let failed = rubbish.iter().filter(|path| files::remove_entry(path).is_err()).count();
+            if failed == 0 {
+                lock(&self.swept).insert(name.clone());
+            }
+            // And one batch of what its rows say is to be removed.
+            self.empty_trash(&name);
+        }
         result
     }
 

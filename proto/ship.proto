@@ -307,6 +307,67 @@ message Trimmed {
   uint64 base = 1;
 }
 
+// Files on the ship. A file is split into chunks of 1 MiB (the last holds the rest) and known
+// by its id: a hash over its length and its chunks' hashes (format 1, see the README).
+
+// A reference to a file: the ship that holds it, its id, and its length. Plain data that an
+// agent keeps in place of the file; an agent never holds a file's bytes.
+message FileRef {
+  string ship = 1;
+  bytes id = 2;
+  uint64 length = 3;
+}
+
+// One file, as the ship tells the agent that claims it, or that agent's owner's devices.
+message FileInfo {
+  bytes id = 1;
+  uint64 length = 2;
+  uint64 chunks = 3;
+  string media_type = 4;
+  uint64 added_ms = 5;
+}
+
+// A page of an agent's files, in order of id. Ask for the next page after the last id.
+message FileList {
+  repeated FileInfo files = 1;
+}
+
+// Client to ship: start an upload of a file of this length.
+message UploadRequest {
+  uint64 length = 1;
+  // Such as "image/png". Left empty, "application/octet-stream".
+  string media_type = 2;
+}
+
+message UploadReply {
+  // The upload's name, for sending its chunks.
+  string upload = 1;
+  uint64 chunks = 2;
+}
+
+// A run of chunks held: `count` chunks from `first`.
+message ChunkRun {
+  uint64 first = 1;
+  uint64 count = 2;
+}
+
+// What an upload holds so far, so a client sends only what is missing.
+message UploadState {
+  uint64 length = 1;
+  uint64 chunks = 2;
+  string media_type = 3;
+  repeated ChunkRun held = 4;
+  // Set when there is more to list: ask again with `from` set to `next`.
+  bool more = 5;
+  uint64 next = 6;
+}
+
+// Client to ship: finish an upload. `id`, if given, is the id the client worked out, and the
+// ship refuses to finish if it is not the id of what it holds.
+message FinishRequest {
+  bytes id = 1;
+}
+
 // Ship to ship. Two ships talk over an encrypted connection in which each has proved it holds
 // the key listed for its name. One request and one reply travel on each stream.
 

@@ -35,6 +35,23 @@ extern "C" {
     fn host_log_unfollow(req: *const u8, req_len: u32);
     #[link_name = "log_share"]
     fn host_log_share(req: *const u8, req_len: u32);
+    #[link_name = "file_info"]
+    fn host_file_info(id: *const u8, id_len: u32, buf: *mut u8, buf_cap: u32) -> i64;
+}
+
+/// Files on the ship. An agent keeps a reference to a file (`FileRef`: the ship, the file's
+/// id, its length) and never its bytes: the owner's devices put files in and take them out
+/// over HTTP, under the agent that claims them.
+pub mod files {
+    pub use ship_proto::{FileInfo, FileRef};
+    use ship_proto::Message;
+
+    /// What this ship holds of a file this agent claims: its length, chunks and media type.
+    /// `None` for any other id, whether the ship holds that file or not.
+    pub fn info(id: &[u8; 32]) -> Option<FileInfo> {
+        let bytes = super::fetch(128, |buf, cap| unsafe { super::host_file_info(id.as_ptr(), 32, buf, cap) })?;
+        Some(FileInfo::decode(&*bytes).expect("the runtime sent a malformed file info"))
+    }
 }
 
 /// Call a host function that fills a buffer and reports the full length, growing the buffer and

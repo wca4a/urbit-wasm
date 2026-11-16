@@ -21,6 +21,20 @@ use crate::{
     EPOCH_TICK_MILLIS, WASM_STACK_BYTES,
 };
 
+/// A transaction that was not kept: why, and whether that is certain (see
+/// `Ship::transact_knowing`).
+#[derive(Debug)]
+pub(crate) struct NotKept {
+    pub error: Error,
+    pub uncertain: bool,
+}
+
+impl From<NotKept> for Error {
+    fn from(not_kept: NotKept) -> Error {
+        not_kept.error
+    }
+}
+
 pub struct Ship {
     pub name: Arc<str>,
     pub conn: Arc<Mutex<Connection>>,
@@ -330,6 +344,64 @@ impl Ship {
         });
         if done.is_err() {
             self.rollback();
+        }
+        done
+    }
+
+    /// Run `work` as a transaction of its own, saying, if it is not kept, whether that is
+    /// certain. An error before `COMMIT` is run, from `work` or from starting, means nothing
+    /// was kept. An error from `COMMIT` itself leaves the outcome unknown: SQLite may have
+    /// written the commit to its log before the error, and a crash then would bring it back.
+    /// Whoever acts on bytes outside the ship's file must treat that case as possibly kept.
+    pub(crate) fn transact_knowing<R>(&mut self, work: impl FnOnce(&Connection) -> Result<R, Error>) -> Result<R, NotKept> {
+        let before = |error: Error| NotKept { error, uncertain: false };
+        self.begin("BEGIN IMMEDIATE").map_err(before)?;
+        let ran = {
+            let conn = lock(&self.conn);
+            work(&conn)
+        };
+        let value = match ran {
+            Ok(value) => value,
+            Err(e) => {
+                self.rollback();
+                return Err(before(e));
+            }
+        };
+        if crate::files::seams::hit("at-commit") {
+            self.rollback();
+            return Err(NotKept { error: Error::Io(std::io::Error::other("failure injected at commit")), uncertain: true });
+        }
+        let committed = lock(&self.conn).execute_batch("COMMIT");
+        match committed {
+            Ok(()) if crate::files::seams::hit("commit-then-fail") => {
+                Err(NotKept { error: Error::Io(std::io::Error::other("failure injected after commit")), uncertain: true })
+            }
+            Ok(()) => Ok(value),
+            Err(e) => {
+                self.rollback();
+                Err(NotKept { error: e.into(), uncertain: true })
+            }
+        }
+    }
+
+    /// Run `work` as a transaction of its own whose commit is durable when it returns,
+    /// whatever the ship's durability setting: the log is synced at the commit. For changes to
+    /// what the ship's file says of bytes kept outside it, which are acted on (bytes removed)
+    /// as soon as the commit returns, and must then not be undone by a power cut. With
+    /// `Durability::Full` every commit is like this already. Says, as `transact_knowing`
+    /// does, whether a failure is certain.
+    pub(crate) fn transact_synced<R>(&mut self, cfg: &crate::Config, work: impl FnOnce(&Connection) -> Result<R, Error>) -> Result<R, NotKept> {
+        let normal = cfg.durability == crate::Durability::Normal;
+        if normal {
+            let conn = lock(&self.conn);
+            let set = conn.pragma_update(None, "synchronous", "FULL").and_then(|()| conn.pragma_update(None, "fullfsync", "ON"));
+            set.map_err(|e| NotKept { error: e.into(), uncertain: false })?;
+        }
+        let done = self.transact_knowing(work);
+        if normal {
+            // Left as it is if this fails: syncing more than asked for is safe.
+            let conn = lock(&self.conn);
+            let _ = conn.pragma_update(None, "synchronous", "NORMAL").and_then(|()| conn.pragma_update(None, "fullfsync", "OFF"));
         }
         done
     }
@@ -1142,6 +1214,23 @@ impl Ship {
         let result = read_agent(&env, &source, agent, interface, payload, rt.cfg.fuel_per_event, 0);
         self.rollback();
         result.map(|(reply, _)| reply).map_err(|e| Error::Rejected(classify(&e)))
+    }
+
+    /// Whether an agent is installed: whether the kernel would route a command from the owner
+    /// to it. Nothing is changed.
+    pub fn installed(&mut self, rt: &Arc<Inner>, agent: &str) -> Result<bool, Error> {
+        self.begin("BEGIN")?;
+        let env = self.env(rt);
+        let source = Source { owner: true, agent: String::new(), ship: String::new() };
+        let routed = route(&env, &source, agent, Kind::Command, "");
+        self.rollback();
+        match routed {
+            Ok(_) => Ok(true),
+            Err(e) => match classify(&e) {
+                Rejection::Denied(_) => Ok(false),
+                other => Err(Error::Rejected(other)),
+            },
+        }
     }
 
     /// The content hashes of the modules this ship's agents run, as its kernel reports them.

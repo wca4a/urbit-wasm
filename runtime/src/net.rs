@@ -3545,7 +3545,7 @@ async fn carry_messages(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried
 /// socket.
 #[cfg(test)]
 #[path = "router_tests.rs"]
-mod router_tests;
+pub(crate) mod router_tests;
 
 #[cfg(test)]
 mod tests {

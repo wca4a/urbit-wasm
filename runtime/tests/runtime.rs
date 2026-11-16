@@ -1362,7 +1362,7 @@ fn small_limits_do_not_break_routing_or_the_ships_own_export() {
 fn a_full_ship_rejects_growth_and_stays_consistent() {
     // A small storage limit, so that a big write makes the database itself report "full" in the
     // middle of an event. This is the same path any storage error takes.
-    let cfg = Config { max_ship_bytes: 128 << 10, ..fast() };
+    let cfg = Config { max_ship_bytes: 152 << 10, ..fast() };
     let dir = TempDir::new("full");
     let rt = boot_pair(&dir, cfg.clone(), counter_manifest(false), tally_manifest(true));
     send(&rt, "~zod", "counter", "inc hits 3");
@@ -3006,7 +3006,7 @@ fn a_full_ship_lets_go_of_log_entries_a_checkpoint_covers() {
     // more than this ship's file has room for. Some of that is already covered by a checkpoint
     // and only kept for followers that are a little behind.
     let dir = TempDir::new("cp-storage");
-    let rt = boot(&dir, Config { max_ship_bytes: 200 << 10, ..fast() });
+    let rt = boot(&dir, Config { max_ship_bytes: 224 << 10, ..fast() });
     let mut refused = 0;
     for expected in 1..=40 {
         match rt.deliver("~zod", "counter", b"log-big 30000") {
@@ -3034,7 +3034,7 @@ fn a_full_ship_can_let_go_of_a_logs_only_entry() {
     // One big entry, covered by a checkpoint taken straight after it. A second entry would fit
     // in the log many times over, but not in what is left of this ship's file.
     let (dir, b, out) = (TempDir::new("cp-last"), TempDir::new("cp-last-b"), TempDir::new("cp-last-out"));
-    let cfg = Config { max_ship_bytes: 168 << 10, checkpoint_min_bytes: 0, ..fast() };
+    let cfg = Config { max_ship_bytes: 192 << 10, checkpoint_min_bytes: 0, ..fast() };
     let rt = boot(&dir, cfg.clone());
     assert_eq!(send(&rt, "~zod", "counter", "log-big 60000"), "1");
     let key = rt.public_key("~zod").unwrap();
@@ -5961,7 +5961,7 @@ fn two_ships_that_have_filled_up_with_commands_for_each_other_still_get_through(
     let directory = Directory::new();
     // Two ships with small files. Each sends the other as much as it is let, while the
     // other is not there to take any of it.
-    let small = Config { max_ship_bytes: 304 << 10, ..fast() };
+    let small = Config { max_ship_bytes: 328 << 10, ..fast() };
     let padding = "p".repeat(2000);
     let fill = |rt: &Runtime, ship: &str, other: &str| {
         let command = format!("tell {other} inc hits 1 {padding}");
