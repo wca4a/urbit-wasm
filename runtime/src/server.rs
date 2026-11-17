@@ -28,7 +28,8 @@ use ship_proto::{
 };
 
 use crate::files::{self, FileError, CHUNK};
-use crate::{canonical_ship, lock, Error, Position, Rejection, Runtime};
+use crate::remote::{Ask, Failed, Remote};
+use crate::{canonical_ship, check_agent_name, lock, Error, Position, Rejection, Runtime};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -95,6 +96,10 @@ struct Shared {
     waiting: AtomicUsize,
     /// Files' contents currently being sent.
     downloading: AtomicUsize,
+    /// Requests for files on other ships currently being answered: their contents, their
+    /// chunks, or what they are. Each also holds a place among the downloads; this counts the
+    /// share of those places other ships' files hold.
+    fetching: AtomicUsize,
     /// The connections being handled, so that stopping the server can cut them off.
     open: Mutex<HashMap<usize, TcpStream>>,
     next: AtomicUsize,
@@ -116,6 +121,7 @@ impl Server {
             stop: AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
             downloading: AtomicUsize::new(0),
+            fetching: AtomicUsize::new(0),
             open: Mutex::new(HashMap::new()),
             next: AtomicUsize::new(0),
         });
@@ -303,7 +309,9 @@ impl Reply {
             431 => "Request Header Fields Too Large",
             500 => "Internal Server Error",
             501 => "Not Implemented",
+            502 => "Bad Gateway",
             503 => "Service Unavailable",
+            504 => "Gateway Timeout",
             507 => "Insufficient Storage",
             _ => "Error",
         };
@@ -327,14 +335,20 @@ enum Answer<'a> {
 /// A file's contents on their way to a client: bytes `start` to `end` (not including `end`).
 struct Download<'a> {
     reply: Reply,
-    ship: String,
-    agent: String,
-    id: [u8; 32],
-    file: crate::store::StoredFile,
+    from: From<'a>,
     start: u64,
     end: u64,
     /// Its place among the downloads, given up however the download ends.
     _place: Waiting<'a>,
+}
+
+/// Where a file being sent comes from.
+enum From<'a> {
+    /// This ship: the file as its row was when the download began.
+    Here { ship: String, agent: String, id: [u8; 32], file: crate::store::StoredFile },
+    /// Another ship, with its length checked against the file's id, and the download's place
+    /// among the requests for other ships' files.
+    Elsewhere { remote: Remote<Ask<'a>>, _fetching: Waiting<'a> },
 }
 
 /// Handle one connection: read one request, answer it, close.
@@ -768,6 +782,16 @@ fn respond_whole<'a>(shared: &'a Shared, request: &mut Request, streamed: &mut O
         ("POST", ["agents", agent, "command"]) => {
             done(runtime.deliver(&ship, agent, &request.body).map(|outcome| Reply::new(200, "application/octet-stream", outcome.reply)))
         }
+        ("GET", ["files", "from", other, agent, id, rest @ ..]) => {
+            match remote_route(shared, &ship, other, agent, id, rest, request.header("Range")) {
+                Ok(Answer::Stream(download)) => {
+                    *streamed = Some(download);
+                    Reply::text(200, "")
+                }
+                Ok(Answer::Whole(reply)) => reply.with("Content-Security-Policy", FILE_POLICY),
+                Err(reply) => reply.with("Content-Security-Policy", FILE_POLICY).with("Content-Disposition", "attachment"),
+            }
+        }
         ("GET", ["agents", agent, "files", id, "content"]) => match file_content(shared, &ship, agent, id, request.header("Range")) {
             Ok(download) => {
                 *streamed = Some(download);
@@ -851,7 +875,7 @@ fn file_route(runtime: &Runtime, ship: &str, agent: &str, method: &str, rest: &[
 }
 
 fn file_info(info: &files::FileInfo) -> ship_proto::FileInfo {
-    ship_proto::FileInfo { id: info.id.to_vec(), length: info.length, chunks: info.chunks, media_type: info.media_type.clone(), added_ms: info.added_ms }
+    ship_proto::FileInfo { id: info.id.to_vec(), length: info.length, chunks: info.chunks, media_type: info.media_type.clone(), added_ms: info.added_ms, open: info.open }
 }
 
 /// What part of a file a `Range` header asks for. Only one range of bytes is understood:
@@ -906,24 +930,119 @@ fn file_content<'a>(shared: &'a Shared, ship: &str, agent: &str, id: &str, range
         }
     };
     // Its own limit, apart from requests waiting for logs, so downloads cannot take every thread.
+    let place = download_place(shared)?;
+    let reply = contents_head(status, &file.media_type, start, end, file.length);
+    let from = From::Here { ship: ship.to_string(), agent: agent.to_string(), id, file };
+    Ok(Download { reply, from, start, end, _place: place })
+}
+
+/// The head of an answer carrying a file's contents, bytes `start` to `end` of `length`, here
+/// or from another ship alike: nothing in it a browser may run or show as a page.
+fn contents_head(status: u16, media_type: &str, start: u64, end: u64, length: u64) -> Reply {
+    let disposition = if files::shown_inline(media_type) { "inline" } else { "attachment" };
+    let mut reply = Reply::new(status, media_type, Vec::new())
+        .with("Content-Security-Policy", FILE_POLICY)
+        .with("Content-Disposition", disposition)
+        .with("Accept-Ranges", "bytes");
+    if status == 206 {
+        reply = reply.with("Content-Range", format!("bytes {start}-{}/{length}", end - 1));
+    }
+    reply
+}
+
+/// A place among the downloads of contents, here or from another ship: `Err` with the
+/// answer if there is none.
+fn download_place(shared: &Shared) -> Result<Waiting<'_>, Reply> {
     let limit = download_limit(&shared.cfg);
     if limit == 0 {
         return Err(Reply::text(503, "this server has too few threads to send a file's contents; fetch its chunks one at a time"));
     }
     let place = Waiting(&shared.downloading);
     if shared.downloading.fetch_add(1, Ordering::SeqCst) >= limit {
-        drop(place);
         return Err(Reply::text(503, "too many downloads at once; try again shortly").with("Retry-After", "1"));
     }
-    let disposition = if files::shown_inline(&file.media_type) { "inline" } else { "attachment" };
-    let mut reply = Reply::new(status, &file.media_type, Vec::new())
-        .with("Content-Security-Policy", FILE_POLICY)
-        .with("Content-Disposition", disposition)
-        .with("Accept-Ranges", "bytes");
-    if status == 206 {
-        reply = reply.with("Content-Range", format!("bytes {start}-{}/{}", end - 1, file.length));
+    Ok(place)
+}
+
+/// How many requests for files on other ships may be answered at once: half the downloads'
+/// places, and at least one. Each holds a thread while it waits on the other ship, and every
+/// one also holds a place among the downloads, so long polls, downloads and waits on other
+/// ships together never take the threads kept for everything else; and a slow ship far away
+/// cannot take every download place, so the owner's own files can still be had. With no
+/// download places at all (two workers), none is answered.
+fn fetch_limit(cfg: &ServerConfig) -> usize {
+    (download_limit(cfg) / 2).max(1)
+}
+
+/// The sentence every refusal from another ship is answered with: this ship's own words,
+/// never the other ship's.
+const NOT_SHARED_ELSEWHERE: &str = "the other ship does not share that file with this one";
+
+/// A file on another ship: `/files/from/<ship>/<agent>/<id>` for what it is,
+/// `.../chunks/<n>` for one chunk, `.../content` for the whole of it or one range. Nothing is
+/// passed on that has not been checked against the id (see `crate::remote`).
+fn remote_route<'a>(shared: &'a Shared, here: &str, other: &str, agent: &str, id: &str, rest: &[&str], range: Option<&str>) -> Result<Answer<'a>, Reply> {
+    // Every name is checked before it is used, and none becomes a path: they only go into a
+    // request to the other ship.
+    let other = match canonical_ship(other) {
+        Ok(other) if other != here => other,
+        _ => return Err(Reply::text(400, "not a ship other than this one")),
+    };
+    if check_agent_name(agent).is_err() {
+        return Err(Reply::text(400, "not a valid agent name"));
     }
-    Ok(Download { reply, ship: ship.to_string(), agent: agent.to_string(), id, file, start, end, _place: place })
+    let Some(id) = files::parse_id(id) else { return Err(Reply::text(400, "not a file id")) };
+    let chunk = match rest {
+        [] | ["content"] => None,
+        ["chunks", n] if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => Some(n.parse::<u64>().map_err(|_| Reply::text(404, "no such chunk"))?),
+        ["chunks", _] => return Err(Reply::text(400, "not a chunk number")),
+        _ => return Err(Reply::text(404, "not found")),
+    };
+    let contents = rest == ["content"];
+    // Places first, before the other ship is asked anything: a place among the downloads,
+    // whichever the route (each waits on the other ship holding a thread), and one among
+    // other ships' share of them.
+    if download_limit(&shared.cfg) == 0 {
+        return Err(Reply::text(503, "this server has too few threads to wait on another ship"));
+    }
+    let fetching = Waiting(&shared.fetching);
+    if shared.fetching.fetch_add(1, Ordering::SeqCst) >= fetch_limit(&shared.cfg) {
+        return Err(Reply::text(503, "too many requests for other ships' files at once; try again shortly").with("Retry-After", "1"));
+    }
+    let place = download_place(shared)?;
+    let mut remote = shared.runtime.remote_file(here, &other, agent, &id).map_err(remote_failure)?;
+    let length = remote.length();
+    if let Some(n) = chunk {
+        if files::chunk_len(length, n).is_none() {
+            return Err(Reply::text(404, "no such chunk"));
+        }
+        let data = remote.chunk(n).map_err(remote_failure)?;
+        return Ok(Answer::Whole(Reply::new(200, "application/octet-stream", data).with("Content-Disposition", "attachment")));
+    }
+    if !contents {
+        let info = ship_proto::FileInfo { id: id.to_vec(), length, chunks: files::chunk_count(length), media_type: remote.media_type().to_string(), added_ms: 0, open: false };
+        return Ok(Answer::Whole(Reply::proto(200, &info).with("Content-Disposition", "attachment")));
+    };
+    let (start, end, status) = match wanted(range, length) {
+        Wanted::Whole => (0, length, 200),
+        Wanted::Part(first, last) => (first, last + 1, 206),
+        Wanted::Unsatisfiable => return Err(Reply::text(416, "that range is not in the file").with("Content-Range", format!("bytes */{length}"))),
+    };
+    let reply = contents_head(status, remote.media_type(), start, end, length);
+    Ok(Answer::Stream(Download { reply, from: From::Elsewhere { remote, _fetching: fetching }, start, end, _place: place }))
+}
+
+/// What a failure to have a file from another ship looks like to a client.
+fn remote_failure(failed: Failed) -> Reply {
+    match failed {
+        // This ship's own words, the same for every refusal: nothing the other ship said.
+        Failed::Refused => Reply::text(404, NOT_SHARED_ELSEWHERE),
+        Failed::Wrong(why) => Reply::text(502, &format!("the other ship's answer is not right: {why}")),
+        Failed::Unreachable => Reply::text(504, "the other ship could not be reached, or did not answer in time"),
+        Failed::Busy => Reply::text(503, "too busy; try again shortly").with("Retry-After", "1"),
+        Failed::NoNetwork => Reply::text(503, "this ship is not on the network just now").with("Retry-After", "5"),
+        Failed::Unfit => Reply::text(503, "this runtime cannot carry files between ships: its max_message_bytes is too small"),
+    }
 }
 
 /// Send a file's contents, a chunk at a time. Each chunk is read and checked against its hash
@@ -931,11 +1050,31 @@ fn file_content<'a>(shared: &'a Shared, ship: &str, agent: &str, id: &str, range
 /// be read whole and matching, or a client that is too slow, ends the answer short: the client
 /// sees fewer bytes than it was told, and never bytes that are not the file's.
 fn send_file(shared: &Shared, stream: &mut TcpStream, download: Download) {
-    let Download { reply, ship, agent, id, file, start, end, _place } = download;
+    let Download { reply, from, start, end, _place } = download;
     if write_by(stream, &reply.encode_head(end - start), Instant::now() + shared.cfg.io_timeout).is_err() || start >= end {
         return;
     }
     let (first, last) = (start / CHUNK, (end - 1) / CHUNK);
+    let (ship, agent, id, file) = match from {
+        From::Here { ship, agent, id, file } => (ship, agent, id, file),
+        From::Elsewhere { mut remote, _fetching } => {
+            // From another ship: each chunk asked for, within `file_timeout`, and checked
+            // against its hash before any of it is written; the client has `io_timeout` to
+            // take each. Anything that goes wrong ends the answer short.
+            for n in first..=last {
+                if shared.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Ok(chunk) = remote.chunk(n) else { return };
+                let from = if n == first { (start % CHUNK) as usize } else { 0 };
+                let to = if n == last { ((end - 1) % CHUNK) as usize + 1 } else { chunk.len() };
+                if write_by(stream, &chunk[from..to], Instant::now() + shared.cfg.io_timeout).is_err() {
+                    return;
+                }
+            }
+            return;
+        }
+    };
     let mut n = first;
     while n <= last {
         if shared.stop.load(Ordering::Relaxed) {
@@ -968,6 +1107,7 @@ fn allowed(parts: &[&str]) -> Option<&'static str> {
         ["agents", _, "files", "uploads"] | ["agents", _, "files", "uploads", _, "finish"] => Some("POST"),
         ["agents", _, "files", "uploads", _] | ["agents", _, "files", _] => Some("GET, DELETE"),
         ["agents", _, "files", "uploads", _, _] => Some("PUT"),
+        ["files", "from", _, _, _] | ["files", "from", _, _, _, "chunks", _] | ["files", "from", _, _, _, "content"] => Some("GET"),
         _ => None,
     }
 }

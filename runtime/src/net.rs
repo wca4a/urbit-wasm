@@ -79,7 +79,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -95,8 +95,8 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use ship_proto::{
-    peer_reply, peer_request, Deliver, Delivered, Fetch, Heard, Hello, Introduction, Message, MoonProof, News, PeerReply, PeerRequest, Ping, Pong,
-    Resync, Resynced, Standing, Welcome,
+    peer_reply, peer_request, Deliver, Delivered, Fetch, FileBytes, FileFacts, FileHashes, FileWanted, Heard, Hello, Introduction, Message, MoonProof,
+    News, PeerReply, PeerRequest, Ping, Pong, Resync, Resynced, Standing, Welcome,
 };
 use tokio::sync::Semaphore;
 
@@ -107,6 +107,7 @@ use crate::lookup::{self, Bucket, Finder, Lead, Lookup, Point, PointStatus};
 use crate::moon;
 use crate::relay::{self, Leg, RelayStatus, Relayed, SessionId};
 use crate::whereabouts;
+use crate::files::{Part, Served};
 use crate::ship::Taken;
 use crate::store::{PeerWork, Stand, MAX_BATCH_MESSAGES, MAX_FETCH_ENTRIES, MAX_NEWS_LOGS};
 use crate::{canonical_ship, lock, Acked, Error, Runtime};
@@ -120,6 +121,31 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The most a ship's first words on a connection, or the answer to them, may come to.
 const MOST_HELLO_BYTES: usize = 1024;
+
+/// The most a request for a part of a file may come to, encoded: an agent's name (at most 64
+/// bytes), a 32-byte id and a number need far less. A larger one is refused before anything
+/// is looked up or any place taken, so nothing the asking ship sized is held while it waits.
+pub(crate) const MOST_FILE_REQUEST_BYTES: usize = 1024;
+
+/// What a ship says to a request for a part of a file over `MOST_FILE_REQUEST_BYTES`.
+pub(crate) const FILE_REQUEST_TOO_LARGE: &str = "a request for a part of a file is never that large";
+
+/// What a ship says when it has no room for a request just now. The asker may try again.
+pub(crate) const TOO_BUSY: &str = "too busy; try again";
+
+/// The least `max_message_bytes` that carries a file's parts: a whole chunk, or a whole group
+/// of 32,768 hashes (both 1 MiB), with room for what goes round them. A runtime set lower
+/// refuses to ask for or to serve files, saying so, and carries everything else as before.
+pub(crate) const FILE_MESSAGE_BYTES: usize = crate::files::CHUNK as usize + 1024;
+
+/// How many requests for files one connection from another ship may have answered at once,
+/// of its `max_streams`, and how many all connections together may. Past either, a request
+/// for a file is told the ship is too busy, and everything else goes on as before.
+pub(crate) const MOST_FILE_STREAMS: usize = 4;
+pub(crate) const MOST_FILES_ANSWERING: usize = 8;
+
+/// What the ship's words for this runtime refusing files, for want of room in a message, are.
+pub(crate) const FILES_UNFIT: &str = "this runtime's max_message_bytes is too small to carry a file's chunks";
 
 /// How many callers nothing is known of may be looked up in Urbit ID in a second, and at a
 /// stroke. Anyone can say any name, and each name not yet known costs questions to an
@@ -786,6 +812,9 @@ pub struct NetConfig {
     pub addr: String,
     /// How long one request to another ship may take, connecting included.
     pub request_timeout: Duration,
+    /// The same for a request for a part of a file, in place of `request_timeout`, on both
+    /// sides: a whole chunk through a relay at its usual allowance takes several seconds.
+    pub file_timeout: Duration,
     /// A connection with nothing on it for this long is closed.
     pub idle_timeout: Duration,
     /// How many connections from other ships may be open at once, counting those still being
@@ -838,6 +867,7 @@ impl Default for NetConfig {
         NetConfig {
             addr: "127.0.0.1:0".into(),
             request_timeout: Duration::from_secs(10),
+            file_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
             max_connections: 1024,
             max_calls: 1024,
@@ -888,6 +918,19 @@ impl fmt::Display for NetError {
 }
 
 impl std::error::Error for NetError {}
+
+/// Why asking another ship about a file got no reply.
+#[derive(Debug)]
+pub(crate) enum FileAskError {
+    /// What any request may come to.
+    Net(NetError),
+    /// This runtime has as many requests out as it may.
+    Busy,
+    /// This runtime's messages are too small to carry a file's parts (see `FILE_MESSAGE_BYTES`).
+    Unfit,
+    /// The network is stopping.
+    Stopped,
+}
 
 /// What came of asking a ship who it is.
 #[derive(Debug, PartialEq, Eq)]
@@ -1115,7 +1158,32 @@ struct Shared {
     direct_tries: Arc<Semaphore>,
     /// What introductions this runtime's ships have been given, and what came of them.
     punching: Punching,
+    /// Places among the requests for files being answered, all connections together. See
+    /// `MOST_FILES_ANSWERING`.
+    files_answering: Arc<Semaphore>,
+    /// For tests: what this runtime, answering for files, does in place of answering honestly.
+    #[cfg(test)]
+    pub(crate) liar: Mutex<Option<Liar>>,
 }
+
+/// For tests: how an answer to a request for a file is told falsely.
+#[cfg(test)]
+pub(crate) enum Lie {
+    /// This reply in place of the true one.
+    Reply(PeerReply),
+    /// The true reply, after this long, holding its places meanwhile.
+    Slow(Duration),
+    /// No reply: the stream is cut off.
+    Cut,
+}
+
+/// For tests: given the request and the true reply, the lie to tell, if any.
+#[cfg(test)]
+pub(crate) type Liar = Arc<dyn Fn(&peer_request::Body, &PeerReply) -> Option<Lie> + Send + Sync>;
+
+/// For tests: the words a reply carries to say its stream is to be cut off instead.
+#[cfg(test)]
+const CUT: &str = "(cut off by a test)";
 
 /// How a runtime acts on introductions its lookup points pass to its ships.
 struct Punching {
@@ -1304,6 +1372,9 @@ impl Network {
         if cfg.request_timeout.is_zero() || cfg.request_timeout > MAX_TIMEOUT || cfg.idle_timeout.is_zero() || cfg.idle_timeout > MAX_TIMEOUT {
             return Err(io::Error::other("request_timeout and idle_timeout must be more than nothing and at most a day"));
         }
+        if cfg.file_timeout.is_zero() || cfg.file_timeout > MAX_TIMEOUT {
+            return Err(io::Error::other("file_timeout must be more than nothing and at most a day"));
+        }
         cfg.lookup.sound().map_err(io::Error::other)?;
         // A packet every `keep_alive` keeps a connection open only if it comes before the
         // connection is taken to be idle.
@@ -1419,6 +1490,9 @@ impl Network {
             going_direct: Mutex::default(),
             direct_tries: Arc::new(Semaphore::new(MOST_DIRECT_TRIES)),
             punching: Punching::new(),
+            files_answering: Arc::new(Semaphore::new(MOST_FILES_ANSWERING)),
+            #[cfg(test)]
+            liar: Mutex::new(None),
         });
         tokio.spawn(answer_calls(shared.clone()));
         tokio.spawn(carry(shared.clone()));
@@ -1438,6 +1512,13 @@ impl Network {
             if queued {
                 told.run_at(ship);
             }
+        })));
+        // And anything outside the network (the HTTP server) may ask other ships for parts of
+        // files through it. Held weakly, so that the runtime holds nothing of the network.
+        let (weak, handle) = (Arc::downgrade(&shared), tokio.handle().clone());
+        shared.runtime.set_file_hook(Some(Arc::new(move |from: &str, to: &str, request: PeerRequest| {
+            let shared = weak.upgrade().ok_or(FileAskError::Stopped)?;
+            ask_for_file(&shared, &handle, from, to, request)
         })));
         // Ships may have had commands waiting since before this network started: to go to
         // other ships, or taken from other ships and not yet run. A command that was taken
@@ -1564,6 +1645,7 @@ impl Network {
 impl Drop for Network {
     fn drop(&mut self) {
         self.shared.runtime.set_outbound_hook(None);
+        self.shared.runtime.set_file_hook(None);
         self.shared.endpoint.close(VarInt::from_u32(0), b"stopping");
         // Give the goodbyes a moment to go out, so the ships at the other end know at once and
         // do not hold a dead connection until it times out. Only a moment: a ship that is not
@@ -1767,9 +1849,14 @@ impl Shared {
     /// The same, also returning the key the ship that answered proved it holds: the one the
     /// directory listed for it when the connection was made.
     async fn ask_keyed(self: &Arc<Self>, from: &str, to: &str, request: PeerRequest) -> Result<(PeerReply, [u8; 32]), NetError> {
+        self.ask_within(from, to, request, self.cfg.request_timeout).await
+    }
+
+    /// The same, with `within` for the whole of it in place of `request_timeout`.
+    async fn ask_within(self: &Arc<Self>, from: &str, to: &str, request: PeerRequest, within: Duration) -> Result<(PeerReply, [u8; 32]), NetError> {
         let from = canonical_ship(from).map_err(|_| NetError::NotHere(from.to_string()))?;
         let to = canonical_ship(to).map_err(|_| NetError::Unlisted(to.to_string()))?;
-        let deadline = tokio::time::Instant::now().checked_add(self.cfg.request_timeout).ok_or(NetError::TimedOut)?;
+        let deadline = tokio::time::Instant::now().checked_add(within).ok_or(NetError::TimedOut)?;
         let lost = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
         let (connection, key) = tokio::time::timeout_at(deadline, self.connection(&from, &to, deadline)).await.map_err(|_| NetError::TimedOut)??;
         let opened = tokio::time::timeout_at(deadline, connection.open_bi()).await.map_err(|_| NetError::TimedOut)?;
@@ -2728,8 +2815,10 @@ async fn answer_caller(shared: Arc<Shared>, incoming: Incoming, place: Place, ad
             older.close(VarInt::from_u32(5), b"replaced by a newer connection");
         }
     }
+    // This connection's places among the requests for files being answered.
+    let files = Arc::new(Semaphore::new(MOST_FILE_STREAMS));
     while let Ok((send, receive)) = connection.accept_bi().await {
-        tokio::spawn(answer_request(shared.clone(), connection.clone(), pair.clone(), send, receive));
+        tokio::spawn(answer_request(shared.clone(), connection.clone(), pair.clone(), files.clone(), send, receive));
     }
     // The connection has gone. Its number stays, as the newest there has been.
     let mut callers = lock(&shared.callers);
@@ -2738,18 +2827,29 @@ async fn answer_caller(shared: Arc<Shared>, incoming: Incoming, place: Place, ad
     }
 }
 
-/// One request on a connection from another ship.
-async fn answer_request(shared: Arc<Shared>, connection: Connection, pair: Pair, mut send: SendStream, mut receive: RecvStream) {
-    let limit = shared.cfg.request_timeout;
-    let served = tokio::time::timeout(limit, async {
+/// One request on a connection from another ship. It has `request_timeout` from its start to be
+/// read and answered; a request for a part of a file has `file_timeout` instead, once it is
+/// read and seen to be one (it is read within `request_timeout` all the same).
+///
+/// In order, before anything is decoded: room to read into, or "too busy"; the whole request
+/// read, or "could not be read"; the caller checked again; one body field at most, or "one
+/// request at a time"; a request for a part of a file no larger than
+/// `MOST_FILE_REQUEST_BYTES`. Then the counts of an earlier kind's repeated messages, and the
+/// decoding. Every refusal and every file's no is written by `reply_small`, which gives back
+/// the room and drops everything of the request's first.
+async fn answer_request(shared: Arc<Shared>, connection: Connection, pair: Pair, files: Arc<Semaphore>, mut send: SendStream, mut receive: RecvStream) {
+    let started = tokio::time::Instant::now();
+    let request_deadline = started + shared.cfg.request_timeout;
+    let read = tokio::time::timeout_at(request_deadline, async {
         // Room is set aside before a byte is read. With none to spare, the request is told so
         // at once, and nothing of it is taken in.
-        let Ok(_room) = shared.reading.clone().try_acquire_many_owned(shared.cfg.max_message_bytes as u32) else {
+        let Ok(room) = shared.reading.clone().try_acquire_many_owned(shared.cfg.max_message_bytes as u32) else {
             let _ = receive.stop(VarInt::from_u32(4));
-            return reply(&mut send, &refused("too busy; try again")).await;
+            return Read::Refuse(TOO_BUSY);
         };
+        // Not read whole: the room, and whatever of it was read, go as this returns.
         let Some(bytes) = read_whole(&mut receive, shared.cfg.max_message_bytes).await else {
-            return reply(&mut send, &refused("the request could not be read, or was too large")).await;
+            return Read::Refuse("the request could not be read, or was too large");
         };
         // Who is calling was settled when the connection was made. It is checked again here,
         // with the whole request in hand and just before acting on it: the directory may
@@ -2759,16 +2859,248 @@ async fn answer_request(shared: Arc<Shared>, connection: Connection, pair: Pair,
         shared.freshen(&pair.0);
         if parties(&shared, &connection, &pair.0).as_ref() != Some(&pair) {
             connection.close(VarInt::from_u32(2), b"the directory changed");
-            return;
+            return Read::Quiet;
         }
-        reply(&mut send, &answer(&shared, &connection, &pair.0, &pair.1, &bytes).await).await;
+        Read::Whole(room, bytes)
     })
     .await;
-    if served.is_err() {
-        // Out of time. Say so on the wire, so nothing of this request lingers at either end.
+    let (room, bytes) = match read {
+        Ok(Read::Whole(room, bytes)) => (room, bytes),
+        Ok(Read::Refuse(why)) => return reply_small(&mut send, &mut receive, Held::nothing(), &refused(why), request_deadline).await,
+        Ok(Read::Quiet) => return,
+        Err(_) => {
+            // Out of time. Say so on the wire, so nothing of this request lingers at either end.
+            let _ = send.reset(VarInt::from_u32(3));
+            let _ = receive.stop(VarInt::from_u32(3));
+            return;
+        }
+    };
+    // One body field at most, found without decoding anything; its number is the kind.
+    let kind = match body_fields(&bytes) {
+        Some((count, _)) if count > 1 => {
+            let held = Held { room: Some(room), bytes: Some(bytes), body: None };
+            return reply_small(&mut send, &mut receive, held, &refused(ONE_AT_A_TIME), request_deadline).await;
+        }
+        Some((1, kind)) => Some(kind),
+        // None at all, or not fields from end to end: decoding says which, as it always has.
+        _ => None,
+    };
+    // A request for a part of a file has no reason to be large: refused before it is decoded.
+    if kind.is_some_and(|kind| FILE_FIELDS.contains(&kind)) && bytes.len() > MOST_FILE_REQUEST_BYTES {
+        let held = Held { room: Some(room), bytes: Some(bytes), body: None };
+        return reply_small(&mut send, &mut receive, held, &refused(FILE_REQUEST_TOO_LARGE), request_deadline).await;
+    }
+    let request = decode_request(&bytes);
+    // The raw bytes go now, on every path.
+    drop(bytes);
+    let request = match request {
+        Ok(request) => request,
+        Err(refusal) => return reply_small(&mut send, &mut receive, Held { room: Some(room), bytes: None, body: None }, &refusal, request_deadline).await,
+    };
+    let body = match request {
+        PeerRequest { body: Some(body) } if is_file_request(&body) => body,
+        request => {
+            // An earlier kind, as before: answered within `request_timeout`. A refusal gives
+            // back its room first; any other reply holds it until it is taken.
+            let held = Held { room: Some(room), bytes: None, body: None };
+            let Ok(answered) = tokio::time::timeout_at(request_deadline, answer(&shared, &connection, &pair.0, &pair.1, request)).await else {
+                let _ = send.reset(VarInt::from_u32(3));
+                let _ = receive.stop(VarInt::from_u32(3));
+                return;
+            };
+            if answered.body.is_none() {
+                return reply_small(&mut send, &mut receive, held, &answered, request_deadline).await;
+            }
+            if tokio::time::timeout_at(request_deadline, reply(&mut send, &answered)).await.is_err() {
+                let _ = send.reset(VarInt::from_u32(3));
+                let _ = receive.stop(VarInt::from_u32(3));
+            }
+            drop(held);
+            return;
+        }
+    };
+    // A request for a part of a file. This runtime unable to carry files: refused before
+    // anything is looked up. Otherwise its places among the file requests (one of this
+    // connection's, one of the runtime's) are taken before anything is looked up, or it is
+    // turned away. Refused or turned away, it holds no place, and is answered by
+    // `reply_small` within what is left of `request_timeout`.
+    let mut held = Held { room: Some(room), bytes: None, body: Some(body) };
+    let places = if shared.cfg.max_message_bytes < FILE_MESSAGE_BYTES {
+        Err(FILES_UNFIT)
+    } else {
+        FilePlaces::take(&files, &shared.files_answering).ok_or(TOO_BUSY)
+    };
+    let places = match places {
+        Ok(places) => places,
+        Err(why) => return reply_small(&mut send, &mut receive, held, &refused(why), request_deadline).await,
+    };
+    // Set when this request is given up on, however that happens (its time runs out, the
+    // asking ship stops the stream or its connection is lost, or this task ends), so that a
+    // blocking job still running for it stops at its next check.
+    let given_up = Arc::new(AtomicBool::new(false));
+    let give_up = GiveUp(given_up.clone());
+    // Served within `file_timeout`, unless the asking ship gives up first: `stopped` completes
+    // when it stops the stream, or the connection is lost (nothing has been written yet, so it
+    // cannot complete for any other reason). `serve_file` turns the decoded request into values
+    // of this runtime's own size, and drops it, before any job is scheduled.
+    let body = held.body.take().expect("held until now");
+    let mut serving = Box::pin(tokio::time::timeout_at(started + shared.cfg.file_timeout, serve_file(&shared, &pair.0, &pair.1, body, places.clone(), given_up)));
+    let mut stopped = std::pin::pin!(send.stopped());
+    let answered = std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(served) = std::future::Future::poll(serving.as_mut(), cx) {
+            return std::task::Poll::Ready(Some(served));
+        }
+        std::future::Future::poll(stopped.as_mut(), cx).map(|_| None)
+    })
+    .await;
+    let Some(Ok((answered, yes))) = answered else {
+        // Out of time, or given up on by the asking ship. Marked given up on now; the
+        // serving future goes (with the decoded request, if it had not yet been turned into
+        // the job's own values), then the request's share of the places and its room; the
+        // blocking job, if one runs on, holds its own share of the places and its own values
+        // (a checked agent's name, at most 64 bytes, a 32-byte id, a number) until it returns.
+        drop(give_up);
+        drop(serving);
+        drop(places);
+        held.give_back();
+        let _ = send.reset(VarInt::from_u32(3));
+        let _ = receive.stop(VarInt::from_u32(3));
+        return;
+    };
+    drop(serving);
+    #[cfg(test)]
+    if answered.body.is_none() && answered.refused == CUT {
+        let _ = send.reset(VarInt::from_u32(6));
+        let _ = receive.stop(VarInt::from_u32(6));
+        return;
+    }
+    // A part sent holds its places and its room until its stream is done with: wholly taken,
+    // or reset at the deadline. A refusal or a no gives back both, by `reply_small`, before it
+    // is written, within `request_timeout` from the request's start.
+    if !yes {
+        drop(places);
+        return reply_small(&mut send, &mut receive, held, &answered, request_deadline).await;
+    }
+    if tokio::time::timeout_at(started + shared.cfg.file_timeout, reply(&mut send, &answered)).await.is_err() {
         let _ = send.reset(VarInt::from_u32(3));
         let _ = receive.stop(VarInt::from_u32(3));
     }
+    drop((places, held));
+    drop(give_up);
+}
+
+/// What reading a request came to.
+enum Read {
+    /// The whole request, in the room it was read into.
+    Whole(tokio::sync::OwnedSemaphorePermit, Vec<u8>),
+    /// A refusal, with nothing of the request held.
+    Refuse(&'static str),
+    /// Nothing to say: the connection is closed.
+    Quiet,
+}
+
+/// What the ship's words are for an envelope with more than one body field.
+pub(crate) const ONE_AT_A_TIME: &str = "one request at a time";
+
+/// The field numbers of `PeerRequest`'s body, and of its four file kinds.
+const BODY_FIELDS: std::ops::RangeInclusive<u64> = 1..=10;
+const FILE_FIELDS: std::ops::RangeInclusive<u64> = 7..=10;
+
+/// How many body fields an encoded request holds, and the number of the last, found without
+/// decoding or keeping anything. `None` if it is not fields from end to end.
+fn body_fields(request: &[u8]) -> Option<(usize, u64)> {
+    let (mut count, mut last) = (0usize, 0u64);
+    // A body field however it is given: one given as a number is still a body field (and
+    // decoding refuses it).
+    walk_fields(request, |field, _, _| {
+        if BODY_FIELDS.contains(&field) {
+            count += 1;
+            last = field;
+        }
+        true
+    })
+    .then_some((count, last))
+}
+
+/// A request's room for reading, and what of it the asking ship sized that is still held where
+/// it is answered: its raw bytes, until decoded, and its decoded body, until it is turned into
+/// values of this runtime's own size.
+///
+/// The rule, kept here and nowhere else: a reply is written while room is held only for a part
+/// of a file being sent and for an earlier kind's answer that is not a refusal. Every other
+/// reply (every refusal, of any kind, and every file's no) is written by `reply_small`, which
+/// first calls `give_back`, dropping everything of the request's and then the room.
+struct Held {
+    room: Option<tokio::sync::OwnedSemaphorePermit>,
+    bytes: Option<Vec<u8>>,
+    body: Option<peer_request::Body>,
+}
+
+impl Held {
+    fn nothing() -> Held {
+        Held { room: None, bytes: None, body: None }
+    }
+
+    fn give_back(self) {
+        let Held { room, bytes, body } = self;
+        drop(bytes);
+        drop(body);
+        drop(room);
+    }
+}
+
+/// The one way a small reply of this runtime's own (a refusal, of any kind, or a file's no) is
+/// written: what the request held is given back first, so a ship that never takes such replies
+/// holds nothing of this runtime's while they wait. Within `deadline`, else the stream is reset.
+async fn reply_small(send: &mut SendStream, receive: &mut RecvStream, held: Held, answer: &PeerReply, deadline: tokio::time::Instant) {
+    held.give_back();
+    if tokio::time::timeout_at(deadline, reply(send, answer)).await.is_err() {
+        let _ = send.reset(VarInt::from_u32(3));
+        let _ = receive.stop(VarInt::from_u32(3));
+    }
+}
+
+/// A request for a file's places: one among its connection's, one among the runtime's. Shared
+/// between the request and its blocking job, and given back when both have let go.
+struct FilePlaces {
+    _one: tokio::sync::OwnedSemaphorePermit,
+    _all: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl FilePlaces {
+    /// Both places, or neither.
+    fn take(connection: &Arc<Semaphore>, all: &Arc<Semaphore>) -> Option<Arc<FilePlaces>> {
+        let one = connection.clone().try_acquire_owned().ok()?;
+        let all = all.clone().try_acquire_owned().ok()?;
+        Some(Arc::new(FilePlaces { _one: one, _all: all }))
+    }
+}
+
+/// Marks a request given up on when dropped.
+struct GiveUp(Arc<AtomicBool>);
+
+impl Drop for GiveUp {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A request as read, or the refusal it gets if it is not one. Counted before it is decoded. A
+/// request of a megabyte can hold half a million empty messages, and decoding would give each
+/// one a few hundred bytes of memory. The same goes for the logs in a piece of news.
+fn decode_request(request: &[u8]) -> Result<PeerRequest, PeerReply> {
+    if !repeats_within(request, 2, 1, MAX_BATCH_MESSAGES) || !repeats_within(request, 4, 1, MAX_NEWS_LOGS) {
+        return Err(refused("not a request, or one with too many messages"));
+    }
+    PeerRequest::decode(request).map_err(|_| refused("not a request"))
+}
+
+/// Whether a request is for a part of a file.
+fn is_file_request(body: &peer_request::Body) -> bool {
+    matches!(
+        body,
+        peer_request::Body::FileAbout(_) | peer_request::Body::FileLeaves(_) | peer_request::Body::FileUpper(_) | peer_request::Body::FileChunk(_)
+    )
 }
 
 /// Read a whole message from a stream, up to `max` bytes. `None` if it is longer, or the
@@ -2850,15 +3182,9 @@ async fn work<T: Send + 'static>(shared: &Shared, job: impl FnOnce() -> T + Send
     done.await.ok()
 }
 
-/// Answer one request from `caller` to `called`.
-async fn answer(shared: &Arc<Shared>, connection: &Connection, caller: &str, called: &str, request: &[u8]) -> PeerReply {
-    // Counted before it is decoded. A request of a megabyte can hold half a million empty
-    // messages, and decoding would give each one a few hundred bytes of memory. The same
-    // goes for the logs in a piece of news.
-    if !repeats_within(request, 2, 1, MAX_BATCH_MESSAGES) || !repeats_within(request, 4, 1, MAX_NEWS_LOGS) {
-        return refused("not a request, or one with too many messages");
-    }
-    let Ok(request) = PeerRequest::decode(request) else { return refused("not a request") };
+/// Answer one request from `caller` to `called`, but for a request for a part of a file
+/// (`serve_file`, from `answer_request`).
+async fn answer(shared: &Arc<Shared>, connection: &Connection, caller: &str, called: &str, request: PeerRequest) -> PeerReply {
     match request.body {
         Some(peer_request::Body::Ping(Ping { nonce })) if nonce.len() <= 64 => {
             // The ship's mark is kept in memory once it has been read, so this wakes the
@@ -2954,57 +3280,169 @@ async fn answer(shared: &Arc<Shared>, connection: &Connection, caller: &str, cal
     }
 }
 
+/// Answer a request for a part of a file, holding `places`, and say whether the answer is a
+/// part sent (true) or a no or a refusal (false). Whether the caller may have it is decided by
+/// the ship (`Runtime::serve_file`), afresh for every request; every no is the same `denied`,
+/// and says nothing of why. The blocking job holds its own share of `places` until it returns,
+/// whatever becomes of the request, and stops at its next check once `given_up` is set. A
+/// chunk that cannot be read whole and matching its hash is refused, never sent.
+async fn serve_file(shared: &Arc<Shared>, caller: &str, called: &str, body: peer_request::Body, places: Arc<FilePlaces>, given_up: Arc<AtomicBool>) -> (PeerReply, bool) {
+    #[cfg(test)]
+    let asked = body.clone();
+    let (wanted, part) = match body {
+        peer_request::Body::FileAbout(wanted) => (wanted, Part::About),
+        peer_request::Body::FileLeaves(wanted) => {
+            let group = wanted.index;
+            (wanted, Part::Leaves(group))
+        }
+        peer_request::Body::FileUpper(wanted) => (wanted, Part::Upper),
+        peer_request::Body::FileChunk(wanted) => {
+            let n = wanted.index;
+            (wanted, Part::Chunk(n))
+        }
+        _ => return (refused(UNKNOWN_REQUEST), false),
+    };
+    // The job is given only values of this runtime's own size: the agent's name once it is
+    // one, copied to exactly its length (at most 64 bytes), and the id as 32 bytes. The decoded
+    // request (whose fields the asking ship sized, and which may keep a larger allocation from
+    // a field given twice) goes here, before any job is scheduled. A name or an id that does not
+    // pass is the same no as any other, answered without a job.
+    let FileWanted { agent, id, .. } = wanted;
+    let checked = match (crate::check_agent_name(&agent), <[u8; 32]>::try_from(id.as_slice())) {
+        (Ok(()), Ok(id)) => Some((String::from(agent.as_str()), id)),
+        _ => None,
+    };
+    drop((agent, id));
+    let Some((agent, id)) = checked else { return (denied_reply(part, called, caller), false) };
+    let (runtime, ship, peer) = (shared.runtime.clone(), called.to_string(), caller.to_string());
+    let served = work(shared, move || {
+        // Given back when the job returns or unwinds, not before.
+        let _places = places;
+        runtime.serve_file(&ship, &peer, &agent, &id, part, &given_up)
+    })
+    .await;
+    let body = match (part, served) {
+        (_, Some(Ok(Served::Denied))) => return (denied_reply(part, called, caller), false),
+        (Part::About, Some(Ok(Served::About { length, media_type }))) => {
+            peer_reply::Body::FileAbout(FileFacts { denied: String::new(), length, media_type })
+        }
+        (Part::Leaves(_), Some(Ok(Served::Hashes(hashes)))) => peer_reply::Body::FileLeaves(FileHashes { denied: String::new(), hashes }),
+        (Part::Upper, Some(Ok(Served::Hashes(hashes)))) => peer_reply::Body::FileUpper(FileHashes { denied: String::new(), hashes }),
+        (Part::Chunk(_), Some(Ok(Served::Chunk(data)))) => peer_reply::Body::FileChunk(FileBytes { denied: String::new(), data }),
+        (_, Some(Ok(Served::NoSuchPart))) => return (refused("that file has no such part"), false),
+        // Damaged or gone after it was allowed, given up on, or the network stopping: never
+        // wrong bytes.
+        _ => return (refused("the file could not be read; try again"), false),
+    };
+    // A part: every no has left above.
+    let honest = PeerReply { body: Some(body), refused: String::new() };
+    #[cfg(test)]
+    {
+        let liar = lock(&shared.liar).clone();
+        match liar.and_then(|liar| liar(&asked, &honest)) {
+            Some(Lie::Reply(reply)) => return (reply, true),
+            Some(Lie::Slow(wait)) => tokio::time::sleep(wait).await,
+            Some(Lie::Cut) => return (refused(CUT), true),
+            None => {}
+        }
+    }
+    (honest, true)
+}
+
+/// The one no to a request for a part of a file, of the part's own kind: the same bytes whatever
+/// the reason.
+fn denied_reply(part: Part, called: &str, caller: &str) -> PeerReply {
+    let denied = crate::files::not_shared(called, caller);
+    let body = match part {
+        Part::About => peer_reply::Body::FileAbout(FileFacts { denied, ..FileFacts::default() }),
+        Part::Leaves(_) => peer_reply::Body::FileLeaves(FileHashes { denied, ..FileHashes::default() }),
+        Part::Upper => peer_reply::Body::FileUpper(FileHashes { denied, ..FileHashes::default() }),
+        Part::Chunk(_) => peer_reply::Body::FileChunk(FileBytes { denied, ..FileBytes::default() }),
+    };
+    PeerReply { body: Some(body), refused: String::new() }
+}
+
+/// Ask another ship for a part of a file, from one of this runtime's ships, and wait for the
+/// reply: for ordinary threads (the HTTP server's). Within `file_timeout`, and only so many at
+/// once (`max_requests`, shared with every other request this runtime's callers make).
+fn ask_for_file(shared: &Arc<Shared>, handle: &tokio::runtime::Handle, from: &str, to: &str, request: PeerRequest) -> Result<PeerReply, FileAskError> {
+    if shared.cfg.max_message_bytes < FILE_MESSAGE_BYTES {
+        return Err(FileAskError::Unfit);
+    }
+    let Ok(turn) = shared.asking.clone().try_acquire_owned() else { return Err(FileAskError::Busy) };
+    let within = shared.cfg.file_timeout;
+    let (report, outcome) = std::sync::mpsc::channel();
+    let (asking, from, to) = (shared.clone(), from.to_string(), to.to_string());
+    handle.spawn(async move {
+        let answer = asking.ask_within(&from, &to, request, within).await;
+        drop(turn);
+        let _ = report.send(answer);
+    });
+    // The request ends within its time on the network's threads; this waits a little longer
+    // for that, and no longer.
+    match outcome.recv_timeout(within + Duration::from_secs(2)) {
+        Ok(answer) => answer.map(|(reply, _)| reply).map_err(FileAskError::Net),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(FileAskError::Net(NetError::TimedOut)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(FileAskError::Stopped),
+    }
+}
+
 /// Whether an encoded request or reply is one that can be walked through field by field and
 /// in which field `outer`, a message, holds at most `most` of its field `inner`: the
 /// messages in a delivery, the logs in a piece of news, the entries in an answer. This reads
 /// only the sizes written there and keeps nothing, so it costs nothing to run on something
 /// that is all padding.
 pub(crate) fn repeats_within(request: &[u8], outer: u64, inner: u64, most: usize) -> bool {
-    /// Walk the fields of one encoded message, handing each length-delimited one to `each`.
-    /// False if the bytes are not fields from end to end, or `each` says to stop.
-    fn walk<'a>(mut bytes: &'a [u8], mut each: impl FnMut(u64, &'a [u8]) -> bool) -> bool {
-        fn varint(bytes: &mut &[u8]) -> Option<u64> {
-            let mut value = 0u64;
-            for shift in (0..64).step_by(7) {
-                let (&byte, rest) = bytes.split_first()?;
-                *bytes = rest;
-                value |= u64::from(byte & 0x7f) << shift;
-                if byte & 0x80 == 0 {
-                    return Some(value);
-                }
-            }
-            None
-        }
-        while !bytes.is_empty() {
-            let Some(key) = varint(&mut bytes) else { return false };
-            let skipped = match key & 7 {
-                0 => varint(&mut bytes).map(drop),
-                1 => bytes.get(8..).map(|rest| bytes = rest),
-                5 => bytes.get(4..).map(|rest| bytes = rest),
-                2 => varint(&mut bytes).and_then(|len| {
-                    let len = usize::try_from(len).ok()?;
-                    let body = bytes.get(..len)?;
-                    bytes = &bytes[len..];
-                    each(key >> 3, body).then_some(())
-                }),
-                // Groups are not used by anything a ship sends.
-                _ => None,
-            };
-            if skipped.is_none() {
-                return false;
-            }
-        }
-        true
-    }
     let mut count = 0usize;
     // A field may be given more than once, and all of them count.
-    walk(request, |field, body| {
-        field != outer
-            || walk(body, |field, _| {
-                count += usize::from(field == inner);
+    // Only length-delimited fields are messages; others are passed over, as they always were.
+    walk_fields(request, |field, wire, body| {
+        wire != 2
+            || field != outer
+            || walk_fields(body, |field, wire, _| {
+                count += usize::from(wire == 2 && field == inner);
                 count <= most
             })
     })
+}
+
+/// Walk the fields of one encoded message, handing each to `each` with its field number, its
+/// wire type, and for a length-delimited one what it holds (nothing for the others). False if
+/// the bytes are not fields from end to end, or `each` says to stop. Reads only the sizes
+/// written there, and keeps nothing.
+fn walk_fields<'a>(mut bytes: &'a [u8], mut each: impl FnMut(u64, u64, &'a [u8]) -> bool) -> bool {
+    fn varint(bytes: &mut &[u8]) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let (&byte, rest) = bytes.split_first()?;
+            *bytes = rest;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+    while !bytes.is_empty() {
+        let Some(key) = varint(&mut bytes) else { return false };
+        let skipped = match key & 7 {
+            0 => varint(&mut bytes).and_then(|_| each(key >> 3, 0, &[]).then_some(())),
+            1 => bytes.get(8..).map(|rest| bytes = rest).and_then(|()| each(key >> 3, 1, &[]).then_some(())),
+            5 => bytes.get(4..).map(|rest| bytes = rest).and_then(|()| each(key >> 3, 5, &[]).then_some(())),
+            2 => varint(&mut bytes).and_then(|len| {
+                let len = usize::try_from(len).ok()?;
+                let body = bytes.get(..len)?;
+                bytes = &bytes[len..];
+                each(key >> 3, 2, body).then_some(())
+            }),
+            // Groups are not used by anything a ship sends.
+            _ => None,
+        };
+        if skipped.is_none() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Carry commands from this runtime's ships to other ships, for as long as the network runs.
@@ -3543,6 +3981,10 @@ async fn carry_messages(shared: &Arc<Shared>, ship: &str, peer: &str) -> Carried
 
 /// Ships behind pretend home routers, which need the crate's own way of giving a network a
 /// socket.
+#[cfg(test)]
+#[path = "remote_tests.rs"]
+mod remote_tests;
+
 #[cfg(test)]
 #[path = "router_tests.rs"]
 pub(crate) mod router_tests;

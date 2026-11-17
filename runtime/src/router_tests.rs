@@ -1303,3 +1303,30 @@ fn a_ship_set_by_hand_at_a_made_up_address_is_not_called_through_anyones_session
     // ~zod's relayed connection is undisturbed.
     assert_eq!(relayed(&zod_net, "~zod", "~nec"), Some(true));
 }
+
+/// Files go over a relayed connection too, at the relay's limits: ~zod's owner, whose ship
+/// reaches ~nec only through their point's relay, fetches a file ~nec's counter has opened.
+#[test]
+fn a_file_is_fetched_over_a_relayed_connection() {
+    use std::io::{Read, Write};
+    let pair = relayed_cone_pair("file");
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
+    let (upload, chunks) = pair.nec.upload_start("~nec", "counter", data.len() as u64, "").unwrap();
+    assert_eq!(chunks, 1);
+    pair.nec.upload_chunk("~nec", "counter", &upload, 0, data.clone()).unwrap();
+    let id = pair.nec.upload_finish("~nec", "counter", &upload, None).unwrap().id;
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(String::from_utf8(pair.nec.deliver("~nec", "counter", format!("open {hex}").as_bytes()).unwrap().reply).unwrap(), "true");
+    let server = crate::server::Server::start(pair.zod.clone(), crate::server::ServerConfig::default()).unwrap();
+    let code = pair.zod.new_signin_code("~zod", Duration::from_secs(60)).unwrap();
+    let token = pair.zod.sign_in("~zod", &code, "test").unwrap().0;
+    let mut stream = std::net::TcpStream::connect(server.addr()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    write!(stream, "GET /ships/zod/files/from/nec/counter/{hex}/content HTTP/1.0\r\nAuthorization: Bearer {token}\r\n\r\n").unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let split = raw.windows(4).position(|window| window == b"\r\n\r\n").unwrap();
+    assert!(raw.starts_with(b"HTTP/1.1 200 "), "{}", String::from_utf8_lossy(&raw[..split]));
+    assert!(raw[split + 4..] == data[..], "the contents differ");
+    assert_eq!(relayed(&pair.zod_net, "~zod", "~nec"), Some(true));
+}

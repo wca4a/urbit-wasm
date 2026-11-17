@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use ed25519_dalek::{Signer, SigningKey};
 use ship_proto::{
-    AppendRequest, Checkpoint, CheckpointBody, Entry, EntryBody, FollowRequest, Grant, Kind, Message, NextReply,
+    AppendRequest, Checkpoint, CheckpointBody, Entry, EntryBody, FileMark, FollowRequest, Grant, Kind, Message, NextReply,
     NextRequest, ReadRequest, SendRequest, ShareRequest, Source,
 };
 use wasmtime::{Caller, Engine, Linker, Memory, StoreLimits, Trap};
@@ -697,10 +697,24 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
                 chunks: crate::files::chunk_count(file.length),
                 media_type: file.media_type,
                 added_ms: file.added,
+                open: file.open,
             };
             fill(&mut caller, buf_ptr, buf_cap, &info.encode_to_vec())
         },
     )?;
+
+    // Mark the calling agent's own claim on a file open to every ship, or take the mark off.
+    // A change, so it is refused while reading, and kept only if the event commits. For a file
+    // the agent does not claim (or an id that is not one) it changes nothing and says so: 0.
+    linker.func_wrap("host", "file_mark", |mut caller: Caller<'_, Ctx>, req_ptr: u32, req_len: u32| -> Result<i64> {
+        charge(&mut caller, req_len as u64)?;
+        writable(&caller)?;
+        let request = FileMark::decode(&*read_guest(&mut caller, req_ptr, req_len, REQUEST_ENVELOPE_BYTES, "file mark")?)?;
+        let Ok(id) = <[u8; 32]>::try_from(request.id.as_slice()) else { return Ok(0) };
+        let (conn, agent) = (caller.data().conn.clone(), caller.data().agent.clone());
+        let marked = store::claim_mark(&lock(&conn), &agent, &id, request.open)?;
+        Ok(i64::from(marked))
+    })?;
 
     Ok(linker)
 }

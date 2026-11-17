@@ -47,12 +47,13 @@
 //! what is served is what was stored, or an error. Rows change only under the ship's slot and
 //! transaction; hashing, encrypting, and moving bytes over the network happen outside it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -167,6 +168,46 @@ pub fn file_id(length: u64, root: &[u8; 32]) -> [u8; 32] {
     Sha256::new().chain_update(STORED_DOMAIN).chain_update(length.to_le_bytes()).chain_update(root).finalize().into()
 }
 
+/// How many groups of `FANOUT` chunk hashes a file of `length` bytes has: one index hash each
+/// in the level above the chunks' own hashes. An empty file has none.
+pub fn group_count(length: u64) -> u64 {
+    chunk_count(length).div_ceil(FANOUT as u64)
+}
+
+/// How many chunk hashes group `g` of a file of `length` bytes holds, if it has such a group.
+pub fn group_len(length: u64, g: u64) -> Option<u64> {
+    (g < group_count(length)).then(|| (chunk_count(length) - g * FANOUT as u64).min(FANOUT as u64))
+}
+
+/// The index hash of one group of chunk hashes: what the level above holds for it.
+pub fn group_hash(leaves: &[[u8; 32]]) -> [u8; 32] {
+    index(leaves)
+}
+
+/// Whether a file of `length` bytes is served to other ships at all: its hashes come down to
+/// its root in at most two levels, so a ship fetching it holds at most one list of index
+/// hashes (`FANOUT` of them, 1 MiB) besides one group of chunk hashes. That is up to 2^30
+/// chunks, a file of 1 PiB.
+pub fn fetchable(length: u64) -> bool {
+    group_count(length) <= FANOUT as u64
+}
+
+/// The id of a file of `length` bytes whose chunks have these hashes, every one of them, in
+/// order; for a file of at most `FANOUT` chunks only. `None` if that is not so.
+pub fn id_from_leaves(length: u64, leaves: &[[u8; 32]]) -> Option<[u8; 32]> {
+    let chunks = chunk_count(length);
+    (chunks <= FANOUT as u64 && leaves.len() as u64 == chunks).then(|| file_id(length, &root(leaves)))
+}
+
+/// The id of a file of `length` bytes whose groups of chunk hashes have these index hashes,
+/// every one of them, in order; for a file of more than `FANOUT` chunks, and at most `FANOUT`
+/// groups, only. `None` if that is not so.
+pub fn id_from_groups(length: u64, groups: &[[u8; 32]]) -> Option<[u8; 32]> {
+    let (chunks, count) = (chunk_count(length), group_count(length));
+    // More than one group, and at most one index's worth of them: the root is their index.
+    (chunks > FANOUT as u64 && count <= FANOUT as u64 && groups.len() as u64 == count).then(|| file_id(length, &index(groups)))
+}
+
 /// The id of a file with these contents, worked out as a client would before uploading.
 pub fn id_of(contents: &[u8]) -> [u8; 32] {
     let mut root = RootBuilder::new();
@@ -266,11 +307,13 @@ pub struct FileInfo {
     pub chunks: u64,
     pub media_type: String,
     pub added_ms: u64,
+    /// The agent has marked its claim open: any ship that names the file may have it.
+    pub open: bool,
 }
 
 impl FileInfo {
     fn of(id: [u8; 32], file: &store::StoredFile) -> FileInfo {
-        FileInfo { id, length: file.length, chunks: chunk_count(file.length), media_type: file.media_type.clone(), added_ms: file.added }
+        FileInfo { id, length: file.length, chunks: chunk_count(file.length), media_type: file.media_type.clone(), added_ms: file.added, open: file.open }
     }
 }
 
@@ -972,11 +1015,14 @@ impl Runtime {
                     return fail(FileError::WrongId);
                 }
                 keeping_room(conn, cfg, || {
-                    if let Some(existing) = store::file_by_id(conn, &id)? {
+                    if store::file_by_id(conn, &id)?.is_some() {
                         store::claim_add(conn, agent, &id)?;
                         // The whole directory is recorded to be removed.
                         store::upload_drop(conn, upload)?;
-                        return Ok(FileInfo::of(id, &existing));
+                        // As the agent's claim now has it: an earlier claim of its own keeps
+                        // its mark.
+                        let claimed = store::file_claimed(conn, agent, &id)?.ok_or_else(|| Error::BadShipFile("a claim just made is not there".into()))?;
+                        return Ok(FileInfo::of(id, &claimed));
                     }
                     if store::file_count(conn)? >= cfg.max_files {
                         return Err(Error::TooMany("files"));
@@ -988,7 +1034,7 @@ impl Runtime {
                     // forgotten only after a sweep that listed the whole directory, removed
                     // every such copy, and synced it; a crash at any point leaves it.
                     store::trash_sweep(conn, upload)?;
-                    Ok(FileInfo { id, length, chunks, media_type, added_ms: now })
+                    Ok(FileInfo { id, length, chunks, media_type, added_ms: now, open: false })
                 })
             })?)
         })?;
@@ -1112,6 +1158,323 @@ impl Runtime {
             let count: i64 = conn.query_row("SELECT COUNT(*) FROM file_trash", [], |r| r.get(0))?;
             Ok((store::removing_bytes(&conn)?, count as usize))
         })
+    }
+}
+
+// Serving a file to another ship.
+//
+// Another ship names the agent that claims a file and the file's id, and asks for one part at a
+// time (see `Part`). Before each, in one hold of the ship's slot and one read transaction
+// (`Ship::file_permit`), the ship decides afresh whether that ship may have it: the agent is
+// installed and claims the file, and the claim is marked open, or the agent's remembered
+// answer says yes, or the agent asked now says yes. Every no, whatever its reason, is the same
+// `Served::Denied`. Serving writes nothing of its own and keeps nothing: no row, and nothing
+// on disk. (A request that is the first thing to wake a ship in a runtime's life sets off the
+// clearing of leftovers owed at first wake, as anything that wakes it does: what the ship
+// recorded to be removed, and directories no row names. It only ever removes.) Chunk hashes
+// are read and hashed, and a chunk
+// read and checked against its hash, outside the slot.
+
+/// The words every refusal of a file carries. The same whatever the reason, so a ship that may
+/// not have a file learns nothing of whether it, its claim, or its agent exists.
+pub(crate) fn not_shared(ship: &str, peer: &str) -> String {
+    format!("~{ship} does not share that file with ~{peer}")
+}
+
+/// A part of a file another ship asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Part {
+    /// Its length and media type.
+    About,
+    /// The hashes of the chunks in group `g`: chunks `g * FANOUT` on, as many as there are.
+    Leaves(u64),
+    /// The index hash of every group, for a file of more than `FANOUT` chunks.
+    Upper,
+    /// Chunk `n`, whole.
+    Chunk(u64),
+}
+
+/// What is served for a part of a file.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Served {
+    /// The one refusal, whatever the reason.
+    Denied,
+    About { length: u64, media_type: String },
+    /// Hashes of 32 bytes each, one after another.
+    Hashes(Vec<u8>),
+    Chunk(Vec<u8>),
+    /// The caller may have the file, and it has no such part.
+    NoSuchPart,
+}
+
+/// How long an agent's answer about a file is remembered: a yes, and a no.
+pub(crate) const ANSWER_YES: Duration = Duration::from_secs(30);
+pub(crate) const ANSWER_NO: Duration = Duration::from_secs(5);
+/// How many answers are remembered. When full the oldest goes, which only costs an ask.
+pub(crate) const MOST_ANSWERS: usize = 4096;
+
+/// What an answer is remembered under: the ship and its incarnation mark (new at every
+/// import, sixteen random bytes), the module the kernel routes the agent to (a hash of its
+/// code), the agent, the asking ship, the file's id, and the file's directory (sixteen random
+/// bytes, never used again, so a file deleted and put back is another file here).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AnswerKey {
+    pub ship: String,
+    pub incarnation: [u8; 16],
+    pub module: String,
+    pub agent: String,
+    pub caller: String,
+    pub id: [u8; 32],
+    pub dir: [u8; 16],
+}
+
+/// Agents' answers about their files, remembered for a while. In memory only, per runtime.
+#[derive(Default)]
+pub(crate) struct Answers {
+    /// Each answer, until when it holds, and its place in `order`.
+    held: HashMap<AnswerKey, (bool, Instant, u64)>,
+    /// The answers in the order they were remembered, oldest first.
+    order: BTreeMap<u64, AnswerKey>,
+    next: u64,
+}
+
+impl Answers {
+    fn get(&mut self, key: &AnswerKey, now: Instant) -> Option<bool> {
+        let (allowed, until, place) = *self.held.get(key)?;
+        if now < until {
+            return Some(allowed);
+        }
+        self.held.remove(key);
+        self.order.remove(&place);
+        None
+    }
+
+    fn put(&mut self, key: AnswerKey, allowed: bool, now: Instant) {
+        if let Some((_, _, place)) = self.held.remove(&key) {
+            self.order.remove(&place);
+        }
+        while self.held.len() >= MOST_ANSWERS {
+            let Some((_, oldest)) = self.order.pop_first() else { break };
+            self.held.remove(&oldest);
+        }
+        let until = now + if allowed { ANSWER_YES } else { ANSWER_NO };
+        let place = self.next;
+        self.next += 1;
+        self.order.insert(place, key.clone());
+        self.held.insert(key, (allowed, until, place));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// For tests: make every answer as old as if `by` had passed.
+    #[cfg(test)]
+    pub(crate) fn age(&mut self, by: Duration) {
+        for (_, until, _) in self.held.values_mut() {
+            *until = until.checked_sub(by).unwrap_or_else(Instant::now);
+        }
+    }
+}
+
+/// The answer remembered under `key`, if one still holds. A table left poisoned by a panic is
+/// emptied and this answer is no: nothing remembered there is trusted.
+pub(crate) fn remembered(answers: &Mutex<Answers>, key: &AnswerKey, now: Instant) -> Option<bool> {
+    match answers.lock() {
+        Ok(mut held) => held.get(key, now),
+        Err(poisoned) => {
+            *poisoned.into_inner() = Answers::default();
+            answers.clear_poison();
+            Some(false)
+        }
+    }
+}
+
+/// Remember an answer from `now`.
+pub(crate) fn remember(answers: &Mutex<Answers>, key: AnswerKey, allowed: bool, now: Instant) {
+    let mut held = answers.lock().unwrap_or_else(|poisoned| {
+        let mut held = poisoned.into_inner();
+        *held = Answers::default();
+        held
+    });
+    answers.clear_poison();
+    held.put(key, allowed, now);
+}
+
+/// An error if whoever asked has stopped waiting.
+fn gave_up(given_up: &std::sync::atomic::AtomicBool) -> Result<(), Error> {
+    if given_up.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(Error::Io(io::Error::new(io::ErrorKind::Interrupted, "the request was given up on")));
+    }
+    Ok(())
+}
+
+/// Forget every answer remembered for `ship`, all agents: called under the ship's slot by every
+/// change made through its kernel, so no request is decided between the change and this. A
+/// module hash is not an installation, and one agent's answer can rest on a read of another.
+pub(crate) fn forget_ship(answers: &Mutex<Answers>, ship: &str) {
+    let mut held = answers.lock().unwrap_or_else(|poisoned| {
+        let mut held = poisoned.into_inner();
+        *held = Answers::default();
+        held
+    });
+    answers.clear_poison();
+    let gone: Vec<(AnswerKey, u64)> = held.held.iter().filter(|(key, _)| key.ship == ship).map(|(key, (_, _, place))| (key.clone(), *place)).collect();
+    for (key, place) in gone {
+        held.held.remove(&key);
+        held.order.remove(&place);
+    }
+}
+
+/// Whether `ship` is resting from asking its agents about files: after a question that took
+/// `t`, it asks none for `3 t`, so questions take at most about a quarter of its time, however
+/// many ships ask. A table left poisoned by a panic is emptied and this is yes: nothing is asked.
+pub(crate) fn resting(rests: &Mutex<HashMap<String, Instant>>, ship: &str, now: Instant) -> bool {
+    match rests.lock() {
+        Ok(rests) => rests.get(ship).is_some_and(|until| now < *until),
+        Err(poisoned) => {
+            poisoned.into_inner().clear();
+            rests.clear_poison();
+            true
+        }
+    }
+}
+
+/// Rest `ship` from asking after a question that took `took`, ending at `now`.
+pub(crate) fn rest_after(rests: &Mutex<HashMap<String, Instant>>, ship: &str, took: Duration, now: Instant) {
+    let mut rests = rests.lock().unwrap_or_else(|poisoned| {
+        let mut rests = poisoned.into_inner();
+        rests.clear();
+        rests
+    });
+    rests.insert(ship.to_string(), now + took.saturating_mul(ASK_REST));
+}
+
+/// How many times as long as its last question a ship rests from asking.
+pub(crate) const ASK_REST: u32 = 3;
+
+impl Runtime {
+    /// Serve `peer`, a ship that proved who it is, a part of the file `id` that `agent` claims
+    /// on `ship`. Whether it may have it is decided afresh, before anything is read (see
+    /// `Ship::file_permit`). Every no is `Served::Denied`, whatever its reason, and anything that
+    /// fails while deciding is a no. Once it is yes, a chunk or hashes that cannot be read, or
+    /// do not match what the ship's file holds, are an error, never wrong bytes.
+    ///
+    /// `given_up` is set when whoever asked has stopped waiting: the work then stops before its
+    /// next batch of hashes, or before reading the chunk, with an error.
+    pub(crate) fn serve_file(&self, ship: &str, peer: &str, agent: &str, id: &[u8], part: Part, given_up: &std::sync::atomic::AtomicBool) -> Result<Served, Error> {
+        let (Ok(ship), Ok(peer), Ok(()), Ok(id)) = (canonical_ship(ship), canonical_ship(peer), check_agent_name(agent), <[u8; 32]>::try_from(id)) else {
+            return Ok(Served::Denied);
+        };
+        if self.inner.files_on().is_err() {
+            return Ok(Served::Denied);
+        }
+        let inner = &self.inner;
+        let chunk = match part {
+            Part::Chunk(n) => Some(n),
+            _ => None,
+        };
+        // Given up on while waiting for the slot: nothing is decided or read, and nobody is told.
+        let permit = inner.with_ship(&ship, |held| {
+            gave_up(given_up)?;
+            #[cfg(test)]
+            inner.served_decisions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held.file_permit(inner, &peer, agent, &id, chunk)
+        });
+        let (file, row) = match permit {
+            Ok(crate::ship::Permit::Yes { file, row }) => (file, row),
+            // No, or failed while deciding: both are no.
+            Ok(crate::ship::Permit::No) | Err(_) => return Ok(Served::Denied),
+        };
+        #[cfg(test)]
+        if let Some(wait) = *crate::lock(&inner.serve_delay) {
+            std::thread::sleep(wait);
+        }
+        match part {
+            Part::About => Ok(Served::About { length: file.length, media_type: file.media_type }),
+            Part::Leaves(g) => {
+                let Some(count) = group_len(file.length, g) else { return Ok(Served::NoSuchPart) };
+                let mut hashes = Vec::with_capacity(count as usize * 32);
+                self.read_hashes(&ship, agent, &id, &file.dir, g * FANOUT as u64, count, given_up, |hash| hashes.extend_from_slice(hash))?;
+                Ok(Served::Hashes(hashes))
+            }
+            Part::Upper => {
+                let count = group_count(file.length);
+                if count < 2 || !fetchable(file.length) {
+                    return Ok(Served::NoSuchPart);
+                }
+                let mut upper = Vec::with_capacity(count as usize * 32);
+                for g in 0..count {
+                    let len = group_len(file.length, g).expect("a group of the file");
+                    let mut run = Sha256::new().chain_update(INDEX_DOMAIN);
+                    self.read_hashes(&ship, agent, &id, &file.dir, g * FANOUT as u64, len, given_up, |hash| run.update(hash))?;
+                    upper.extend_from_slice(&run.finalize());
+                }
+                Ok(Served::Hashes(upper))
+            }
+            Part::Chunk(n) => {
+                let Some(len) = chunk_len(file.length, n) else { return Ok(Served::NoSuchPart) };
+                // The file has the chunk, and its row was read with the decision: one missing
+                // is damage.
+                let Some((hash, gen)) = row else { return fail(FileError::Damaged) };
+                gave_up(given_up)?;
+                #[cfg(test)]
+                inner.served_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Served::Chunk(inner.read_chunk(&ship, &file.dir, n, &gen, len, &hash)?))
+            }
+        }
+    }
+
+    /// Read the hashes of chunks `from` to `from + count - 1` of a file `agent` still claims
+    /// and that is still the one in `dir`, a batch at a time, each batch under the slot, and
+    /// hand each to `each` outside it.
+    #[allow(clippy::too_many_arguments)]
+    fn read_hashes(
+        &self,
+        ship: &str,
+        agent: &str,
+        id: &[u8; 32],
+        dir: &[u8; 16],
+        from: u64,
+        count: u64,
+        given_up: &std::sync::atomic::AtomicBool,
+        mut each: impl FnMut(&[u8; 32]),
+    ) -> Result<(), Error> {
+        #[cfg(test)]
+        let batch_size = match self.inner.hash_batch.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => LEAF_BATCH,
+            size => size,
+        };
+        #[cfg(not(test))]
+        let batch_size = LEAF_BATCH;
+        let mut done = 0;
+        while done < count {
+            gave_up(given_up)?;
+            let batch = batch_size.min(count - done);
+            // Looked up again under the slot, by claim and directory; and checked again there
+            // that the request has not been given up on while this waited for the slot.
+            let rows = self.inner.with_ship(ship, |held| {
+                gave_up(given_up)?;
+                #[cfg(test)]
+                self.inner.served_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let conn = lock(&held.conn);
+                match store::file_claimed(&conn, agent, id)? {
+                    Some(file) if file.dir == *dir => {}
+                    _ => return fail(FileError::NotFound),
+                }
+                store::chunks(&conn, dir, from + done, batch)?.ok_or(Error::File(FileError::Damaged))
+            })?;
+            for (hash, _) in rows {
+                each(&hash);
+            }
+            done += batch;
+            #[cfg(test)]
+            if let Some(wait) = *crate::lock(&self.inner.batch_delay) {
+                std::thread::sleep(wait);
+            }
+        }
+        Ok(())
     }
 }
 

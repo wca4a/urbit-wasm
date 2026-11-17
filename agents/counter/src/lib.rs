@@ -1,4 +1,4 @@
-use ship_sdk::{agent, emit, kv, log};
+use ship_sdk::{agent, emit, files, kv, log};
 
 fn read(key: &str) -> i64 {
     kv::get(key.as_bytes())
@@ -9,6 +9,21 @@ fn read(key: &str) -> i64 {
 
 fn write(key: &str, value: i64) {
     kv::put(key.as_bytes(), &value.to_le_bytes());
+}
+
+/// A file id written in hexadecimal, if it is one.
+fn file_id(text: &str) -> Option<[u8; 32]> {
+    let bytes: Vec<u8> = (0..text.len() / 2).filter_map(|i| text.get(2 * i..2 * i + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok())).collect();
+    <[u8; 32]>::try_from(bytes).ok()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The key under which this agent notes that a ship may have a file.
+fn let_key(ship: &str, id: &[u8; 32]) -> Vec<u8> {
+    format!("let {} {}", ship.trim_start_matches('~'), hex(id)).into_bytes()
 }
 
 fn handle(event: &[u8]) -> Vec<u8> {
@@ -22,12 +37,35 @@ fn handle(event: &[u8]) -> Vec<u8> {
         }
         (Some("get"), Some(key), None) => read(key).to_string(),
         // What the ship holds of a file this agent claims, by its id in hexadecimal.
-        (Some("file"), Some(id), None) => {
-            let bytes: Vec<u8> = (0..id.len() / 2).filter_map(|i| id.get(2 * i..2 * i + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok())).collect();
-            match <[u8; 32]>::try_from(bytes).ok().and_then(|id| ship_sdk::files::info(&id)) {
-                Some(info) => format!("{} {} {}", info.length, info.chunks, info.media_type),
-                None => "none".to_string(),
+        (Some("file"), Some(id), None) => match file_id(id).and_then(|id| files::info(&id)) {
+            Some(info) => format!("{} {} {}{}", info.length, info.chunks, info.media_type, if info.open { " open" } else { "" }),
+            None => "none".to_string(),
+        },
+        // Mark a file this agent claims open to every ship, or take the mark off.
+        (Some("open"), Some(id), None) => file_id(id).map_or(false, |id| files::open(&id)).to_string(),
+        (Some("close"), Some(id), None) => file_id(id).map_or(false, |id| files::close(&id)).to_string(),
+        // Let one ship have a file, or stop letting it: what the file_ask handler goes by.
+        (Some("let"), Some(ship), Some(id)) => match file_id(id) {
+            Some(id) => {
+                kv::put(&let_key(ship, &id), b"yes");
+                "ok".to_string()
             }
+            None => "error: not a file id".to_string(),
+        },
+        (Some("unlet"), Some(ship), Some(id)) => match file_id(id) {
+            Some(id) => {
+                kv::delete(&let_key(ship, &id));
+                "ok".to_string()
+            }
+            None => "error: not a file id".to_string(),
+        },
+        // How the file_ask handler behaves: `trap` makes it fail, `spin` makes it run until it
+        // is stopped, `meddle` makes it try to change something, `mark` makes it try to mark
+        // the file open, `via` makes it go by the keeper's `gate` counter, anything else
+        // makes it behave.
+        (Some("asks"), Some(mode), None) => {
+            kv::put(b"asks", mode.as_bytes());
+            "ok".to_string()
         }
         // Publish an entry and then fail, to check that the entry goes with everything else.
         (Some("log-then-crash"), Some(key), None) => {
@@ -142,4 +180,28 @@ fn state(log: &str) -> Option<Vec<u8>> {
     }
 }
 
-agent!(handle, read = value, checkpoint = state);
+/// Whether another ship may have a file this agent claims: only if it has been let.
+fn asked(question: &files::FileAsk) -> bool {
+    match kv::get(b"asks").as_deref() {
+        Some(b"trap") => panic!("asked to fail"),
+        Some(b"spin") => loop {
+            std::hint::black_box(0u8);
+        },
+        Some(b"meddle") => {
+            write("meddled", 1);
+            return true;
+        }
+        // Yes if the keeper agent's `gate` counter is set: an answer that rests on a read of
+        // another agent, which needs a grant.
+        Some(b"via") => return ship_sdk::read("keeper", "counter", b"gate") != b"0",
+        _ => {}
+    }
+    let Ok(id) = <[u8; 32]>::try_from(question.id.as_slice()) else { return false };
+    // Try to mark the file open while answering, and say yes if that worked.
+    if kv::get(b"asks").as_deref() == Some(b"mark") {
+        return files::open(&id);
+    }
+    kv::get(&let_key(&question.ship, &id)).is_some()
+}
+
+agent!(handle, read = value, checkpoint = state, file_ask = asked);

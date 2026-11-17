@@ -22,6 +22,10 @@ enum Kind {
   // Tells an agent what became of a command it sent to an agent on another ship. The payload
   // is a Receipt. Runs as its own event, like a command.
   KIND_RECEIPT = 5;
+  // Asks an agent whether another ship may have a file the agent claims. The payload is a
+  // FileAsk; the reply a FileAnswer. The agent can only read while answering, and nothing it
+  // does is kept.
+  KIND_FILE_ASK = 6;
 }
 
 // Who is asking.
@@ -310,12 +314,15 @@ message Trimmed {
 // Files on the ship. A file is split into chunks of 1 MiB (the last holds the rest) and known
 // by its id: a hash over its length and its chunks' hashes (format 1, see the README).
 
-// A reference to a file: the ship that holds it, its id, and its length. Plain data that an
-// agent keeps in place of the file; an agent never holds a file's bytes.
+// A reference to a file: the ship that holds it, its id, its length, and the agent there that
+// claims it. Plain data that an agent keeps in place of the file; an agent never holds a
+// file's bytes. The id fixes the bytes and the length; the ship and the agent only say where
+// to ask, and the agent is the one asked whether the file may be had.
 message FileRef {
   string ship = 1;
   bytes id = 2;
   uint64 length = 3;
+  string agent = 4;
 }
 
 // One file, as the ship tells the agent that claims it, or that agent's owner's devices.
@@ -325,6 +332,28 @@ message FileInfo {
   uint64 chunks = 3;
   string media_type = 4;
   uint64 added_ms = 5;
+  // Set when the agent has marked the file open: any ship that names it may have it, and
+  // the agent is not asked. Never set for a file on another ship.
+  bool open = 6;
+}
+
+// Agent to runtime: mark a file this agent claims open to every ship, or take the mark off.
+message FileMark {
+  bytes id = 1;
+  bool open = 2;
+}
+
+// Runtime to agent, as a KIND_FILE_ASK call: may this ship have this file, which the agent
+// claims? The ship proved who it is on its connection.
+message FileAsk {
+  string ship = 1;
+  bytes id = 2;
+}
+
+// Agent to runtime: the answer to a FileAsk. Anything but a reply that decodes to `allow`
+// set, within 64 bytes, is no.
+message FileAnswer {
+  bool allow = 1;
 }
 
 // A page of an agent's files, in order of id. Ask for the next page after the last id.
@@ -379,6 +408,11 @@ message PeerRequest {
     News news = 4;
     Resync resync = 5;
     Hello hello = 6;
+    // A part of a file a ship here holds, for the ship at the other end. See FileWanted.
+    FileWanted file_about = 7;
+    FileWanted file_leaves = 8;
+    FileWanted file_upper = 9;
+    FileWanted file_chunk = 10;
   }
 }
 
@@ -390,6 +424,10 @@ message PeerReply {
     Heard heard = 4;
     Resynced resynced = 5;
     Welcome welcome = 6;
+    FileFacts file_about = 7;
+    FileHashes file_leaves = 8;
+    FileHashes file_upper = 9;
+    FileBytes file_chunk = 10;
   }
   // Set, with no body, when the request was not one the other ship would answer.
   string refused = 15;
@@ -512,6 +550,41 @@ message Delivered {
 // it, and keeps them for its agent. The publishing ship keeps a note of each ship that
 // follows a log, and tells it when the log has grown. Being told is only a prompt to ask:
 // the entries always come by asking, so the ship that follows takes them when it has room.
+
+// Fetching a file from another ship. The asking ship names the agent that claims the file
+// and the file's id, and asks for one part at a time: what the file is (its length and media
+// type), one group of its chunks' hashes (chunks `index * 32768` on, as many as there are, at
+// most 32,768), the index hash of every group (only for a file of more than 32,768 chunks),
+// or one chunk (`index`), whole. Before each, the ship asked checks afresh that the caller may
+// have the file. Every refusal is the same `denied`, whatever the reason. The id is checked
+// against what comes: nothing but the media type is taken on the other ship's word. A request
+// over 1,024 bytes, encoded, is refused before anything is looked up.
+message FileWanted {
+  string agent = 1;
+  bytes id = 2;
+  // The group of hashes, or the chunk. Unused for the other parts.
+  uint64 index = 3;
+}
+
+// What a file is. Set `denied` alone, when the caller may not have it.
+message FileFacts {
+  string denied = 1;
+  uint64 length = 2;
+  string media_type = 3;
+}
+
+// Hashes of 32 bytes each, one after another. Set `denied` alone, when the caller may not
+// have the file.
+message FileHashes {
+  string denied = 1;
+  bytes hashes = 2;
+}
+
+// One chunk of a file, whole. Set `denied` alone, when the caller may not have the file.
+message FileBytes {
+  string denied = 1;
+  bytes data = 2;
+}
 
 // A ship that follows to the ship that publishes: the entries of a log after number `after`.
 message Fetch {

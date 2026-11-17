@@ -37,20 +37,48 @@ extern "C" {
     fn host_log_share(req: *const u8, req_len: u32);
     #[link_name = "file_info"]
     fn host_file_info(id: *const u8, id_len: u32, buf: *mut u8, buf_cap: u32) -> i64;
+    #[link_name = "file_mark"]
+    fn host_file_mark(req: *const u8, req_len: u32) -> i64;
 }
 
 /// Files on the ship. An agent keeps a reference to a file (`FileRef`: the ship, the file's
-/// id, its length) and never its bytes: the owner's devices put files in and take them out
-/// over HTTP, under the agent that claims them.
+/// id, its length, and the agent there that claims it) and never its bytes: the owner's
+/// devices put files in and take them out over HTTP, under the agent that claims them.
+///
+/// Another ship's owner can open a file through their own ship. Whether that ship may have it
+/// is this agent's decision alone: an agent declared with `file_ask = f` is asked, and says
+/// yes or no, unless it has marked the file open with `open`, which lets every ship that
+/// names it have it without asking. Without a `file_ask` handler, and without the mark, no
+/// other ship may have the agent's files.
 pub mod files {
-    pub use ship_proto::{FileInfo, FileRef};
-    use ship_proto::Message;
+    pub use ship_proto::{FileAnswer, FileAsk, FileInfo, FileRef};
+    use ship_proto::{FileMark, Message};
 
-    /// What this ship holds of a file this agent claims: its length, chunks and media type.
-    /// `None` for any other id, whether the ship holds that file or not.
+    /// What this ship holds of a file this agent claims: its length, chunks, media type, and
+    /// whether it is marked open. `None` for any other id, whether the ship holds that file or
+    /// not.
     pub fn info(id: &[u8; 32]) -> Option<FileInfo> {
         let bytes = super::fetch(128, |buf, cap| unsafe { super::host_file_info(id.as_ptr(), 32, buf, cap) })?;
         Some(FileInfo::decode(&*bytes).expect("the runtime sent a malformed file info"))
+    }
+
+    /// Mark a file this agent claims open: any ship that names it may have it, and this agent
+    /// is not asked. Returns false, and changes nothing, if this agent claims no such file.
+    /// Kept only if this event commits. Another agent's claim on the same file is its own,
+    /// and is not marked.
+    pub fn open(id: &[u8; 32]) -> bool {
+        mark(id, true)
+    }
+
+    /// Take the mark off: from the next request on, other ships are asked about again. A
+    /// request already allowed finishes the one part it asked for.
+    pub fn close(id: &[u8; 32]) -> bool {
+        mark(id, false)
+    }
+
+    fn mark(id: &[u8; 32], open: bool) -> bool {
+        let request = FileMark { id: id.to_vec(), open }.encode_to_vec();
+        unsafe { super::host_file_mark(request.as_ptr(), request.len() as u32) > 0 }
     }
 }
 
@@ -271,6 +299,12 @@ pub fn __receipt(bytes: &[u8], handler: fn(&Receipt)) -> Vec<u8> {
 }
 
 #[doc(hidden)]
+pub fn __file_ask(bytes: &[u8], handler: fn(&files::FileAsk) -> bool) -> Vec<u8> {
+    let asked = files::FileAsk::decode(bytes).expect("the runtime sent a malformed file question");
+    files::FileAnswer { allow: handler(&asked) }.encode_to_vec()
+}
+
+#[doc(hidden)]
 pub fn __checkpoint(log: &[u8], handler: fn(&str) -> Option<Vec<u8>>) -> Vec<u8> {
     CheckpointReply { state: handler(&String::from_utf8_lossy(log)) }.encode_to_vec()
 }
@@ -303,7 +337,16 @@ macro_rules! export_fn {
 }
 
 /// Declare an agent: a command handler, then any of `read = f`, `notify = f`, `checkpoint = f`,
-/// `receipt = f`.
+/// `receipt = f`, `file_ask = f`.
+///
+/// The file_ask handler is `fn(&files::FileAsk) -> bool`. It is called when another ship asks
+/// for a file this agent claims and has not marked open: `FileAsk.ship` is the ship asking,
+/// which proved who it is on its connection, and `FileAsk.id` the file. Returning true lets
+/// that ship have it. It can only read, as a read handler, and nothing it does is kept. It has
+/// a small budget of its own (10,000,000 fuel and 500 ms by default); a handler that fails, runs
+/// out of either, or answers anything but a FileAnswer of at most 64 bytes is taken as no.
+/// The runtime remembers the answer for a while (a yes for 30 s, a no for 5 s), so a change of
+/// mind takes effect within that time.
 ///
 /// The receipt handler is `fn(&Receipt)`. It is called once for each command this agent sent
 /// to another ship with `send_to`, when that ship says what became of it: whether it ran, and
@@ -345,6 +388,14 @@ macro_rules! __export_role {
             #[export_name = "checkpoint"]
             pub unsafe extern "C" fn __ship_export(ptr: *mut u8, len: u32) -> u64 {
                 $crate::__handle(ptr, len, |log| $crate::__checkpoint(log, $handler))
+            }
+        };
+    };
+    (file_ask, $handler:path) => {
+        const _: () = {
+            #[export_name = "file_ask"]
+            pub unsafe extern "C" fn __ship_export(ptr: *mut u8, len: u32) -> u64 {
+                $crate::__handle(ptr, len, |asked| $crate::__file_ask(asked, $handler))
             }
         };
     };

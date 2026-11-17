@@ -5,6 +5,7 @@
 pub mod files;
 mod host;
 pub mod net;
+mod remote;
 pub mod relay;
 pub mod lookup;
 pub mod whereabouts;
@@ -153,6 +154,12 @@ pub struct Config {
     /// An upload nothing has been sent to for this long is given up, and its reservation
     /// returned, when the next upload on the ship starts.
     pub upload_keep_millis: u64,
+    /// Compute budget for asking an agent whether another ship may have one of its files
+    /// (`KIND_FILE_ASK`), apart from the event budget: the question is asked while the ship
+    /// is held, on behalf of a ship that may be a stranger.
+    pub file_ask_fuel: u64,
+    /// Wall-clock cap on that question, the kernel's decision included.
+    pub file_ask_millis: u64,
     pub durability: Durability,
     pub limits: Limits,
     /// The key everything this runtime keeps on disk for its ships is encrypted under: each
@@ -203,6 +210,8 @@ impl Default for Config {
             max_files: 100_000,
             max_uploads: 16,
             upload_keep_millis: 24 * 60 * 60 * 1000,
+            file_ask_fuel: 10_000_000,
+            file_ask_millis: 500,
             durability: Durability::Full,
             limits: Limits {
                 max_key_bytes: 1024,
@@ -416,6 +425,37 @@ pub(crate) struct Inner {
     /// Whether a network is running for this runtime. There is one at most: it alone carries
     /// what the ships here have waiting for other ships.
     networked: AtomicBool,
+    /// What agents here last answered when another ship asked for one of their files, for a
+    /// while. In memory only. Taken under a ship's slot; nothing else is locked under it.
+    pub(crate) file_answers: Mutex<files::Answers>,
+    /// Set by the network while it runs: ask another ship for a part of a file, and wait for
+    /// the answer. The only way anything outside the network reaches another ship.
+    file_hook: std::sync::RwLock<Option<FileHook>>,
+    /// Per ship, until when it asks no agent about a file (see `files::resting`). In memory
+    /// only; one entry per ship of this runtime at most. Taken under a ship's slot.
+    pub(crate) ask_rest: Mutex<HashMap<String, Instant>>,
+    /// For tests: how long serving a file waits once it is allowed, before reading; how many
+    /// reads (a chunk, or a batch of hashes) it has gone to make; and each question asked of
+    /// an agent, when it ended and how long it took.
+    #[cfg(test)]
+    pub(crate) serve_delay: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    pub(crate) served_reads: AtomicU64,
+    #[cfg(test)]
+    pub(crate) asked: Mutex<Vec<(Instant, Duration)>>,
+    /// For tests: a batch size for reading a file's hashes in place of `LEAF_BATCH` (0 for
+    /// none), and a wait after each batch.
+    #[cfg(test)]
+    pub(crate) hash_batch: AtomicU64,
+    /// For tests: how many decisions serving has gone on to make, under the slot.
+    #[cfg(test)]
+    pub(crate) served_decisions: AtomicU64,
+    #[cfg(test)]
+    pub(crate) batch_delay: Mutex<Option<Duration>>,
+    /// For tests: the kind number a file question is put to the kernel under, in place of
+    /// `KIND_FILE_ASK`, to stand for a kernel that does not know the kind. 0 for none.
+    #[cfg(test)]
+    pub(crate) file_ask_kind: std::sync::atomic::AtomicI32,
 }
 
 /// What came of another ship's word on how much of a delivery it holds.
@@ -437,6 +477,10 @@ pub(crate) type WorkFound = (Vec<String>, Vec<(String, String)>, Vec<(String, St
 /// Called with a ship's name when it has something waiting to go to other ships. The second
 /// argument says the ship may also have events queued that nothing is about to run.
 type OutboundHook = Arc<dyn Fn(&str, bool) + Send + Sync>;
+
+/// Ask, from the first ship (one here), the second for something about a file, and wait for its
+/// reply. The network sets it.
+pub(crate) type FileHook = Arc<dyn Fn(&str, &str, ship_proto::PeerRequest) -> Result<ship_proto::PeerReply, net::FileAskError> + Send + Sync>;
 
 pub struct Runtime {
     inner: Arc<Inner>,
@@ -1029,6 +1073,23 @@ impl Runtime {
                 logs_changed: Condvar::new(),
                 outbound_hook: std::sync::RwLock::new(None),
                 networked: AtomicBool::new(false),
+                file_answers: Mutex::new(files::Answers::default()),
+                file_hook: std::sync::RwLock::new(None),
+                ask_rest: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                serve_delay: Mutex::new(None),
+                #[cfg(test)]
+                served_reads: AtomicU64::new(0),
+                #[cfg(test)]
+                asked: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                hash_batch: AtomicU64::new(0),
+                #[cfg(test)]
+                served_decisions: AtomicU64::new(0),
+                #[cfg(test)]
+                batch_delay: Mutex::new(None),
+                #[cfg(test)]
+                file_ask_kind: std::sync::atomic::AtomicI32::new(0),
             }),
         })
     }
@@ -1545,6 +1606,18 @@ impl Runtime {
     /// other ships, or with `None` stop that.
     pub(crate) fn set_outbound_hook(&self, hook: Option<OutboundHook>) {
         *self.inner.outbound_hook.write().unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// Have `hook` used to ask other ships for parts of files, or with `None` stop that.
+    pub(crate) fn set_file_hook(&self, hook: Option<FileHook>) {
+        *self.inner.file_hook.write().unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// Ask, from `from` (a ship here), the ship `to` for something about a file, through the
+    /// network. `None` when no network is running.
+    pub(crate) fn ask_for_file(&self, from: &str, to: &str, request: ship_proto::PeerRequest) -> Option<Result<ship_proto::PeerReply, net::FileAskError>> {
+        let hook = self.inner.file_hook.read().unwrap_or_else(PoisonError::into_inner).clone()?;
+        Some(hook(from, to, request))
     }
 
     /// The mark a ship was given when it was made or brought into this runtime. It changes

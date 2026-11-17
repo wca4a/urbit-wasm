@@ -1223,8 +1223,12 @@ fn import_checks_every_file_row_against_every_other() {
     refused("empty media type", "UPDATE files SET media_type = '' WHERE id = BIG", fast());
     refused("short dir", &format!("UPDATE file_chunks SET dir = x'00' WHERE dir = {chunk_of_big}; UPDATE files SET dir = x'00' WHERE id = BIG"), fast());
     refused("unclaimed", "DELETE FROM file_claims WHERE id = BIG", fast());
-    refused("claim on nothing", "INSERT INTO file_claims VALUES ('counter', zeroblob(32))", fast());
-    refused("claim by no agent", "INSERT INTO file_claims VALUES ('Not An Agent', BIG)", fast());
+    refused("claim on nothing", "INSERT INTO file_claims VALUES ('counter', zeroblob(32), 0)", fast());
+    refused("claim by no agent", "INSERT INTO file_claims VALUES ('Not An Agent', BIG, 0)", fast());
+    // A claim is marked open or it is not.
+    refused("open mark of 2", "UPDATE file_claims SET open = 2 WHERE id = BIG", fast());
+    refused("open mark below 0", "UPDATE file_claims SET open = -1 WHERE id = BIG", fast());
+    refused("open mark not a number", "UPDATE file_claims SET open = 'yes' WHERE id = BIG", fast());
     refused("an empty file with a chunk", "INSERT INTO file_chunks SELECT dir, 0, zeroblob(16), zeroblob(32) FROM files WHERE length = 0", fast());
     refused("an empty file under another id", "UPDATE files SET id = zeroblob(32) WHERE length = 0", fast());
     refused("a file with no chunks left", &format!("DELETE FROM file_chunks WHERE dir = {chunk_of_big}"), fast());
@@ -1417,4 +1421,33 @@ fn downloads_and_long_polls_never_take_every_thread() {
     let refused = http(&tight, "GET", &format!("/ships/zod/agents/counter/files/{}/content", hex(&id)), &[("Authorization", &auth)], b"");
     assert_eq!(refused.status, 503, "{}", refused.text());
     assert_eq!(http(&tight, "GET", &format!("/ships/zod/agents/counter/files/{}/chunks/0", hex(&id)), &[("Authorization", &auth)], b"").status, 200);
+}
+
+/// A claim's open mark goes with an exported copy, claim by claim, and comes back as it was.
+#[test]
+fn an_open_mark_goes_with_an_export() {
+    let (a, out) = (TempDir::new("mark-a"), TempDir::new("mark-out"));
+    let rt = boot(&a, fast());
+    let data = contents(CHUNK as usize + 5, 41);
+    let id = put_file(&rt, "~zod", "counter", &data, "");
+    assert_eq!(put_file(&rt, "~zod", "keeper", &data, ""), id);
+    let opened = rt.deliver("~zod", "counter", format!("open {}", hex(&id)).as_bytes()).unwrap().reply;
+    assert_eq!(opened, b"true");
+    assert!(rt.file_info("~zod", "counter", &id).unwrap().open && !rt.file_info("~zod", "keeper", &id).unwrap().open);
+    rt.set_recovery_key("~zod", seal::recovery_public(CODE)).unwrap();
+    rt.export_ship("~zod", &out.0).unwrap();
+    let (_b, back, imported) = import("mark-b", &out, fast());
+    assert_eq!(imported.unwrap(), FilesKept { kept: 1, dropped: 0 });
+    assert!(back.file_info("~zod", "counter", &id).unwrap().open);
+    assert!(!back.file_info("~zod", "keeper", &id).unwrap().open);
+}
+
+/// Nor one from before claims could be marked open (schema 10).
+#[test]
+fn a_ship_file_from_before_open_marks_does_not_open() {
+    let dir = TempDir::new("schema-10");
+    drop(boot(&dir, fast()));
+    live(&dir, "zod").execute("UPDATE meta SET value = 10 WHERE key = 'schema'", []).unwrap();
+    let rt = Runtime::open(&dir.0, fast()).unwrap();
+    assert!(matches!(rt.deliver("~zod", "counter", b"get hits"), Err(Error::BadShipFile(why)) if why.contains("schema")));
 }

@@ -17,7 +17,7 @@ use ship_proto::{CheckpointBody, Device, Kind, LogNews, Message, PeerMessage, Re
 use crate::moon::PROOF_BYTES;
 use crate::{signed_bytes, AuditEntry, ChainCheck, Config, Durability, Effect, Error, CHECKPOINT_DOMAIN};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 // The schema and one query name a command by its number, where SQLite needs to see it written out.
 const _: () = assert!(Kind::Command as i32 == 1);
@@ -261,6 +261,7 @@ CREATE TABLE files (
 CREATE TABLE file_claims (
     agent TEXT NOT NULL,
     id BLOB NOT NULL,
+    open INTEGER NOT NULL,
     PRIMARY KEY (agent, id)
 ) WITHOUT ROWID;
 CREATE INDEX file_claims_id ON file_claims (id);
@@ -2098,6 +2099,9 @@ pub struct StoredFile {
     pub length: u64,
     pub media_type: String,
     pub added: u64,
+    /// Whether the claim it was looked up through is marked open to every ship. Always false
+    /// when it was looked up by its id alone, through no claim.
+    pub open: bool,
 }
 
 /// Which copy of a chunk a row names: sixteen random bytes, part of its name on disk.
@@ -2324,26 +2328,40 @@ pub fn chunks(conn: &Connection, dir: &[u8; 16], from: u64, count: u64) -> rusql
 }
 
 fn stored_file(r: &Row, at: usize) -> rusqlite::Result<StoredFile> {
-    Ok(StoredFile { dir: dir_of(r.get(at)?)?, length: r.get::<_, i64>(at + 1)? as u64, media_type: r.get(at + 2)?, added: r.get::<_, i64>(at + 3)? as u64 })
+    Ok(StoredFile {
+        dir: dir_of(r.get(at)?)?,
+        length: r.get::<_, i64>(at + 1)? as u64,
+        media_type: r.get(at + 2)?,
+        added: r.get::<_, i64>(at + 3)? as u64,
+        // Only exactly 1 is open: anything else a row could hold is closed.
+        open: r.get::<_, i64>(at + 4)? == 1,
+    })
 }
 
 pub fn file_by_id(conn: &Connection, id: &[u8; 32]) -> rusqlite::Result<Option<StoredFile>> {
-    conn.prepare_cached("SELECT dir, length, media_type, added FROM files WHERE id = ?1")?.query_row([&id[..]], |r| stored_file(r, 0)).optional()
+    conn.prepare_cached("SELECT dir, length, media_type, added, 0 FROM files WHERE id = ?1")?.query_row([&id[..]], |r| stored_file(r, 0)).optional()
 }
 
-/// A file, if `agent` claims it.
+/// A file, if `agent` claims it, with whether that claim is marked open.
 pub fn file_claimed(conn: &Connection, agent: &str, id: &[u8; 32]) -> rusqlite::Result<Option<StoredFile>> {
     conn.prepare_cached(
-        "SELECT f.dir, f.length, f.media_type, f.added FROM file_claims c JOIN files f ON f.id = c.id WHERE c.agent = ?1 AND c.id = ?2",
+        "SELECT f.dir, f.length, f.media_type, f.added, c.open FROM file_claims c JOIN files f ON f.id = c.id WHERE c.agent = ?1 AND c.id = ?2",
     )?
     .query_row(params![agent, &id[..]], |r| stored_file(r, 0))
     .optional()
 }
 
+/// Mark `agent`'s claim on a file open to every ship, or take the mark off. Whether the agent
+/// claims that file; nothing is changed if it does not.
+pub fn claim_mark(conn: &Connection, agent: &str, id: &[u8; 32], open: bool) -> rusqlite::Result<bool> {
+    let changed = conn.prepare_cached("UPDATE file_claims SET open = ?3 WHERE agent = ?1 AND id = ?2")?.execute(params![agent, &id[..], i64::from(open)])?;
+    Ok(changed > 0)
+}
+
 /// The files `agent` claims, by id, after `after`, at most `max`.
 pub fn files_claimed(conn: &Connection, agent: &str, after: &[u8], max: usize) -> rusqlite::Result<Vec<([u8; 32], StoredFile)>> {
     conn.prepare_cached(
-        "SELECT c.id, f.dir, f.length, f.media_type, f.added FROM file_claims c JOIN files f ON f.id = c.id
+        "SELECT c.id, f.dir, f.length, f.media_type, f.added, c.open FROM file_claims c JOIN files f ON f.id = c.id
          WHERE c.agent = ?1 AND c.id > ?2 ORDER BY c.id LIMIT ?3",
     )?
     .query_map(params![agent, after, max as i64], |r| Ok((hash_of(r.get(0)?)?, stored_file(r, 1)?)))?
@@ -2358,9 +2376,10 @@ pub fn file_add(conn: &Connection, id: &[u8; 32], dir: &[u8; 16], length: u64, m
     set_file_bytes(conn, file_bytes(conn)?.saturating_add(length))
 }
 
-/// Let `agent` claim a file the ship holds. Claiming it twice is claiming it once.
+/// Let `agent` claim a file the ship holds, not marked open. Claiming it twice is claiming it
+/// once, and leaves the mark as it was.
 pub fn claim_add(conn: &Connection, agent: &str, id: &[u8; 32]) -> rusqlite::Result<()> {
-    conn.prepare_cached("INSERT OR IGNORE INTO file_claims VALUES (?1, ?2)")?.execute(params![agent, &id[..]]).map(drop)
+    conn.prepare_cached("INSERT OR IGNORE INTO file_claims (agent, id, open) VALUES (?1, ?2, 0)")?.execute(params![agent, &id[..]]).map(drop)
 }
 
 /// Take back `agent`'s claim on a file: `None` if it had none, else whether the file went
@@ -3439,19 +3458,23 @@ pub fn import(
             }
             file.done = true;
         }
-        let mut stmt = from.prepare("SELECT agent, id FROM file_claims")?;
+        let mut stmt = from.prepare("SELECT agent, id, open FROM file_claims")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             in_time()?;
-            let (agent, id) = (text(row, 0)?, blob(row, 1, 32)?);
+            let (agent, id, open) = (text(row, 0)?, blob(row, 1, 32)?, integer(row, 2)?);
             check_agent(&agent)?;
+            // A claim is marked open or it is not: nothing else a row could hold is taken.
+            if open > 1 {
+                return Err(bad_row("a claim's open mark is neither 0 nor 1"));
+            }
             let Some(at) = <[u8; 32]>::try_from(id).ok().and_then(|id| by_id.get(&id).copied()) else {
                 return Err(bad_row("an agent claims a file the ship does not hold"));
             };
             let file = &mut incoming[at as usize];
             file.claimed = true;
             // A plain insert, so a claim that appears twice is an error, not one claim.
-            to.execute("INSERT INTO file_claims VALUES (?1, ?2)", params![agent, &file.id[..]])?;
+            to.execute("INSERT INTO file_claims VALUES (?1, ?2, ?3)", params![agent, &file.id[..], open])?;
         }
         if incoming.iter().any(|file| !file.claimed) {
             return Err(bad_row("the ship holds a file no agent claims"));

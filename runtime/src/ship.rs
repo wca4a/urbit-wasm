@@ -9,8 +9,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use rusqlite::Connection;
 use ship_proto::admin_request::Op;
 use ship_proto::{
-    AdminReply, AdminRequest, CheckpointBody, CheckpointReply, EntryBody, Fetch, Fetched, Grant, Invocation, Kind, LogHead,
-    LogNews, Message, Receipt, RouteReply, RouteRequest, SignedCheckpoint, SignedEntry, Source, Verdict,
+    AdminReply, AdminRequest, CheckpointBody, CheckpointReply, EntryBody, Fetch, Fetched, FileAnswer, FileAsk, Grant, Invocation,
+    Kind, LogHead, LogNews, Message, Receipt, RouteReply, RouteRequest, SignedCheckpoint, SignedEntry, Source, Verdict,
 };
 use wasmtime::{Store, StoreLimitsBuilder, Trap};
 
@@ -242,9 +242,13 @@ fn kernel_call(env: &Env, export: &str, input: &[u8], read_only: bool) -> anyhow
 /// Ask the kernel whether a call may go ahead. On yes, returns the module to run and the
 /// permissions the called agent holds while handling it.
 fn route(env: &Env, source: &Source, agent: &str, kind: Kind, interface: &str) -> anyhow::Result<(Arc<AgentModule>, RouteReply)> {
+    route_as(env, source, agent, kind as i32, interface)
+}
+
+/// The same, with the kind of call as the number the kernel is sent.
+fn route_as(env: &Env, source: &Source, agent: &str, kind: i32, interface: &str) -> anyhow::Result<(Arc<AgentModule>, RouteReply)> {
     check_target(agent, interface).map_err(|_| Denied(format!("{agent:?} cannot be called")))?;
-    let request =
-        RouteRequest { source: Some(source.clone()), agent: agent.into(), kind: kind as i32, interface: interface.into() };
+    let request = RouteRequest { source: Some(source.clone()), agent: agent.into(), kind, interface: interface.into() };
     let reply = RouteReply::decode(&*kernel_call(env, "route", &request.encode_to_vec(), true)?)?;
     if !reply.allowed {
         return Err(Denied(reply.reason).into());
@@ -284,6 +288,18 @@ pub(crate) fn read_agent(
         },
     )?;
     Ok((returned.reply, returned.fuel_left))
+}
+
+/// The most an agent's answer to a file question may be. A `FileAnswer` saying yes is two bytes.
+const FILE_ANSWER_BYTES: usize = 64;
+
+/// What a ship decides when another ship asks for a part of a file.
+pub(crate) enum Permit {
+    /// No: for any reason, or because something failed.
+    No,
+    /// Yes. The file as its row is now, and for a chunk asked for, its row (hash and copy) if
+    /// the file has that chunk and the row is there.
+    Yes { file: store::StoredFile, row: Option<([u8; 32], store::Gen)> },
 }
 
 /// Store what an agent answered when asked for a checkpoint of one of its logs.
@@ -1216,6 +1232,122 @@ impl Ship {
         result.map(|(reply, _)| reply).map_err(|e| Error::Rejected(classify(&e)))
     }
 
+    /// Whether `peer` may have the file `id` that `agent` claims, decided in one read
+    /// transaction while the ship is held: the agent is installed (the kernel would route the
+    /// owner's command to it) and claims the file; then the claim is marked open, or the
+    /// answer remembered for exactly this copy of the ship, this module, the caller and the
+    /// file is yes, or the agent, asked now, says yes. With `chunk`, that chunk's row is read
+    /// in the same transaction. Nothing is written: the transaction is always rolled back.
+    ///
+    /// Anything that fails on the way is a no. Only reading the file's own rows, once the
+    /// answer is yes, can be an error, and the caller takes that as no too.
+    pub(crate) fn file_permit(&mut self, rt: &Arc<Inner>, peer: &str, agent: &str, id: &[u8; 32], chunk: Option<u64>) -> Result<Permit, Error> {
+        self.begin("BEGIN")?;
+        let decided = self.file_decide(rt, peer, agent, id, chunk);
+        self.rollback();
+        decided
+    }
+
+    fn file_decide(&mut self, rt: &Arc<Inner>, peer: &str, agent: &str, id: &[u8; 32], chunk: Option<u64>) -> Result<Permit, Error> {
+        let env = self.env(rt);
+        let owner = Source { owner: true, agent: String::new(), ship: String::new() };
+        // Installed, and which module it runs: any failure to say is a no.
+        let Ok((_, routed)) = route(&env, &owner, agent, Kind::Command, "") else { return Ok(Permit::No) };
+        let Some(file) = store::file_claimed(&lock(&self.conn), agent, id)? else { return Ok(Permit::No) };
+        if !file.open {
+            // Values of this runtime's own that are never used for anything else: this copy
+            // of the ship's mark (new at every import) and the module the kernel routes to,
+            // with the names and the id. An answer an earlier copy, or another module, gave is
+            // never found under them.
+            let key = crate::files::AnswerKey {
+                ship: self.name.to_string(),
+                incarnation: self.incarnation,
+                module: routed.module,
+                agent: agent.to_string(),
+                caller: peer.to_string(),
+                id: *id,
+                dir: file.dir,
+            };
+            let allowed = match crate::files::remembered(&rt.file_answers, &key, Instant::now()) {
+                Some(allowed) => allowed,
+                // Resting from asking: a no, exactly as any other, and not remembered.
+                None if crate::files::resting(&rt.ask_rest, &self.name, Instant::now()) => false,
+                None => {
+                    let asked = Instant::now();
+                    let allowed = self.ask_file(rt, peer, agent, id);
+                    let (ended, took) = (Instant::now(), asked.elapsed());
+                    crate::files::rest_after(&rt.ask_rest, &self.name, took, ended);
+                    #[cfg(test)]
+                    lock(&rt.asked).push((ended, took));
+                    crate::files::remember(&rt.file_answers, key, allowed, ended);
+                    allowed
+                }
+            };
+            if !allowed {
+                return Ok(Permit::No);
+            }
+        }
+        let row = match chunk {
+            Some(n) if crate::files::chunk_len(file.length, n).is_some() => {
+                store::chunks(&lock(&self.conn), &file.dir, n, 1)?.and_then(|rows| rows.into_iter().next())
+            }
+            _ => None,
+        };
+        Ok(Permit::Yes { file, row })
+    }
+
+    /// Ask `agent` whether `peer` may have the file `id`, as a `KIND_FILE_ASK` call: read-only,
+    /// with no send grants, the agent's own read grants, and a budget of its own. Run inside
+    /// the caller's read transaction, which is rolled back. Yes only if the kernel lets the
+    /// call through and the agent answers, in time and within its budget, with a `FileAnswer`
+    /// of at most 64 bytes that says yes. Anything else is no.
+    fn ask_file(&mut self, rt: &Arc<Inner>, peer: &str, agent: &str, id: &[u8; 32]) -> bool {
+        let millis = rt.cfg.file_ask_millis.min(24 * 60 * 60 * 1000);
+        let deadline = Instant::now() + Duration::from_millis(millis);
+        let env = Env { rt, ship: &self.name, kernel: &self.kernel, conn: &self.conn, key: &self.key, deadline };
+        let source = Source { owner: false, agent: String::new(), ship: peer.to_string() };
+        #[cfg(test)]
+        let kind = match rt.file_ask_kind.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => Kind::FileAsk as i32,
+            other => other,
+        };
+        #[cfg(not(test))]
+        let kind = Kind::FileAsk as i32;
+        let asked = (|| -> anyhow::Result<bool> {
+            let (module, grants) = route_as(&env, &source, agent, kind, "")?;
+            let invocation = Invocation { kind: Kind::FileAsk as i32, interface: String::new(), source: Some(source.clone()) };
+            let question = FileAsk { ship: peer.to_string(), id: id.to_vec() };
+            let returned = invoke(
+                &env,
+                Invoke {
+                    module: &module,
+                    export: "file_ask",
+                    agent,
+                    invocation: invocation.encode_to_vec(),
+                    input: &question.encode_to_vec(),
+                    read_only: true,
+                    depth: 0,
+                    reads: grants.reads,
+                    sends: Vec::new(),
+                    fuel: rt.cfg.file_ask_fuel,
+                    outbox_room: 0,
+                    inbox_room: 0,
+                    max_reply: FILE_ANSWER_BYTES,
+                },
+            )?;
+            Ok(FileAnswer::decode(&*returned.reply)?.allow)
+        })();
+        // An error, of any kind, is never a yes.
+        matches!(asked, Ok(true))
+    }
+
+    /// For tests: whether the kernel lets a call of `kind` from `source` through to `agent`.
+    #[cfg(test)]
+    pub(crate) fn routes(&mut self, rt: &Arc<Inner>, source: &Source, agent: &str, kind: Kind) -> bool {
+        let env = self.env(rt);
+        route(&env, source, agent, kind, "").is_ok()
+    }
+
     /// Whether an agent is installed: whether the kernel would route a command from the owner
     /// to it. Nothing is changed.
     pub fn installed(&mut self, rt: &Arc<Inner>, agent: &str) -> Result<bool, Error> {
@@ -1249,6 +1381,10 @@ impl Ship {
             .and_then(|bytes| Ok(AdminReply::decode(&*bytes)?));
         match reply {
             Ok(reply) if write && reply.ok => {
+                // Whatever the change, and whether or not its commit is known to land, no answer
+                // an agent here gave about a file is used again: the ship is held, so no request
+                // is decided between the change and this.
+                crate::files::forget_ship(&rt.file_answers, &self.name);
                 let committed = lock(&self.conn).execute_batch("COMMIT");
                 if let Err(e) = committed {
                     self.rollback();

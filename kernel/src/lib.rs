@@ -125,6 +125,16 @@ fn decide(request: &RouteRequest) -> RouteReply {
         }
         return allow(&registry, target);
     }
+    // Another ship asks whether it may have a file the agent claims. As with sharing a log,
+    // who may have a file is the agent's decision alone: nothing at install names ships, and
+    // any installed agent may be asked. Only another ship asks this, never the owner or an
+    // agent here.
+    if request.kind() == Kind::FileAsk {
+        if source.ship.is_empty() || source.owner {
+            return deny("only another ship asks for a file");
+        }
+        return allow(&registry, target);
+    }
     // A request from an agent on another ship. Only a command, and only to an interface that
     // is open to other ships. Which ships may do what is then up to the agent, which is told
     // who is asking. Nothing is known here about the other ship's agents, so nothing is
@@ -167,7 +177,7 @@ fn decide(request: &RouteRequest) -> RouteReply {
         }
         // An unrecognised kind must be refused, never treated as something harmless.
         // (A receipt was answered above.)
-        Kind::Receipt | Kind::Unspecified => return deny("unknown kind of call"),
+        Kind::Receipt | Kind::Unspecified | Kind::FileAsk => return deny("unknown kind of call"),
     };
     // The owner may call anything on their own ship. An agent needs the target to provide the
     // interface, and needs it to be public, its own, or a declared use.

@@ -7,7 +7,8 @@ written in Rust.
 Experimental. There is a runtime, a kernel, logs that agents can follow, an
 HTTP server that lets an app or a browser sign in to a ship, a store of files
 of any size on each ship for the owner's devices, and an encrypted link over
-which ships send each other commands and follow each other's logs.
+which ships send each other commands, follow each other's logs, and fetch each
+other's files.
 A ship's file is encrypted on disk. A ship's keys can be derived from its Urbit
 ID master ticket, but ships do not yet look each other up in Azimuth, and there
 is no update mechanism yet.
@@ -32,6 +33,11 @@ is no update mechanism yet.
   download it whole or in part. Each file belongs to the agents that claim it,
   and only a device asking through one of those agents sees it. An agent keeps
   only a reference to a file, never its bytes.
+- The owner of one ship can open a file kept on another, through their own
+  ship, if the agent that holds it there allows it: the agent is asked, or
+  has marked the file open to every ship. The owner's ship checks every piece
+  against the file's id before passing it on, so a ship that lies can make a
+  fetch fail but never hand over a wrong byte, and it keeps nothing.
 - A file is known by a hash over its contents, checked chunk by chunk, so
   every byte served is checked against what was stored, and identical files
   are kept once. Files are encrypted on disk like everything else, and go
@@ -238,7 +244,8 @@ source rather than something the tests prove.
 | `runtime/src/host.rs` | The host functions agents import, and the fuel each costs |
 | `runtime/src/store.rs` | The SQLite schema and every query; import validation |
 | `runtime/src/seal.rs` | Keys: the storage key, the keys derived from it, the recovery key, and sealing and opening an exported copy and its stream of files |
-| `runtime/src/files.rs` | Files on the ship: the file id format, uploads and downloads, reading chunks back checked, clearing leftovers, and the stream of files beside an exported copy |
+| `runtime/src/files.rs` | Files on the ship: the file id format, uploads and downloads, reading chunks back checked, clearing leftovers, serving a file to another ship and the answers agents gave about it, and the stream of files beside an exported copy |
+| `runtime/src/remote.rs` | Fetching a file from another ship for the owner's devices, and checking every part of it against the file's id |
 | `urbit-id/src/` | Urbit ID's keys as Urbit derives them: `wallet.rs` (master ticket to networking keys, UP 8), `argon2.rs` (Urbit's Argon2 variant), `ob.rs` (ship and moon names, tickets), `keyfile.rs` (reading and writing keyfiles), `naive.rs` (Azimuth's state worked out from its logs and layer 2 batches: a port of Urbit's `naive.hoon`) |
 | `runtime/src/azimuth.rs` | Reading Urbit ID: a ship's key from the Azimuth contract on Ethereum, or from the roller for a ship on layer 2 |
 | `runtime/src/chain.rs` | Reading Ethereum's history over JSON-RPC: logs over a range of blocks, transaction inputs, the finalised block |
@@ -254,6 +261,7 @@ source rather than something the tests prove.
 | `runtime/tests/runtime.rs` | Integration tests |
 | `runtime/tests/files.rs` | Integration tests of files on the ship |
 | `runtime/tests/lookup.rs` | Integration tests of finding ships through lookup points |
+| `runtime/src/remote_tests.rs` | Tests of fetching a file from another ship, inside the crate so that the ship answering can be made to lie |
 | `kernel/src/lib.rs` | The default kernel: agent registry and routing policy |
 | `proto/ship.proto` | Every message: runtime and kernel, runtime and agent, client and ship, ship and ship |
 | `sdk/src/lib.rs` | Guest-side bindings and the `agent!` macro |
@@ -342,6 +350,7 @@ calls:
 | `KIND_NOTIFY` | `notify` | A log the agent follows has entries for it. No payload |
 | `KIND_CHECKPOINT` | `checkpoint` | The runtime asks for the state behind one of the agent's logs. Read-only, with no send grants |
 | `KIND_RECEIPT` | `receipt` | What became of a command the agent sent to another ship. Skipped if the module has no `receipt` export |
+| `KIND_FILE_ASK` | `file_ask` | Another ship asks for a file the agent claims. Read-only, with no send grants, a budget of its own, and never queued or kept; see Fetching a file from another ship |
 
 ### Compute, time, and memory limits
 
@@ -413,6 +422,11 @@ The default kernel's `route` rules:
 - An agent on another ship may only send a `KIND_COMMAND`, and only to an
   interface marked `remote`. What each ship may then do is up to the agent,
   which is told the calling ship in `Invocation.source`.
+- Another ship (not the owner, not an agent here) may put a `KIND_FILE_ASK`
+  to any installed agent. As with sharing a log, who may have a file is the
+  agent's decision alone, and nothing at install names ships. A kernel from
+  before this kind decodes it as `KIND_UNSPECIFIED` and refuses it, which is
+  read as no.
 - A notification about a local log needs the follower to be allowed to read
   the publisher's interface. One about a log on another ship needs a `Use`
   naming that ship (or `*`), agent, and log with `read` set.
@@ -430,7 +444,7 @@ brings its own kernel, which decides policy for that ship only.
 
 An agent module exports `memory`, `alloc(len: u32) -> u32`, and
 `handle(ptr: u32, len: u32) -> u64`, plus any of `read`, `notify`,
-`checkpoint`, and `receipt` with the same signature. The runtime calls `alloc`,
+`checkpoint`, `receipt`, and `file_ask` with the same signature. The runtime calls `alloc`,
 writes the input there, calls the handler, and reads the reply from the
 returned value: pointer in the high 32 bits, length in the low 32.
 
@@ -457,7 +471,8 @@ bigger buffer.
 | `log_unfollow(req, req_len)` | Stop following. No permission needed |
 | `log_share(req, req_len)` | `ShareRequest`. Let a named ship, or `*`, follow one of this agent's logs, or stop |
 | `log_next(req, req_len, buf, cap) -> i64` | `NextRequest`. Take entries after this agent's position, at most 256 entries or 256 KiB per call |
-| `file_info(id, id_len, buf, cap) -> i64` | `FileInfo` of a file this agent claims on this ship, by its 32-byte id. `-1` for any other id, whether the ship holds it or not. Read-only, and no grant is needed: it is the agent's own data. No host function reads or writes a file's bytes |
+| `file_info(id, id_len, buf, cap) -> i64` | `FileInfo` of a file this agent claims on this ship, by its 32-byte id, with whether its claim is marked open. `-1` for any other id, whether the ship holds it or not. Read-only, and no grant is needed: it is the agent's own data. No host function reads or writes a file's bytes |
+| `file_mark(req, req_len) -> i64` | `FileMark {id, open}`. Mark this agent's own claim on a file open to every ship, or take the mark off. `1` if the agent claims that file, else `0` and nothing changes (not an error). A change, so refused while reading, and kept only if the event commits |
 
 The calls that change something are refused during a read or a checkpoint.
 
@@ -473,19 +488,23 @@ The calls that change something are refused during a read or a checkpoint.
   replace local state with, and an optional `stopped` reason for a log on
   another ship.
 - `Receipt` and `Verdict`, re-exported from the protocol.
-- `files::info(id)`, and `FileRef` and `FileInfo` from the protocol. A
-  `FileRef` (ship, id, length) is plain data an agent keeps in place of a file.
-- `agent!(handle, read = f, notify = f, checkpoint = f, receipt = f)` exports
-  `alloc`, `handle`, and whichever roles are named. Command, read, and notify
-  handlers are `fn(&[u8]) -> Vec<u8>`; a checkpoint handler is
-  `fn(&str) -> Option<Vec<u8>>`; a receipt handler is `fn(&Receipt)`.
+- `files::info(id)`, `files::open(id)`, `files::close(id)`, and `FileRef`,
+  `FileInfo`, `FileAsk` and `FileAnswer` from the protocol. A `FileRef` (ship,
+  id, length, agent) is plain data an agent keeps in place of a file: the id
+  fixes the bytes and the length, and the ship and agent say where to ask.
+- `agent!(handle, read = f, notify = f, checkpoint = f, receipt = f,
+  file_ask = f)` exports `alloc`, `handle`, and whichever roles are named.
+  Command, read, and notify handlers are `fn(&[u8]) -> Vec<u8>`; a checkpoint
+  handler is `fn(&str) -> Option<Vec<u8>>`; a receipt handler is
+  `fn(&Receipt)`; a file_ask handler is `fn(&FileAsk) -> bool`.
 
 ## Storage
 
 Each ship is one SQLite file, and the file is the ship's source of truth. The
-schema version is `10`, stored in the `meta` table; a file with any other
+schema version is `11`, stored in the `meta` table; a file with any other
 version is refused. There is no migration: ship files and exports made before
-version 10 (before files on the ship) do not open.
+version 11 (before a claim on a file could be marked open to other ships) do
+not open.
 
 | Table | Purpose |
 | --- | --- |
@@ -509,7 +528,7 @@ version 10 (before files on the ship) do not open.
 | `signin_codes` | Hashes of one-time codes and of the reusable access code, with expiry |
 | `uploads` | Open uploads: directory, agent, length, media type, and when last sent to |
 | `files` | Files held: id, directory, length, media type, when added. `meta.file_bytes` is the sum of their lengths |
-| `file_claims` | Which agents claim which files |
+| `file_claims` | Which agents claim which files, and whether each claim is marked open to every ship (`open`, 0 or 1) |
 | `file_chunks` | The copy and hash of each chunk held, for uploads and files alike, by directory and chunk number |
 | `file_trash` | What no row names any more and is still to be removed from disk: whole directories and single chunk copies, with the bytes each holds |
 
@@ -1186,11 +1205,11 @@ A ship's own file holds nothing larger than 1 MiB. Files of any size are kept
 beside it, in `files/<ship>/`, and the ship's file holds the truth about them:
 which files there are, which agents claim each, and the hash of every chunk.
 The owner's signed-in devices put files in and take them out over HTTP, under
-an agent. An agent keeps only a reference (`FileRef`: ship, id, length) and
-never loads a file; no host function reads or writes file bytes. Fetching a
-file from another ship, a cache, and "save a copy" are not built yet; the id
-is made so that another ship can check a file chunk by chunk in messages of at
-most 1 MiB.
+an agent. An agent keeps only a reference (`FileRef`: ship, id, length,
+agent) and never loads a file; no host function reads or writes file bytes.
+Another ship's owner can fetch a file through their own ship, which checks it
+chunk by chunk against its id in chunks of at most 1 MiB (see Fetching a
+file from another ship). A cache and "save a copy" are not built yet.
 
 ### The file id (format 1)
 
@@ -1415,7 +1434,8 @@ Bounds, with their working:
   `max_downloads` says. With 16 workers: 8 may wait, 4 may download (the
   default), and 4 are always left; with 4: 2, 1, and 1; with 2: 1, none, and 1,
   and a file's contents are refused (503) while its chunks can still be
-  fetched one at a time. Past the limit, 503 with `Retry-After: 1`. A client
+  fetched one at a time. Requests for files on other ships take the same
+  download places, whichever route (see Fetching a file from another ship). Past the limit, 503 with `Retry-After: 1`. A client
   gets `io_timeout` (10 s) to take each chunk, not the whole file: a stalled
   reader is cut off after 10 s; one that keeps taking a little holds its worker
   for at most 10 s a chunk.
@@ -1457,7 +1477,8 @@ comes in with none, its files are counted as dropped, and no limit on files
 in with every file row checked against every other: each file's chunks are
 all there once, in order, as many as its length takes, and its id is the id of
 its length and their hashes; every claim is by a valid agent name on a file
-that is there; every file is claimed; media types are valid; and the files fit
+that is there, with an open mark of exactly 0 or 1, which comes in as it was;
+every file is claimed; media types are valid; and the files fit
 `max_file_bytes` and `max_files`, or the import is refused (the runtime does
 not choose which of the owner's files to lose). Each file is given a new
 directory, so nothing in a copy becomes a path; upload rows and their chunks,
@@ -1486,6 +1507,250 @@ import reading a directory that something outside this runtime is exporting
 into at the same moment can find a copy and a stream from different exports;
 the stream then does not open beside the copy, and the ship comes in without
 its files, which the count says.
+
+
+### Fetching a file from another ship
+
+The owner of ship B opens a file that lives on ship A. B's device asks B over
+HTTP; B asks A over the ship-to-ship connection; A checks that B may have the
+file; B checks every piece against the file's id and passes it straight to
+the device. B keeps nothing: no file, no directory, no row. Code: serving in
+`files.rs` (`Runtime::serve_file`) and `ship.rs` (`Ship::file_permit`), the
+wire in `net.rs`, checking in `remote.rs`, routes in `server.rs`.
+
+**Who may have a file** is decided by the agent on A that claims it, never at
+install. Closed by default: the agent is asked, as a `KIND_FILE_ASK` call
+(`FileAsk {ship, id}` in, `FileAnswer {allow}` out), and says yes or no. It can
+instead mark its claim open (`files::open(id)`, host `file_mark`; `close` takes
+the mark off), and then any ship that names the file gets it and the agent is
+not asked. The mark is per agent and per file, a column of `file_claims`, and
+goes with the claim. "Any ship" means a ship that proved its Urbit ID on the
+connection; there is no public web link.
+
+**The question** runs like a read: read-only (every write, send, emit, log
+change and `file_mark` is refused), no send grants, the agent's ordinary read
+grants (it may read another agent here, to see who is in a group, say), inside
+a transaction that is always rolled back. It has its own budget,
+`file_ask_fuel` (10,000,000) and `file_ask_millis` (500 ms, the kernel's
+decision included), not the event budget. No `file_ask` export, a trap, out of
+fuel, out of time, a reply over 64 bytes, a reply that does not decode, a
+kernel refusal: each is no.
+
+**On A, before each request** (what the file is, one group of hashes, the
+upper hashes, one chunk), in one hold of the ship's slot and one read
+transaction: the agent is installed (the kernel routes the owner's command to
+it, which also gives the module it runs) and claims the file; then the claim is
+open, or the answer remembered for exactly this key is still fresh, or the
+agent is asked now and its answer remembered. Anything that fails on the way
+is no. Every no is the same in-body refusal, `denied: "~A does not share that
+file with ~B"`, whether the store is off, the agent or the file does not
+exist, the agent does not claim it, the agent said no, or the agent failed.
+Once the answer is yes, hashes are read in batches of 4,096 rows (each batch
+under the slot, looked up again by the claim and the file's directory) and
+hashed outside the slot, and a chunk's row is read with the decision and the
+chunk read, opened and checked against it outside the slot (`read_chunk`). A
+damaged or vanished chunk is a refusal at the transport level ("the file could
+not be read; try again"), never bytes. Serving writes nothing of its own and
+keeps nothing: no row, no file. A request that is the first thing to wake a
+ship in a runtime's life sets off the clearing of leftovers part 1 owes at
+first wake, as anything that wakes it does (a command or a log fetch from
+another ship already did). That clearing removes what the ship had recorded
+to be removed and directories under `files/<ship>/` that no row names (such
+as an upload's directory whose row never committed); it only ever removes,
+and is the one thing a stranger's request can change.
+
+**Remembered answers** are in memory only, per runtime: a yes for 30 s, a no
+for 5 s, at most 4,096, the oldest going first when full (which only costs an
+extra ask). The key is the ship, its incarnation mark (new at every import),
+the module the kernel routes the agent to, the agent, the calling ship, the
+file's id, and the file's directory (random, never used again). So an import
+or a file deleted and put back is never answered from an earlier answer. A
+module hash is not an installation: every successful change made through a
+ship's kernel (an install, the same module installed again with other grants,
+a module replaced and put back) forgets every answer remembered for that ship,
+all agents (one agent's answer can rest on a read of another), under the same
+hold of the slot as the change, so no request is decided between the change
+and the forgetting. Other ships' answers stay. A table left poisoned by a panic
+is emptied, and that lookup is no. Questions to one ship are asked one at a
+time, under its slot.
+
+**A ship rests from asking.** After a question to an agent that took `t`, the
+ship asks no agent about a file for `3t`. So over any stretch of time, however
+many ships ask (one owner can prove many ships: a planet and its moons),
+questions take at most a quarter of it plus the length of one question: every
+question but the last that falls in the stretch is followed, inside the
+stretch, by a rest three times as long. A single question is cut off at
+`file_ask_millis` (500 ms), as the cut-off is noticed: at the agent's next
+check of the clock (a loop or a call; the runtime's clock moves every 10 ms)
+or when it returns, so a question can run a little past it. A request that
+would need a fresh question during that
+rest is answered exactly as any no (the same `denied`, and not remembered); a
+remembered answer and an open mark are honoured as always. In memory only, one
+entry per ship. The cost: under such a flood, a ship that would be allowed may
+be told no and must try again.
+
+**The wire**: four kinds from field 7 on (see Wire messages), each naming the
+agent and the id. A chunk reply is 1 MiB and a few bytes, inside the default
+`max_message_bytes` (1 MiB + 64 KiB); a runtime whose `max_message_bytes` is
+below 1 MiB + 1 KiB refuses to ask for files and to serve them, saying so, and
+starts and carries everything else as before. File requests have their own
+deadline at both ends, `file_timeout` (30 s), in place of `request_timeout`.
+On A the request is still read within `request_timeout`, and only then given
+the longer time.
+
+**On B, in this order, before one byte or one number goes to the device:**
+
+1. Ask A what the file is: its length `L` and media type. A length whose
+   hashes could not come to the root in two levels (more than 2^30 chunks) is
+   refused before anything else is asked.
+2. For at most 32,768 chunks, ask for group 0's hashes: exactly as many as
+   `L` takes, and with `L` they must give exactly the id in the address. For
+   more, ask for every group's index hash: exactly as many groups as `L`
+   takes, and with `L` they must give the id; then each group of chunk hashes
+   needed is fetched when needed, counted, and must hash to its index hash.
+   Only now is `L` believed, and only now is the head (`Content-Length`,
+   `Content-Range`) sent. For a file of more than 32,768 chunks every group of
+   chunk hashes needed, the first included, is fetched after the head of the
+   contents: the index hashes already tie `L` to the id, so nothing believed
+   comes later (a group that fails its check ends the answer short), but this
+   is not the plan's literal order.
+3. Each chunk: exactly as long as `L` says chunk `n` is, and hashing to its
+   checked hash; then written to the device.
+
+The media type is the one thing A says that the id does not cover. It goes
+through the check made at upload (anything it refuses becomes
+`application/octet-stream`), and the answer carries every header a local file's
+does: `nosniff`, `Content-Security-Policy: sandbox; default-src 'none'`, and
+`inline` only for the same fixed list. No text A sends reaches the device: A's
+`denied` is read only as "not empty means no", and B answers every refusal
+with its own fixed sentence; reasons for a refusal at the transport level are
+not passed on either. Every answer the signed-in remote handler gives,
+errors included, carries `nosniff`, the sandbox policy and a
+`Content-Disposition`. A request without a valid device is answered 401 by the
+server before that handler, and that answer carries nothing of A's.
+
+Routes, under the ship, signed in as every route, and not under an agent:
+
+| Method and path | Answer |
+| --- | --- |
+| `GET /files/from/<ship>/<agent>/<id>` | `FileInfo {id, length, chunks, media_type}` (`added_ms` and `open` unset) |
+| `GET /files/from/<ship>/<agent>/<id>/chunks/<n>` | One chunk, `application/octet-stream`, an attachment |
+| `GET /files/from/<ship>/<agent>/<id>/content` | The file, or one `Range`, streamed, with the same rules as the local route |
+
+`<ship>` must be a valid ship name other than this ship, `<agent>` a valid agent
+name, `<id>` 64 lower-case hex digits; otherwise 400. They only go into the
+request to the other ship; none becomes a path. Before the head: 404 for A's
+refusal ("the other ship does not share that file with this one"), 502 when
+A's answer fails a check, does not decode,
+is of the wrong kind, or is a refusal at the transport level, 504 when A
+cannot be reached or does not answer within `file_timeout`, 503 with
+`Retry-After` when B or A is too busy (B: `Retry-After: 1`) or B has no network
+running (`Retry-After: 5`), and 503 without it when B's messages are too small
+for a chunk or B's server has no download places (two workers). After the head, anything wrong ends the answer short, never padded
+and never with unchecked bytes; the device carries on with `Range`. Hashes are
+fetched again for each HTTP request: nothing learned from one answer of A's is
+used in another request.
+
+Over a relayed connection files go at the relay's existing limits with no
+special handling: about 128 KiB/s at most, shared with everything else sent to
+that ship through its point, so a chunk takes eight seconds or more. Only a
+small file has been fetched this way in the tests.
+
+#### What holds, and how
+
+- HARD. A gives a file only to a ship allowed now: the caller is the ship
+  proved on the connection, checked again before each request as for every
+  request, and the claim, its mark and the agent's install are read under the
+  ship's slot for each request. A request whose decision begins after the
+  event that closed the file or removed the claim has committed is not
+  answered from the mark; one that begins after any change made through the
+  ship's kernel is not answered from anything remembered before it. Nothing
+  uninstalls an agent, as in part 1, so there is nothing more to race.
+- BEST EFFORT. An agent's own change of mind takes effect within 30 s (a
+  remembered yes) or 5 s (a remembered no). A request already allowed finishes
+  its one part: hashes are read after the decision, by claim and directory,
+  and a claim gone meanwhile ends that request with a refusal.
+- HARD. An error is never a yes, at every place a yes or no is decided (the
+  agent's install, the claim, the mark, the remembered answer, the kernel, the
+  agent's answer and its decoding), and every no on A is the same reply. The
+  replies to a ship that may not have a file are the same bytes whatever the
+  reason; how long they take is not made equal.
+- HARD on B: every byte and the length given to the device are fixed by the
+  id. A lying, broken or replaced A can cause an error or a short answer.
+
+Bounds, with their working:
+
+- On A, file places: a request for a part of a file is at most 1,024 bytes,
+  encoded (an agent's name and a 32-byte id need far less); a larger one is
+  refused at once, the same whatever it names, before it is decoded, so no
+  decoded request is ever made for it; its raw bytes are read into a buffer
+  that its room for reading covers until the buffer is dropped, before the
+  refusal is written (see Wire messages for the order of the checks). Otherwise it takes one of its connection's 4 places and one
+  of the runtime's 8 before anything is looked up, or is turned away ("too
+  busy; try again"). Refused or turned away, it holds no place, gives back the
+  room it was read into before it replies, and has what is left of
+  `request_timeout` to deliver the refusal. A part sent (a yes)
+  holds both places until its blocking job has returned and its stream is done
+  with (the reply wholly taken, or the stream reset at `file_timeout`),
+  whichever is later; a no or any other refusal gives back both places and its
+  room for reading as soon as it is decided and its job has returned, before
+  it is written, and is sent within `request_timeout`. A request given up on
+  (out of time, or the asking ship stopping the stream or losing its
+  connection) is marked so at once: its own share of the places and its room
+  go, and its blocking job, still holding its share, stops before its next
+  batch of hashes or before reading the chunk; the check is made again inside
+  each hold of the ship's slot, before its decision and before each batch of
+  hashes is read, so a job that was waiting for the slot when its request was
+  given up on reads nothing. The job is given only values of this runtime's
+  own size: the agent's name once it passes the runtime's check, copied to
+  exactly its length (at most 64 bytes), the id as 32 bytes, and the number of
+  the part; the decoded request is dropped before the job is scheduled, and a
+  name or an id that does not pass is the same no, made without a job.
+  Whenever a request's room goes back before its reply is written, what the
+  asking ship sized of it goes first (the bytes it sent, and the decoded
+  request if there is one): it then holds only its own small reply, and its
+  job, if one still runs, those values of its own. So at every instant at most 4 of
+  a connection's 8 streams and at most 8 requests in the runtime are file
+  parts in hand.
+- On A, what those hold: a `work` place for the whole blocking job (waiting
+  for the slot, the decision with any question, reading and hashing hashes,
+  reading and checking a chunk), so at most 8 of the network's 16; a place
+  among the about 60 for requests being read (64 MiB over 1 MiB + 64 KiB) for
+  as long as the request is being decided, and for a part sent until its
+  stream is done with. Bare refusals, of any kind of request, and a file's no
+  give their room back before they are written, so a ship that never takes
+  those holds no room for them; a reply of an earlier kind that carries a
+  body (a log fetch's `denied` among them) keeps its room until it is taken or
+  timed out, as before. At most 8 rooms are held by file parts being sent. (Waiting for their
+  decision, file requests hold at most 8 more.) Memory: one chunk or one list of 32,768 hashes (1 MiB) per part
+  in hand, and its encoded reply, about 2 MiB each, 16 MiB at most. The
+  remembered answers: 4,096 entries of about 250 bytes, about 1 MiB.
+- Slot time on A, measured in a test on a Mac laptop in an unoptimised build
+  with the default kernel and the counter agent, for one caller: about 0.15 ms
+  to decide for an open file or a file that is not there, 0.07 ms from a
+  remembered answer, 0.5 ms with a fresh question to the counter agent. A ship
+  holding no reference never reaches an agent: each request costs the kernel's
+  decision and one lookup, at most 4 at a time on its connection. Questions to
+  agents, from however many callers, take at most a quarter of any stretch of
+  the ship's time plus one question, by the rest above; a single question at
+  most `file_ask_millis` (500 ms) with the kernel's decision, and a little
+  more, as the cut-off is noticed (above). These were not measured on other machines or
+  in a release build.
+- On B, threads: each of the three routes waits on A holding a worker, so each
+  takes a place among the downloads, as a local file's contents do, and of
+  those places requests to other ships may hold at most half, and at least one.
+  Long polls, downloads and waits on other ships together therefore never take
+  the threads kept for everything else. With 16 workers (the default): 8 may
+  wait for logs, 4 download or wait on other ships (2 of them at most waiting
+  on other ships), 4 are always left; with 4: 2, 1 (which may be a wait on
+  another ship), 1; with 2: 1, none (every remote route answers 503), 1. Past a
+  limit: 503 with `Retry-After: 1`.
+- On B, memory per request: one list of index hashes, one group of chunk
+  hashes and one chunk (1 MiB each) and one reply being read and decoded
+  (about 2 MiB): about 5 MiB, 10 MiB with the defaults. Each wait on A is
+  within `file_timeout` (and 2 s more on the waiting thread), each write to
+  the device within `io_timeout`. There is no deadline for a whole download, as
+  for a local one.
 
 ## Networking
 
@@ -2109,6 +2374,30 @@ matching answer, or only `refused` with a reason.
 | `News { logs }` | `Heard { unknown }` | The publisher says these logs grew (or are closed to you). The follower says which it no longer follows |
 | `Resync { standing }` | `Resynced { standing }` | Two ships say where each stands, to get back in step after a restore |
 | `Hello { ship, proof }` | `Welcome { proof }` | First on every connection: which ship is calling. Each side sends its moon proof if it is a moon |
+| `file_about: FileWanted { agent, id }` | `file_about: FileFacts { denied, length, media_type }` | What a file is |
+| `file_leaves: FileWanted { agent, id, index }` | `file_leaves: FileHashes { denied, hashes }` | The chunk hashes of group `index` (chunks `index * 32768` on), 32 bytes each, one after another |
+| `file_upper: FileWanted { agent, id }` | `file_upper: FileHashes { denied, hashes }` | The index hash of every group, for a file of more than 32,768 chunks |
+| `file_chunk: FileWanted { agent, id, index }` | `file_chunk: FileBytes { denied, data }` | Chunk `index`, whole |
+
+A refusal of a file is `denied` alone, the same words whatever the reason. An
+older runtime answers the four file kinds with `refused`, as any kind it does
+not know.
+
+A request holds one body, of one kind. For every request after the greeting
+(the first stream's `Hello`, which is read and bounded on its own, at most
+1,024 bytes), before anything is decoded, in this order: room to read it into (else "too busy; try again"); the whole request
+read within `max_message_bytes` (else "the request could not be read, or was too
+large"); the caller checked again (else the connection is closed); its body
+fields counted by walking the encoded fields, without decoding or keeping
+anything, and a request with more than one (two kinds, or one kind twice) is
+answered `refused: "one request at a time"`, whatever the kinds; and a request
+for a part of a file over 1,024 bytes is answered `refused` there and then.
+Only then are an earlier kind's repeated messages counted (at most 256 in a
+delivery, 256 logs in a piece of news) and the request decoded. Every bare
+`refused`, of any kind and for any reason, and every file's `denied`, is written
+only after the request's room for reading, and everything of it the asking
+ship sized, have been given back. An earlier kind's reply that carries a body (a
+log fetch's `denied` among them) is written with its room held, as before.
 
 To a lookup point, under `ship-where/1`, a `WhereRequest` holds one of these,
 and the `WhereReply` the matching answer, or only `refused` with a reason.
@@ -2248,6 +2537,7 @@ starting at `/`).
 | `GET /logs/<agent>/<log>/checkpoint` | device | `SignedCheckpoint`, or 404 |
 | `POST /agents/<agent>/command` | device | Runs the body as an owner command; the agent's reply as the body |
 | `/agents/<agent>/files/...` | device | The agent's files (see Files on the ship) |
+| `GET /files/from/<ship>/<agent>/<id>...` | device | A file on another ship (see Fetching a file from another ship) |
 
 - Codes. A one-time code is 128 random bits in hex, made by
   `new_signin_code` on the machine the ship runs on. The reusable access code
@@ -2327,6 +2617,8 @@ and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 | `max_files` | 100,000 | Files per ship |
 | `max_uploads` | 16 | Uploads open per ship |
 | `upload_keep_millis` | 86,400,000 (24 h) | An upload not sent to for this long is given up when the next one starts |
+| `file_ask_fuel` | 10,000,000 | Compute budget for asking an agent whether another ship may have a file |
+| `file_ask_millis` | 500 | Wall-clock cap on that question, the kernel's decision included |
 | `durability` | `Full` | `Full` or `Normal` (see Storage) |
 | `storage_key` | none | The key everything kept on disk for ships is encrypted under. If none, one is made and kept in the data directory (see Encryption at rest) |
 | `limits.max_key_bytes` | 1,024 | Largest `kv` key |
@@ -2340,6 +2632,7 @@ and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 | --- | --- | --- |
 | `addr` | `127.0.0.1:0` | UDP address to listen on; port 0 picks one |
 | `request_timeout` | 10 s | One request to another ship, connecting included |
+| `file_timeout` | 30 s | The same for a request for a part of a file, at both ends, in place of `request_timeout` |
 | `idle_timeout` | 30 s | A connection with no traffic is closed |
 | `max_connections` | 1,024 | Incoming connections at once |
 | `max_calls` | 1,024 | Other ships this runtime's ships may be connected to at once |
@@ -2383,7 +2676,8 @@ second and at a stroke; `sessions_each` 16, `sessions_from` 16,
 `Network::start` refuses settings that could wedge a ship: `max_ship_bytes`
 below 256 KiB, a `max_message_bytes` without room for the largest command or
 checkpoint plus 4 KiB, or without room for `max_unanswered` command numbers
-twice over, and any time limit that is zero or over a day.
+twice over, and any time limit that is zero or over a day. A `max_message_bytes` below
+1 MiB + 1 KiB is allowed, and then files are neither fetched nor served.
 
 ### `ReplicaConfig` (copy of Azimuth)
 
@@ -2417,7 +2711,7 @@ twice over, and any time limit that is zero or over a day.
 | `max_wait` | 30 s | Longest long poll |
 | `max_body_bytes` | 1 MiB | Largest request body. A `PUT` of a file's chunk is always allowed exactly 1 MiB, never more |
 | `io_timeout` | 10 s | Time to send the whole request, and again to take the whole answer; for a file's contents, to take each chunk |
-| `max_downloads` | 4 | Files' contents being sent at once, apart from long polls; never more than half the workers less a quarter of them (at least one), so some are always left |
+| `max_downloads` | 4 | Files' contents being sent, and requests for files on other ships being answered, at once, apart from long polls; never more than half the workers less a quarter of them (at least one), so some are always left. Requests for other ships' files may hold at most half of these places (at least one), and with no places (two workers) are refused |
 
 ## Tests
 
@@ -2430,7 +2724,7 @@ twice over, and any time limit that is zero or over a day.
   inline in WebAssembly text and compiled with the `wat` crate. Each test uses
   its own temporary data directory, and most use `Durability::Normal` to skip
   per-commit syncs.
-- Unit tests in `net.rs`, `seal.rs`, `files.rs`, `server.rs`, `store.rs`, `moon.rs`,
+- Unit tests in `net.rs`, `seal.rs`, `files.rs`, `remote.rs`, `server.rs`, `store.rs`, `moon.rs`,
   `whereabouts.rs`, `lookup.rs`, and `azimuth.rs`. The Azimuth tests run against a stand-in JSON-RPC server on
   localhost that replays what Ethereum and the roller really answered for
   `~zod`, and answers like them for made-up ships. One more test asks the real
@@ -2629,7 +2923,9 @@ an import clearing what an earlier one left, and one import at a time per
 name; a copy without its stream never refused for its files, and one with it
 refused when they would not fit; downloads and long polls leaving a thread
 free with four workers, and contents refused with two; and finishing a 10 GiB
-upload from its hashes alone, timed with every commit synced.
+upload from its hashes alone, timed with every commit synced. It also has a
+claim's open mark carried by export and import, a mark that is not 0 or 1
+refused on import, and a ship file of schema 10 refused.
 
 `files.rs` also has unit tests that make the file store fail at chosen points,
 through checks compiled only into the crate's own tests: a chunk's commit
@@ -2655,6 +2951,73 @@ directory whose type cannot be read, kept, and a leftover whose type cannot be
 read, kept until the next look; an import that cannot tell whether its ship
 exists, stopped without clearing anything; and a relative data directory
 synced into the current one.
+
+`runtime/src/remote_tests.rs` covers fetching a file from another ship, with
+two real runtimes on localhost, the fetching one with its HTTP server. The
+ship answering can be made to lie through a door only the crate's own code can
+use: a reply put in place of the true one, held back, or cut off. Files of 0
+bytes, 1 byte, one chunk, one chunk and a byte, and several chunks, had whole,
+by range and by chunk, byte for byte, with every header; every no answering
+the same, on the wire and to the device, for a file closed and not let, no
+such file, no such agent, an agent that does not claim it, one with no
+handler, one whose handler fails, a kernel that does not know the question, an
+open claim by an agent that is not installed, a row that cannot be read, and a
+ship resting from asking, and on the wire alone an agent name that is not one,
+an id of the wrong length or none, and a ship whose runtime keeps no files,
+byte for byte on the wire for all four parts; a question that traps, runs out of fuel or of time, answers
+rubbish or more than 64 bytes, or tries to change something, each no, with
+nothing kept; let and then not let, refused once the remembered yes runs out,
+and open and then closed, refused on the next request; a claim taken back, a
+file put back, and a module replaced, none answered from an earlier answer; a
+file open under one agent and not under another; every lie (bytes, a chunk
+short or long, the length, a hash, too few or too many hashes, the wrong kind
+of reply, a refusal, media types) caught before the head where it can be, and
+ending the answer short where it cannot, with nothing the lying ship says (words
+of refusal full of markup and control characters) reaching the device; a ship
+too slow, or gone; four requests for files at once on one connection and eight
+in all, and on the ship fetching two of the four places for downloads with a
+file of its own still had; a ship that asks for whole chunks and never reads
+them holding at most four places on its connection and eight in all (counted
+every 50 ms from 0.5 s to 2 s after the first six requests, with one
+connection asking; then, after more requests, the rooms checked and commands
+and a log fetched, every 100 ms until 25 s on the same clock, with three: samples,
+not every instant), with no room held for those turned away, while commands and
+a log between the same ships go through; a request over 1,024 bytes refused
+before it is looked into, the same whatever it names, and requests of the
+largest size allowed, turned away with every place held, holding no room;
+a request given up on while its job waits for the ship's slot (before its
+decision, or before a batch of hashes) or between two batches reading
+nothing more; envelopes of two bodies (a delivery over its count then a
+file kind, the same padded past 1,024 bytes, two file kinds, one kind twice, a
+ping then a file kind) refused before they are decoded, the same whatever they
+name, and these and the earlier kinds' refusals left untaken holding no room; a
+name given twice (900 bytes, then a real one) served as the real name, and a
+bad name or id answered with the same no (that no job is made for it is read
+from the code, not shown by the test);
+refusals never taken, on three connections, holding no place and no room
+while a ping, commands and a log between other ships on the same runtime go
+through; the asking ship stopping the stream or closing the connection while
+a job waits, and the job reading neither the chunk nor hashes; a refusal for
+want of a place reset when `request_timeout` runs out, seen without reading
+it; a job that outlives its
+request holding its places until it returns, and not reading the chunk; long
+polls, slow downloads and waits on other ships leaving the kept threads free
+with 2, 4 and 16 workers, for what a file is and for a chunk; an install, the same module installed again without
+a grant, a module replaced and put back, and another agent installed, each
+forgetting the ship's remembered answers and no other ship's; a stranger's
+request that first wakes a ship setting off only the clearing owed at first
+wake; questions from many callers taking at most about a quarter of a ship's
+time;
+every name in the address checked, no device, no network, messages too small
+at either end; nothing written at either end by serving, by listing both
+runtimes' directories and counting the rows of both ships (both ships already
+awake, so no first-wake clearing is set off); commands and a log between
+the same two ships going through while files are pulled as fast as they are
+let; how long serving holds the ship; the remembered answers' bounds and
+times; and the kernel letting only another ship ask. `remote.rs` checks a file
+of 32,768 chunks and one more on made-up hashes, so nothing of 32 GiB is
+hashed, and lies about the level above. `router_tests.rs` fetches a small file
+over a relayed connection.
 
 `runtime/tests/lookup.rs` runs real runtimes on localhost with keys from a
 stand-in for Urbit ID and no address given by hand: ships finding each other
@@ -3012,14 +3375,43 @@ These are stated in the source.
   nothing prevents yet.
 - Data directories and exports from before encryption do not open. There is
   no migration. Nor do ship files and exports from before files on the ship
-  (schema 9 and earlier).
-- Files on the ship do not yet go between ships: no fetching a file from
-  another ship by reference, no cache, no "save a copy", no thumbnails. Agents
-  cannot read a file's bytes. Identical files are kept once per ship, not
-  across ships, and chunks are not shared between different files. The HTTP
-  server keeps no connection open between requests, so each chunk is its own
-  connection. An import that stops part way does not carry on where it left
-  off.
+  (schema 9 and earlier), nor from before a claim could be marked open
+  (schema 10).
+- Fetching a file from another ship keeps nothing on the ship that fetches:
+  no cache, no "save a copy", no thumbnails, and the hashes are fetched again
+  for every HTTP request. Only the owner's devices fetch: an agent cannot start
+  a fetch, and there is no public web link. A chunk is the smallest piece
+  asked for, a range is not resumed inside a chunk, and chunks are fetched one
+  at a time. Nobody is told who fetched what. The time it takes to say no is
+  not made the same for every reason. Closing a file under
+  `Durability::Normal` is as durable as any event, no more (as for
+  `log::unshare`). A file of more than 2^30 chunks is not served. Agents
+  cannot read a file's bytes.
+- Two ships that are allowed a file (any two ships, if they know of an open
+  file on some ship of this runtime) can hold all eight of a runtime's places
+  for file requests by reading their replies slowly, each for up to
+  `file_timeout`; other ships' file requests are then told to try again.
+  Commands and logs are not affected. There is no fairness between callers
+  beyond the 4 per connection and the 8 in all. A ship that reads nothing on
+  its own connection stops everything coming back to it on that connection,
+  its own commands' acknowledgements included. A bare refusal, of any kind of
+  request, and a file's no hold no room once decided (nor anything of the
+  request), so such replies left untaken shut out nobody else; an allowed part
+  whose asker stops taking it keeps its room and its places until
+  `file_timeout`, which is the limit stated just above. The replies of the kinds
+  that came before files that carry a body (a ping's answer, an acknowledgement
+  of commands, a log fetch's answer, its `denied` included) still hold their
+  room for reading until they are taken or `request_timeout` runs out, so a
+  ship that takes none of those can, with enough connections, use up the room
+  other ships' requests are read into, for that long. Bare refusals and file
+  requests do not add to that.
+- Under a flood of fresh questions (many callers, each with a reference), a
+  ship rests from asking for three times as long as each question took, and
+  an allowed ship may be told no meanwhile and must try again.
+- Identical files are kept once per ship, not across ships, and chunks are not
+  shared between different files. The HTTP server keeps no connection open
+  between requests, so each chunk is its own connection. An import that stops
+  part way does not carry on where it left off.
 - The files of an import are not under `max_import_millis`; they take as long
   as their bytes take to read, bounded by the lengths in the ship's file.
 - When a files stream is supplied with a copy, a runtime with a smaller
