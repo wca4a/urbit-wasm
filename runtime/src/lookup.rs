@@ -769,7 +769,7 @@ impl Table {
     fn weighs_against_held(&self, believed: &Believed, now: u64) -> Result<(), &'static str> {
         let known = self.known(believed.number, now);
         if known.issued.is_some_and(|seen| believed.issued <= seen) {
-            return Err("a record of the ship as new or newer is already held");
+            return Err(whereabouts::HELD_NEWER);
         }
         if let (Some((seen, seen_key)), Some((revision, key))) = (known.moon, believed.moon) {
             if revision < seen {
@@ -1037,6 +1037,12 @@ impl Point {
     #[cfg(test)]
     pub(crate) fn sessions(&self) -> Vec<(SessionId, u64, u64, SocketAddr, SocketAddr)> {
         lock(&self.table).sessions.list()
+    }
+
+    /// When the record held for a ship was made, if one is held. For tests.
+    #[cfg(test)]
+    pub(crate) fn held_issued(&self, ship: u64) -> Option<u64> {
+        lock(&self.table).held.get(&ship).map(|held| held.issued)
     }
 
     /// Count one session made for a caller against its allowance, if it has one left. Only so
@@ -1671,7 +1677,7 @@ impl Floors {
             return Err("the record is no longer good by this clock");
         }
         if self.floor(&believed.ship, now).is_some_and(|floor| believed.issued <= floor) {
-            return Err("a record of the ship as new or newer is already held");
+            return Err(whereabouts::HELD_NEWER);
         }
         if !self.held.contains_key(&believed.ship) && self.held.len() >= self.most {
             // Only what has run out makes way.
@@ -1777,7 +1783,21 @@ pub(crate) struct Finder {
     trouble: Mutex<Option<String>>,
     /// The clock records are weighed by: the machine's. Nothing but a test sets another.
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// For tests: what is done with each request to a point made once a connection is in hand.
+    #[cfg(test)]
+    pub(crate) stand_in: Mutex<Option<StandIn>>,
+    /// For tests: the deadline each round of asking a point (`exchange_from`) was given, kept
+    /// only while a stand-in is set.
+    #[cfg(test)]
+    pub(crate) rounds: Mutex<Vec<tokio::time::Instant>>,
 }
+
+/// For tests: given a request to a point, made (its record signed, if it carries one) and not
+/// yet sent, an answer to take in place of the point's, and then nothing is sent; or nothing,
+/// and it is sent as usual. It may wait first, for the test to make something happen between
+/// the signing and the sending.
+#[cfg(test)]
+pub(crate) type StandIn = Arc<dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<WhereReply>> + Send>> + Send + Sync>;
 
 impl Finder {
     pub(crate) fn new(
@@ -1840,6 +1860,10 @@ impl Finder {
             last_issued: AtomicU64::new(0),
             trouble: Mutex::default(),
             clock: Box::new(now_ms),
+            #[cfg(test)]
+            stand_in: Mutex::new(None),
+            #[cfg(test)]
+            rounds: Mutex::default(),
         })
     }
 
@@ -1986,6 +2010,15 @@ impl Finder {
             }
         };
         let request = make(&connection)?;
+        #[cfg(test)]
+        {
+            let stand_in = lock(&self.stand_in).clone();
+            if let Some(stand_in) = stand_in {
+                if let Some(reply) = stand_in(request.clone()).await {
+                    return Ok(reply);
+                }
+            }
+        }
         request_on(&connection, addr, &request).await
     }
 
@@ -2003,6 +2036,10 @@ impl Finder {
 
     /// The same, with the address of the point that answered.
     async fn exchange_from(&self, galaxy: u8, make: &(dyn Fn(&Connection) -> Result<Vec<u8>, String> + Send + Sync), deadline: tokio::time::Instant) -> Result<(WhereReply, SocketAddr), String> {
+        #[cfg(test)]
+        if lock(&self.stand_in).is_some() {
+            lock(&self.rounds).push(deadline);
+        }
         let mut why = format!("no lookup point is known for ~{}", galaxy_name(galaxy));
         for addr in self.points_for(galaxy, deadline).await? {
             match tokio::time::timeout(try_limit(deadline), self.over(addr, make)).await {
@@ -2013,6 +2050,26 @@ impl Finder {
             self.forget_point(addr);
         }
         Err(why)
+    }
+
+    /// The same, for a request that carries a record of one of this runtime's ships, signed by
+    /// `make` (to be introduced, or relayed). The ship's own announcer signs records from the
+    /// same clock and sends them on other streams, so one signed after `make`'s may reach the
+    /// point first, and the point then refuses the request for not being newer. On that refusal
+    /// alone, and only if `deadline` has not passed, the point is asked once more, the record
+    /// signed afresh (later than any this runtime has signed) with its presence on the connection
+    /// it then goes over, within the same `deadline`. Never more than two rounds of asking, each
+    /// one `exchange_from` as before (the point's addresses as then listed tried in turn until
+    /// one answers, the second round starting again at the first of them): one address, two
+    /// requests; a list of N addresses that does not change between the rounds, up to 2N, each
+    /// with its own record signed. The second round's answer, of any kind, is the answer.
+    async fn exchange_signed(&self, galaxy: u8, make: &(dyn Fn(&Connection) -> Result<Vec<u8>, String> + Send + Sync), deadline: tokio::time::Instant) -> Result<(WhereReply, SocketAddr), String> {
+        let first = self.exchange_from(galaxy, make, deadline).await;
+        let overtaken = matches!(&first, Ok((WhereReply { refused, body: None }, _)) if refused == whereabouts::HELD_NEWER);
+        if !overtaken || tokio::time::Instant::now() >= deadline {
+            return first;
+        }
+        self.exchange_from(galaxy, make, deadline).await
     }
 
     /// The clock records are weighed by, in milliseconds since 1970.
@@ -2403,6 +2460,17 @@ impl Finder {
         }
     }
 
+    /// Announce one ship of this runtime to the point for its galaxy now, as a round of
+    /// announcing does: a record signed now, over the connection ships are announced on. Why
+    /// the point did not keep it, if it did not. For tests.
+    #[cfg(test)]
+    pub(crate) async fn announce_now(self: &Arc<Self>, runtime: &Runtime, ship: &str) -> Result<Option<String>, String> {
+        let galaxy = whereabouts::galaxy_of(ob::any_number(ship).ok_or("not the name of a ship")?);
+        let deadline = tokio::time::Instant::now() + self.limit;
+        let connection = self.lane_connection(galaxy, deadline).await?;
+        self.announce_over(runtime, galaxy, &[ship.to_string()], &[], &connection, deadline).await
+    }
+
     /// Whether a call from `from` may be relayed: this runtime has the socket for it, and `from`
     /// has a record of its own to show (it is announced, and its point took its record).
     pub(crate) fn may_relay(&self, from: &str) -> bool {
@@ -2441,7 +2509,8 @@ impl Finder {
     /// now at the addresses it is announced at, with its presence on the connection the request
     /// goes over. The address of the point that answered (which is what carries the session)
     /// and the session's name; or why not, in words that say whether the point does not relay,
-    /// refused for a limit, or could not be asked.
+    /// refused for a limit, or could not be asked. Overtaken by `from`'s own announcement, it
+    /// asks once more (`exchange_signed`).
     pub(crate) async fn relay(&self, runtime: &Runtime, from: &str, to: &str, deadline: tokio::time::Instant) -> Result<(SocketAddr, SessionId), String> {
         let (Some(number), Some(callee)) = (ob::any_number(from), ob::any_number(to)) else { return Err("not the name of a ship".into()) };
         let no_record = "this ship announces no record of its own, so it cannot be relayed";
@@ -2458,7 +2527,7 @@ impl Finder {
             let presence = whereabouts::presence(number, issued, &binding, &key);
             Ok(WhereRequest { body: Some(where_request::Body::Relay(Relay { callee, record, presence })) }.encode_to_vec())
         };
-        match self.exchange_from(whereabouts::galaxy_of(callee), &make, deadline).await {
+        match self.exchange_signed(whereabouts::galaxy_of(callee), &make, deadline).await {
             Ok((WhereReply { body: Some(where_reply::Body::Relaying(Relaying { session })), .. }, point)) => {
                 let id = SessionId::try_from(session.as_slice()).map_err(|_| "its point answered with something that names no session".to_string())?;
                 Ok((point, id))
@@ -2472,7 +2541,8 @@ impl Finder {
 
     /// Ask the point for `to`'s galaxy to introduce `from` to it: `from`'s record, signed now at
     /// the addresses it is announced at, with its presence on the connection the request goes
-    /// over. Fails if `from` announces no record of its own, or the point refuses.
+    /// over. Fails if `from` announces no record of its own, or the point refuses. Overtaken by
+    /// `from`'s own announcement, it asks once more (`exchange_signed`).
     pub(crate) async fn introduce(&self, runtime: &Runtime, from: &str, to: &str, deadline: tokio::time::Instant) -> Result<(), String> {
         if !self.introducing.load(Ordering::SeqCst) {
             return Err("this runtime does not ask for introductions".into());
@@ -2492,7 +2562,7 @@ impl Finder {
             let presence = whereabouts::presence(number, issued, &binding, &key);
             Ok(WhereRequest { body: Some(where_request::Body::Introduce(Introduce { callee, record, presence })) }.encode_to_vec())
         };
-        match self.exchange_with(whereabouts::galaxy_of(callee), &make, deadline).await? {
+        match self.exchange_signed(whereabouts::galaxy_of(callee), &make, deadline).await?.0 {
             WhereReply { body: Some(where_reply::Body::Introduced(Introduced {})), .. } => Ok(()),
             WhereReply { refused, .. } => Err(format!("the lookup point did not introduce ~{from} to ~{to}: {}", refused.chars().take(200).collect::<String>())),
         }

@@ -85,6 +85,11 @@ pub const MOST_AHEAD_MS: u64 = 2 * 60 * 1000;
 /// is under three hundred bytes.
 pub const MOST_RECORD_BYTES: usize = 512;
 
+/// Why a record is refused for not being newer than one already held of its ship. A point
+/// says it in these words, and a ship that asked to be introduced or relayed tries once more
+/// on them alone; they are on the wire, so they do not change.
+pub const HELD_NEWER: &str = "a record of the ship as new or newer is already held";
+
 /// How one address is written in the fixed layout: what kind it is (four or six, or nothing
 /// for an empty slot), sixteen bytes of address (an IPv4 address in the first four, the rest
 /// zeros), and the port.
@@ -329,7 +334,7 @@ pub fn check(bytes: &[u8], key_of: &dyn Fn(&str) -> Option<[u8; 32]>, known: Kno
         return Err("the record has run out");
     }
     if known.issued.is_some_and(|seen| holds_off(seen, now) && record.issued <= seen) {
-        return Err("a record of the ship as new or newer is already held");
+        return Err(HELD_NEWER);
     }
     let signature = Signature::from_slice(&record.signature).map_err(|_| "the record is not signed")?;
     let is_moon = record.ship > u64::from(u32::MAX);

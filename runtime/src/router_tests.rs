@@ -11,7 +11,8 @@
 //!
 //! Phase 3's tests are here too: two ships behind strict routers reach each other through their
 //! point's relay; a relayed pair goes direct when it can; and the point's and the ships' rules
-//! for relayed packets, counted at the routers.
+//! for relayed packets, counted at the routers. Last, a request to be introduced or relayed that
+//! the ship's own announcement overtakes, made to happen every time by a stand-in.
 
 use std::collections::HashMap;
 use std::fs;
@@ -27,11 +28,13 @@ use std::time::{Duration, Instant};
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
+use ship_proto::{where_request, Introduce, Message, Relay, WhereReply, WhereRequest, Whereabouts};
 
 use crate::azimuth::{Keys, Listing};
-use crate::lookup::{Lookup, PointBounds, PointConfig};
+use crate::lookup::{Lookup, PointBounds, PointConfig, StandIn};
 use crate::net::{Directory, MakeSocket, NetConfig, Network, MOST_DIRECT_TRIES};
-use crate::relay::RelayBounds;
+use crate::relay::{RelayBounds, NO_RELAY};
+use crate::whereabouts::HELD_NEWER;
 use crate::{lock, Config, Durability, Manifest, Provide, Runtime, Use};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1329,4 +1332,221 @@ fn a_file_is_fetched_over_a_relayed_connection() {
     assert!(raw.starts_with(b"HTTP/1.1 200 "), "{}", String::from_utf8_lossy(&raw[..split]));
     assert!(raw[split + 4..] == data[..], "the contents differ");
     assert_eq!(relayed(&pair.zod_net, "~zod", "~nec"), Some(true));
+}
+
+// A request to be introduced or relayed, overtaken by the ship's own announcement.
+
+struct QuietPair {
+    _dirs: Vec<TempDir>,
+    point: Network,
+    zod: Arc<Runtime>,
+    zod_net: Network,
+    _nec: Arc<Runtime>,
+    _nec_net: Network,
+    _point_rt: Arc<Runtime>,
+}
+
+/// A point that relays, and ~zod and ~nec at public addresses, each announced once, at start,
+/// and not again for five minutes (the longest `announce_every` may be, far longer than these
+/// tests) unless the test does it; ~nec's record asks callers to be introduced. So no
+/// announcement can overtake a request but the one a test makes.
+fn quiet_pair(label: &str) -> QuietPair {
+    let dirs: Vec<TempDir> = (0..3).map(|n| TempDir::new(&format!("{label}-{n}"))).collect();
+    let urbit = Arc::new(Listings::default());
+    let (point_rt, point) = point_relaying(&dirs[0], &urbit, Some(RelayBounds::default()));
+    let quiet = |behind_router: bool| {
+        let mut cfg = settings(Some(point.addr()));
+        cfg.lookup.announce_every = Duration::from_secs(300);
+        cfg.lookup.behind_router = behind_router;
+        cfg
+    };
+    let (zod, zod_net) = crew_with(&dirs[1], "~zod", &urbit, quiet(false), None);
+    let (nec, nec_net) = crew_with(&dirs[2], "~nec", &urbit, quiet(true), None);
+    eventually("both are announced", || point.point_status().unwrap().attending == 2 && zod_net.announced_as("~zod").is_some() && nec_net.announced_as("~nec").is_some_and(|(_, introduce)| introduce));
+    QuietPair { _dirs: dirs, point, zod, zod_net, _nec: nec, _nec_net: nec_net, _point_rt: point_rt }
+}
+
+/// Which request to a point these bytes are, to be introduced or relayed, and when the record in
+/// it was made; `None` for any other.
+fn signed_request(request: &[u8]) -> Option<(&'static str, u64)> {
+    let (kind, record) = match WhereRequest::decode(request).ok()?.body? {
+        where_request::Body::Introduce(Introduce { record, .. }) => ("introduce", record),
+        where_request::Body::Relay(Relay { record, .. }) => ("relay", record),
+        _ => return None,
+    };
+    Some((kind, Whereabouts::decode(&*record).ok()?.issued))
+}
+
+/// What a stand-in saw of the requests of one kind ~zod made: when each one's record was made,
+/// what came of the announcement made after the first was signed and before it was sent, and
+/// when the record the point then held of ~zod was made.
+#[derive(Default)]
+struct Overtaking {
+    issued: Mutex<Vec<u64>>,
+    announced: Mutex<Option<Result<Option<String>, String>>>,
+    overtook: Mutex<Option<u64>>,
+}
+
+/// Between signing ~zod's first request of `kind` and sending it, ~zod's own announcer signs a
+/// newer record and the point keeps it: the overtaking, made to happen every time. Every request
+/// is then sent to the point as it is.
+fn overtake_first(pair: &QuietPair, kind: &'static str) -> Arc<Overtaking> {
+    let finder = pair.zod_net.shared.finder.clone().unwrap();
+    let seen = Arc::new(Overtaking::default());
+    let (weak, zod, point, kept) = (Arc::downgrade(&finder), pair.zod.clone(), pair.point.shared.point.clone().unwrap(), seen.clone());
+    let stand_in: StandIn = Arc::new(move |request| {
+        let (weak, zod, point, seen) = (weak.clone(), zod.clone(), point.clone(), kept.clone());
+        Box::pin(async move {
+            let (_, issued) = signed_request(&request).filter(|(asked, _)| *asked == kind)?;
+            let first = {
+                let mut all = lock(&seen.issued);
+                all.push(issued);
+                all.len() == 1
+            };
+            if let (true, Some(finder)) = (first, weak.upgrade()) {
+                let announced = finder.announce_now(&zod, "zod").await;
+                *lock(&seen.announced) = Some(announced);
+                *lock(&seen.overtook) = point.held_issued(0);
+            }
+            None
+        })
+    });
+    *lock(&finder.stand_in) = Some(stand_in);
+    seen
+}
+
+/// After an overtaken call: two requests, the first's record made before the announcement that
+/// overtook it, which the point kept, and the second's after it; and the point still holds that
+/// announcement (a request's record is never kept).
+fn overtaken_twice(pair: &QuietPair, seen: &Overtaking) {
+    assert_eq!(lock(&seen.announced).clone(), Some(Ok(None)), "the overtaking announcement was not kept");
+    let issued = lock(&seen.issued).clone();
+    let overtook = lock(&seen.overtook).expect("the point holds a record of ~zod");
+    assert_eq!(issued.len(), 2, "{issued:?}");
+    assert!(issued[0] < overtook && overtook < issued[1], "requests {issued:?}, announcement {overtook}");
+    assert_eq!(pair.point.shared.point.as_ref().unwrap().held_issued(0), Some(overtook));
+}
+
+/// Put a stand-in point before ~zod's: each request to be introduced or relayed is counted and
+/// refused in these words, and nothing is sent.
+fn refusing(net: &Network, words: &str) -> Arc<AtomicUsize> {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let (counted, words) = (asked.clone(), words.to_string());
+    let stand_in: StandIn = Arc::new(move |request| {
+        let answer = signed_request(&request).map(|_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            WhereReply { body: None, refused: words.clone() }
+        });
+        Box::pin(async move { answer })
+    });
+    *lock(&net.shared.finder.as_ref().unwrap().stand_in) = Some(stand_in);
+    asked
+}
+
+/// ~zod asks the point to relay it to ~nec, and to introduce it, each by `deadline`.
+fn relay_and_introduce(pair: &QuietPair, deadline: impl Fn() -> tokio::time::Instant) -> (Result<(SocketAddr, crate::relay::SessionId), String>, Result<(), String>) {
+    let finder = pair.zod_net.shared.finder.clone().unwrap();
+    let relayed = pair.zod_net.threads.get().block_on(finder.relay(&pair.zod, "zod", "nec", deadline()));
+    let introduced = pair.zod_net.threads.get().block_on(finder.introduce(&pair.zod, "zod", "nec", deadline()));
+    (relayed, introduced)
+}
+
+fn eight_seconds() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(8)
+}
+
+#[test]
+fn a_request_to_relay_overtaken_by_the_ships_own_announcement_is_made_once_more_and_relayed() {
+    let pair = quiet_pair("overtaken-relay");
+    let seen = overtake_first(&pair, "relay");
+    let before = pair.point.point_status().unwrap();
+    let finder = pair.zod_net.shared.finder.clone().unwrap();
+    let relayed = pair.zod_net.threads.get().block_on(finder.relay(&pair.zod, "zod", "nec", eight_seconds()));
+    assert!(relayed.is_ok(), "{relayed:?}");
+    let after = pair.point.point_status().unwrap();
+    assert_eq!((after.relay_asked - before.relay_asked, after.relays_made - before.relays_made), (2, 1), "{after:?}");
+    overtaken_twice(&pair, &seen);
+}
+
+#[test]
+fn a_request_to_be_introduced_overtaken_by_the_ships_own_announcement_is_made_once_more_and_passed_on() {
+    let pair = quiet_pair("overtaken-introduce");
+    let seen = overtake_first(&pair, "introduce");
+    let before = pair.point.point_status().unwrap();
+    let finder = pair.zod_net.shared.finder.clone().unwrap();
+    let introduced = pair.zod_net.threads.get().block_on(finder.introduce(&pair.zod, "zod", "nec", eight_seconds()));
+    assert_eq!(introduced, Ok(()));
+    // The point weighed three records: the announcement and the two requests' (each request's
+    // record is counted against the record rates as it arrives); it passed one on.
+    let after = pair.point.point_status().unwrap();
+    assert_eq!((after.announced - before.announced, after.introduced - before.introduced), (3, 1), "{after:?}");
+    overtaken_twice(&pair, &seen);
+}
+
+#[test]
+fn a_point_that_always_says_a_newer_record_is_held_gets_two_requests_and_the_call_fails_as_before() {
+    let pair = quiet_pair("twice");
+    let asked = refusing(&pair.zod_net, HELD_NEWER);
+    let (relayed, introduced) = relay_and_introduce(&pair, eight_seconds);
+    assert_eq!(relayed, Err(format!("its point refused to relay: {HELD_NEWER}")));
+    assert_eq!(introduced, Err(format!("the lookup point did not introduce ~zod to ~nec: {HELD_NEWER}")));
+    assert_eq!(asked.load(Ordering::SeqCst), 4, "two requests for each call, not three");
+}
+
+#[test]
+fn any_other_refusal_is_answered_after_one_request_in_the_same_words_as_before() {
+    let pair = quiet_pair("other");
+    let near = format!("{HELD_NEWER} (and more)");
+    let others = [NO_RELAY, "too many sessions made for that ship just now; try again later", "the record is not signed by the ship's key", near.as_str()];
+    for words in others {
+        let asked = refusing(&pair.zod_net, words);
+        let (relayed, introduced) = relay_and_introduce(&pair, eight_seconds);
+        let relay_words = if words == NO_RELAY { "its point does not relay".to_string() } else { format!("its point refused to relay: {words}") };
+        assert_eq!(relayed, Err(relay_words));
+        assert_eq!(introduced, Err(format!("the lookup point did not introduce ~zod to ~nec: {words}")));
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "one request for each call: {words}");
+    }
+}
+
+#[test]
+fn a_request_overtaken_is_made_again_only_within_its_deadline() {
+    let pair = quiet_pair("deadline");
+    // A first call opens the connection to the point, so that the next is made at once.
+    let asked = refusing(&pair.zod_net, NO_RELAY);
+    let _ = relay_and_introduce(&pair, eight_seconds);
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    // With the deadline already passed, the one request made is answered at once, and refused as
+    // overtaken: the first refusal is the answer, and nothing more is sent. (This relies on the
+    // connection the first call opened being still open, so that the request is made at once.)
+    let asked = refusing(&pair.zod_net, HELD_NEWER);
+    let (relayed, introduced) = relay_and_introduce(&pair, tokio::time::Instant::now);
+    assert_eq!(relayed, Err(format!("its point refused to relay: {HELD_NEWER}")));
+    assert_eq!(introduced, Err(format!("the lookup point did not introduce ~zod to ~nec: {HELD_NEWER}")));
+    assert_eq!(asked.load(Ordering::SeqCst), 2, "one request for each call");
+    // With time left, the first request refused as overtaken and the second never answered: both
+    // rounds of asking are given exactly the caller's deadline, nothing later.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = asked.clone();
+    let stand_in: StandIn = Arc::new(move |request| {
+        let first = signed_request(&request).is_some() && counted.fetch_add(1, Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            match first {
+                true => Some(WhereReply { body: None, refused: HELD_NEWER.to_string() }),
+                false => std::future::pending().await,
+            }
+        })
+    });
+    let finder = pair.zod_net.shared.finder.clone().unwrap();
+    *lock(&finder.stand_in) = Some(stand_in);
+    lock(&finder.rounds).clear();
+    // A generous deadline, so that the test does not turn on reaching the second round within a
+    // couple of seconds; normally the second request, never answered, is given up after about
+    // three seconds (the most one try at an address is given).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // Only a watchdog: what is judged is the deadlines the rounds were given, not the clock.
+    let relayed = pair.zod_net.threads.get().block_on(async { tokio::time::timeout(Duration::from_secs(30), finder.relay(&pair.zod, "zod", "nec", deadline)).await });
+    let relayed = relayed.expect("the call did not end at all");
+    assert!(relayed.as_ref().is_err_and(|why| why.ends_with("did not answer in time")), "{relayed:?}");
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    assert_eq!(*lock(&finder.rounds), vec![deadline, deadline], "each round of asking given exactly the caller's deadline");
 }

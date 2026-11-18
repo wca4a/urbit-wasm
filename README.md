@@ -2476,7 +2476,35 @@ lists for it, the same key the ship must prove when it is called.
      a connection that is open, the point passes the caller's record to it
      over that connection, on a stream of its own, and answers "passed on"
      without waiting for the ship. It never sends anything to an address out
-     of a record.
+     of a record. The caller's own announcer signs records from the same
+     clock and sends them over another connection, so one signed a moment
+     after the request's may reach the point first, and the point then
+     refuses the request: it already holds a record of the caller as new or
+     newer. On that refusal alone, in those words, and only if the call's time
+     has not run out, the point is asked once more, the record signed afresh
+     (later than any this runtime has signed) with its presence on the
+     connection it then goes over, within the same wait for the point's
+     answer, and with no pause first. Never more than two rounds of asking,
+     each as one question to a point has always gone: its addresses tried in
+     turn until one answers. With one address, the usual case, that is two
+     requests, and a point that always answers so gets two; with a list of N
+     addresses that does not change between the rounds it can be up to 2N
+     requests, each with a record of its own signed, all within that same
+     wait (the list is read again for each round, so in general as many as
+     the two lists hold together). The second round starts again at the first
+     address of the list as it then is, so one that failed in the first round
+     may spend part of the wait before the one that refused is reached again.
+     Whatever the second round brings is the answer. Each request faces the
+     same allowances at the point as any does, in the same order (a question,
+     a record against the record rates, one of its allowance of introductions
+     or of sessions made, each charged only if the one before let it by); the
+     caller's own allowance is charged for the first only if it was refused
+     after its presence was checked, because the record the point held
+     changed meanwhile. Any of these still empty when the second request
+     reaches it (the caller's last token, a point that is busy, or limits set
+     as low as one; they fill again with time) can have the second refused
+     for that limit. An announcement that overtakes the second request too
+     leaves the call where a refusal leaves it.
   3. The ship checks the caller's record itself, as it would any record: keys
      from its own directory, fresh by its own clock. If it believes it, it
      sends three packets of four bytes from its own port to each address in
@@ -2578,8 +2606,10 @@ lists for it, the same key the ship must prove when it is called.
   2. If nothing answered, the directory is read again (an address set by hand
      wins, as before every question), and the caller asks the ship's point to
      relay (`Relay`): the ship's name, its own record signed just then, and its
-     presence on that connection, exactly as for an introduction. It waits at
-     most a second, and at most a quarter of the time left.
+     presence on that connection, exactly as for an introduction, and asked
+     once more on the same refusal, in at most two rounds, as an introduction
+     is. It waits at most a second, and at most a quarter of the time left,
+     for both rounds together.
   3. The point refuses, saying so, if it does not relay. Otherwise it checks
      the record and presence as it checks an introduction (the same admission,
      threads and rates, keeping nothing), and with its table held makes a
@@ -3626,7 +3656,15 @@ address whose session is gone reaching no router; a point's rules counted at
 the routers (from a pinned address carried, from a stranger or naming no
 session not, and nothing after the ship called's connection closes); and
 ordinary lookups and calls completing while relayed packets and requests to
-relay flood a point and a ship. Unit tests in `relay.rs` cover the first byte
+relay flood a point and a ship. With a point at one address, a request to be
+introduced or relayed that the caller's own announcement overtakes (a stand-in
+between the signing and the sending has the announcer's newer record kept
+first, every time) is made once more and goes through, after exactly two
+requests, the second's record later than the announcement; a point that always
+says a newer record is held gets two requests, and any other refusal one, the
+words out the same as before; and with the deadline passed, none is made again,
+while with time left and the second never answered, both rounds are given
+exactly the caller's deadline. Unit tests in `relay.rs` cover the first byte
 against QUIC's and the punch's, segmented sends split each with its header,
 received batches split and rebuilt, a relayed datagram reaching QUIC only for
 a session here from its point (and nothing sent in answer, nor for a session
