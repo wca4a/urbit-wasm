@@ -4,6 +4,7 @@
 
 pub mod files;
 mod host;
+mod kept;
 pub mod net;
 mod remote;
 pub mod relay;
@@ -154,6 +155,21 @@ pub struct Config {
     /// An upload nothing has been sent to for this long is given up, and its reservation
     /// returned, when the next upload on the ship starts.
     pub upload_keep_millis: u64,
+    /// The most the pieces of files fetched from other ships that a ship keeps for its owner may
+    /// take, counting what was thrown away from them and is still on disk: the operator's
+    /// setting. When it is full the least recently opened are thrown away to make room. 0
+    /// keeps nothing, and opening another ship's file is then as it was before files were kept.
+    /// A file being saved counts against `max_file_bytes` instead.
+    pub max_cache_bytes: u64,
+    /// A kept file not opened for this long is thrown away, when the next upload, keeping or
+    /// save on the ship starts.
+    pub cache_keep_millis: u64,
+    /// How many files fetched from other ships a ship may keep at once, in the cache and being
+    /// saved together.
+    pub max_kept: usize,
+    /// How long one call to save a copy goes on fetching missing pieces before it answers, so
+    /// that the device can call again. One fetch already begun is let finish.
+    pub save_slice_millis: u64,
     /// Compute budget for asking an agent whether another ship may have one of its files
     /// (`KIND_FILE_ASK`), apart from the event budget: the question is asked while the ship
     /// is held, on behalf of a ship that may be a stranger.
@@ -210,6 +226,10 @@ impl Default for Config {
             max_files: 100_000,
             max_uploads: 16,
             upload_keep_millis: 24 * 60 * 60 * 1000,
+            max_cache_bytes: 3 << 30,
+            cache_keep_millis: 30 * 24 * 60 * 60 * 1000,
+            max_kept: 1024,
+            save_slice_millis: 10_000,
             file_ask_fuel: 10_000_000,
             file_ask_millis: 500,
             durability: Durability::Full,
@@ -434,6 +454,12 @@ pub(crate) struct Inner {
     /// Per ship, until when it asks no agent about a file (see `files::resting`). In memory
     /// only; one entry per ship of this runtime at most. Taken under a ship's slot.
     pub(crate) ask_rest: Mutex<HashMap<String, Instant>>,
+    /// One record per kept file's directory this runtime has kept into: whether it was looked
+    /// through, its strays, its copies on their way, and whether it is retired (`kept::KeptDirs`).
+    /// In memory only. Taken under a ship's slot or alone; nothing else is locked while it is held.
+    pub(crate) kept_dirs: Mutex<kept::KeptDirs>,
+    /// Pieces being kept after their answer was sent, at most `kept::MOST_KEEPING_AFTER`.
+    pub(crate) keeping_after: std::sync::atomic::AtomicUsize,
     /// For tests: how long serving a file waits once it is allowed, before reading; how many
     /// reads (a chunk, or a batch of hashes) it has gone to make; and each question asked of
     /// an agent, when it ended and how long it took.
@@ -1076,6 +1102,8 @@ impl Runtime {
                 file_answers: Mutex::new(files::Answers::default()),
                 file_hook: std::sync::RwLock::new(None),
                 ask_rest: Mutex::new(HashMap::new()),
+                kept_dirs: Mutex::new(kept::KeptDirs::default()),
+                keeping_after: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 serve_delay: Mutex::new(None),
                 #[cfg(test)]

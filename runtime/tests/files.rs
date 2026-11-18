@@ -1451,3 +1451,13 @@ fn a_ship_file_from_before_open_marks_does_not_open() {
     let rt = Runtime::open(&dir.0, fast()).unwrap();
     assert!(matches!(rt.deliver("~zod", "counter", b"get hits"), Err(Error::BadShipFile(why)) if why.contains("schema")));
 }
+
+/// Nor one from before a ship kept files fetched from other ships (schema 11).
+#[test]
+fn a_ship_file_from_before_kept_files_does_not_open() {
+    let dir = TempDir::new("schema-11");
+    drop(boot(&dir, fast()));
+    live(&dir, "zod").execute("UPDATE meta SET value = 11 WHERE key = 'schema'", []).unwrap();
+    let rt = Runtime::open(&dir.0, fast()).unwrap();
+    assert!(matches!(rt.deliver("~zod", "counter", b"get hits"), Err(Error::BadShipFile(why)) if why.contains("schema")));
+}

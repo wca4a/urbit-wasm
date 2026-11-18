@@ -23,12 +23,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ship_proto::{
-    ChunkRun, Device, DeviceList, EntryList, FileList, FinishRequest, LogHead, Message, SignInReply, SignInRequest, Trimmed, UploadReply,
-    UploadRequest,
+    ChunkRun, Device, DeviceList, EntryList, FileList, FinishRequest, KeptList, LogHead, Message, SaveList, SaveReply, SaveRequest, SignInReply,
+    SignInRequest, Trimmed, UploadReply, UploadRequest,
 };
 
 use crate::files::{self, FileError, CHUNK};
-use crate::remote::{Ask, Failed, Remote};
+use crate::kept::{Opened, SaveFailed};
+use crate::remote::Failed;
 use crate::{canonical_ship, check_agent_name, lock, Error, Position, Rejection, Runtime};
 
 #[derive(Clone, Debug)]
@@ -326,11 +327,18 @@ impl Reply {
     }
 }
 
-/// What goes back: an answer held whole, or a file's contents, sent a chunk at a time.
+/// What goes back: an answer held whole, or a file's contents, sent a chunk at a time; or an
+/// answer held whole and then something to do with its body once the device has it (a piece of
+/// another ship's file, kept after its answer).
 enum Answer<'a> {
     Whole(Reply),
     Stream(Download<'a>),
+    Then(Reply, After<'a>),
 }
+
+/// What to do with an answer's body once the answer has been sent, or failed to be, and the
+/// connection is closed.
+type After<'a> = Box<dyn FnOnce(Vec<u8>) + 'a>;
 
 /// A file's contents on their way to a client: bytes `start` to `end` (not including `end`).
 struct Download<'a> {
@@ -338,17 +346,19 @@ struct Download<'a> {
     from: From<'a>,
     start: u64,
     end: u64,
-    /// Its place among the downloads, given up however the download ends.
-    _place: Waiting<'a>,
+    /// Its place among the downloads, given up however the download ends (before keeping the
+    /// last piece of another ship's file).
+    place: Option<Waiting<'a>>,
 }
 
 /// Where a file being sent comes from.
 enum From<'a> {
     /// This ship: the file as its row was when the download began.
     Here { ship: String, agent: String, id: [u8; 32], file: crate::store::StoredFile },
-    /// Another ship, with its length checked against the file's id, and the download's place
-    /// among the requests for other ships' files.
-    Elsewhere { remote: Remote<Ask<'a>>, _fetching: Waiting<'a> },
+    /// Another ship, with its length checked against the file's id, and its pieces read from
+    /// what this ship keeps of it, where it does. Its place among other ships' share of the
+    /// downloads is taken by its gate, at its first question to the other ship, if it asks one.
+    Elsewhere { opened: Opened<'a> },
 }
 
 /// Handle one connection: read one request, answer it, close.
@@ -364,15 +374,16 @@ fn serve(shared: &Shared, mut stream: TcpStream) {
         Ok(mut request) => (Some(respond(shared, &mut request)), false),
         Err(reply) => (reply.map(Answer::Whole), true),
     };
-    let reply = match answer {
-        Some(Answer::Whole(reply)) => Some(reply),
+    let (reply, after) = match answer {
+        Some(Answer::Whole(reply)) => (Some(reply), None),
+        Some(Answer::Then(reply, after)) => (Some(reply), Some(after)),
         Some(Answer::Stream(download)) => {
             send_file(shared, &mut stream, download);
-            None
+            (None, None)
         }
-        None => None,
+        None => (None, None),
     };
-    if let Some(reply) = reply {
+    if let Some(mut reply) = reply {
         // The client gets as long again to take the whole answer as it had to send the request.
         let sent = write_by(&mut stream, &reply.encode(head_only), Instant::now() + shared.cfg.io_timeout);
         // A request refused part way may still be arriving. Closing on top of it can make the
@@ -381,6 +392,12 @@ fn serve(shared: &Shared, mut stream: TcpStream) {
         if refused && sent.is_ok() && stream.shutdown(Shutdown::Write).is_ok() {
             let (until, mut scrap) = (Instant::now() + Duration::from_millis(500), [0u8; 16 << 10]);
             while read_some(&mut stream, &mut scrap, until).is_some() {}
+        }
+        // The device has its answer, or will not: the connection is closed first, and then the
+        // body goes to whatever was to be done with it after.
+        if let Some(after) = after {
+            let _ = stream.shutdown(Shutdown::Both);
+            after(std::mem::take(&mut reply.body));
         }
     }
     let _ = stream.shutdown(Shutdown::Both);
@@ -662,6 +679,7 @@ fn failure(error: Error) -> Reply {
                 FileError::Incomplete => 409,
                 FileError::WrongId => 422,
                 FileError::Damaged => 500,
+                FileError::Unsettled => 503,
             };
             Reply::text(status, &why.to_string())
         }
@@ -682,15 +700,16 @@ fn failure(error: Error) -> Reply {
 fn respond<'a>(shared: &'a Shared, request: &mut Request) -> Answer<'a> {
     // A file's contents are the one answer sent a chunk at a time. That route is found, and
     // the request signed in, by the same code as every other.
-    let mut streamed = None;
-    let reply = respond_whole(shared, request, &mut streamed);
-    match streamed {
-        Some(download) => Answer::Stream(download),
-        None => Answer::Whole(reply),
+    let (mut streamed, mut after) = (None, None);
+    let reply = respond_whole(shared, request, &mut streamed, &mut after);
+    match (streamed, after) {
+        (Some(download), _) => Answer::Stream(download),
+        (None, Some(after)) => Answer::Then(reply, after),
+        (None, None) => Answer::Whole(reply),
     }
 }
 
-fn respond_whole<'a>(shared: &'a Shared, request: &mut Request, streamed: &mut Option<Download<'a>>) -> Reply {
+fn respond_whole<'a>(shared: &'a Shared, request: &mut Request, streamed: &mut Option<Download<'a>>, after: &mut Option<After<'a>>) -> Reply {
     let (path, query) = request.url.split_once('?').unwrap_or((&request.url, ""));
     let Some((ship, root, rest)) = locate(&shared.cfg, request.header("Host"), path) else {
         return Reply::text(404, "not found");
@@ -789,8 +808,38 @@ fn respond_whole<'a>(shared: &'a Shared, request: &mut Request, streamed: &mut O
                     Reply::text(200, "")
                 }
                 Ok(Answer::Whole(reply)) => reply.with("Content-Security-Policy", FILE_POLICY),
+                Ok(Answer::Then(reply, then)) => {
+                    *after = Some(then);
+                    reply.with("Content-Security-Policy", FILE_POLICY)
+                }
                 Err(reply) => reply.with("Content-Security-Policy", FILE_POLICY).with("Content-Disposition", "attachment"),
             }
+        }
+        ("GET", ["files", "kept"]) => {
+            let after = match field(query, "after") {
+                Some(after) => match files::parse_id(&after) {
+                    Some(id) => Some(id),
+                    None => return Reply::text(400, "not a file id").with("Content-Security-Policy", FILE_POLICY),
+                },
+                None => None,
+            };
+            let max = field(query, "max").and_then(|max| max.parse::<usize>().ok().filter(|_| max.bytes().all(|b| b.is_ascii_digit()))).unwrap_or(100);
+            done(runtime.kept(&ship, after, max).map(|listed| Reply::proto(200, &KeptList { kept: listed.iter().map(kept_info).collect() })))
+                .with("Content-Security-Policy", FILE_POLICY)
+        }
+        ("DELETE", ["files", "kept"]) => done(runtime.kept_clear_all(&ship).map(|cleared| Reply::proto(200, &cleared_reply(cleared)))).with("Content-Security-Policy", FILE_POLICY),
+        ("DELETE", ["files", "kept", id]) => {
+            let Some(id) = files::parse_id(id) else { return failure(Error::File(FileError::NotFound)).with("Content-Security-Policy", FILE_POLICY) };
+            done(runtime.kept_clear(&ship, &id).map(|cleared| Reply::proto(200, &cleared_reply(cleared)))).with("Content-Security-Policy", FILE_POLICY)
+        }
+        ("POST", ["agents", agent, "files", "save"]) => save_route(shared, &ship, agent, &request.body).with("Content-Security-Policy", FILE_POLICY),
+        ("GET", ["agents", agent, "files", "saves"]) => {
+            let listed = runtime.saves(&ship, agent);
+            done(listed.map(|saves| Reply::proto(200, &SaveList { saves: saves.iter().map(save_info).collect() }))).with("Content-Security-Policy", FILE_POLICY)
+        }
+        ("DELETE", ["agents", agent, "files", "saves", id]) => {
+            let stopped = files::parse_id(id).ok_or(Error::File(FileError::NotFound)).and_then(|id| runtime.save_stop(&ship, agent, &id));
+            done(stopped.map(|()| Reply::text(204, ""))).with("Content-Security-Policy", FILE_POLICY)
         }
         ("GET", ["agents", agent, "files", id, "content"]) => match file_content(shared, &ship, agent, id, request.header("Range")) {
             Ok(download) => {
@@ -874,6 +923,18 @@ fn file_route(runtime: &Runtime, ship: &str, agent: &str, method: &str, rest: &[
     }
 }
 
+fn kept_info(info: &crate::kept::KeptInfo) -> ship_proto::KeptInfo {
+    ship_proto::KeptInfo { id: info.id.to_vec(), length: info.length, held: info.held, used_ms: info.used_ms, saving: info.saving }
+}
+
+fn save_info(info: &crate::kept::SaveInfo) -> ship_proto::SaveInfo {
+    ship_proto::SaveInfo { id: info.id.to_vec(), length: info.length, held: info.held, chunks: info.chunks, touched_ms: info.touched_ms }
+}
+
+fn cleared_reply(cleared: crate::kept::Cleared) -> ship_proto::Cleared {
+    ship_proto::Cleared { thrown_away: cleared.thrown_away, being_saved: cleared.being_saved }
+}
+
 fn file_info(info: &files::FileInfo) -> ship_proto::FileInfo {
     ship_proto::FileInfo { id: info.id.to_vec(), length: info.length, chunks: info.chunks, media_type: info.media_type.clone(), added_ms: info.added_ms, open: info.open }
 }
@@ -933,7 +994,7 @@ fn file_content<'a>(shared: &'a Shared, ship: &str, agent: &str, id: &str, range
     let place = download_place(shared)?;
     let reply = contents_head(status, &file.media_type, start, end, file.length);
     let from = From::Here { ship: ship.to_string(), agent: agent.to_string(), id, file };
-    Ok(Download { reply, from, start, end, _place: place })
+    Ok(Download { reply, from, start, end, place: Some(place) })
 }
 
 /// The head of an answer carrying a file's contents, bytes `start` to `end` of `length`, here
@@ -999,9 +1060,83 @@ fn remote_route<'a>(shared: &'a Shared, here: &str, other: &str, agent: &str, id
         _ => return Err(Reply::text(404, "not found")),
     };
     let contents = rest == ["content"];
-    // Places first, before the other ship is asked anything: a place among the downloads,
-    // whichever the route (each waits on the other ship holding a thread), and one among
-    // other ships' share of them.
+    // A file's contents are a download whatever comes of them: their place among the downloads
+    // first, as for a file of this ship's. Nothing else is taken until a question is about to
+    // go to the other ship: then the gate takes a place among other ships' share of the
+    // downloads (and, for what a file is and for one chunk, a place among the downloads too),
+    // held from then until the request is done with the other ship. What this ship keeps is
+    // read under the ordinary places alone.
+    let place = if contents { Some(download_place(shared)?) } else { None };
+    let gate = Places { shared, download: !contents, held: None };
+    let mut opened = shared.runtime.open_remote_gated(here, &other, agent, &id, Box::new(gate)).map_err(remote_failure)?;
+    let length = opened.length();
+    if let Some(n) = chunk {
+        if files::chunk_len(length, n).is_none() {
+            return Err(Reply::text(404, "no such chunk"));
+        }
+        let (data, fetched) = opened.piece(n).map_err(remote_failure)?;
+        let reply = Reply::new(200, "application/octet-stream", data).with("Content-Disposition", "attachment");
+        if !fetched {
+            return Ok(Answer::Whole(reply));
+        }
+        // Given to the device first; then the places given back, and the piece kept if a place
+        // for keeping after an answer can be had at once.
+        return Ok(Answer::Then(
+            reply,
+            Box::new(move |data| {
+                let _ = opened.keep_after(n, data);
+            }),
+        ));
+    }
+    if !contents {
+        let info = ship_proto::FileInfo { id: id.to_vec(), length, chunks: files::chunk_count(length), media_type: opened.media_type().to_string(), added_ms: 0, open: false };
+        return Ok(Answer::Whole(Reply::proto(200, &info).with("Content-Disposition", "attachment")));
+    };
+    let (start, end, status) = match wanted(range, length) {
+        Wanted::Whole => (0, length, 200),
+        Wanted::Part(first, last) => (first, last + 1, 206),
+        Wanted::Unsatisfiable => return Err(Reply::text(416, "that range is not in the file").with("Content-Range", format!("bytes */{length}"))),
+    };
+    let reply = contents_head(status, opened.media_type(), start, end, length);
+    Ok(Answer::Stream(Download { reply, from: From::Elsewhere { opened }, start, end, place }))
+}
+
+/// What a request for another ship's file waits on that ship with, taken at its first question
+/// to it (`kept::Gate`): a place among other ships' share of the downloads, and, unless the
+/// request holds a place among the downloads already (a contents answer does), one of those.
+/// Given back when the request is done with the other ship, or when it ends.
+struct Places<'a> {
+    shared: &'a Shared,
+    download: bool,
+    held: Option<(Waiting<'a>, Option<Waiting<'a>>)>,
+}
+
+impl crate::kept::Gate for Places<'_> {
+    fn take(&mut self) -> Result<(), Failed> {
+        if self.held.is_some() {
+            return Ok(());
+        }
+        if download_limit(&self.shared.cfg) == 0 {
+            return Err(Failed::NoThreads);
+        }
+        let fetching = Waiting(&self.shared.fetching);
+        if self.shared.fetching.fetch_add(1, Ordering::SeqCst) >= fetch_limit(&self.shared.cfg) {
+            return Err(Failed::Busy);
+        }
+        let download = if self.download { Some(download_place(self.shared).map_err(|_| Failed::Busy)?) } else { None };
+        self.held = Some((fetching, download));
+        Ok(())
+    }
+
+    fn release(&mut self) {
+        self.held = None;
+    }
+}
+
+/// The places a request that may wait on another ship takes before it asks anything: one
+/// among other ships' share of the download places, and one among the download places. With
+/// no download places at all (two workers), none.
+fn remote_places(shared: &Shared) -> Result<(Waiting<'_>, Waiting<'_>), Reply> {
     if download_limit(&shared.cfg) == 0 {
         return Err(Reply::text(503, "this server has too few threads to wait on another ship"));
     }
@@ -1010,26 +1145,35 @@ fn remote_route<'a>(shared: &'a Shared, here: &str, other: &str, agent: &str, id
         return Err(Reply::text(503, "too many requests for other ships' files at once; try again shortly").with("Retry-After", "1"));
     }
     let place = download_place(shared)?;
-    let mut remote = shared.runtime.remote_file(here, &other, agent, &id).map_err(remote_failure)?;
-    let length = remote.length();
-    if let Some(n) = chunk {
-        if files::chunk_len(length, n).is_none() {
-            return Err(Reply::text(404, "no such chunk"));
-        }
-        let data = remote.chunk(n).map_err(remote_failure)?;
-        return Ok(Answer::Whole(Reply::new(200, "application/octet-stream", data).with("Content-Disposition", "attachment")));
+    Ok((fetching, place))
+}
+
+/// Save a copy, for `agent` here, of a file on another ship (`POST /agents/<a>/files/save`):
+/// one call of a save, which fetches missing pieces for at most `save_slice_millis` and says
+/// where it stands. It may wait on the other ship, so it takes the same places first as the
+/// routes of other ships' files, and holds them for the whole call.
+fn save_route(shared: &Shared, ship: &str, agent: &str, body: &[u8]) -> Reply {
+    let Ok(asked) = SaveRequest::decode(body) else { return Reply::text(400, "not a save request") };
+    // Every name checked before it is used; none becomes a path.
+    match canonical_ship(&asked.ship) {
+        Ok(other) if other != ship => {}
+        _ => return Reply::text(400, "not a ship other than this one"),
     }
-    if !contents {
-        let info = ship_proto::FileInfo { id: id.to_vec(), length, chunks: files::chunk_count(length), media_type: remote.media_type().to_string(), added_ms: 0, open: false };
-        return Ok(Answer::Whole(Reply::proto(200, &info).with("Content-Disposition", "attachment")));
+    if check_agent_name(&asked.agent).is_err() {
+        return Reply::text(400, "not a valid agent name");
+    }
+    let Ok(id) = <[u8; 32]>::try_from(asked.id.as_slice()) else { return Reply::text(400, "not a file id") };
+    let places = match remote_places(shared) {
+        Ok(places) => places,
+        Err(reply) => return reply,
     };
-    let (start, end, status) = match wanted(range, length) {
-        Wanted::Whole => (0, length, 200),
-        Wanted::Part(first, last) => (first, last + 1, 206),
-        Wanted::Unsatisfiable => return Err(Reply::text(416, "that range is not in the file").with("Content-Range", format!("bytes */{length}"))),
-    };
-    let reply = contents_head(status, remote.media_type(), start, end, length);
-    Ok(Answer::Stream(Download { reply, from: From::Elsewhere { remote, _fetching: fetching }, start, end, _place: place }))
+    let saved = shared.runtime.save_file(ship, agent, &asked.ship, &asked.agent, &id);
+    drop(places);
+    match saved {
+        Ok(state) => Reply::proto(200, &SaveReply { done: state.done, held: state.held, chunks: state.chunks }),
+        Err(SaveFailed::Here(error)) => failure(error),
+        Err(SaveFailed::There(failed)) => remote_failure(failed),
+    }
 }
 
 /// What a failure to have a file from another ship looks like to a client.
@@ -1042,6 +1186,7 @@ fn remote_failure(failed: Failed) -> Reply {
         Failed::Busy => Reply::text(503, "too busy; try again shortly").with("Retry-After", "1"),
         Failed::NoNetwork => Reply::text(503, "this ship is not on the network just now").with("Retry-After", "5"),
         Failed::Unfit => Reply::text(503, "this runtime cannot carry files between ships: its max_message_bytes is too small"),
+        Failed::NoThreads => Reply::text(503, "this server has too few threads to wait on another ship"),
     }
 }
 
@@ -1050,31 +1195,45 @@ fn remote_failure(failed: Failed) -> Reply {
 /// be read whole and matching, or a client that is too slow, ends the answer short: the client
 /// sees fewer bytes than it was told, and never bytes that are not the file's.
 fn send_file(shared: &Shared, stream: &mut TcpStream, download: Download) {
-    let Download { reply, from, start, end, _place } = download;
+    let Download { reply, from, start, end, mut place } = download;
     if write_by(stream, &reply.encode_head(end - start), Instant::now() + shared.cfg.io_timeout).is_err() || start >= end {
         return;
     }
     let (first, last) = (start / CHUNK, (end - 1) / CHUNK);
     let (ship, agent, id, file) = match from {
         From::Here { ship, agent, id, file } => (ship, agent, id, file),
-        From::Elsewhere { mut remote, _fetching } => {
-            // From another ship: each chunk asked for, within `file_timeout`, and checked
-            // against its hash before any of it is written; the client has `io_timeout` to
-            // take each. Anything that goes wrong ends the answer short.
+        From::Elsewhere { mut opened } => {
+            // From another ship: each chunk read from what this ship keeps of it and checked,
+            // or asked for within `file_timeout` and checked against its hash, before any of it
+            // is written; the client has `io_timeout` to take each. A chunk fetched is written
+            // first, then kept if it can be (best effort, changing nothing about the answer),
+            // then the next is fetched; one whose write fails is not kept. The last one is kept
+            // only after the answer is whole, the device let go and both places given back, if a
+            // place for keeping after an answer can be had at once. Anything that goes wrong with
+            // the answer ends it short.
             for n in first..=last {
                 if shared.stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let Ok(chunk) = remote.chunk(n) else { return };
+                let Ok((chunk, fetched)) = opened.piece(n) else { return };
                 let from = if n == first { (start % CHUNK) as usize } else { 0 };
                 let to = if n == last { ((end - 1) % CHUNK) as usize + 1 } else { chunk.len() };
                 if write_by(stream, &chunk[from..to], Instant::now() + shared.cfg.io_timeout).is_err() {
+                    return;
+                }
+                if fetched && n < last {
+                    let _ = opened.keep(n, chunk);
+                } else if fetched {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    drop(place.take());
+                    let _ = opened.keep_after(n, chunk);
                     return;
                 }
             }
             return;
         }
     };
+    let _place = place;
     let mut n = first;
     while n <= last {
         if shared.stop.load(Ordering::Relaxed) {
@@ -1100,6 +1259,11 @@ fn send_file(shared: &Shared, stream: &mut TcpStream, download: Download) {
 fn allowed(parts: &[&str]) -> Option<&'static str> {
     match parts {
         ["signin"] => Some("GET, POST"),
+        ["files", "kept"] => Some("GET, DELETE"),
+        ["files", "kept", _] => Some("DELETE"),
+        ["agents", _, "files", "save"] => Some("POST"),
+        ["agents", _, "files", "saves"] => Some("GET"),
+        ["agents", _, "files", "saves", _] => Some("DELETE"),
         [""] | ["devices"] | ["key"] | ["logs", _, _, "head" | "checkpoint" | "entries"] => Some("GET"),
         ["signout"] | ["devices", _, "revoke"] | ["agents", _, "command"] => Some("POST"),
         ["devices", _] => Some("DELETE"),

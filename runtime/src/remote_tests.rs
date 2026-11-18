@@ -129,6 +129,20 @@ fn two(label: &str) -> Two {
     two_with(label, (fast(), NetConfig::default()), (fast(), NetConfig::default()), &["~nec"])
 }
 
+/// As `two`, with keeping off on ~nec (`max_cache_bytes` 0): opening another ship's file is
+/// then exactly as part 2 made it. For the tests of part 2 whose point is that ~nec keeps
+/// nothing and asks ~zod every time; part 3's own tests show what changes with keeping on.
+fn two_uncached(label: &str) -> Two {
+    two_with(label, (fast(), NetConfig::default()), (Config { max_cache_bytes: 0, ..fast() }, NetConfig::default()), &["~nec"])
+}
+
+/// Network deadlines longer than any test's own watchdog (their waits add up to at most about two minutes), for tests
+/// that hold requests at the other ship (`Lie::Held`) while they assert what else is answered:
+/// the held requests cannot run out of time and give their places back meanwhile.
+fn held_net() -> NetConfig {
+    NetConfig { file_timeout: Duration::from_secs(300), request_timeout: Duration::from_secs(300), ..NetConfig::default() }
+}
+
 fn two_with(label: &str, (a_cfg, a_net_cfg): (Config, NetConfig), (b_cfg, b_net_cfg): (Config, NetConfig), b_ships: &[&str]) -> Two {
     let dirs = (TempDir::new(&format!("{label}-a")), TempDir::new(&format!("{label}-b")));
     let directory = Directory::new();
@@ -540,7 +554,7 @@ fn rows(rt: &Runtime, ship: &str) -> BTreeMap<String, i64> {
 /// at once, whatever was remembered. (G2, G10)
 #[test]
 fn a_file_is_had_only_while_its_agent_allows_it() {
-    let t = two("allowed");
+    let t = two_uncached("allowed");
     let id = put(&t.a, "~zod", "counter", &contents(2 * CHUNK as usize, 1), "");
     let status = || t.get(&t.path("counter", &id, ""), &[]).status;
     assert_eq!(status(), 404);
@@ -599,7 +613,7 @@ fn a_file_is_had_only_while_its_agent_allows_it() {
 /// The same bytes claimed by two agents: open under one, which says nothing of the other.
 #[test]
 fn a_file_open_under_one_agent_is_not_open_under_another() {
-    let t = two("agents");
+    let t = two_uncached("agents");
     let data = contents(CHUNK as usize + 3, 5);
     let id = put(&t.a, "~zod", "counter", &data, "");
     assert_eq!(put(&t.a, "~zod", "keeper", &data, ""), id);
@@ -615,7 +629,7 @@ fn a_file_open_under_one_agent_is_not_open_under_another() {
 /// made at upload. (G1, G5)
 #[test]
 fn a_ship_that_lies_is_caught_before_anything_wrong_is_passed_on() {
-    let t = two("lies");
+    let t = two_uncached("lies");
     let data = contents(3 * CHUNK as usize + 5, 6);
     let id = put(&t.a, "~zod", "counter", &data, "");
     say(&t.a, "~zod", "counter", &format!("open {}", hex(&id)));
@@ -801,38 +815,53 @@ fn a_ship_too_slow_or_gone_is_waited_for_only_so_long() {
 /// the downloads' places, so its own files can still be had. (G7)
 #[test]
 fn requests_for_files_are_bounded_at_both_ends() {
-    let t = two_with("bounds", (fast(), NetConfig::default()), (fast(), NetConfig::default()), &["~nec", "~bud", "~wes"]);
+    let t = two_with("bounds", (fast(), held_net()), (fast(), held_net()), &["~nec", "~bud", "~wes"]);
     let id = put(&t.a, "~zod", "counter", &contents(10, 1), "");
     say(&t.a, "~zod", "counter", &format!("open {}", hex(&id)));
     for ship in ["~nec", "~bud", "~wes"] {
         t.b_net.ping(ship, "~zod").unwrap();
     }
-    t.lie(|_, _| Some(Lie::Slow(Duration::from_secs(2))));
-    let ask = |ships: Vec<&'static str>| {
+    // Every request let in is held at ~zod until the test lets them all go, by a barrier, not a
+    // delay that runs out by itself: those turned away answer at once, while the rest are held,
+    // so the first `busy` answers must all be turned away, and no more come until the barrier
+    // goes.
+    let ask = |ships: Vec<&'static str>, busy: usize| {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let holding = gate.clone();
+        t.lie(move |_, _| Some(Lie::Held(holding.clone())));
+        let (answers, answered) = std::sync::mpsc::channel();
+        let asked = ships.len();
         let handles: Vec<_> = ships
             .into_iter()
             .map(|ship| {
-                let b = t.b.clone();
+                let (b, answers) = (t.b.clone(), answers.clone());
                 std::thread::spawn(move || {
                     let wanted = FileWanted { agent: "counter".into(), id: id.to_vec(), index: 0 };
-                    b.ask_for_file(ship, "~zod", PeerRequest { body: Some(peer_request::Body::FileAbout(wanted)) }).unwrap()
+                    let _ = answers.send(b.ask_for_file(ship, "~zod", PeerRequest { body: Some(peer_request::Body::FileAbout(wanted)) }).unwrap());
                 })
             })
             .collect();
-        let (mut served, mut busy) = (0, 0);
+        let sort = |answer| match answer {
+            Ok(PeerReply { body: Some(peer_reply::Body::FileAbout(_)), .. }) => true,
+            Err(FileAskError::Net(NetError::Refused(why))) if why == TOO_BUSY => false,
+            other => panic!("{other:?}"),
+        };
+        for _ in 0..busy {
+            let answer = answered.recv_timeout(Duration::from_secs(20)).expect("fewer were turned away than should be");
+            assert!(!sort(answer), "a request was answered while those let in were held");
+        }
+        assert!(answered.recv_timeout(Duration::from_millis(300)).is_err(), "more were turned away than should be");
+        gate.close();
+        let served = (0..asked - busy).filter(|_| sort(answered.recv_timeout(Duration::from_secs(30)).expect("a held request never answered"))).count();
         for handle in handles {
-            match handle.join().unwrap() {
-                Ok(PeerReply { body: Some(peer_reply::Body::FileAbout(_)), .. }) => served += 1,
-                Err(FileAskError::Net(NetError::Refused(why))) if why == TOO_BUSY => busy += 1,
-                other => panic!("{other:?}"),
-            }
+            handle.join().unwrap();
         }
         (served, busy)
     };
     // One connection: four at once.
-    assert_eq!(ask(vec!["~nec"; 6]), (4, 2));
+    assert_eq!(ask(vec!["~nec"; 6], 2), (4, 2));
     // Three connections: eight at once.
-    assert_eq!(ask([vec!["~nec"; 4], vec!["~bud"; 4], vec!["~wes"; 4]].concat()), (8, 4));
+    assert_eq!(ask([vec!["~nec"; 4], vec!["~bud"; 4], vec!["~wes"; 4]].concat(), 4), (8, 4));
 
     // On the ship asking: two requests for other ships' files at once, of the four places for
     // downloads; a third is told to try again, and a file of its own is still had meanwhile.
@@ -841,13 +870,32 @@ fn requests_for_files_are_bounded_at_both_ends() {
     let server = &t.server;
     let auth = t.auth.clone();
     let path = t.path("counter", &id, "/content");
+    // Each request for the file asks ~zod (nothing of it is kept on ~nec: its earlier requests
+    // were made straight to the network), and is held there by a barrier the test lets go after
+    // its assertions; its first question counted, once a request, so as to wait until both hold
+    // their places, never for a fixed time.
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = asked.clone();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let holding = gate.clone();
+    t.lie(move |asked, _| {
+        if matches!(asked, peer_request::Body::FileAbout(_)) {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+        Some(Lie::Held(holding.clone()))
+    });
     std::thread::scope(|scope| {
         let slow: Vec<_> = (0..2).map(|_| scope.spawn(|| http(server, &path, &[("Authorization", &auth)]).status)).collect();
-        std::thread::sleep(Duration::from_millis(500));
+        let until = Instant::now() + Duration::from_secs(20);
+        while asked.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < until, "inconclusive: the two slow requests never asked ~zod");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let third = http(server, &path, &[("Authorization", &auth)]);
         assert_eq!((third.status, third.header("Retry-After")), (503, Some("1")));
         let mine = http(server, &format!("/ships/nec/agents/counter/files/{}/content", hex(&own_id)), &[("Authorization", &auth)]);
         assert!(mine.status == 200 && mine.body == own);
+        gate.close();
         for status in slow {
             assert_eq!(status.join().unwrap(), 200);
         }
@@ -858,7 +906,7 @@ fn requests_for_files_are_bounded_at_both_ends() {
 /// asked for its own files this way, and with no network the answer is 503. (G6)
 #[test]
 fn only_the_owners_devices_and_only_good_names() {
-    let t = two("names");
+    let t = two_uncached("names");
     let id = put(&t.a, "~zod", "counter", &contents(10, 1), "");
     say(&t.a, "~zod", "counter", &format!("open {}", hex(&id)));
     let good = t.path("counter", &id, "/content");
@@ -944,7 +992,7 @@ fn listing(root: &Path) -> BTreeMap<String, u64> {
 /// on the ship asked. (G8)
 #[test]
 fn fetching_a_file_writes_nothing_at_either_end() {
-    let t = two("nothing");
+    let t = two_uncached("nothing");
     let data = contents(3 * CHUNK as usize + 5, 2);
     let id = put(&t.a, "~zod", "counter", &data, "");
     let closed = put(&t.a, "~zod", "counter", &contents(100, 3), "");
@@ -1992,3 +2040,8 @@ fn the_job_holds_only_values_of_this_runtimes_size() {
     // No decision for them (which a job given such a name would not have made either).
     assert_eq!(t.a.inner.served_decisions.load(Ordering::SeqCst), decided + 1, "a decision was made for a name or an id that does not pass");
 }
+
+/// Files on the ship, part 3: what was opened is kept, and a copy can be saved. Here, so as to
+/// use the two runtimes and the liar above.
+#[path = "kept_tests.rs"]
+mod kept_tests;

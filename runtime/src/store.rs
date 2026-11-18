@@ -17,7 +17,7 @@ use ship_proto::{CheckpointBody, Device, Kind, LogNews, Message, PeerMessage, Re
 use crate::moon::PROOF_BYTES;
 use crate::{signed_bytes, AuditEntry, ChainCheck, Config, Durability, Effect, Error, CHECKPOINT_DOMAIN};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 // The schema and one query name a command by its number, where SQLite needs to see it written out.
 const _: () = assert!(Kind::Command as i32 == 1);
@@ -277,7 +277,29 @@ CREATE TABLE file_trash (
     n INTEGER NOT NULL,
     gen BLOB NOT NULL,
     bytes INTEGER NOT NULL,
+    pool INTEGER NOT NULL,
     PRIMARY KEY (dir, n, gen)
+) WITHOUT ROWID;
+CREATE TABLE kept (
+    id BLOB PRIMARY KEY,
+    dir BLOB NOT NULL,
+    length INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    used INTEGER NOT NULL,
+    held INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE kept_chunks (
+    dir BLOB NOT NULL,
+    n INTEGER NOT NULL,
+    hash BLOB NOT NULL,
+    gen BLOB,
+    PRIMARY KEY (dir, n)
+) WITHOUT ROWID;
+CREATE TABLE saves (
+    id BLOB NOT NULL,
+    agent TEXT NOT NULL,
+    touched INTEGER NOT NULL,
+    PRIMARY KEY (id, agent)
 ) WITHOUT ROWID;
 ";
 
@@ -2091,6 +2113,18 @@ pub fn audit_tail(conn: &Connection, limit: usize) -> Result<Vec<AuditEntry>, Er
 // copies are of unknown size and are not counted. `meta.file_bytes` is the sum of the
 // lengths of the ship's files, kept in step with `files` in every transaction that changes it;
 // what open uploads reserve is the sum of their lengths.
+//
+// Kept files (part 3): a file fetched from another ship that this ship holds some or all of, by
+// its id. `kept` has its directory (sixteen random bytes, never reused, like an upload's), its
+// length and media type, when it was last opened, and how many bytes of its chunks are held.
+// `kept_chunks` has a row for every chunk of it from the moment it is kept, with the chunk's
+// hash, checked against the id before the file was kept, and the copy's generation once the
+// chunk itself is held (NULL until then). `saves` has the agents for which a kept file is being
+// saved. A kept file with no `saves` row is in the cache: its held bytes count against
+// `max_cache_bytes`. One with any is being saved: its whole length is reserved against
+// `max_file_bytes`, as an upload's is. What is thrown away from the cache is recorded in
+// `file_trash` like anything else, in the cache's pool (`pool` 1), and counts against the cache
+// until it is gone; everything else there is in the file allowance's pool (`pool` 0).
 
 /// A file the ship holds, as its row has it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2128,6 +2162,15 @@ pub struct Trash {
 /// How `file_trash` writes a sweep of a directory's unnamed copies: a generation of one byte.
 const SWEEP: &[u8] = &[0];
 
+/// Which allowance something waiting to be removed counts against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pool {
+    /// The ship's file allowance, `max_file_bytes`.
+    Files = 0,
+    /// The cache of kept files, `max_cache_bytes`.
+    Cache = 1,
+}
+
 fn dir_of(bytes: Vec<u8>) -> rusqlite::Result<[u8; 16]> {
     <[u8; 16]>::try_from(bytes).map_err(|_| rusqlite::Error::InvalidColumnType(0, "dir".into(), rusqlite::types::Type::Blob))
 }
@@ -2149,14 +2192,30 @@ fn set_file_bytes(conn: &Connection, bytes: u64) -> rusqlite::Result<()> {
     meta_set(conn, "file_bytes", bytes)
 }
 
-/// The bytes open uploads have reserved.
+/// The bytes open uploads and kept files being saved have reserved: their whole lengths.
 pub fn reserved_bytes(conn: &Connection) -> rusqlite::Result<u64> {
-    conn.prepare_cached("SELECT COALESCE(SUM(length), 0) FROM uploads")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n.max(0) as u64)
+    let uploads = conn.prepare_cached("SELECT COALESCE(SUM(length), 0) FROM uploads")?.query_row([], |r| r.get::<_, i64>(0))?.max(0) as u64;
+    Ok(uploads.saturating_add(saving_bytes(conn)?))
 }
 
-/// The bytes still on disk that no row names, waiting to be removed.
+/// The bytes kept files being saved have reserved: their whole lengths.
+pub fn saving_bytes(conn: &Connection) -> rusqlite::Result<u64> {
+    conn.prepare_cached("SELECT COALESCE(SUM(length), 0) FROM kept k WHERE EXISTS (SELECT 1 FROM saves s WHERE s.id = k.id)")?
+        .query_row([], |r| r.get::<_, i64>(0))
+        .map(|n| n.max(0) as u64)
+}
+
+/// The bytes still on disk that no row names, waiting to be removed, that count against the
+/// ship's file allowance.
 pub fn removing_bytes(conn: &Connection) -> rusqlite::Result<u64> {
-    conn.prepare_cached("SELECT COALESCE(SUM(bytes), 0) FROM file_trash")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n.max(0) as u64)
+    pool_removing(conn, Pool::Files)
+}
+
+/// The bytes waiting to be removed that count against `pool`.
+pub fn pool_removing(conn: &Connection, pool: Pool) -> rusqlite::Result<u64> {
+    conn.prepare_cached("SELECT COALESCE(SUM(bytes), 0) FROM file_trash WHERE pool = ?1")?
+        .query_row([pool as i64], |r| r.get::<_, i64>(0))
+        .map(|n| n.max(0) as u64)
 }
 
 /// Held, reserved and still to be removed: what counts against the ship's allowance.
@@ -2172,19 +2231,28 @@ pub fn file_count(conn: &Connection) -> rusqlite::Result<usize> {
     conn.prepare_cached("SELECT COUNT(*) FROM files")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n as usize)
 }
 
-/// A whole directory to remove, with the bytes it holds.
-fn trash_dir(conn: &Connection, dir: &[u8; 16], bytes: u64) -> rusqlite::Result<()> {
-    conn.prepare_cached("INSERT OR REPLACE INTO file_trash VALUES (?1, 0, x'', ?2)")?.execute(params![&dir[..], bytes as i64]).map(drop)
+/// A whole directory to remove, with the bytes it holds, counted against `pool` until it goes.
+fn trash_dir(conn: &Connection, dir: &[u8; 16], bytes: u64, pool: Pool) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO file_trash VALUES (?1, 0, x'', ?2, ?3)")?.execute(params![&dir[..], bytes as i64, pool as i64]).map(drop)
 }
 
-/// One copy of one chunk to remove, with its length.
-fn trash_chunk(conn: &Connection, dir: &[u8; 16], n: u64, gen: &Gen, bytes: u64) -> rusqlite::Result<()> {
-    conn.prepare_cached("INSERT OR REPLACE INTO file_trash VALUES (?1, ?2, ?3, ?4)")?.execute(params![&dir[..], n as i64, &gen[..], bytes as i64]).map(drop)
+/// One copy of one chunk to remove, with its length, counted against `pool` until it goes.
+fn trash_chunk(conn: &Connection, dir: &[u8; 16], n: u64, gen: &Gen, bytes: u64, pool: Pool) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO file_trash VALUES (?1, ?2, ?3, ?4, ?5)")?
+        .execute(params![&dir[..], n as i64, &gen[..], bytes as i64, pool as i64])
+        .map(drop)
+}
+
+/// A directory to look through for copies no row names, counted at `bytes` against the file
+/// allowance until the sweep is done: a kept file's directory made a file's, charged for the
+/// copies its record says may be there.
+pub fn trash_sweep_charged(conn: &Connection, dir: &[u8; 16], bytes: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO file_trash VALUES (?1, 0, ?2, ?3, 0)")?.execute(params![&dir[..], SWEEP, bytes as i64]).map(drop)
 }
 
 /// A directory to look through for copies no row names, because removing one failed.
 pub fn trash_sweep(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<()> {
-    conn.prepare_cached("INSERT OR REPLACE INTO file_trash VALUES (?1, 0, ?2, 0)")?.execute(params![&dir[..], SWEEP]).map(drop)
+    conn.prepare_cached("INSERT OR REPLACE INTO file_trash VALUES (?1, 0, ?2, 0, 0)")?.execute(params![&dir[..], SWEEP]).map(drop)
 }
 
 /// Up to `max` things waiting to be removed.
@@ -2216,12 +2284,17 @@ pub fn trash_done(conn: &Connection, trash: &Trash) -> rusqlite::Result<()> {
     conn.prepare_cached("DELETE FROM file_trash WHERE dir = ?1 AND n = ?2 AND gen = ?3")?.execute(params![&trash.dir[..], n as i64, gen]).map(drop)
 }
 
+/// Whether the trash records the whole of the directory `dir` to be removed.
+pub fn trash_whole(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<bool> {
+    conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM file_trash WHERE dir = ?1 AND length(gen) = 0)")?.query_row([&dir[..]], |r| r.get(0))
+}
+
 /// Whose a directory is, as the rows have it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Owner {
     /// A file's: the names (`<n>.<gen>`) of the chunk copies its rows name. They never change.
     File(HashSet<String>),
-    /// An open upload's: copies may be on their way that no row names yet.
+    /// An open upload's, or a kept file's: copies may be on their way that no row names yet.
     Upload,
     /// No one's.
     Nobody,
@@ -2229,7 +2302,8 @@ pub enum Owner {
 
 pub fn dir_owner(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<Owner> {
     let upload: bool = conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM uploads WHERE dir = ?1)")?.query_row([&dir[..]], |r| r.get(0))?;
-    if upload {
+    let kept: bool = conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM kept WHERE dir = ?1)")?.query_row([&dir[..]], |r| r.get(0))?;
+    if upload || kept {
         return Ok(Owner::Upload);
     }
     let file: bool = conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM files WHERE dir = ?1)")?.query_row([&dir[..]], |r| r.get(0))?;
@@ -2282,7 +2356,7 @@ pub fn upload_drop(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<()> {
     let length: Option<i64> = conn.prepare_cached("SELECT length FROM uploads WHERE dir = ?1")?.query_row([&dir[..]], |r| r.get(0)).optional()?;
     conn.prepare_cached("DELETE FROM uploads WHERE dir = ?1")?.execute([&dir[..]])?;
     conn.prepare_cached("DELETE FROM file_chunks WHERE dir = ?1")?.execute([&dir[..]])?;
-    trash_dir(conn, dir, length.unwrap_or(0).max(0) as u64)
+    trash_dir(conn, dir, length.unwrap_or(0).max(0) as u64, Pool::Files)
 }
 
 /// Which copy of chunk `n` of `dir` is held, if any.
@@ -2295,7 +2369,7 @@ pub fn chunk_of(conn: &Connection, dir: &[u8; 16], n: u64) -> rusqlite::Result<O
 /// marked to be removed, counted at `len` bytes until it is.
 pub fn chunk_put(conn: &Connection, dir: &[u8; 16], n: u64, gen: &Gen, hash: &[u8; 32], len: u64) -> rusqlite::Result<()> {
     if let Some(old) = chunk_of(conn, dir, n)? {
-        trash_chunk(conn, dir, n, &old, len)?;
+        trash_chunk(conn, dir, n, &old, len, Pool::Files)?;
     }
     conn.prepare_cached("INSERT OR REPLACE INTO file_chunks VALUES (?1, ?2, ?3, ?4)")?
         .execute(params![&dir[..], n as i64, &gen[..], &hash[..]])
@@ -2397,15 +2471,15 @@ pub fn claim_remove(conn: &Connection, agent: &str, id: &[u8; 32]) -> rusqlite::
     conn.prepare_cached("DELETE FROM files WHERE id = ?1")?.execute([&id[..]])?;
     conn.prepare_cached("DELETE FROM file_chunks WHERE dir = ?1")?.execute([&file.dir[..]])?;
     set_file_bytes(conn, file_bytes(conn)?.saturating_sub(file.length))?;
-    trash_dir(conn, &file.dir, file.length)?;
+    trash_dir(conn, &file.dir, file.length, Pool::Files)?;
     Ok(Some(true))
 }
 
-/// Every directory a row names: those of open uploads, of files, and of what is still to be
-/// removed.
+/// Every directory a row names: those of open uploads, of files, of kept files, and of what
+/// is still to be removed.
 pub fn named_dirs(conn: &Connection) -> rusqlite::Result<HashSet<[u8; 16]>> {
     let mut named = HashSet::new();
-    for sql in ["SELECT dir FROM uploads", "SELECT dir FROM files", "SELECT DISTINCT dir FROM file_trash"] {
+    for sql in ["SELECT dir FROM uploads", "SELECT dir FROM files", "SELECT dir FROM kept", "SELECT DISTINCT dir FROM file_trash"] {
         let mut stmt = conn.prepare(sql)?;
         for dir in stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))? {
             named.insert(dir_of(dir?)?);
@@ -2419,6 +2493,256 @@ pub fn all_files(conn: &Connection) -> rusqlite::Result<Vec<([u8; 32], [u8; 16],
     conn.prepare("SELECT id, dir, length FROM files ORDER BY id")?
         .query_map([], |r| Ok((hash_of(r.get(0)?)?, dir_of(r.get(1)?)?, r.get::<_, i64>(2)? as u64)))?
         .collect()
+}
+
+/// A kept file, as its row has it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptFile {
+    pub dir: [u8; 16],
+    pub length: u64,
+    pub media_type: String,
+    /// When it was last opened, in milliseconds.
+    pub used: u64,
+    /// The bytes of its chunks held.
+    pub held: u64,
+    /// Whether any agent is saving it.
+    pub saving: bool,
+}
+
+const KEPT_COLUMNS: &str = "k.dir, k.length, k.media_type, k.used, k.held, EXISTS (SELECT 1 FROM saves s WHERE s.id = k.id)";
+
+fn kept_file(r: &Row, at: usize) -> rusqlite::Result<KeptFile> {
+    Ok(KeptFile {
+        dir: dir_of(r.get(at)?)?,
+        length: r.get::<_, i64>(at + 1)?.max(0) as u64,
+        media_type: r.get(at + 2)?,
+        used: r.get::<_, i64>(at + 3)?.max(0) as u64,
+        held: r.get::<_, i64>(at + 4)?.max(0) as u64,
+        saving: r.get(at + 5)?,
+    })
+}
+
+/// The kept file with this id, if there is one.
+pub fn kept_get(conn: &Connection, id: &[u8; 32]) -> rusqlite::Result<Option<KeptFile>> {
+    conn.prepare_cached(&format!("SELECT {KEPT_COLUMNS} FROM kept k WHERE k.id = ?1"))?.query_row([&id[..]], |r| kept_file(r, 0)).optional()
+}
+
+/// How many kept files there are, in the cache and being saved.
+pub fn kept_count(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(*) FROM kept")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+}
+
+/// How many kept files are being saved.
+pub fn saving_count(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.prepare_cached("SELECT COUNT(DISTINCT id) FROM saves")?.query_row([], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+}
+
+/// What counts against the cache: the held bytes of kept files no agent is saving, and what was
+/// thrown away from the cache and is still on disk.
+pub fn cache_bytes(conn: &Connection) -> rusqlite::Result<u64> {
+    Ok(cache_held(conn)?.saturating_add(pool_removing(conn, Pool::Cache)?))
+}
+
+/// The held bytes of kept files no agent is saving.
+pub fn cache_held(conn: &Connection) -> rusqlite::Result<u64> {
+    conn.prepare_cached("SELECT COALESCE(SUM(held), 0) FROM kept k WHERE NOT EXISTS (SELECT 1 FROM saves s WHERE s.id = k.id)")?
+        .query_row([], |r| r.get::<_, i64>(0))
+        .map(|n| n.max(0) as u64)
+}
+
+/// What the rows of kept files in the cache (none saving them) take in the ship's file, by
+/// `files::rows_cost`: 128 bytes a chunk and 1 KiB a file, whether or not a byte is held.
+pub fn cache_rows(conn: &Connection) -> rusqlite::Result<u64> {
+    let (chunk, row) = (crate::files::CHUNK as i64, crate::files::CHUNK_ROW_BYTES as i64);
+    conn.prepare_cached(&format!(
+        "SELECT COALESCE(SUM(((length + {chunk} - 1) / {chunk}) * {row} + 1024), 0) FROM kept k WHERE NOT EXISTS (SELECT 1 FROM saves s WHERE s.id = k.id)"
+    ))?
+    .query_row([], |r| r.get::<_, i64>(0))
+    .map(|n| n.max(0) as u64)
+}
+
+/// The id of the kept file in `dir`, if there is one.
+pub fn kept_in_dir(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<Option<[u8; 32]>> {
+    let id: Option<Vec<u8>> = conn.prepare_cached("SELECT id FROM kept WHERE dir = ?1")?.query_row([&dir[..]], |r| r.get(0)).optional()?;
+    id.map(hash_of).transpose()
+}
+
+/// Every kept file's id, in order, after `after`, at most `max`: in the cache and being saved.
+pub fn kept_ids_after(conn: &Connection, after: &[u8], max: usize) -> rusqlite::Result<Vec<[u8; 32]>> {
+    conn.prepare_cached("SELECT id FROM kept WHERE id > ?1 ORDER BY id LIMIT ?2")?.query_map(params![after, max as i64], |r| hash_of(r.get(0)?))?.collect()
+}
+
+/// The names on disk (`<n>.<gen>`) that a kept file's rows, and the trash, name in `dir`; and
+/// whether the trash records the whole directory or a sweep of it.
+pub fn kept_dir_names(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<(HashSet<String>, bool)> {
+    let name = |n: i64, gen: &[u8]| format!("{n}.{}", gen.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let mut names = HashSet::new();
+    let mut rows = conn.prepare_cached("SELECT n, gen FROM kept_chunks WHERE dir = ?1 AND gen IS NOT NULL")?;
+    for row in rows.query_map([&dir[..]], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))? {
+        let (n, gen) = row?;
+        names.insert(name(n, &gen));
+    }
+    let mut whole = false;
+    let mut trash = conn.prepare_cached("SELECT n, gen FROM file_trash WHERE dir = ?1")?;
+    for row in trash.query_map([&dir[..]], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))? {
+        let (n, gen) = row?;
+        match gen.len() {
+            16 => {
+                names.insert(name(n, &gen));
+            }
+            _ => whole = true,
+        }
+    }
+    Ok((names, whole))
+}
+
+/// Keep a file: its row, and a row for every chunk with its hash and no copy yet. `leaves` are
+/// every chunk's hash, in order, already checked against the id.
+pub fn kept_add(conn: &Connection, id: &[u8; 32], dir: &[u8; 16], length: u64, media_type: &str, now: u64, leaves: &[[u8; 32]]) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT INTO kept VALUES (?1, ?2, ?3, ?4, ?5, 0)")?.execute(params![&id[..], &dir[..], length as i64, media_type, now as i64])?;
+    let mut put = conn.prepare_cached("INSERT INTO kept_chunks VALUES (?1, ?2, ?3, NULL)")?;
+    for (n, hash) in leaves.iter().enumerate() {
+        put.execute(params![&dir[..], n as i64, &hash[..]])?;
+    }
+    Ok(())
+}
+
+/// Every chunk hash of the kept file in `dir`, in order, if there are exactly `count`.
+pub fn kept_leaves(conn: &Connection, dir: &[u8; 16], count: u64) -> rusqlite::Result<Option<Vec<[u8; 32]>>> {
+    let rows: Vec<(i64, Vec<u8>)> = conn
+        .prepare_cached("SELECT n, hash FROM kept_chunks WHERE dir = ?1 ORDER BY n LIMIT ?2")?
+        .query_map(params![&dir[..], count.saturating_add(1).min(i64::MAX as u64) as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if rows.len() as u64 != count || rows.iter().enumerate().any(|(i, (n, _))| *n as u64 != i as u64) {
+        return Ok(None);
+    }
+    rows.into_iter().map(|(_, hash)| hash_of(hash)).collect::<rusqlite::Result<Vec<_>>>().map(Some)
+}
+
+/// Chunk `n` of the kept file in `dir`: its hash, and the copy held, if one is.
+pub fn kept_piece(conn: &Connection, dir: &[u8; 16], n: u64) -> rusqlite::Result<Option<([u8; 32], Option<Gen>)>> {
+    let row: Option<(Vec<u8>, Option<Vec<u8>>)> = conn
+        .prepare_cached("SELECT hash, gen FROM kept_chunks WHERE dir = ?1 AND n = ?2")?
+        .query_row(params![&dir[..], n.min(i64::MAX as u64) as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    row.map(|(hash, gen)| Ok((hash_of(hash)?, gen.map(gen_of).transpose()?))).transpose()
+}
+
+/// Record that copy `gen` of chunk `n` of the kept file `id` in `dir` is held, `len` bytes. The
+/// caller has checked that none was.
+pub fn kept_piece_put(conn: &Connection, id: &[u8; 32], dir: &[u8; 16], n: u64, gen: &Gen, len: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE kept_chunks SET gen = ?3 WHERE dir = ?1 AND n = ?2 AND gen IS NULL")?.execute(params![&dir[..], n as i64, &gen[..]])?;
+    conn.prepare_cached("UPDATE kept SET held = held + ?2 WHERE id = ?1")?.execute(params![&id[..], len as i64]).map(drop)
+}
+
+/// Give up copy `gen` of chunk `n` of the kept file `id` in `dir`: its row no longer names it,
+/// and it is recorded to be removed, counted against `pool`. False if that copy was not the one
+/// held.
+pub fn kept_piece_drop(conn: &Connection, id: &[u8; 32], dir: &[u8; 16], n: u64, gen: &Gen, len: u64, pool: Pool) -> rusqlite::Result<bool> {
+    let changed = conn.prepare_cached("UPDATE kept_chunks SET gen = NULL WHERE dir = ?1 AND n = ?2 AND gen = ?3")?.execute(params![&dir[..], n as i64, &gen[..]])?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    conn.prepare_cached("UPDATE kept SET held = MAX(held - ?2, 0) WHERE id = ?1")?.execute(params![&id[..], len as i64])?;
+    trash_chunk(conn, dir, n, gen, len, pool)?;
+    Ok(true)
+}
+
+/// The first chunk of the kept file in `dir`, from `from` on, that is not held.
+pub fn kept_missing(conn: &Connection, dir: &[u8; 16], from: u64) -> rusqlite::Result<Option<u64>> {
+    conn.prepare_cached("SELECT n FROM kept_chunks WHERE dir = ?1 AND n >= ?2 AND gen IS NULL ORDER BY n LIMIT 1")?
+        .query_row(params![&dir[..], from.min(i64::MAX as u64) as i64], |r| r.get::<_, i64>(0).map(|n| n as u64))
+        .optional()
+}
+
+/// How many chunks of the kept file in `dir` are held.
+pub fn kept_held_count(conn: &Connection, dir: &[u8; 16]) -> rusqlite::Result<u64> {
+    conn.prepare_cached("SELECT COUNT(*) FROM kept_chunks WHERE dir = ?1 AND gen IS NOT NULL")?.query_row([&dir[..]], |r| r.get::<_, i64>(0)).map(|n| n as u64)
+}
+
+/// Say a kept file was opened now.
+pub fn kept_touch(conn: &Connection, id: &[u8; 32], now: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE kept SET used = ?2 WHERE id = ?1")?.execute(params![&id[..], now as i64]).map(drop)
+}
+
+/// Throw a kept file away: its rows and its saves go, and its directory is recorded to be
+/// removed, its held bytes and `extra` (copies on disk no row names) counted against `pool`
+/// until they are. Returns how many chunk rows went, or `None` if there was no such kept file.
+pub fn kept_throw(conn: &Connection, id: &[u8; 32], pool: Pool, extra: u64) -> rusqlite::Result<Option<u64>> {
+    let Some(kept) = kept_get(conn, id)? else { return Ok(None) };
+    conn.prepare_cached("DELETE FROM kept WHERE id = ?1")?.execute([&id[..]])?;
+    conn.prepare_cached("DELETE FROM saves WHERE id = ?1")?.execute([&id[..]])?;
+    let rows = conn.prepare_cached("DELETE FROM kept_chunks WHERE dir = ?1")?.execute([&kept.dir[..]])?;
+    trash_dir(conn, &kept.dir, kept.held.saturating_add(extra), pool)?;
+    Ok(Some(rows as u64))
+}
+
+/// Kept files in the cache (none saving them), least recently opened first: id, length and
+/// bytes held. At most `max`, none of them `except`.
+pub fn cached_oldest(conn: &Connection, except: Option<&[u8; 32]>, max: usize) -> rusqlite::Result<Vec<([u8; 32], u64, u64, u64)>> {
+    let except = except.map_or(Vec::new(), |id| id.to_vec());
+    conn.prepare_cached(
+        "SELECT id, length, held, used FROM kept k WHERE id != ?1 AND NOT EXISTS (SELECT 1 FROM saves s WHERE s.id = k.id) ORDER BY used, id LIMIT ?2",
+    )?
+    .query_map(params![except, max as i64], |r| Ok((hash_of(r.get(0)?)?, r.get::<_, i64>(1)?.max(0) as u64, r.get::<_, i64>(2)?.max(0) as u64, r.get::<_, i64>(3)?.max(0) as u64)))?
+    .collect()
+}
+
+/// Kept files by id, after `after`, at most `max`: each id and its row.
+pub fn kept_list(conn: &Connection, after: &[u8], max: usize) -> rusqlite::Result<Vec<([u8; 32], KeptFile)>> {
+    conn.prepare_cached(&format!("SELECT k.id, {KEPT_COLUMNS} FROM kept k WHERE k.id > ?1 ORDER BY k.id LIMIT ?2"))?
+        .query_map(params![after, max as i64], |r| Ok((hash_of(r.get(0)?)?, kept_file(r, 1)?)))?
+        .collect()
+}
+
+/// Say `agent` is saving the kept file `id`, as of `now`.
+pub fn save_add(conn: &Connection, agent: &str, id: &[u8; 32], now: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO saves VALUES (?1, ?2, ?3)")?.execute(params![&id[..], agent, now as i64]).map(drop)
+}
+
+/// Whether `agent` is saving the kept file `id`.
+pub fn save_of(conn: &Connection, agent: &str, id: &[u8; 32]) -> rusqlite::Result<bool> {
+    conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM saves WHERE id = ?1 AND agent = ?2)")?.query_row(params![&id[..], agent], |r| r.get(0))
+}
+
+/// Stop `agent`'s save of `id`. Whether there was one.
+pub fn save_remove(conn: &Connection, agent: &str, id: &[u8; 32]) -> rusqlite::Result<bool> {
+    Ok(conn.prepare_cached("DELETE FROM saves WHERE id = ?1 AND agent = ?2")?.execute(params![&id[..], agent])? > 0)
+}
+
+/// The agents saving the kept file `id`.
+pub fn save_agents(conn: &Connection, id: &[u8; 32]) -> rusqlite::Result<Vec<String>> {
+    conn.prepare_cached("SELECT agent FROM saves WHERE id = ?1 ORDER BY agent")?.query_map([&id[..]], |r| r.get(0))?.collect()
+}
+
+/// The saves `agent` has in progress: each id, when it was last touched, and the kept row.
+pub fn saves_of(conn: &Connection, agent: &str, max: usize) -> rusqlite::Result<Vec<([u8; 32], u64, KeptFile)>> {
+    conn.prepare_cached(&format!("SELECT s.id, s.touched, {KEPT_COLUMNS} FROM saves s JOIN kept k ON k.id = s.id WHERE s.agent = ?1 ORDER BY s.id LIMIT ?2"))?
+        .query_map(params![agent, max as i64], |r| Ok((hash_of(r.get(0)?)?, r.get::<_, i64>(1)?.max(0) as u64, kept_file(r, 2)?)))?
+        .collect()
+}
+
+/// Saves last touched before `before`: each agent and id, at most `max`.
+pub fn saves_expired(conn: &Connection, before: u64, max: usize) -> rusqlite::Result<Vec<(String, [u8; 32])>> {
+    conn.prepare_cached("SELECT agent, id FROM saves WHERE touched < ?1 ORDER BY touched LIMIT ?2")?
+        .query_map(params![before.min(i64::MAX as u64) as i64, max as i64], |r| Ok((r.get(0)?, hash_of(r.get(1)?)?)))?
+        .collect()
+}
+
+/// Make the kept file `id`, every chunk of which is held, a file of the ship: its row, its
+/// chunks' rows made from the kept ones under the same directory (no byte is moved), a claim
+/// for each agent saving it, and the count of bytes held. Its kept and saves rows go. Nothing on
+/// disk changes.
+pub fn kept_to_file(conn: &Connection, id: &[u8; 32], kept: &KeptFile, agents: &[String], now: u64) -> rusqlite::Result<()> {
+    conn.prepare_cached("INSERT INTO files VALUES (?1, ?2, ?3, ?4, ?5)")?.execute(params![&id[..], &kept.dir[..], kept.length as i64, kept.media_type, now as i64])?;
+    conn.prepare_cached("INSERT INTO file_chunks SELECT dir, n, gen, hash FROM kept_chunks WHERE dir = ?1 AND gen IS NOT NULL")?.execute([&kept.dir[..]])?;
+    for agent in agents {
+        claim_add(conn, agent, id)?;
+    }
+    conn.prepare_cached("DELETE FROM kept_chunks WHERE dir = ?1")?.execute([&kept.dir[..]])?;
+    conn.prepare_cached("DELETE FROM kept WHERE id = ?1")?.execute([&id[..]])?;
+    conn.prepare_cached("DELETE FROM saves WHERE id = ?1")?.execute([&id[..]])?;
+    set_file_bytes(conn, file_bytes(conn)?.saturating_add(kept.length))
 }
 
 /// Open a ship file just built by `import`, before it is published, to finish it: it stays

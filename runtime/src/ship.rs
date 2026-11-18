@@ -414,6 +414,9 @@ impl Ship {
             set.map_err(|e| NotKept { error: e.into(), uncertain: false })?;
         }
         let done = self.transact_knowing(work);
+        if done.is_ok() {
+            crate::files::seams::synced_commit();
+        }
         if normal {
             // Left as it is if this fails: syncing more than asked for is safe.
             let conn = lock(&self.conn);

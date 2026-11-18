@@ -26,7 +26,9 @@ is no update mechanism yet.
   runs with the networking key Urbit's own wallet derives for it.
 - A ship can be exported as one sealed file (and, if it holds files, a second
   sealed file beside it with them) and imported into another runtime. Only the
-  owner opens these, with the master ticket.
+  owner opens these, with the master ticket. The sealed file also lists what
+  the owner had kept from other ships (which files, not their contents); an
+  import leaves that list behind.
 - A ship keeps files of any size beside its own file, up to an allowance the
   operator sets (10 GiB by default). The owner's signed-in devices upload a
   file a chunk at a time, can stop and carry on where they left off, and
@@ -37,7 +39,13 @@ is no update mechanism yet.
   ship, if the agent that holds it there allows it: the agent is asked, or
   has marked the file open to every ship. The owner's ship checks every piece
   against the file's id before passing it on, so a ship that lies can make a
-  fetch fail but never hand over a wrong byte, and it keeps nothing.
+  fetch fail but never hand over a wrong byte.
+- What the owner opens is kept for a while, so opening it again needs no
+  network, even if the other ship is off or has taken the file back. The
+  owner can see what is kept and clear it. Up to an allowance the operator
+  sets (3 GiB by default); when that is full the least recently opened goes,
+  and anything not opened for 30 days. The owner can also save a copy for
+  good: it then becomes one of their own files, as if they had uploaded it.
 - A file is known by a hash over its contents, checked chunk by chunk, so
   every byte served is checked against what was stored, and identical files
   are kept once. Files are encrypted on disk like everything else, and go
@@ -246,6 +254,7 @@ source rather than something the tests prove.
 | `runtime/src/seal.rs` | Keys: the storage key, the keys derived from it, the recovery key, and sealing and opening an exported copy and its stream of files |
 | `runtime/src/files.rs` | Files on the ship: the file id format, uploads and downloads, reading chunks back checked, clearing leftovers, serving a file to another ship and the answers agents gave about it, and the stream of files beside an exported copy |
 | `runtime/src/remote.rs` | Fetching a file from another ship for the owner's devices, and checking every part of it against the file's id |
+| `runtime/src/kept.rs` | Keeping what was fetched from another ship (the cache), clearing it, and saving a copy as a file of the ship's own |
 | `urbit-id/src/` | Urbit ID's keys as Urbit derives them: `wallet.rs` (master ticket to networking keys, UP 8), `argon2.rs` (Urbit's Argon2 variant), `ob.rs` (ship and moon names, tickets), `keyfile.rs` (reading and writing keyfiles), `naive.rs` (Azimuth's state worked out from its logs and layer 2 batches: a port of Urbit's `naive.hoon`) |
 | `runtime/src/azimuth.rs` | Reading Urbit ID: a ship's key from the Azimuth contract on Ethereum, or from the roller for a ship on layer 2 |
 | `runtime/src/chain.rs` | Reading Ethereum's history over JSON-RPC: logs over a range of blocks, transaction inputs, the finalised block |
@@ -262,6 +271,7 @@ source rather than something the tests prove.
 | `runtime/tests/files.rs` | Integration tests of files on the ship |
 | `runtime/tests/lookup.rs` | Integration tests of finding ships through lookup points |
 | `runtime/src/remote_tests.rs` | Tests of fetching a file from another ship, inside the crate so that the ship answering can be made to lie |
+| `runtime/src/kept_tests.rs` | Tests of keeping what was fetched and saving a copy, with the same runtimes and liar, and failures made to happen at chosen points |
 | `kernel/src/lib.rs` | The default kernel: agent registry and routing policy |
 | `proto/ship.proto` | Every message: runtime and kernel, runtime and agent, client and ship, ship and ship |
 | `sdk/src/lib.rs` | Guest-side bindings and the `agent!` macro |
@@ -282,7 +292,7 @@ The workspace's default members are `runtime` and `urbit-id`, so a plain
 | `storage.key` | The storage key as 64 hexadecimal digits, mode 0600. Only there if the runtime was not handed a key and made its own |
 | `storage.check` | A value derived from the storage key, by which the directory tells its own key. It is not the key and opens nothing |
 | `blobs/<sha256>.wasm` | Module bytes, named by content hash and re-verified against that hash on every load. Not encrypted: they are code, shared between ships |
-| `files/<ship>/<dir>/<n>.<gen>` | The ship's files: one directory per upload, kept under the same name when the upload becomes a file, named with 16 random bytes in hex that are never used again; in each, copy `gen` (16 random bytes in hex) of chunk `n`, encrypted. Nothing here is named by a hash of what it holds (see Files on the ship) |
+| `files/<ship>/<dir>/<n>.<gen>` | The ship's files: one directory per upload, kept under the same name when the upload becomes a file, and one per file kept from another ship, kept under the same name if it is saved; each named with 16 random bytes in hex that are never used again; in each, copy `gen` (16 random bytes in hex) of chunk `n`, encrypted. Nothing here is named by a hash of what it holds (see Files on the ship) |
 | `tmp/` | Scratch files. New and imported ships are built here and then hard-linked into `ships/`, so a failure never leaves a half-made ship under its real name |
 | `runtime.lock` | Held with an exclusive `flock` for the life of the runtime. A second runtime on the same directory fails with `Error::DataDirInUse` |
 
@@ -501,10 +511,9 @@ The calls that change something are refused during a read or a checkpoint.
 ## Storage
 
 Each ship is one SQLite file, and the file is the ship's source of truth. The
-schema version is `11`, stored in the `meta` table; a file with any other
+schema version is `12`, stored in the `meta` table; a file with any other
 version is refused. There is no migration: ship files and exports made before
-version 11 (before a claim on a file could be marked open to other ships) do
-not open.
+version 12 (before a ship kept files fetched from other ships) do not open.
 
 | Table | Purpose |
 | --- | --- |
@@ -530,7 +539,10 @@ not open.
 | `files` | Files held: id, directory, length, media type, when added. `meta.file_bytes` is the sum of their lengths |
 | `file_claims` | Which agents claim which files, and whether each claim is marked open to every ship (`open`, 0 or 1) |
 | `file_chunks` | The copy and hash of each chunk held, for uploads and files alike, by directory and chunk number |
-| `file_trash` | What no row names any more and is still to be removed from disk: whole directories and single chunk copies, with the bytes each holds |
+| `file_trash` | What no row names any more and is still to be removed from disk: whole directories and single chunk copies, with the bytes each holds and the allowance it counts against (`pool`: 0 the file allowance, 1 the cache of kept files) |
+| `kept` | Files fetched from other ships that the ship keeps: id, directory, length, media type, when last opened (`used`), and the bytes of pieces held (`held`) |
+| `kept_chunks` | Every chunk of a kept file, by directory and chunk number: its hash, from the moment the file is kept, and the copy's generation once the piece is held (NULL until then) |
+| `saves` | Which agents are saving which kept file, and when each last called (`touched`) |
 
 Files are opened with `journal_mode = WAL` and `trusted_schema = OFF`. With
 `Durability::Full` (the default), SQLite uses `synchronous = FULL` and
@@ -1209,7 +1221,8 @@ an agent. An agent keeps only a reference (`FileRef`: ship, id, length,
 agent) and never loads a file; no host function reads or writes file bytes.
 Another ship's owner can fetch a file through their own ship, which checks it
 chunk by chunk against its id in chunks of at most 1 MiB (see Fetching a
-file from another ship). A cache and "save a copy" are not built yet.
+file from another ship). What is fetched is kept for a while, and a copy can
+be saved for good (see Keeping what was opened, and saving a copy).
 
 ### The file id (format 1)
 
@@ -1291,7 +1304,13 @@ stated at the top of `files.rs`, keeps them in step:
   be swept; the drain sweeps it, and strikes the record off only after the
   whole directory was listed without error, every copy no row names was
   removed, and the directory was synced. A crash or a failure at any point
-  leaves the record, and the next drain tries again. An upload given up or
+  leaves the record, and the next drain tries again. A sweep of a directory
+  no row owns any more (its file deleted) is struck off as done, since the
+  directory itself is to go, unless the whole directory is recorded to go and
+  has not yet: then the sweep stays, with what it is counted at, until that
+  removal works, which strikes off every record of the directory. (An
+  upload's sweep is counted at nothing, so for it this changes only when the
+  record goes.) An upload given up or
   expired takes its directory with it. Copies swept this way are of unknown
   size and are not counted against the allowance; they arise only from failed
   disk operations, at most one chunk per failed operation. A directory no row
@@ -1360,7 +1379,10 @@ elsewhere.
 
 - HARD. Held, reserved, and still-to-be-removed bytes together never pass
   `max_file_bytes` (10 GiB; 0 turns the store off) because of a new upload,
-  and never pass it by more than one chunk (1 MiB) at all. An upload reserves
+  and never pass it by more than one chunk (1 MiB) at all, but for what part 3
+  adds (see What holds, and how, under Keeping what was opened: pieces given
+  up from files being saved, and up to 2 MiB counted for a file made from a
+  kept file until its sweep works). An upload reserves
   its whole length when it starts, and only if all three together leave room.
   Finishing moves that from reserved to held, or to be removed when the file
   was already held; abandoning, expiry, and deletion move bytes to be removed;
@@ -1402,7 +1424,8 @@ elsewhere.
 Bounds, with their working:
 
 - Disk. Held, reserved, and to-be-removed bytes are within `max_file_bytes`
-  plus one chunk. Beyond them: 28 bytes per chunk copy (280 KiB for 10 GiB);
+  plus one chunk (with part 3's additions, under Keeping what was opened).
+  Beyond them: 28 bytes per chunk copy (280 KiB for 10 GiB);
   one new chunk copy (1 MiB and 28 bytes) per chunk upload in progress, and
   over HTTP each one holds a worker, so at most `workers` (16) per server,
   about 16 MiB; and, after a crash or a failure that could not clean up after
@@ -1514,9 +1537,13 @@ its files, which the count says.
 The owner of ship B opens a file that lives on ship A. B's device asks B over
 HTTP; B asks A over the ship-to-ship connection; A checks that B may have the
 file; B checks every piece against the file's id and passes it straight to
-the device. B keeps nothing: no file, no directory, no row. Code: serving in
-`files.rs` (`Runtime::serve_file`) and `ship.rs` (`Ship::file_permit`), the
-wire in `net.rs`, checking in `remote.rs`, routes in `server.rs`.
+the device. With keeping off (`max_cache_bytes` 0) B keeps nothing: no file,
+no directory, no row. With it on, B keeps what it was given, once checked (see
+Keeping what was opened, and saving a copy); what follows here is what happens
+for a file B does not keep. Code: serving in `files.rs`
+(`Runtime::serve_file`) and `ship.rs` (`Ship::file_permit`), the wire in
+`net.rs`, checking in `remote.rs`, keeping in `kept.rs`, routes in
+`server.rs`.
 
 **Who may have a file** is decided by the agent on A that claims it, never at
 install. Closed by default: the agent is asked, as a `KIND_FILE_ASK` call
@@ -1647,9 +1674,10 @@ cannot be reached or does not answer within `file_timeout`, 503 with
 `Retry-After` when B or A is too busy (B: `Retry-After: 1`) or B has no network
 running (`Retry-After: 5`), and 503 without it when B's messages are too small
 for a chunk or B's server has no download places (two workers). After the head, anything wrong ends the answer short, never padded
-and never with unchecked bytes; the device carries on with `Range`. Hashes are
-fetched again for each HTTP request: nothing learned from one answer of A's is
-used in another request.
+and never with unchecked bytes; the device carries on with `Range`. For a file
+B does not keep, hashes are fetched again for each HTTP request: nothing learned
+from one answer of A's is used in another request. A file B keeps is read
+from B's own rows, which were checked against the id when it was first kept.
 
 Over a relayed connection files go at the relay's existing limits with no
 special handling: about 128 KiB/s at most, shared with everything else sent to
@@ -1736,21 +1764,404 @@ Bounds, with their working:
   most `file_ask_millis` (500 ms) with the kernel's decision, and a little
   more, as the cut-off is noticed (above). These were not measured on other machines or
   in a release build.
-- On B, threads: each of the three routes waits on A holding a worker, so each
-  takes a place among the downloads, as a local file's contents do, and of
-  those places requests to other ships may hold at most half, and at least one.
-  Long polls, downloads and waits on other ships together therefore never take
-  the threads kept for everything else. With 16 workers (the default): 8 may
-  wait for logs, 4 download or wait on other ships (2 of them at most waiting
-  on other ships), 4 are always left; with 4: 2, 1 (which may be a wait on
-  another ship), 1; with 2: 1, none (every remote route answers 503), 1. Past a
-  limit: 503 with `Retry-After: 1`.
+- On B, threads: each of the three routes that waits on A does so holding a
+  worker, so it holds a place among the downloads, as a local file's contents
+  do, and of those places requests to other ships may hold at most half, and
+  at least one. Long polls, downloads and waits on other ships together
+  therefore never take the threads kept for everything else. With 16 workers
+  (the default): 8 may wait for logs, 4 download or wait on other ships (2 of
+  them at most waiting on other ships), 4 are always left; with 4: 2, 1 (which
+  may be a wait on another ship), 1; with 2: 1, none (no route can wait on
+  another ship, 503), 1. Past a limit: 503 with `Retry-After: 1`. Since part
+  3 these places are taken at a request's first question to A, not before:
+  what B keeps of a file is read without them (see Keeping what was opened,
+  and saving a copy).
 - On B, memory per request: one list of index hashes, one group of chunk
   hashes and one chunk (1 MiB each) and one reply being read and decoded
-  (about 2 MiB): about 5 MiB, 10 MiB with the defaults. Each wait on A is
+  (about 2 MiB): about 5 MiB, 10 MiB with the defaults. A piece kept is
+  sealed where it lies, and needs no copy. Each wait on A is
   within `file_timeout` (and 2 s more on the waiting thread), each write to
   the device within `io_timeout`. There is no deadline for a whole download, as
   for a local one.
+
+### Keeping what was opened, and saving a copy
+
+After part 2, opening a file on ship A from ship B fetched it every time, and
+a file A had taken back, or A switched off, could not be opened at all. Now B
+keeps what it was given, up to an allowance, so opening it again needs no
+network; and B's owner can ask for a file to be kept for good, as one of B's
+own files. Nothing changes on A or on the wire. Code: `runtime/src/kept.rs`,
+with the shared chunk-copy path in `files.rs` and the routes in `server.rs`.
+
+**A kept file** is a file of another ship's that B holds some or all of, known
+by its id. It has a row in `kept` (its directory, 16 random bytes never used
+again, as for an upload; its length and media type; when it was last opened;
+the bytes of its pieces held) and a row in `kept_chunks` for every chunk, with
+the chunk's hash from the moment it is kept and the copy's generation once the
+piece is held. Only a file of at most `FANOUT` chunks (32 GiB) is kept, and
+only once its length and every hash have been checked against its id as part 2
+checks them; a larger file is passed through as in part 2. A kept file is in
+one of two states:
+
+- **In the cache**: no agent is saving it. Its held bytes count against
+  `max_cache_bytes` (3 GiB; 0 turns keeping off, and the three routes are then
+  exactly part 2's). It may be thrown away at any time.
+- **Being saved**: one or more rows in `saves`. Its whole length is reserved
+  against `max_file_bytes`, as an upload's is, its held bytes do not count
+  against the cache, and it is not thrown away. When every piece is held it
+  becomes a file of B's.
+
+**Opening** (the three routes of part 2, same addresses). If B keeps the file,
+its length, media type and hashes come from B's own rows, with no question to
+A, whatever ship and agent the address names: what B was given, B has. The
+hashes are checked against the id again each time they are read, and rows
+that no longer come to it are not used (the file is then opened as part 2
+opens it). When it was last opened is written at most once a minute. For each
+piece wanted: if it is held it is read from disk and checked against its hash,
+as every chunk is. A copy that is certainly not the piece (missing, the wrong
+size, not opening under its key for its place, not matching) is given up: in
+one synced transaction its row stops naming it and it is recorded in the trash,
+counted where the file's bytes are counted, and the drain removes it. A copy
+that could not be read for some other reason (a failed read that says nothing
+about the copy) is not given up. Either way the piece is then fetched from A
+as in part 2, checked, kept if it can be, and given to the device. A file B
+does not keep is opened as part 2 opens it, and then, if keeping is on and
+there is room for its rows, begins to be kept.
+
+The device gets a piece before the ship tries to keep it, and keeping is best
+effort: whatever stops a piece being kept (no room, a full ship file, a disk
+error, the kept file thrown away meanwhile, no place free for keeping) the
+checked piece goes to the device all the same, and no sooner or later because
+of it. In a contents answer each piece fetched is written to the device, then
+kept, then the next is fetched; a piece whose write fails is not kept. The
+answer of one chunk, and the last piece of a contents answer, are kept only
+after the device has the whole answer and the connection is closed, and after
+the request has given back its places; at most two pieces are kept like this
+at once in a runtime (`MOST_KEEPING_AFTER`), taken without waiting, and with
+neither free the piece is not kept. One keep of a whole 1 MiB piece (seal,
+write, sync the copy and its directory, one synced commit) took 41 ms at the
+median and 46 ms at worst, in three runs of 50 on a Mac laptop in an
+unoptimised build with the default durability. That is a measurement of one
+keep on that machine, not a bound on what keeping can add between two pieces
+of a contents answer: a keep can also wait for the ship's slot, throw others
+away, drain the trash, or sit on a disk that is slow or stuck. Not measured
+elsewhere.
+
+**Room in the cache.** A piece goes into a file in the cache only if the
+cache, with it, stays within `max_cache_bytes`, decided in the transaction
+that names the piece. The cache counts the held bytes of kept files in the
+cache and what was thrown away from it and is still on disk (`file_trash`
+rows with `pool` 1), so throwing away makes room only once the drain has
+removed the bytes. If the piece does not fit, the least recently opened kept
+files in the cache, never the one being read, are thrown away in one synced
+transaction until what is left with the piece would fit or the request's
+budget is spent; the trash is drained, whether or not anything new was thrown
+away (what was thrown away before and could not be removed then may go now);
+and the piece is tried once more. If it still does not fit it is not kept.
+
+The rows of files in the cache have an allowance of their own, a sixteenth of
+`max_ship_bytes` (64 MiB by default), counted by the rule an upload's rows are
+counted by (128 bytes a chunk and 1 KiB a file), whether or not a byte of the
+file is held: a ship that answers what its files are, and nothing else, can
+make B keep their rows and no bytes. Beginning to keep a file in the cache
+throws away the least recently opened ones until its rows fit, within the
+request's budget, and keeps nothing if they still do not; a file whose own
+rows pass the allowance (more than about half a million chunks' worth with
+the defaults; a 32 GiB file's rows are 4 MiB and 1 KiB, so 15 of them fit, in
+62,929,920 bytes: 62.9 MB, 60.0 MiB) is never kept in the cache. A save is not
+counted here: its rows are bounded by its reservation against
+`max_file_bytes` (see Bounds below). A save that stops goes back to the
+cache only if its rows fit too.
+
+Kept files in the cache not opened for `cache_keep_millis` (30 days) are thrown
+away, and so are the least recently opened while the cache holds more bytes
+than its allowance, more rows than its allowance, or more than `max_kept`
+files are kept (any of which can be after a setting is lowered), when an
+upload starts, when a file begins to be kept, and when a save call starts. At
+most `max_kept` (1,024) files are kept, in the cache and being saved together;
+a new one throws away the least recently opened in the cache to make its
+place, and is not kept if every one is being saved. A kept file's rows must
+also fit the room the ship keeps in its own file, as an upload's must.
+Throwing away is rows first, in a synced transaction that records the
+directory in the trash, and bytes after, as a file's deletion is.
+
+Everything one request throws away under the ship's slot shares one budget:
+at most 64 kept files, and at most 65,538 rows counting each file's chunk rows
+and its own row (two whole files of 32,768 chunks). That covers the saves that
+ran out and are stopped, the sweep of the cache, room made for bytes, for rows
+and in the count, a second sweep in the same request, and the request's own
+target: a save call keeps back room in its budget, from its first throwing
+away, to throw away its own kept file (a redundant copy at its finish, or one
+whose rows are damaged), and stopping a save keeps back room for the file it
+stops. What does not fit waits for a later request; a request that finds it
+must throw away its own target and cannot is refused (503, try again later)
+and throws nothing away. Clearing everything is the one exception: it takes
+one budget for each of its transactions, letting the ship go between them.
+
+A request's opening sweep (saves run out, stale files, files over a lowered
+setting, files in the cache with strays) is a synced transaction of its own,
+run only when there is something to sweep, and drained after; what it throws
+away stays thrown away even if the request is then refused. What a request
+throws away only to make room for the very file it is about to keep (rows
+and the count, in beginning to keep it) is in that file's transaction, and
+goes back with it if the file is refused.
+
+**Seeing and clearing the cache** (signed in, under the ship, not under an
+agent):
+
+| Method and path | Answer |
+| --- | --- |
+| `GET /files/kept?after=&max=` | `KeptList` of `KeptInfo {id, length, held, used_ms, saving}`, in order of id, at most 256 (100 by default) per page |
+| `DELETE /files/kept/<id>` | Throws that file away from the cache. `Cleared {thrown_away, being_saved}`: a file being saved is left alone and counted in `being_saved`. 404 for an id not kept |
+| `DELETE /files/kept` | Throws away every file in the cache: every kept file is listed by id, 256 at a time, until there are no more (whatever `max_kept` now is), and those in the cache thrown away in transactions with one budget each, letting the ship go between them. `being_saved` counts the kept files left alone because some agent was saving them when their batch ran, counted inside those transactions |
+
+When a clear returns, no row names the files it threw away, they are not read
+back from B (opening one again asks A afresh), and their bytes are in the trash
+or gone; they are gone once the trash has drained, which the call does before
+it returns unless a removal fails, in which case the next file operation tries
+again. Files being saved are untouched.
+
+**Saving a copy** (signed in, under the agent that is to claim the file, which
+must be installed):
+
+| Method and path | Answer |
+| --- | --- |
+| `POST /agents/<a>/files/save` | `SaveRequest {ship, agent, id}` gets `SaveReply {done, held, chunks}`. Call again until `done`; each call carries on where the last left off |
+| `GET /agents/<a>/files/saves` | `SaveList` of `SaveInfo {id, length, held, chunks, touched_ms}`: the agent's saves in progress |
+| `DELETE /agents/<a>/files/saves/<id>` | Stops the agent's save. 204, or 404 if it has none |
+
+- If B already holds a file with that id, the claim for `<a>` is added and the
+  answer is done, with nothing asked of A. A save of it `<a>` had begun is
+  ended, and if no other agent is saving the kept copy, it is thrown away.
+- Otherwise saves and kept files gone stale are swept first, in a synced
+  transaction of their own when there is anything to sweep, so that what is
+  thrown away there stays thrown away whatever the call then finds; the file becomes
+  kept if it is not (asking A, as opening does); and a save for `<a>` is added,
+  with the whole length reserved against the file allowance, in one synced
+  transaction. It is refused as an upload would be: 403 if the store is off,
+  413 if the file could never be one of B's, 507 if there is no room, 409 if
+  B already holds, with the files being saved, `max_files` files.
+- Then missing pieces are fetched from the ship and agent the request names,
+  checked against the kept hashes, and kept, one at a time, until none is
+  missing or `save_slice_millis` (10 s) has passed since the call began; a
+  fetch begun before then is let finish. A's failures answer as on the
+  remote routes (404, 502, 503, 504), and what was kept by then stays. A kept
+  file whose directory holds as many strays as it may (see On disk) answers
+  503, try again later.
+- When no piece is missing, one synced transaction makes the file: its rows
+  from the kept rows under the same directory (no byte is moved or written
+  again), a claim for every agent saving it, the kept and saves rows gone, the
+  reservation become held bytes, and the directory recorded to be swept of
+  copies no row names. The held count and every hash are checked inside that
+  transaction: a piece given up meanwhile makes it refuse (409), and the next
+  call fetches the piece. The id is worked out from the stored hashes and must
+  be the id asked for. If a file with that id has appeared meanwhile (the same
+  bytes uploaded), every agent saving it claims that one instead and the kept
+  copy is thrown away, with the room the call kept back for it.
+- Stopping the last save of a kept file returns its reservation. The file goes
+  back to the cache if its held bytes and rows fit there, after the least
+  recently opened others are thrown away to make room (done first, while the
+  file is still reserved, within the request's budget, keeping back enough to
+  throw this one away), and its directory has no strays; it is thrown away if
+  not. A save not called for `upload_keep_millis` (24 h) is stopped when an
+  upload, a keeping or a save starts, without throwing others away for it: it
+  goes back to the cache only if it fits as the cache is.
+- A save call that finds the file's stored hashes certainly do not vouch for
+  its id (read without error, and not as many as its length takes, or not
+  coming to the id) ends its own save in that call: the agent's save is
+  removed, and if no other agent is saving the file it is thrown away, never
+  returned to the cache, with the room the call kept back, in one synced
+  transaction. The call answers 500 (damaged) once; made again, it starts
+  afresh. Another agent still saving it keeps its save, and its next call does
+  the same. An error reading decides nothing. A save stopped or run out
+  without such a call leaves the file as it is, and the next open or save call
+  finds it (an open throws a file in the cache with such rows away).
+- The saved file is an ordinary file of part 1 from then on: closed (`open`
+  0), listed, downloadable, deletable, and exported with the ship.
+
+A kept file is never a file as far as serving goes: B never serves it, or any
+piece of it, to another ship, and no agent sees it (no host function reaches
+it, and `files::info` answers as for a file the agent does not claim). An
+exported ship carries, inside its sealed copy, the rows of `kept`,
+`kept_chunks`, `saves` and the trash: the ids, lengths, media types and hashes
+of what was opened from other ships, and no bytes of them, as it already
+carries `uploads`. The rows of files in the cache are bounded by their
+allowance above, which bounds what they add to an export. An import brings
+none of these rows in and looks at none of them. The first look at a ship's
+files when it wakes counts a kept file's directory as named.
+
+#### On disk
+
+A piece is put on disk by the same code as an upload's chunk
+(`Runtime::prepare_copy` and `PreparedChunk`, with a `Holder` that is either
+an upload or a kept file): hashed and sealed outside the ship's slot, its name
+made by an exclusive create under the slot only while the kept file is still
+there under the same directory and does not hold the piece, written and synced
+outside, and named in a transaction committed synced only if the kept file is
+still there under the same directory, does not hold the piece, and the row's
+hash is the hash of what was written. A copy refused, or failing before its
+commit, is removed by the call that made it. The trash, its drain, and the
+sealing are part 1's. Every transaction that names bytes or records something
+to remove (keeping a piece, giving one up, throwing away, clearing, beginning
+to keep a file, a save beginning, stopping and finishing) is committed synced.
+
+Copies no row names in a kept directory are bounded and cleared:
+
+The runtime keeps one record, in memory, for each kept directory it keeps
+into: whether it has been looked through, its strays, its copies on their
+way, and whether it is retired.
+
+- After a crash. The first time in a runtime's life that a copy is about to be
+  made in a kept directory, under the ship's slot and before that copy's name
+  is made, the directory is marked looked and then listed, and every entry
+  that no `kept_chunks` row names by its exact generation, and that the trash
+  does not record, is removed. The safety of this rests on one thing: the
+  first look precedes every copy this life makes in that directory (all of
+  them are made under the slot, after it). A second look would not, and could
+  remove a copy made and not yet named; so a directory is looked through once
+  in a life whatever comes of the look. An error reading the rows or listing
+  the directory, or a removal that fails, removes nothing more, and what the
+  look left stays until the next life's first copy there, or until the
+  directory goes. Each look lists one directory: at most its 32,768 named
+  copies and whatever a crash left in it.
+- In a running runtime. A copy is on its way from when its place is taken,
+  under the slot, before its name is made, until it ends, exactly once: named
+  by a commit known to have landed, removed, or become a stray (a commit of
+  unknown outcome, or a removal that failed). A directory takes a new copy only
+  while its strays and copies on their way are fewer than two
+  (`MOST_STRAYS`): so at most two pieces are kept at once into one kept
+  directory, a third request passes its piece through unkept (an open) or
+  answers 503, try again later (a save call), and strays and copies on their
+  way together never pass two. A file in the cache with a stray is thrown away
+  at the first chance (the request that made the stray tries once, and the
+  sweep tries again); a spent budget or a failed transaction can put that off.
+  A file being saved goes on up to the cap; when it is saved, the sweep of its
+  directory clears its strays; when its last save stops or runs out it is
+  thrown away, not returned to the cache.
+- Retirement. When the transaction that throws a kept directory away, or makes
+  it a file's, is known to have landed, its record goes; with copies still on
+  their way it is marked retired, counts no more strays, and goes when the
+  last of them ends. A late completion never brings a record back. Each sweep
+  also drops up to 64 records of the ship whose directory no `kept` row names
+  and that have nothing on their way (a throwing away that landed and
+  reported an error leaves such a record), carrying on from where the last
+  one stopped. So the records number at most the kept directories kept into
+  in this life, and those with copies on their way.
+- Charging. A kept directory thrown away is recorded in the trash at its held
+  bytes and 1 MiB more for each stray and each copy on its way into it then,
+  so what cannot be removed stays counted against its pool until the
+  directory is durably gone. The sweep recorded for a directory made a file's
+  is charged the same way, against the file allowance, until it is done; if
+  the file is deleted first, the sweep and its charge stay until the whole
+  directory is removed.
+
+A drain that runs after a transaction failed, or after one whose commit's
+outcome is unknown, reads the trash afresh and acts only on rows the ship's
+file holds as committed when it reads them: after a rolled-back transaction it
+finds nothing that transaction wrote. Every transaction that records trash is
+committed with its log synced, and the bundled SQLite makes a commit visible to
+readers only after that sync; so the drain never acts on rows a commit that
+reported an error may yet lose. That last step is SQLite's, and was not tried
+with a failing disk.
+
+#### What holds, and how
+
+- HARD. Every byte handed on from a kept file hashes to the hash the request
+  checked against the id, read back and checked on every read; a piece that
+  fails is never served. A saved file's id is the id asked for.
+- HARD. A piece is named only by the very kept file it was fetched for: the
+  directory, never used again, is compared under the slot when the copy's name
+  is made and again in the transaction that names it. A file thrown away and
+  kept again meanwhile has another directory.
+- HARD. The cache, held and to be removed, is within `max_cache_bytes` at
+  every instant, but for one thing: a kept file in the cache that is thrown
+  away is recorded to be removed at its held bytes and 1 MiB more for each
+  stray and copy on its way into it, so that what may not be removable stays
+  counted; that can take the count over by at most 2 MiB for each such
+  directory until it is gone. A piece is kept only if it fits with what is
+  to be removed counted. The rows of files in the cache are within their
+  allowance against everything the runtime does: no file is admitted to the
+  cache, and no save returned to it, while the cache's rows are, or would be,
+  over. A setting lowered between runs (`max_cache_bytes`, `max_ship_bytes`,
+  `max_kept`) is not something the runtime does: the cache may then be over
+  until sweeps bring it down within their budgets. While its rows are over,
+  no new file is kept in it, and pieces of files already in it may still be
+  kept (they add no rows). While its bytes, with what is to be removed, are
+  over a lowered `max_cache_bytes` and its rows and count are not, a new file
+  may still be begun in the cache (its rows, no bytes), and no piece is kept
+  in the cache, its file's or another's, until they fit. Held and reserved
+  file bytes, saves included, are within `max_file_bytes`: a save is begun
+  only if held, reserved and to-be-removed bytes leave room for its whole
+  length. What is to be removed can take that count over it by the bytes of
+  pieces given up from files being saved whose removal has not worked yet,
+  each one a copy found certainly bad on disk, and by what a file made from a
+  kept file is charged until its sweep works: 1 MiB for each stray and copy on
+  its way into its directory when it was made, at most 2 MiB, also kept when
+  the file is deleted until the directory itself is gone. While it is over,
+  nothing is reserved and no piece is taken for a file being saved.
+- HARD. At most `max_kept` kept files. Every write about kept files leaves the
+  ship's file the room it keeps (`room_to_take_one`) or used none.
+- HARD. Only signed-in devices reach these routes; a saved file is reached
+  only through an agent that claims it; names in an address or a body are
+  checked before use and none becomes a path.
+- BEST EFFORT. Beginning to keep needs room for all of a kept file's rows
+  then, and a save needs room for the file's rows to come; others may use the
+  room meanwhile, and every write is checked again.
+
+#### Bounds, with their working
+
+- Disk beyond the two allowances, while running: one sealed piece (1 MiB and
+  28 bytes) between its create and its commit per keep in progress, at most
+  two into one kept directory. Over HTTP, keeps in progress are those of
+  requests waiting on other ships (at most other ships' share of the download
+  places: 2 with the default 16 workers) and of pieces kept after their answer
+  (at most 2 a runtime): about 4 MiB. Then 28 bytes per piece held. Strays,
+  with copies on their way, at most two per kept directory: in a file being
+  saved, at most 2 MiB beyond its reservation; in a file in the cache, at most
+  2 MiB until the file is thrown away (at the first chance, which a spent
+  budget or a failed transaction can put off), and counted against the cache
+  from that moment until the directory is durably gone. After a crash, what it
+  left in a kept directory (at most one copy per keep that was in progress)
+  stays until the next life's first keep into that directory looks it
+  through, or until the directory goes; a look that fails leaves it until the
+  life after. A directory made for a kept file whose row never committed stays
+  until the ship first wakes.
+- Throwing away under the slot, per request: at most 64 kept files and 65,538
+  rows, in the request's transactions; clearing everything, the same per
+  transaction, letting the ship go between them. Not measured.
+- The rows of files being saved are not in the cache's allowance. They are
+  bounded by the reservation together with `max_kept`, `max_files`, and the
+  working room each save's row leaves: for N saves of positive length whose
+  reservations total S, the rows their files will need are at most
+  128 x (floor((S - N) / 1 MiB) + N) + 1,024 x N bytes by the estimate, which
+  with the defaults (N at most 1,024, S at most 10 GiB) is at most 11,263
+  chunk rows, about 2.5 MB.
+- A save call is network waits plus local work, not a deadline. The waits: at
+  most the longer of `save_slice_millis` and the time to ask A what the file
+  is (two waits, each within `file_timeout` and 2 s more), plus one more wait
+  for a piece begun before the slice ran out: with the defaults at most about
+  96 s, and 10 s and one piece when A answers at once. The local work, not
+  bounded by that figure: waiting for the ship's slot, keeping each piece
+  fetched (one keep took 41 ms at the median on the machine above, which is
+  not a bound), throwing away and draining within the budget, and finishing.
+- Memory per request on B: a kept file's hashes (at most 1 MiB, as a group in
+  part 2), one piece (1 MiB), and one reply being read (about 2 MiB). A piece
+  is sealed where it lies, so keeping it needs no copy; a piece kept after its
+  answer is the answer's own body, held until it is kept, by at most two
+  requests at once.
+- Places. A file's contents take a place among the downloads first, as a file
+  of B's own does, whatever comes of them. Nothing else is taken until a
+  question is about to go to A: then a place among other ships' share of the
+  downloads (and, for what a file is and for one chunk, a place among the
+  downloads too), held until the request is done with A. So what B keeps is
+  read under the ordinary places only: a file B holds whole opens with other
+  ships' share taken by stalled requests, and on a server of two workers what
+  it is and its chunks are had (its whole contents are refused, as a file of
+  B's own would be). If the place cannot be had at the first question, the
+  answer of what a file is or of one chunk is 503, and a contents answer
+  already begun ends short. A save call takes both places before anything,
+  and holds them for the whole call. The cache routes, the saves list and
+  stopping a save wait on nothing and take none.
 
 ## Networking
 
@@ -2536,8 +2947,9 @@ starting at `/`).
 | `GET /logs/<agent>/<log>/entries?after=&max_bytes=&wait=` | device | `EntryList` with the current head. `max_bytes` defaults to 256 KiB, at most 1 MiB. `wait` (seconds) long-polls up to `max_wait`. Gone entries answer 410 with `Trimmed` |
 | `GET /logs/<agent>/<log>/checkpoint` | device | `SignedCheckpoint`, or 404 |
 | `POST /agents/<agent>/command` | device | Runs the body as an owner command; the agent's reply as the body |
-| `/agents/<agent>/files/...` | device | The agent's files (see Files on the ship) |
+| `/agents/<agent>/files/...` | device | The agent's files (see Files on the ship), and saving a copy of a file on another ship for the agent (`POST .../files/save`, `GET .../files/saves`, `DELETE .../files/saves/<id>`; see Keeping what was opened, and saving a copy) |
 | `GET /files/from/<ship>/<agent>/<id>...` | device | A file on another ship (see Fetching a file from another ship) |
+| `GET /files/kept`, `DELETE /files/kept`, `DELETE /files/kept/<id>` | device | What the ship keeps of files fetched from other ships, and clearing it (see Keeping what was opened, and saving a copy) |
 
 - Codes. A one-time code is 128 random bits in hex, made by
   `new_signin_code` on the machine the ship runs on. The reusable access code
@@ -2616,7 +3028,11 @@ and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 | `max_file_bytes` | 10 GiB | Files per ship, held and reserved together; 0 turns the file store off |
 | `max_files` | 100,000 | Files per ship |
 | `max_uploads` | 16 | Uploads open per ship |
-| `upload_keep_millis` | 86,400,000 (24 h) | An upload not sent to for this long is given up when the next one starts |
+| `upload_keep_millis` | 86,400,000 (24 h) | An upload not sent to for this long is given up when the next one starts; a save not called for this long is stopped |
+| `max_cache_bytes` | 3 GiB | Pieces of files fetched from other ships that a ship keeps, counting what was thrown away from them and is still on disk; 0 keeps nothing |
+| `cache_keep_millis` | 2,592,000,000 (30 days) | A kept file not opened for this long is thrown away when an upload, a keeping or a save next starts |
+| `max_kept` | 1,024 | Files kept from other ships per ship, in the cache and being saved together |
+| `save_slice_millis` | 10,000 | How long one call to save a copy fetches missing pieces before it answers (one fetch begun is let finish) |
 | `file_ask_fuel` | 10,000,000 | Compute budget for asking an agent whether another ship may have a file |
 | `file_ask_millis` | 500 | Wall-clock cap on that question, the kernel's decision included |
 | `durability` | `Full` | `Full` or `Normal` (see Storage) |
@@ -3017,7 +3433,94 @@ let; how long serving holds the ship; the remembered answers' bounds and
 times; and the kernel letting only another ship ask. `remote.rs` checks a file
 of 32,768 chunks and one more on made-up hashes, so nothing of 32 GiB is
 hashed, and lies about the level above. `router_tests.rs` fetches a small file
-over a relayed connection.
+over a relayed connection. Five of these tests are about B keeping nothing and
+asking A every time (a file had only while its agent allows it, open under
+one agent and not another, every lie caught, no network, nothing written);
+with keeping on, B rightly serves what it already holds without asking, so
+those five run with keeping off on B (`max_cache_bytes` 0), which is when
+part 2's behaviour is promised.
+
+`runtime/src/kept_tests.rs` covers keeping what was opened and saving a copy,
+with the same two runtimes and liar, and failures made to happen at chosen
+points on the test's own thread: a file opened is kept and opens again with
+nothing asked and with the other ship gone, what is not held still fetched; a
+piece damaged, missing or cut short given up and fetched again, one only not
+read left alone, and with the other ship gone a damaged piece ending the
+answer short and never wrong; a kept file's rows changed in the ship's file
+not believed; lies about the length, the hashes and chunks (a wrong byte, cut
+short, cut off) never kept; a failure at each step of keeping a piece (making
+its name, writing, syncing it, syncing its directory, before the commit, a
+commit of unknown outcome, a commit that lands and reports failure, an
+unwind) leaving no row naming wrong bytes, the piece passed on all the same,
+and what was left going with the kept file or when it is saved; bytes that
+are not the piece never named; a piece never going into a kept file thrown
+away and kept again meanwhile, at three points; the cache sampled throughout
+many concurrent opens and never over its allowance, least recently opened
+thrown away first and never the file being read, when it was opened written
+at most once a minute, stale files swept, a lowered allowance kept to, what
+was thrown away counted until it is gone, and at most 64 files or 65,538 rows
+thrown away per request; saves counting against the file allowance and the
+count of files; kept files bounded in number and by the room in the ship's
+file; a save call bounded in time, carrying on where it left off, and holding
+its places; a saved file an ordinary file (closed, listed, exported and
+imported, seen only through the agents that saved it, had with the other ship
+gone, deleted from disk), in the kept file's directory; a save meeting the
+same file uploaded meanwhile; stopping a save, back to the cache, with room
+made, or thrown away, and a save not called for a day stopped; clearing one
+and all, saves left alone, cleared files asked afresh, a failed removal
+counted and done later, a failed or uncertain clear changing nothing; only
+signed-in devices, checked names, never to another ship or an agent; nothing
+readable on disk; the file headers and stored media types; the first look
+counting a kept file's directory as named; leftovers of keeping and throwing
+away cleared; a failure while saving finished by the next call; kept files and
+saves not imported, rows of them that make no sense refusing nothing; and with
+keeping off nothing kept, nothing read from a file left in the cache, and a
+save still works. Also: the rows of files in the cache held to their
+allowance (driven through the call the route makes once part 2's checks pass,
+since the test liar stands in only for parts the asked ship allows), oldest
+first, an upload starting after, and a file whose rows pass the allowance
+never kept and nothing thrown away for it, and a stopped save going back to the cache only if its rows fit;
+copies a crash left removed at the next keep into their directory
+in a new life, nothing a row names or the trash records touched, and an error
+listing removing nothing; strays capped at two a directory, a save call then
+answering 503 while an open passes the file through, and the file thrown away
+when its save stops; a cached file left with a stray thrown away by the sweep; the device having its piece while the keep is held at
+its sync (by a gate on the copy's sync), with another request answered
+meanwhile; one keep timed, 50 times; a held file opening with other ships'
+share taken by stalled requests and on two workers; the trash drained when a
+piece finds no room though nothing new is thrown away; 64 saves run out
+stopped one budget at a time; clearing everything whatever `max_kept` now is,
+past one page, and the sweep bringing the count down; a save begun between
+clearing's listing and its batch left alone and counted; a piece given up
+before a save's finish making the finish refuse; a file being saved taking no
+piece while the ship is over its allowance; part 2's whole liar matrix with
+keeping on, nothing it says kept; nothing written on the ship asked with
+keeping on; the rows of kept files and saves in an export's sealed copy, and
+none in the import; and a kept file in the cache whose rows do not come to its
+id thrown away and kept afresh, and one being saved ended by the save call
+that finds it: the call answers 500 once, the file is thrown away (not
+returned to the cache) when no other agent saves it, and the next call starts
+afresh. Also, for the per-directory record: a directory looked through once
+in a life whatever comes of the look (a failed listing, a failed removal),
+so a copy made and not yet named is never removed by a second look; copies
+on their way counted with strays against the cap of two, a third request
+held off while two copies are between their name and their commit; a copy
+refused at its commit whose removal fails counted a stray, and its cached
+file thrown away for it; a stray's
+directory thrown away charging 1 MiB for it in the trash until it is gone;
+a retired directory's record gone once its last copy ends, a late
+completion bringing nothing back, and the sweep pruning records left by a
+throwing away that landed and reported an error; a save's finish throwing
+away its redundant copy with the room the call kept back, never past the
+budget; and while the cache's rows are over after a lowered setting, no
+new file admitted and no stopped save returned to it, pieces of files
+already kept still kept, and sweeps bringing it down; a deleted file's
+sweep, with a stray's charge, kept until its directory is gone; a save
+call's sweep landing though the call is refused, the next call then saving
+the file; and a file refused keeping for the count leaving the stale file its
+sweep threw away gone. Each step that must be
+durable is shown to make a synced commit by a counter only tests have; that a
+synced commit survives a power cut is SQLite's, and was not tried.
 
 `runtime/tests/lookup.rs` runs real runtimes on localhost with keys from a
 stand-in for Urbit ID and no address given by hand: ships finding each other
@@ -3376,11 +3879,49 @@ These are stated in the source.
 - Data directories and exports from before encryption do not open. There is
   no migration. Nor do ship files and exports from before files on the ship
   (schema 9 and earlier), nor from before a claim could be marked open
-  (schema 10).
-- Fetching a file from another ship keeps nothing on the ship that fetches:
-  no cache, no "save a copy", no thumbnails, and the hashes are fetched again
-  for every HTTP request. Only the owner's devices fetch: an agent cannot start
-  a fetch, and there is no public web link. A chunk is the smallest piece
+  (schema 10), nor from before files fetched from other ships were kept
+  (schema 11).
+- A file fetched from another ship is kept only if it has at most 32,768
+  chunks (32 GiB); a larger one is passed through and fetched again each time.
+  A piece is kept whole or not at all, and pieces are fetched one at a time,
+  for opening and saving alike. An agent cannot start a save or see what is
+  kept; a save goes on only while a device calls; the owner is not told when
+  the other ship has taken a file back (what is kept still opens); there are
+  no thumbnails. "Least recently opened" is to within a minute, since when a
+  file was opened is written at most once a minute. A save not called for a
+  day stops without throwing others away for it. Lowering `max_cache_bytes`,
+  `max_ship_bytes` or `max_kept` between runs throws nothing away at once: the
+  cache may be over until sweeps bring it down, a budget at a time. While its
+  rows are over, no new file is kept in it (pieces of files already kept may
+  be); while only its bytes are over, a new file may be begun with no bytes,
+  and no piece is kept until the bytes fit.
+  Copies no row names in a kept file's directory count against no allowance
+  until their directory is thrown away: with copies on their way, at most two
+  per directory at once, and after a crash what it left there until the next
+  life's first keep into that directory (see On disk under Keeping what was
+  opened, and saving a copy). Uploads and saves do not throw away kept files
+  when the ship's own file is short of room: the rows of files in the cache
+  are held to a sixteenth of it instead. A slow disk can delay the next piece
+  of a contents answer by the time one keep takes (one took 41 ms at the
+  median on a Mac laptop; a keep can also wait for the slot, throw away and
+  drain), and a disk that hangs inside a commit holds the ship's slot, as it would
+  for anything else; at most two pieces are kept after their answer at once
+  in a runtime, and others are then not kept. On a server of two workers, a
+  kept file's whole contents are refused, as a file of the ship's own would
+  be; what it is and its chunks are had. A save call that finds its file's
+  stored hashes do not vouch for its id answers 500 once, ending its own save.
+  The drain takes the trash 16 records at a time from its front, and stops
+  when a batch strikes nothing off. Records whose removal keeps failing stay
+  at the front, and so does a deleted file's sweep waiting for its directory
+  to go; when such records fill a batch (16 removals that fail, or 8
+  directories that will not go, each with its waiting sweep), the records
+  behind them are not reached until one of them goes. What is not removed
+  stays counted, so this costs room and never removes or releases anything
+  wrongly; it takes a disk that refuses removals.
+  For a file the ship does not keep, the
+  hashes are fetched again for every HTTP request.
+  Only the owner's devices fetch: an agent cannot start a fetch, and there is
+  no public web link. A chunk is the smallest piece
   asked for, a range is not resumed inside a chunk, and chunks are fetched one
   at a time. Nobody is told who fetched what. The time it takes to say no is
   not made the same for every reason. Closing a file under

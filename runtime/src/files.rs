@@ -270,6 +270,9 @@ pub enum FileError {
     WrongId,
     /// Bytes on disk are not what the ship's file says they are. Nothing of them is served.
     Damaged,
+    /// A kept file's directory holds as many copies this runtime could neither name nor remove
+    /// as it may (`kept::MOST_STRAYS`): nothing more is kept into it for now. Try again later.
+    Unsettled,
 }
 
 impl std::fmt::Display for FileError {
@@ -283,11 +286,12 @@ impl std::fmt::Display for FileError {
             FileError::Incomplete => write!(f, "the upload does not hold every chunk"),
             FileError::WrongId => write!(f, "the stated id is not the id of what was sent"),
             FileError::Damaged => write!(f, "a stored file is damaged"),
+            FileError::Unsettled => write!(f, "this ship cannot keep more of that file just now; try again later"),
         }
     }
 }
 
-fn fail<T>(error: FileError) -> Result<T, Error> {
+pub(crate) fn fail<T>(error: FileError) -> Result<T, Error> {
     Err(Error::File(error))
 }
 
@@ -351,13 +355,13 @@ pub(crate) const LEAF_BATCH: u64 = 4096;
 pub const CHUNK_ROW_BYTES: u64 = 128;
 
 /// The room a file of this many chunks needs in the ship's file for its rows.
-fn rows_cost(chunks: u64) -> u64 {
+pub(crate) fn rows_cost(chunks: u64) -> u64 {
     chunks.saturating_mul(CHUNK_ROW_BYTES).saturating_add(1024)
 }
 
 /// Run `work` and keep it only if it leaves the ship's file the room the ship keeps to go on
 /// working (`room_to_take_one`), or used none. As for what is written for other ships.
-fn keeping_room<R>(conn: &Connection, cfg: &crate::Config, work: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
+pub(crate) fn keeping_room<R>(conn: &Connection, cfg: &crate::Config, work: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
     let before = store::spare_bytes(conn)?;
     let done = work().map_err(full_is_no_room)?;
     let after = store::spare_bytes(conn)?;
@@ -401,6 +405,17 @@ pub(crate) mod seams {
         static ARMED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
         static GEN: RefCell<Option<[u8; 16]>> = const { RefCell::new(None) };
         static SYNCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        static SYNCED_COMMITS: RefCell<u64> = const { RefCell::new(0) };
+    }
+
+    /// A transaction committed with its log synced, on this thread (`Ship::transact_synced`).
+    pub fn synced_commit() {
+        SYNCED_COMMITS.with(|count| *count.borrow_mut() += 1);
+    }
+
+    /// How many transactions were committed synced on this thread since the last call.
+    pub fn take_synced_commits() -> u64 {
+        SYNCED_COMMITS.with(|count| std::mem::take(&mut *count.borrow_mut()))
     }
 
     thread_local! {
@@ -417,6 +432,103 @@ pub(crate) mod seams {
         let then = BEFORE_CREATE.with(|slot| slot.borrow_mut().take());
         if let Some(then) = then {
             then();
+        }
+    }
+
+    thread_local! {
+        static BEFORE_BATCH: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static BEFORE_FINISH: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Run `then` on this thread when clearing every kept file has listed a page and is about
+    /// to take its first batch.
+    pub fn on_before_batch(then: impl FnOnce() + 'static) {
+        BEFORE_BATCH.with(|slot| *slot.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub fn before_batch() {
+        let then = BEFORE_BATCH.with(|slot| slot.borrow_mut().take());
+        if let Some(then) = then {
+            then();
+        }
+    }
+
+    /// Run `then` on this thread when a save call has found no piece missing and is about to
+    /// make the file.
+    pub fn on_before_finish(then: impl FnOnce() + 'static) {
+        BEFORE_FINISH.with(|slot| *slot.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub fn before_finish() {
+        let then = BEFORE_FINISH.with(|slot| slot.borrow_mut().take());
+        if let Some(then) = then {
+            then();
+        }
+    }
+
+    /// The first `holds` copies about to be synced at a path under `under`, on any thread, each
+    /// say so on the first channel and wait there for one message on the second. Gates are
+    /// registered by `under` (each test's own directory), so tests that run at once each have
+    /// their own; one goes when its `Go` is dropped, or when its last hold is taken.
+    pub struct SyncGate {
+        pub under: PathBuf,
+        pub holds: usize,
+        pub reached: Sender<()>,
+        pub go: std::sync::Arc<Mutex<Receiver<()>>>,
+    }
+
+    /// What lets a held copy go: one message for each. Dropping it takes its gate away.
+    pub struct Go {
+        under: PathBuf,
+        go: Sender<()>,
+    }
+
+    impl Go {
+        pub fn send(&self, message: ()) -> Result<(), std::sync::mpsc::SendError<()>> {
+            self.go.send(message)
+        }
+    }
+
+    impl Drop for Go {
+        fn drop(&mut self) {
+            SYNC_GATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|gate| gate.under != self.under);
+        }
+    }
+
+    impl SyncGate {
+        /// A gate holding `holds` copies under `under`: what the test waits on, and what it
+        /// sends one message on for each copy to let go. One gate for a directory at a time.
+        pub fn new(under: PathBuf, holds: usize) -> (Receiver<()>, Go) {
+            let (reached, reached_rx) = std::sync::mpsc::channel();
+            let (go_tx, go) = std::sync::mpsc::channel();
+            let mut gates = SYNC_GATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!gates.iter().any(|gate| under.starts_with(&gate.under) || gate.under.starts_with(&under)), "two sync gates over one directory");
+            gates.push(SyncGate { under: under.clone(), holds, reached, go: std::sync::Arc::new(Mutex::new(go)) });
+            (reached_rx, Go { under, go: go_tx })
+        }
+    }
+
+    pub static SYNC_GATES: Mutex<Vec<SyncGate>> = Mutex::new(Vec::new());
+
+    pub fn before_copy_sync(path: &Path) {
+        let held = {
+            let mut gates = SYNC_GATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match gates.iter().position(|gate| gate.holds > 0 && path.starts_with(&gate.under)) {
+                Some(at) => {
+                    let open = &mut gates[at];
+                    open.holds -= 1;
+                    let held = (open.reached.clone(), open.go.clone());
+                    if open.holds == 0 {
+                        gates.remove(at);
+                    }
+                    Some(held)
+                }
+                None => None,
+            }
+        };
+        if let Some((reached, go)) = held {
+            let _ = reached.send(());
+            let _ = go.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
         }
     }
 
@@ -495,9 +607,24 @@ pub(crate) mod seams {
 
     #[inline(always)]
     pub fn synced(_: &std::path::Path) {}
+
+    #[inline(always)]
+    pub fn arm(_: &'static str) {}
+
+    #[inline(always)]
+    pub fn synced_commit() {}
+
+    #[inline(always)]
+    pub fn before_batch() {}
+
+    #[inline(always)]
+    pub fn before_finish() {}
+
+    #[inline(always)]
+    pub fn before_copy_sync(_: &std::path::Path) {}
 }
 
-fn injected(point: &str) -> Error {
+pub(crate) fn injected(point: &str) -> Error {
     Error::Io(io::Error::other(format!("failure injected at {point}")))
 }
 
@@ -548,7 +675,7 @@ fn parent_synced(path: &Path) -> io::Result<()> {
 }
 
 /// Make a new directory, and make its name durable. One already there is an error.
-fn make_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn make_dir(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
     parent_synced(path)
 }
@@ -567,6 +694,17 @@ fn ensure_dir(path: &Path) -> io::Result<()> {
 /// How many things waiting to be removed one attempt takes on.
 pub const TRASH_BATCH: usize = 16;
 
+/// What reading a chunk copy back came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReadBack {
+    /// The chunk, exactly as its row says.
+    Good(Vec<u8>),
+    /// Certainly not what its row says.
+    Bad,
+    /// Not read, for a reason that says nothing about the copy.
+    Unread,
+}
+
 impl Inner {
     /// Where one ship's files are.
     pub(crate) fn ship_files(&self, ship: &str) -> PathBuf {
@@ -574,7 +712,7 @@ impl Inner {
     }
 
     /// The ship's files directory, there and with its name durable.
-    fn ship_files_made(&self, ship: &str) -> io::Result<PathBuf> {
+    pub(crate) fn ship_files_made(&self, ship: &str) -> io::Result<PathBuf> {
         let root = self.ship_files(ship);
         ensure_dir(&root)?;
         Ok(root)
@@ -582,7 +720,7 @@ impl Inner {
 
     /// Where the bytes of one upload or file are. The name is the directory's own sixteen
     /// bytes, which are never anything a request or another ship's copy said.
-    fn dir_path(&self, ship: &str, dir: &[u8; 16]) -> PathBuf {
+    pub(crate) fn dir_path(&self, ship: &str, dir: &[u8; 16]) -> PathBuf {
         self.ship_files(ship).join(hex(dir))
     }
 
@@ -591,7 +729,7 @@ impl Inner {
         self.dir_path(ship, dir).join(format!("{n}.{}", hex(gen)))
     }
 
-    fn files_on(&self) -> Result<(), Error> {
+    pub(crate) fn files_on(&self) -> Result<(), Error> {
         if self.cfg.max_file_bytes == 0 {
             return fail(FileError::Off);
         }
@@ -603,21 +741,40 @@ impl Inner {
     /// outside the ship's slot; the directory and the copy are the ship's own never-reused
     /// names, so these are that chunk's bytes or none.
     pub(crate) fn read_chunk(&self, ship: &str, dir: &[u8; 16], n: u64, gen: &store::Gen, len: u64, leaf_hash: &[u8; 32]) -> Result<Vec<u8>, Error> {
+        match self.read_copy(ship, dir, n, gen, len, leaf_hash) {
+            ReadBack::Good(chunk) => Ok(chunk),
+            ReadBack::Bad | ReadBack::Unread => fail(FileError::Damaged),
+        }
+    }
+
+    /// As `read_chunk`, telling apart a copy that is certainly not what its row says (`Bad`:
+    /// not there, not a regular file, not exactly as long as it must be, not opening under its
+    /// key for its place, or not hashing to `leaf_hash`) from one that could not be read for
+    /// some other reason (`Unread`), which says nothing about the copy.
+    pub(crate) fn read_copy(&self, ship: &str, dir: &[u8; 16], n: u64, gen: &store::Gen, len: u64, leaf_hash: &[u8; 32]) -> ReadBack {
         let path = self.chunk_path(ship, dir, n, gen);
         let whole = len as usize + seal::CHUNK_FILE_OVERHEAD;
         let mut buf = Vec::with_capacity(whole + 1);
-        let read = open_regular(&path).and_then(|file| file.take(whole as u64 + 1).read_to_end(&mut buf));
-        if read.is_err() || buf.len() != whole {
-            return fail(FileError::Damaged);
+        if seams::hit("read-copy") {
+            return ReadBack::Unread;
+        }
+        match open_regular(&path).and_then(|file| file.take(whole as u64 + 1).read_to_end(&mut buf)) {
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidInput) => return ReadBack::Bad,
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return ReadBack::Bad,
+            Err(_) => return ReadBack::Unread,
+        }
+        if buf.len() != whole {
+            return ReadBack::Bad;
         }
         let key = seal::chunk_key(&self.storage, ship, dir);
         let matches = key.open(n, gen, &mut buf).is_some_and(|chunk| chunk.len() as u64 == len && leaf(chunk) == *leaf_hash);
         if !matches {
-            return fail(FileError::Damaged);
+            return ReadBack::Bad;
         }
         buf.truncate(12 + len as usize);
         buf.drain(..12);
-        Ok(buf)
+        ReadBack::Good(buf)
     }
 
     /// The first time a ship wakes in the life of this runtime: what in `files/<ship>/` no row
@@ -654,8 +811,8 @@ impl Inner {
     /// Remove up to `TRASH_BATCH` things waiting to be removed, and strike off those that
     /// went. Each was recorded by a transaction committed with its log synced, so nothing that
     /// can come back after a power cut names them. What fails to go stays recorded, counted
-    /// against the allowance, and is tried again next time.
-    pub(crate) fn empty_trash(&self, ship: &str) {
+    /// against the allowance, and is tried again next time. Returns how many were struck off.
+    pub(crate) fn empty_trash(&self, ship: &str) -> usize {
         let read = self.with_ship(ship, |held| {
             let conn = lock(&held.conn);
             let batch = store::trash_batch(&conn, TRASH_BATCH)?;
@@ -663,14 +820,19 @@ impl Inner {
                 .into_iter()
                 .map(|trash| {
                     let owner = match trash.what {
-                        store::Discard::Unnamed => Some(store::dir_owner(&conn, &trash.dir)?),
+                        store::Discard::Unnamed => match store::dir_owner(&conn, &trash.dir)? {
+                            // No one's, while the whole directory is recorded to go too: the
+                            // sweep, and what it is charged, wait for that.
+                            store::Owner::Nobody if store::trash_whole(&conn, &trash.dir)? => None,
+                            owner => Some(owner),
+                        },
                         _ => None,
                     };
                     Ok((trash, owner))
                 })
                 .collect::<Result<Vec<_>, Error>>()
         });
-        let Ok(batch) = read else { return };
+        let Ok(batch) = read else { return 0 };
         // What went, and the directories whose entries changed, each to be synced once.
         let mut gone: Vec<store::Trash> = Vec::new();
         let mut touched: Vec<PathBuf> = Vec::new();
@@ -678,15 +840,18 @@ impl Inner {
             let (removed, place) = match (trash.what, owner) {
                 (store::Discard::All, _) => (remove_entry(&self.dir_path(ship, &trash.dir)).is_ok(), self.ship_files(ship)),
                 (store::Discard::Chunk(n, gen), _) => (remove_entry(&self.chunk_path(ship, &trash.dir, n, &gen)).is_ok(), self.dir_path(ship, &trash.dir)),
-                // An open upload's directory is looked through when it finishes, never while
-                // copies may be on their way that no row names yet.
+                // An open upload's or a kept file's directory is looked through when it becomes
+                // a file, never while copies may be on their way that no row names yet.
                 (store::Discard::Unnamed, Some(store::Owner::Upload)) => continue,
                 (store::Discard::Unnamed, Some(store::Owner::File(named))) => {
                     let place = self.dir_path(ship, &trash.dir);
                     (remove_unnamed(&place, &named), place)
                 }
-                // No one's: the directory itself is to go, or already has.
-                (store::Discard::Unnamed, _) => {
+                // No one's, and the whole directory is recorded to go: the sweep stays, counted,
+                // until the directory is durably removed, which strikes off every record of it.
+                (store::Discard::Unnamed, None) => continue,
+                // No one's, and nothing records the directory: it has gone already.
+                (store::Discard::Unnamed, Some(store::Owner::Nobody)) => {
                     gone.push(trash);
                     continue;
                 }
@@ -709,11 +874,11 @@ impl Inner {
             !unsynced.contains(&place)
         });
         if gone.is_empty() {
-            return;
+            return 0;
         }
         // Striking them off need not be durable: if it is lost, removing them again finds
         // them already gone.
-        let _ = self.with_ship(ship, |held| {
+        let struck = self.with_ship(ship, |held| {
             held.transact(|conn| {
                 for trash in &gone {
                     store::trash_done(conn, trash)?;
@@ -721,6 +886,16 @@ impl Inner {
                 Ok(())
             })
         });
+        if struck.is_ok() { gone.len() } else { 0 }
+    }
+
+    /// Empty the trash in batches until a batch strikes nothing off, at most `rounds` batches.
+    pub(crate) fn empty_trash_rounds(&self, ship: &str, rounds: usize) {
+        for _ in 0..rounds {
+            if self.empty_trash(ship) == 0 {
+                break;
+            }
+        }
     }
 
 }
@@ -748,71 +923,148 @@ fn remove_unnamed(place: &Path, named: &HashSet<String>) -> bool {
 
 /// Whether `agent` is installed on the ship: whether the kernel would take a command for it
 /// from the owner.
-fn installed(rt: &Arc<Inner>, ship: &mut Ship, agent: &str) -> Result<(), Error> {
+pub(crate) fn installed(rt: &Arc<Inner>, ship: &mut Ship, agent: &str) -> Result<(), Error> {
     if ship.installed(rt, agent)? { Ok(()) } else { Err(Error::UnknownAgent(agent.to_string())) }
 }
 
+/// What a chunk copy is made for: an open upload, or a file kept from another ship. Each is
+/// known by its directory, sixteen random bytes never used again, and is looked up again under
+/// the ship's slot both before the copy's name is made and in the transaction that names it, so
+/// a copy is only ever named by the very upload or kept file it was made for.
+#[derive(Clone, Debug)]
+pub(crate) enum Holder {
+    /// An open upload of `agent`'s, of a file of `length` bytes.
+    Upload { agent: String, length: u64 },
+    /// The kept file `id`, of `length` bytes. The copy is of a chunk it does not hold yet, and
+    /// is the chunk whose hash its row holds.
+    Kept { id: [u8; 32], length: u64 },
+}
+
+impl Holder {
+    /// Whether this holder is still there under `dir`, and may still take chunk `n` hashing to
+    /// `hash`.
+    fn still_there(&self, conn: &Connection, dir: &[u8; 16], n: u64, hash: &[u8; 32]) -> Result<bool, Error> {
+        match self {
+            Holder::Upload { agent, length } => Ok(matches!(store::upload_of(conn, dir, agent)?, Some((held, _)) if held == *length)),
+            Holder::Kept { id, length } => {
+                let same = store::kept_get(conn, id)?.is_some_and(|kept| kept.dir == *dir && kept.length == *length);
+                Ok(same && store::kept_piece(conn, dir, n)? == Some((*hash, None)))
+            }
+        }
+    }
+
+    fn length(&self) -> u64 {
+        match self {
+            Holder::Upload { length, .. } | Holder::Kept { length, .. } => *length,
+        }
+    }
+}
+
 /// A chunk that has been hashed, encrypted, and written to disk under a name of its own,
-/// outside the ship's slot, and is waiting to be named by its upload's row. `commit` names it;
-/// dropping it throws it away.
+/// outside the ship's slot, and is waiting to be named by its holder's row: an upload's, or a
+/// kept file's. `commit` names it; dropping it throws it away.
 pub struct PreparedChunk<'a> {
     rt: &'a Runtime,
     ship: String,
-    agent: String,
     dir: [u8; 16],
     n: u64,
     gen: store::Gen,
-    length: u64,
     hash: [u8; 32],
-    /// The copy, while it is still this chunk's to remove: made by this upload's own exclusive
+    holder: Holder,
+    /// The copy, while it is still this chunk's to remove: made by this call's own exclusive
     /// create, and no commit that may name it attempted.
     owned: Owned,
 }
 
 /// A chunk copy this call made and may remove. Removed on drop unless let go. If removing it
-/// fails it is left: it was made while its upload was open, so it is a copy no row names in
-/// that upload's directory, which finish records to be swept, and which otherwise goes with
-/// the directory.
-struct Owned(Option<PathBuf>);
+/// fails it is left: it was made while its upload or kept file was there, so it is a copy no
+/// row names in that directory, which finishing an upload or saving a kept file records to be
+/// swept, and which otherwise goes with the directory. For a kept file it carries the copy's
+/// place among its directory's copies on their way (`kept::CopySlot`), which it ends exactly
+/// once: named, removed, or a stray.
+struct Owned {
+    path: Option<PathBuf>,
+    /// For a kept file's copy: its place among the copies on their way into the directory.
+    slot: Option<crate::kept::CopySlot>,
+}
+
+impl Owned {
+    /// The copy is no longer this call's to remove: named by a commit known to have landed, or
+    /// its commit's outcome unknown. In the second case a kept file's copy becomes a stray,
+    /// since it may be named by nothing.
+    fn let_go(&mut self, named: bool) {
+        if self.path.take().is_some() {
+            if let Some(slot) = &mut self.slot {
+                slot.end(!named);
+            }
+        }
+    }
+}
 
 impl Drop for Owned {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = remove_entry(&path);
+        if let Some(path) = self.path.take() {
+            let failed = remove_entry(&path).is_err();
+            if let Some(slot) = &mut self.slot {
+                slot.end(failed);
+            }
         }
     }
 }
 
 impl PreparedChunk<'_> {
     /// Name the chunk, under the ship's slot and in one transaction committed with its log
-    /// synced: the upload must still be there (named by its directory, which is never reused),
-    /// and the row for chunk `n` is made to name this copy. A copy it replaces is recorded to
-    /// be removed, and is removed once that is durable; it is counted against the allowance
-    /// until then, so a replacement is refused while the ship is already over it.
+    /// synced: the holder must still be there (named by its directory, which is never reused),
+    /// and the row for chunk `n` is made to name this copy. For an upload, a copy it replaces
+    /// is recorded to be removed, and is removed once that is durable; it is counted against
+    /// the allowance until then, so a replacement is refused while the ship is already over it.
     ///
     /// If it is refused, or fails before the commit is tried, this copy is removed and no
     /// other. If the commit itself fails, nothing is removed: the commit may still have
     /// reached the log and come back after a crash, naming this copy. What is left goes when
-    /// the upload finishes, after a synced commit has settled what is named, or with its
-    /// directory.
+    /// the upload finishes or the kept file is saved, after a synced commit has settled what is
+    /// named, or with its directory.
     pub fn commit(mut self) -> Result<(), Error> {
+        self.try_commit()
+    }
+
+    /// As `commit`, but a copy refused, or failing before its commit was tried, is still this
+    /// chunk's, to try again or to be removed when this is dropped.
+    pub(crate) fn try_commit(&mut self) -> Result<(), Error> {
         let inner = &self.rt.inner;
         let cfg = &inner.cfg;
-        let (dir, n, gen, hash, length, agent) = (self.dir, self.n, self.gen, self.hash, self.length, self.agent.clone());
-        let len = chunk_len(length, n).expect("checked when prepared");
+        let (dir, n, gen, hash) = (self.dir, self.n, self.gen, self.hash);
+        let holder = self.holder.clone();
+        let len = chunk_len(holder.length(), n).expect("checked when prepared");
         let done = inner.with_ship(&self.ship, |ship| {
             Ok(ship.transact_synced(cfg, |conn| {
-                match store::upload_of(conn, &dir, &agent)? {
-                    Some((held, _)) if held == length => {}
-                    _ => return fail(FileError::NotFound),
+                if !holder.still_there(conn, &dir, n, &hash)? {
+                    return fail(FileError::NotFound);
                 }
-                if store::chunk_of(conn, &dir, n)?.is_some() && store::counted_bytes(conn)? > cfg.max_file_bytes {
-                    return fail(FileError::NoRoom);
+                match &holder {
+                    Holder::Upload { .. } => {
+                        if store::chunk_of(conn, &dir, n)?.is_some() && store::counted_bytes(conn)? > cfg.max_file_bytes {
+                            return fail(FileError::NoRoom);
+                        }
+                        keeping_room(conn, cfg, || {
+                            store::chunk_put(conn, &dir, n, &gen, &hash, len)?;
+                            Ok(store::upload_touch(conn, &dir, store::now_ms())?)
+                        })?;
+                    }
+                    Holder::Kept { id, .. } => {
+                        let saving = store::kept_get(conn, id)?.is_some_and(|kept| kept.saving);
+                        // Being saved, its whole length is reserved already; only bytes given
+                        // up and still on disk can have taken the ship over its allowance, and
+                        // then nothing more is taken. In the cache, the piece must fit.
+                        if saving && store::counted_bytes(conn)? > cfg.max_file_bytes {
+                            return fail(FileError::NoRoom);
+                        }
+                        if !saving && store::cache_bytes(conn)?.saturating_add(len) > cfg.max_cache_bytes {
+                            return fail(FileError::NoRoom);
+                        }
+                        keeping_room(conn, cfg, || Ok(store::kept_piece_put(conn, id, &dir, n, &gen, len)?))?;
+                    }
                 }
-                keeping_room(conn, cfg, || {
-                    store::chunk_put(conn, &dir, n, &gen, &hash, len)?;
-                    Ok(store::upload_touch(conn, &dir, store::now_ms())?)
-                })?;
                 if seams::hit("chunk-commit") {
                     return Err(injected("chunk-commit"));
                 }
@@ -825,16 +1077,17 @@ impl PreparedChunk<'_> {
         match done {
             // Named now, durably: no longer this call's to remove.
             Ok(Ok(())) => {
-                self.owned.0 = None;
+                self.owned.let_go(true);
                 inner.empty_trash(&self.ship);
                 Ok(())
             }
-            // The commit was tried, and its outcome is not known: this copy may be named.
+            // The commit was tried, and its outcome is not known: this copy may be named, and
+            // may be named by nothing.
             Ok(Err(not_kept)) if not_kept.uncertain => {
-                self.owned.0 = None;
+                self.owned.let_go(false);
                 Err(not_kept.error)
             }
-            // Refused, or failed before the commit: dropping this removes its own copy.
+            // Refused, or failed before the commit: still this call's own copy.
             Ok(Err(not_kept)) => Err(not_kept.error),
             Err(e) => Err(e),
         }
@@ -842,6 +1095,71 @@ impl PreparedChunk<'_> {
 }
 
 impl Runtime {
+    /// Seal chunk `n` and write it under a name of its own in `dir`, for `holder`, ready to be
+    /// named. One path for an upload's chunk and a kept file's piece alike. While the ship is
+    /// held, after hashing and encrypting: the holder looked up again, and then the copy's name
+    /// made by an exclusive create, only if the holder is still there. So a name only ever
+    /// appears in a directory while its upload is open or its kept file is kept. Writing the
+    /// bytes and syncing the copy and its directory are done outside. `ship` is canonical; the
+    /// caller has checked the chunk's length.
+    pub(crate) fn prepare_copy(&self, ship: &str, dir: &[u8; 16], n: u64, mut chunk: Vec<u8>, holder: Holder) -> Result<PreparedChunk<'_>, Error> {
+        let inner = &self.inner;
+        let hash = leaf(&chunk);
+        // Sixteen random bytes, as for a directory: taken as never chosen twice.
+        let gen = match seams::forced_gen() {
+            Some(gen) => gen,
+            None => random_bytes::<16>()?,
+        };
+        let nonce = random_bytes::<12>()?;
+        seal::chunk_key(&inner.storage, ship, dir).seal(n, &gen, nonce, &mut chunk);
+        seams::before_create();
+        // The name is made under the ship's slot, and only while the holder is still the one it
+        // was (its directory is never reused). A name that is taken is an error that touches
+        // nothing: the copy there is not this call's.
+        let path = inner.chunk_path(ship, dir, n, &gen);
+        let (mut file, owned) = inner.with_ship(ship, |held| {
+            if !holder.still_there(&lock(&held.conn), dir, n, &hash)? {
+                return fail(FileError::NotFound);
+            }
+            // For a kept file: a place among its directory's copies on their way, refused once
+            // strays and copies on their way are `MOST_STRAYS`; and the first copy of this life
+            // there looks the directory through for what a crash left, before its own name is
+            // made (marked looked first, whatever comes of the look).
+            let slot = match holder {
+                Holder::Kept { .. } => {
+                    let (slot, look) = inner.reserve_copy(ship, dir).map_err(Error::File)?;
+                    if look {
+                        inner.look(ship, dir, &lock(&held.conn));
+                    }
+                    Some(slot)
+                }
+                Holder::Upload { .. } => None,
+            };
+            if seams::hit("copy-create") {
+                return Err(injected("copy-create"));
+            }
+            let file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path).map_err(|e| match e.kind() {
+                io::ErrorKind::NotFound => Error::File(FileError::NotFound),
+                _ => Error::Io(e),
+            })?;
+            // Made by this call's own exclusive create: from this instant it is this call's to
+            // remove.
+            Ok((file, Owned { path: Some(path.clone()), slot }))
+        })?;
+        // Any failure from here on drops `owned`, which removes this call's own copy.
+        let fault = |point: &'static str| if seams::hit(point) { Err(io::Error::other(format!("failure injected at {point}"))) } else { Ok(()) };
+        fault("copy-write")?;
+        file.write_all(&nonce)?;
+        file.write_all(&chunk)?;
+        fault("copy-sync")?;
+        seams::before_copy_sync(&path);
+        file.sync_all()?;
+        drop(file);
+        fault("copy-dir-sync")?;
+        sync_dir(&inner.dir_path(ship, dir))?;
+        Ok(PreparedChunk { rt: self, ship: ship.to_string(), dir: *dir, n, gen, hash, holder, owned })
+    }
+
     /// Start an upload of a file of `length` bytes for `agent` on `ship`. Returns the upload's
     /// name and how many chunks to send. The whole length is reserved against the ship's
     /// allowance here, so that held, reserved, and still-to-be-removed bytes together never
@@ -869,7 +1187,14 @@ impl Runtime {
             // Uploads left untouched too long go first, and their reservations with them,
             // whatever becomes of this one.
             let before = store::now_ms().saturating_sub(cfg.upload_keep_millis);
-            held.transact_synced(cfg, |conn| Ok(store::uploads_expire(conn, before)?))?;
+            let mut budget = crate::kept::Budget::default();
+            held.transact_synced(cfg, |conn| {
+                store::uploads_expire(conn, before)?;
+                // Kept files not opened for too long go where uploads do, and saves not
+                // touched for too long stop (see `kept`), within one request's budget.
+                crate::kept::sweep(inner, &ship, conn, cfg, store::now_ms(), &mut budget)
+            })?;
+            inner.retire_thrown(&ship, &mut budget);
             let started = held.transact_knowing(|conn| {
                 if store::upload_count(conn)? >= cfg.max_uploads {
                     return Err(Error::TooMany("uploads open"));
@@ -902,11 +1227,10 @@ impl Runtime {
     }
 
     /// Hash, encrypt and write chunk `n` of an upload under a name of its own, ready to be
-    /// named. While the ship is held: looking the upload up, and then, after hashing and
-    /// encrypting, making the copy's name, and only if the upload is still open. So a name only
-    /// ever appears in an upload's directory while it is open, never after finishing has
-    /// recorded the directory to be swept. Writing the bytes and syncing are done outside.
-    pub fn prepare_chunk(&self, ship: &str, agent: &str, upload: &[u8; 16], n: u64, mut chunk: Vec<u8>) -> Result<PreparedChunk<'_>, Error> {
+    /// named (`prepare_copy`). The upload is looked up first, and again under the slot when the
+    /// copy's name is made, so a name only ever appears in an upload's directory while it is
+    /// open, never after finishing has recorded the directory to be swept.
+    pub fn prepare_chunk(&self, ship: &str, agent: &str, upload: &[u8; 16], n: u64, chunk: Vec<u8>) -> Result<PreparedChunk<'_>, Error> {
         check_agent_name(agent)?;
         let ship = canonical_ship(ship)?;
         let inner = &self.inner;
@@ -919,38 +1243,7 @@ impl Runtime {
         if chunk.len() as u64 != expected {
             return fail(FileError::Malformed("a chunk of the wrong size"));
         }
-        let hash = leaf(&chunk);
-        // Sixteen random bytes, as for a directory: taken as never chosen twice.
-        let gen = match seams::forced_gen() {
-            Some(gen) => gen,
-            None => random_bytes::<16>()?,
-        };
-        let nonce = random_bytes::<12>()?;
-        seal::chunk_key(&inner.storage, &ship, upload).seal(n, &gen, nonce, &mut chunk);
-        seams::before_create();
-        // The name is made under the ship's slot, and only while the upload is still the open
-        // one it was (its directory is never reused). A name that is taken is an error that
-        // touches nothing: the copy there is not this call's.
-        let path = inner.chunk_path(&ship, upload, n, &gen);
-        let (mut file, owned) = inner.with_ship(&ship, |held| {
-            match store::upload_of(&lock(&held.conn), upload, agent)? {
-                Some((held_length, _)) if held_length == length => {}
-                _ => return fail(FileError::NotFound),
-            }
-            let file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path).map_err(|e| match e.kind() {
-                io::ErrorKind::NotFound => Error::File(FileError::NotFound),
-                _ => Error::Io(e),
-            })?;
-            // Made by this call's own exclusive create: from this instant it is this call's to
-            // remove.
-            Ok((file, Owned(Some(path.clone()))))
-        })?;
-        file.write_all(&nonce)?;
-        file.write_all(&chunk)?;
-        file.sync_all()?;
-        drop(file);
-        sync_dir(&inner.dir_path(&ship, upload))?;
-        Ok(PreparedChunk { rt: self, ship, agent: agent.to_string(), dir: *upload, n, gen, length, hash, owned })
+        self.prepare_copy(&ship, upload, n, chunk, Holder::Upload { agent: agent.to_string(), length })
     }
 
     /// Put chunk `n` of an upload in place: `prepare_chunk` then `commit`. A chunk sent again
@@ -1151,12 +1444,14 @@ impl Runtime {
     }
 
     /// How many bytes no row names any more and are still to be removed from disk, and how
-    /// many things that is. They count against the ship's allowance until they are gone.
+    /// many things that is. They count against the ship's allowance until they are gone, or,
+    /// for what was thrown away from the cache of kept files, against the cache.
     pub fn files_to_remove(&self, ship: &str) -> Result<(u64, usize), Error> {
         self.inner.with_ship(ship, |held| {
             let conn = lock(&held.conn);
             let count: i64 = conn.query_row("SELECT COUNT(*) FROM file_trash", [], |r| r.get(0))?;
-            Ok((store::removing_bytes(&conn)?, count as usize))
+            let bytes = store::removing_bytes(&conn)?.saturating_add(store::pool_removing(&conn, store::Pool::Cache)?);
+            Ok((bytes, count as usize))
         })
     }
 }

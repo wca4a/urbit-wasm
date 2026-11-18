@@ -397,6 +397,62 @@ message FinishRequest {
   bytes id = 1;
 }
 
+// A file fetched from another ship that this ship keeps, some or all of it, as the owner's
+// devices see it (`GET /files/kept`).
+message KeptInfo {
+  bytes id = 1;
+  uint64 length = 2;
+  // The bytes of its pieces held.
+  uint64 held = 3;
+  // When it was last opened.
+  uint64 used_ms = 4;
+  // Some agent is saving it: it is not thrown away, nor cleared.
+  bool saving = 5;
+}
+
+// A page of kept files, in order of id. Ask for the next page after the last id.
+message KeptList {
+  repeated KeptInfo kept = 1;
+}
+
+// What a clearing of kept files did (`DELETE /files/kept`, `DELETE /files/kept/<id>`).
+message Cleared {
+  // Thrown away: no row names them, and their bytes are in the trash or gone.
+  uint64 thrown_away = 1;
+  // Left alone, because some agent is saving them.
+  uint64 being_saved = 2;
+}
+
+// Client to ship: save, for the agent in the address, the file `id` that `agent` on `ship`
+// claims (`POST /agents/<a>/files/save`). The same call carries a save on.
+message SaveRequest {
+  string ship = 1;
+  string agent = 2;
+  bytes id = 3;
+}
+
+// Where a save stands. Call again until `done`.
+message SaveReply {
+  bool done = 1;
+  // How many of its chunks the ship holds.
+  uint64 held = 2;
+  uint64 chunks = 3;
+}
+
+// A save in progress (`GET /agents/<a>/files/saves`).
+message SaveInfo {
+  bytes id = 1;
+  uint64 length = 2;
+  // The bytes of its pieces held.
+  uint64 held = 3;
+  uint64 chunks = 4;
+  uint64 touched_ms = 5;
+}
+
+message SaveList {
+  repeated SaveInfo saves = 1;
+}
+
 // Ship to ship. Two ships talk over an encrypted connection in which each has proved it holds
 // the key listed for its name. One request and one reply travel on each stream.
 

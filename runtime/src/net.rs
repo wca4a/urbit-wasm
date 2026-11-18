@@ -1175,6 +1175,9 @@ pub(crate) enum Lie {
     Slow(Duration),
     /// No reply: the stream is cut off.
     Cut,
+    /// The true reply, once the test closes this semaphore, holding its places meanwhile: a
+    /// barrier the test releases, not a delay that runs out by itself.
+    Held(Arc<tokio::sync::Semaphore>),
 }
 
 /// For tests: given the request and the true reply, the lie to tell, if any.
@@ -3343,6 +3346,7 @@ async fn serve_file(shared: &Arc<Shared>, caller: &str, called: &str, body: peer
             Some(Lie::Reply(reply)) => return (reply, true),
             Some(Lie::Slow(wait)) => tokio::time::sleep(wait).await,
             Some(Lie::Cut) => return (refused(CUT), true),
+            Some(Lie::Held(gate)) => drop(gate.acquire().await),
             None => {}
         }
     }

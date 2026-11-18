@@ -3,8 +3,11 @@
 //! The owner of a ship here names a file on another ship: that ship, the agent there that
 //! claims the file, and the file's id. This ship asks the other for what the file is, then for
 //! the hashes of its chunks, and then for each chunk wanted, one request at a time over the
-//! ship-to-ship connection, and passes each chunk on. It keeps nothing: nothing is written to
-//! disk or to the ship's file, and nothing learned in one HTTP request is used in another.
+//! ship-to-ship connection, and passes each chunk on. This module keeps nothing: nothing
+//! learned in one HTTP request is used in another. What the ship keeps of a file it fetched
+//! (`crate::kept`) it keeps only once the length and every chunk hash have been checked here
+//! against the id; a kept file's pieces still missing are then fetched against those hashes
+//! (`Remote::known`).
 //!
 //! The other ship is believed about nothing the id does not vouch for. The length it gives is
 //! believed only once the hashes it sends, counted and hashed, come to exactly the id asked
@@ -35,6 +38,8 @@ pub(crate) enum Failed {
     NoNetwork,
     /// This runtime cannot carry a file's chunks: its messages are too small.
     Unfit,
+    /// This server has too few threads to wait on another ship at all.
+    NoThreads,
 }
 
 /// A file on another ship, as far as it has been checked. Made by `Remote::open`, which checks
@@ -60,8 +65,14 @@ impl Runtime {
     /// Ask `to`, from `from` (a ship here), about the file `id` that `agent` there claims, as
     /// `Remote::open` does.
     pub(crate) fn remote_file<'a>(&'a self, from: &str, to: &str, agent: &str, id: &[u8; 32]) -> Result<Remote<Ask<'a>>, Failed> {
+        Remote::open(self.remote_ask(from, to, agent, id), id)
+    }
+
+    /// One question at a time to `to`, from `from`, about the file `id` that `agent` there
+    /// claims.
+    pub(crate) fn remote_ask<'a>(&'a self, from: &str, to: &str, agent: &str, id: &[u8; 32]) -> Ask<'a> {
         let (from, to, agent, id) = (from.to_string(), to.to_string(), agent.to_string(), *id);
-        let ask: Ask<'a> = Box::new(move |body: peer_request::Body| {
+        Box::new(move |body: peer_request::Body| {
             let wanted = |index: u64| FileWanted { agent: agent.clone(), id: id.to_vec(), index };
             // The agent and the id are this request's own, whatever the caller put in.
             let body = match body {
@@ -76,8 +87,7 @@ impl Runtime {
                 Some(Ok(reply)) => reply.body.ok_or(Failed::Wrong("a reply with nothing in it")),
                 Some(Err(why)) => Err(failed(why)),
             }
-        });
-        Remote::open(ask, &id)
+        })
     }
 }
 
@@ -146,6 +156,34 @@ impl<A: FnMut(peer_request::Body) -> Result<peer_reply::Body, Failed>> Remote<A>
             return Err(Failed::Wrong("the hashes sent are not those of that file"));
         }
         Ok(remote)
+    }
+
+    /// A file of at most `FANOUT` chunks whose length and every chunk hash are already known,
+    /// and were checked against its id by whoever kept them (`crate::kept`): nothing is asked
+    /// until a chunk is, and each chunk is checked against its hash here as always. `None` if
+    /// the hashes are not as many as the length takes.
+    pub(crate) fn known(ask: A, length: u64, media_type: String, leaves: Vec<[u8; 32]>) -> Option<Remote<A>> {
+        (chunk_count(length) <= FANOUT as u64 && leaves.len() as u64 == chunk_count(length))
+            .then(|| Remote { ask, length, media_type, groups: None, group: Some((0, leaves)) })
+    }
+
+    /// Every chunk hash, checked against the id, for a file of at most `FANOUT` chunks.
+    pub(crate) fn leaves(&self) -> Option<&[[u8; 32]]> {
+        if chunk_count(self.length) > FANOUT as u64 {
+            return None;
+        }
+        match &self.group {
+            Some((0, leaves)) if leaves.len() as u64 == chunk_count(self.length) => Some(leaves),
+            _ if self.length == 0 => Some(&[]),
+            _ => None,
+        }
+    }
+
+    /// The checked hash of chunk `n`, if its group is held: always, for a file of at most
+    /// `FANOUT` chunks.
+    pub(crate) fn held_leaf(&self, n: u64) -> Option<[u8; 32]> {
+        let (g, leaves) = self.group.as_ref()?;
+        (*g == n / FANOUT as u64).then(|| leaves.get((n % FANOUT as u64) as usize).copied()).flatten()
     }
 
     /// The file's length, checked against its id.
