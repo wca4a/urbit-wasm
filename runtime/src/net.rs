@@ -817,6 +817,14 @@ pub struct NetConfig {
     pub file_timeout: Duration,
     /// A connection with nothing on it for this long is closed.
     pub idle_timeout: Duration,
+    /// How long a request waits, once this runtime has sent something on its connection that
+    /// the other end must acknowledge, without hearing a single packet from that end, before
+    /// the connection is taken to be dead: it is closed, so that the next call makes a new one,
+    /// and the request fails. A ship that is there acknowledges within a round trip, however
+    /// slow its agents, so this is many round trips even through a relay. A ship that stopped
+    /// without closing its connections (killed, or its machine gone) otherwise goes on being
+    /// called over the dead one until `idle_timeout`.
+    pub silence_timeout: Duration,
     /// How many connections from other ships may be open at once, counting those still being
     /// set up. More are turned away. A calling ship has one connection to each ship it calls
     /// here; a newer one from the same ship replaces the older.
@@ -869,6 +877,7 @@ impl Default for NetConfig {
             request_timeout: Duration::from_secs(10),
             file_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
+            silence_timeout: Duration::from_secs(3),
             max_connections: 1024,
             max_calls: 1024,
             max_streams: 8,
@@ -1011,6 +1020,9 @@ struct Made {
     /// `stable_id` will not do: it is an allocation's address, and can be given to a newer
     /// connection once the old one is dropped.)
     generation: u64,
+    /// Set by the connection's watcher (`watch`) when it closed the connection because nothing
+    /// was heard from the other end, so that a request on it can say so.
+    silenced: Arc<AtomicBool>,
 }
 
 /// What a kept connection through a relay goes with.
@@ -1378,6 +1390,9 @@ impl Network {
         if cfg.file_timeout.is_zero() || cfg.file_timeout > MAX_TIMEOUT {
             return Err(io::Error::other("file_timeout must be more than nothing and at most a day"));
         }
+        if cfg.silence_timeout.is_zero() || cfg.silence_timeout > MAX_TIMEOUT {
+            return Err(io::Error::other("silence_timeout must be more than nothing and at most a day"));
+        }
         cfg.lookup.sound().map_err(io::Error::other)?;
         // A packet every `keep_alive` keeps a connection open only if it comes before the
         // connection is taken to be idle.
@@ -1645,6 +1660,36 @@ impl Network {
     }
 }
 
+#[cfg(test)]
+impl Network {
+    /// For tests: stop as a machine that has gone stops, with none of the goodbyes `drop` sends.
+    /// The network's tokio runtime is shut down without waiting (`shutdown_background`), so by
+    /// the time this returns not everything has stopped. Shutting down closes the runtime's
+    /// queue (tokio 1.54.1, `scheduler/multi_thread/handle.rs` 74 to 78); each worker notices at
+    /// its next maintenance (`worker.rs` 1294 to 1302) and only then cancels the tasks
+    /// (`pre_shutdown`, `worker.rs` 1305 on). Until a worker has seen it, tasks that are ready
+    /// may still be polled, and may send what they had ready. The socket is let go of only
+    /// once what holds it has been dropped, and work handed to `spawn_blocking` (a ship's work,
+    /// a test's delay among it) runs on until it returns. What this does make sure of: the
+    /// hooks are cleared, the goodbyes `drop` sends are not sent, and the network's claim on the
+    /// runtime is let go of, so the runtime may start a network again. One thing it cannot
+    /// rule out: when the last handle on a connection is dropped as its tasks are cancelled,
+    /// quinn closes that connection itself (quinn 0.11.12, `connection.rs` 946 to 960), and a
+    /// driver still being polled then may send that close.
+    pub(crate) fn vanish(self) {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        this.shared.runtime.set_outbound_hook(None);
+        this.shared.runtime.set_file_hook(None);
+        if let Some(tokio) = this.threads.0.take() {
+            tokio.shutdown_background();
+        }
+        // Safe: each field is read out once and never touched again; `this` is never dropped.
+        let (shared, claim) = unsafe { (std::ptr::read(&this.shared), std::ptr::read(&this._claim)) };
+        drop(shared);
+        drop(claim);
+    }
+}
+
 impl Drop for Network {
     fn drop(&mut self) {
         self.shared.runtime.set_outbound_hook(None);
@@ -1842,6 +1887,142 @@ impl ServerCertVerifier for ListedKey {
     }
 }
 
+/// Why a connection is closed when nothing was heard from its other end.
+pub(crate) const NOTHING_HEARD: &[u8] = b"nothing heard from the other end";
+
+/// How often a watcher looks at its connection's counters to see whether the other end has
+/// fallen silent.
+const SILENCE_LOOK: Duration = Duration::from_millis(250);
+
+/// What a connection has heard and been asked to have acknowledged, by QUIC's own counters.
+///
+/// `heard`: every frame received in a packet that was decrypted and was not a duplicate
+/// (quinn-proto 0.11.19 counts `frame_rx` in `process_early_payload` and `process_payload`,
+/// and for a connection already closed in `process_decrypted_packet`, all reached from
+/// `handle_packet` only after `decrypt_packet` succeeded and after its duplicate check returned
+/// early for a packet number seen before). Acknowledgements count: they are what a live peer
+/// sends back. A packet that does not authenticate moves nothing; nor does a replayed one, on
+/// the connections watched, which this runtime opened. (On a connection it accepted, the very
+/// first Initial packet is decrypted by the endpoint and handed to `handle_first_packet`,
+/// which records it before any duplicate check, `endpoint.rs` 605 to 613 and
+/// `connection/mod.rs` 2013 to 2044, so one replay of it could be counted once; no watcher is
+/// on those connections.) `udp_rx.datagrams` is not used: quinn counts it before either check.
+/// Padding is not counted by quinn; a packet of nothing but padding is never ack-eliciting and
+/// no live peer needs to send one, so missing it costs nothing.
+///
+/// The `frame_tx` counters move when a frame is put in a packet (`populate_packet`), before the
+/// socket has taken the packet (quinn's `Connection::drive_transmit` sends it afterwards). So
+/// `asked` says something was built to be sent; a socket that cannot send anything for
+/// `silence_timeout` ends the connection too, if nothing is heard either (a peer that is
+/// still heard from keeps it). `handshake_done` is a `u8` in quinn and stops at 255. That frame
+/// is sent once at first and may be sent again while it goes unacknowledged; were its count
+/// ever to stop at 255, a further one would not move `asked` by itself.
+///
+/// `asked`: every frame sent that the other end must acknowledge. In quinn-proto 0.11.19
+/// (`Frame::is_ack_eliciting`) that is every frame but ACK, PADDING and CONNECTION_CLOSE: so
+/// every `frame_tx` counter but `acks` and `connection_close` (PADDING has none). That is
+/// STREAM, PING, CRYPTO, RESET_STREAM, STOP_SENDING, MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS
+/// (both ways), DATA_BLOCKED, STREAM_DATA_BLOCKED, STREAMS_BLOCKED (both ways),
+/// NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, NEW_TOKEN, DATAGRAM, PATH_CHALLENGE, PATH_RESPONSE,
+/// ACK_FREQUENCY, IMMEDIATE_ACK and HANDSHAKE_DONE; quinn's loss probes are among these (a PING
+/// or an IMMEDIATE_ACK when there is nothing to send again).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Traffic {
+    heard: u64,
+    asked: u64,
+}
+
+impl Traffic {
+    pub(crate) fn of(connection: &Connection) -> Traffic {
+        let stats = connection.stats();
+        let (rx, tx) = (stats.frame_rx, stats.frame_tx);
+        let eliciting = |f: &quinn::FrameStats| {
+            f.ack_frequency
+                + f.crypto
+                + f.data_blocked
+                + f.datagram
+                + u64::from(f.handshake_done)
+                + f.immediate_ack
+                + f.max_data
+                + f.max_stream_data
+                + f.max_streams_bidi
+                + f.max_streams_uni
+                + f.new_connection_id
+                + f.new_token
+                + f.path_challenge
+                + f.path_response
+                + f.ping
+                + f.reset_stream
+                + f.retire_connection_id
+                + f.stream_data_blocked
+                + f.streams_blocked_bidi
+                + f.streams_blocked_uni
+                + f.stop_sending
+                + f.stream
+        };
+        Traffic { heard: eliciting(&rx) + rx.acks + rx.connection_close, asked: eliciting(&tx) }
+    }
+}
+
+/// Watch a connection this runtime keeps, for as long as it is open: once `silent` says its other
+/// end has gone quiet, `silenced` is set and the connection closed, so that every request on it
+/// fails at once (saying so) and the next call makes a new one. Ends at the next look once the
+/// connection has closed for any other reason. One watcher for each connection kept.
+pub(crate) fn watch(connection: Connection, after: Duration, silenced: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        silent(&connection, after, Traffic::of(&connection)).await;
+        if connection.close_reason().is_none() {
+            silenced.store(true, Ordering::SeqCst);
+            connection.close(VarInt::from_u32(2), NOTHING_HEARD);
+        }
+    });
+}
+
+/// Ends once something this runtime sent on `connection` since `before`, which the other end
+/// must acknowledge, has gone unanswered by anything at all from that end for `after`, or once
+/// the connection has closed; never, while the other end is heard from, or while nothing is
+/// waiting on it.
+///
+/// How late it can be: it looks every `SILENCE_LOOK`, so up to two looks late (the sending is
+/// first seen at the look after it, and the end at the first look after `after` has passed
+/// from then), plus however late its task is scheduled. When both counters move between two
+/// looks, the connection is taken as heard last (the sending may have been answered). If the
+/// other end is in fact gone, quinn sends a loss probe (an ack-eliciting frame) once its probe
+/// timeout passes, which moves `asked` again, and the wait starts from the look after. That
+/// adds the probe timeout as it then stands: in quinn-proto 0.11.19 (`Connection::pto`,
+/// `RttEstimator::pto_base`) the round trip plus four times its variation (at least a
+/// millisecond) plus the peer's maximum ack delay (25 ms by default), doubled for each probe
+/// already sent unanswered, and reset to the first once anything is acknowledged; about 26 ms
+/// on loopback, and with no round trip measured yet (an initial round trip of 333 ms,
+/// variation half that) about one second.
+///
+/// There is no bound that holds whatever happens: if nothing can be sent at all (every stream
+/// held, everything sent already acknowledged, and nothing left to send), the clock does not
+/// start until something is, for example when a waiting request runs out of time and resets
+/// its streams, or until quinn's idle timeout ends the connection.
+pub(crate) async fn silent(connection: &Connection, after: Duration, before: Traffic) {
+    let mut last = before;
+    // When something was first seen sent since the last packet heard, if it has been.
+    let mut waiting: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::time::sleep(SILENCE_LOOK).await;
+        if connection.close_reason().is_some() {
+            return;
+        }
+        let now = Traffic::of(connection);
+        let at = tokio::time::Instant::now();
+        if now.heard != last.heard {
+            waiting = None;
+            last = now;
+        } else if now.asked != last.asked && waiting.is_none() {
+            waiting = Some(at);
+        }
+        if waiting.is_some_and(|since| at.duration_since(since) >= after) {
+            return;
+        }
+    }
+}
+
 impl Shared {
     /// Send one request and read its reply, over a connection made for this pair of ships,
     /// all within the time allowed for a request.
@@ -1861,11 +2042,16 @@ impl Shared {
         let to = canonical_ship(to).map_err(|_| NetError::Unlisted(to.to_string()))?;
         let deadline = tokio::time::Instant::now().checked_add(within).ok_or(NetError::TimedOut)?;
         let lost = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
-        let (connection, key) = tokio::time::timeout_at(deadline, self.connection(&from, &to, deadline)).await.map_err(|_| NetError::TimedOut)??;
-        let opened = tokio::time::timeout_at(deadline, connection.open_bi()).await.map_err(|_| NetError::TimedOut)?;
-        let (mut send, mut receive) = opened.map_err(|e| lost(&e))?;
+        let (connection, key, silenced) = tokio::time::timeout_at(deadline, self.connection(&from, &to, deadline)).await.map_err(|_| NetError::TimedOut)??;
+        // Whatever went wrong, if the connection's watcher gave it up for silence, that is what
+        // is said.
+        let quiet = || NetError::Unreachable(format!("nothing was heard from {to} for {} seconds, so the connection to it was given up", self.cfg.silence_timeout.as_secs_f64()));
+        let said = |error: NetError| if silenced.load(Ordering::SeqCst) { quiet() } else { error };
+        let opened = tokio::time::timeout_at(deadline, connection.open_bi()).await.map_err(|_| said(NetError::TimedOut))?;
+        let (mut send, mut receive) = opened.map_err(|e| said(lost(&e)))?;
         // The streams are held out here, so that if time runs out part way they can be told
-        // to stop. Merely letting go of them would leave the request to go on being sent.
+        // to stop. Merely letting go of them would leave the request to go on being sent. A
+        // request that runs out of time never closes the connection: only its watcher does.
         let exchanged = tokio::time::timeout_at(deadline, async {
             send.write_all(&request.encode_to_vec()).await.map_err(|e| lost(&e))?;
             send.finish().map_err(|e| lost(&e))?;
@@ -1880,9 +2066,9 @@ impl Shared {
         let Ok(answer) = exchanged else {
             let _ = send.reset(VarInt::from_u32(3));
             let _ = receive.stop(VarInt::from_u32(3));
-            return Err(NetError::TimedOut);
+            return Err(said(NetError::TimedOut));
         };
-        let answer = answer?;
+        let answer = answer.map_err(said)?;
         // Counted before it is decoded, as a request is: an answer can be all padding too.
         if !repeats_within(&answer, 3, 1, MAX_FETCH_ENTRIES) {
             return Err(NetError::Garbled);
@@ -1945,7 +2131,7 @@ impl Shared {
     ///
     /// A kept connection that goes through a relay starts a try at going direct again when it
     /// is used, if one is due (`Lookup::direct_again`) and none is under way for the pair.
-    async fn connection(self: &Arc<Self>, from: &str, to: &str, deadline: tokio::time::Instant) -> Result<(Connection, [u8; 32]), NetError> {
+    async fn connection(self: &Arc<Self>, from: &str, to: &str, deadline: tokio::time::Instant) -> Result<(Connection, [u8; 32], Arc<AtomicBool>), NetError> {
         let key = self.runtime.signing_key(from).map_err(|_| NetError::NotHere(from.to_string()))?;
         let shown = key.verifying_key().to_bytes();
         let pair = (from.to_string(), to.to_string());
@@ -1989,13 +2175,13 @@ impl Shared {
             // lookup point, that includes that no address has been set by hand meanwhile.
             if stands && self.directory.prove_as(to, &made.peer.key, made.found) {
                 let mut made = made;
-                let (connection, proved) = (made.connection.clone(), made.peer.key);
+                let (connection, proved, silenced) = (made.connection.clone(), made.peer.key, made.silenced.clone());
                 let generation = made.generation;
                 if let Some(relaying) = made.relayed.as_mut() {
                     self.direct_due(&pair, relaying, generation);
                 }
                 *kept = Some(made);
-                return Ok((connection, proved));
+                return Ok((connection, proved, silenced));
             }
             made.connection.close(VarInt::from_u32(2), b"the directory changed");
             // A connection found through a point that the directory would not prove again:
@@ -2037,8 +2223,13 @@ impl Shared {
         };
         // A connection through a relay is marked so where it is kept, with its session.
         let relayed = leg.map(|leg| Relaying { leg, next_try: tokio::time::Instant::now() + self.cfg.lookup.direct_again });
-        *kept = Some(Made { connection: connection.clone(), peer, shown, found, relayed, generation: self.generation() });
-        Ok((connection, peer.key))
+        // Watched from now until it closes, relayed or not: through a relay the connection is
+        // still end to end, and the relay carries only what each end sends, so silence means
+        // the far ship, or the relay between, has gone.
+        let silenced = Arc::new(AtomicBool::new(false));
+        watch(connection.clone(), self.cfg.silence_timeout, silenced.clone());
+        *kept = Some(Made { connection: connection.clone(), peer, shown, found, relayed, generation: self.generation(), silenced: silenced.clone() });
+        Ok((connection, peer.key, silenced))
     }
 
     /// How a ship of this runtime (with `key`) calls `to`: showing its key, and accepting only
@@ -2418,7 +2609,9 @@ impl Shared {
             let current = kept.as_ref().is_some_and(|made| made.relayed.is_some() && made.generation == relayed && made.shown == shown);
             let fits = matches!(self.route(to), Some(Route::Found(Some(key))) if key == proved);
             if current && fits && self.directory.prove_as(to, &proved, true) {
-                let direct = Made { connection, peer: Peer { key: proved, addr }, shown, found: true, relayed: None, generation: self.generation() };
+                let silenced = Arc::new(AtomicBool::new(false));
+                watch(connection.clone(), self.cfg.silence_timeout, silenced.clone());
+                let direct = Made { connection, peer: Peer { key: proved, addr }, shown, found: true, relayed: None, generation: self.generation(), silenced };
                 if let Some(old) = kept.replace(direct) {
                     old.connection.close(VarInt::from_u32(2), b"replaced by a direct connection");
                 }
@@ -4071,6 +4264,42 @@ mod tests {
     }
 
     const HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn a_ship_taken_off_a_pretend_list_or_given_a_new_key_holds_from_the_next_reading() {
+        let dir = std::env::temp_dir().join(format!("urbit-wasm-{}-net-pretend", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ids.txt");
+        let (zod, nec) = (0u32, 1u32);
+        std::fs::write(&path, format!("{}\n{}\n", crate::pretend::line("~zod", &[1; 32]), crate::pretend::line("~nec", &[2; 32]))).unwrap();
+        let ids = Arc::new(crate::pretend::PretendIds::open(&path).unwrap());
+        // Read again as soon as what is held is a moment old, and believed for an hour.
+        let directory = Directory::made(Some(ids), Duration::from_millis(1), HOUR, Bounds::default());
+        let read = |ship: u32| {
+            std::thread::sleep(Duration::from_millis(3));
+            directory.read(&name(ship));
+        };
+        read(zod);
+        read(nec);
+        assert_eq!((directory.key_of("~zod"), directory.key_of("~nec")), (Some([1; 32]), Some([2; 32])));
+        // ~zod is taken off the list and ~nec is given a new key. At the next reading of each,
+        // ~zod has no key and ~nec has its new one, though both were believed for an hour.
+        std::fs::write(&path, format!("{}\n", crate::pretend::line("~nec", &[9; 32]))).unwrap();
+        read(zod);
+        read(nec);
+        assert_eq!((directory.key_of("~zod"), directory.key_of("~nec")), (None, Some([9; 32])));
+        // Put back, it is believed again.
+        std::fs::write(&path, format!("{}\n", crate::pretend::line("~zod", &[3; 32]))).unwrap();
+        read(zod);
+        assert_eq!(directory.key_of("~zod"), Some([3; 32]));
+        // A ship never on the list has no key, and nothing is kept for it.
+        let bud = 2u32;
+        read(bud);
+        assert_eq!(directory.key_of("~bud"), None);
+        assert!(!directory.listed.read().unwrap().keys.contains_key(&name(bud)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn keys_nobody_has_proved_make_way_for_each_other_and_for_nothing_else() {

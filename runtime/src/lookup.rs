@@ -1759,6 +1759,9 @@ pub(crate) struct Finder {
     /// How long one question to a point may take, and how long to wait between tries at
     /// announcing: as for ships.
     limit: Duration,
+    /// How long the connection to a point may go unanswered while a packet sent on it waits
+    /// for an acknowledgement, before it is taken to be dead (`NetConfig::silence_timeout`).
+    silence: Duration,
     retry_delay: Duration,
     max_retry_delay: Duration,
     /// What the resolver said for each galaxy, and when.
@@ -1847,6 +1850,7 @@ impl Finder {
             introducing: std::sync::atomic::AtomicBool::new(true),
             resolver,
             limit: cfg.request_timeout,
+            silence: cfg.silence_timeout,
             retry_delay: cfg.retry_delay,
             max_retry_delay: cfg.max_retry_delay,
             resolved: Mutex::default(),
@@ -2419,6 +2423,16 @@ impl Finder {
         if let Some(relayed) = &self.relayed {
             relayed.heard_on(connection.stable_id());
         }
+        // A point that stopped without closing the connection (killed, or its machine gone)
+        // never answers the packet sent on it every `keep_alive`. Once one has gone unanswered
+        // for `silence`, the connection is closed, so that it is made again and the ships are
+        // announced again at once, rather than after the connection's idle timeout.
+        let watched = connection.clone();
+        let silence = self.silence;
+        tokio::spawn(async move {
+            net::silent(&watched, silence, net::Traffic::of(&watched)).await;
+            watched.close(VarInt::from_u32(2), net::NOTHING_HEARD);
+        });
         while let Ok(mut receive) = connection.accept_uni().await {
             match tokio::time::timeout(PUSH_READ_LIMIT, net::read_whole(&mut receive, MOST_PUSH_BYTES)).await {
                 Ok(Some(introduction)) => {

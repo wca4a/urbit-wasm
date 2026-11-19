@@ -11,6 +11,7 @@ pub mod relay;
 pub mod lookup;
 pub mod whereabouts;
 pub mod azimuth;
+pub mod pretend;
 pub mod chain;
 pub mod replica;
 pub mod moon;
@@ -82,8 +83,14 @@ pub struct Config {
     /// event that breaks a limit.
     pub max_ship_bytes: u64,
     pub max_module_bytes: usize,
-    /// Largest ship file `import_ship` will read, and the longest it will spend reading one.
+    /// Largest exported copy `import_ship` will read. The default is the default
+    /// `max_ship_bytes` and a measured margin (see `import_bytes_for`). A lower limit is a fair
+    /// choice, since it bounds the memory an untrusted file can take.
     pub max_import_bytes: u64,
+    /// How long `import_ship` may spend bringing a ship's file in. Looked at between steps (each
+    /// row copied, and before and during the packing of the new file, which is interrupted when
+    /// the time is up), so one step that blocks can take it past; the stream of files beside the
+    /// copy is not under it.
     pub max_import_millis: u64,
     pub max_table_elements: usize,
     pub max_event_bytes: usize,
@@ -189,6 +196,42 @@ pub struct Config {
     pub storage_key: Option<StorageKey>,
 }
 
+impl Config {
+    /// An import limit for ships whose files are at most `max_ship_bytes`: that limit, a measured
+    /// margin, and the seal.
+    ///
+    /// A copy is the ship's signing key and the plain contents of its file, sealed:
+    /// `seal::EXPORT_OVERHEAD` (95) bytes more than those contents. The contents are what
+    /// `store::snapshot` makes, a plain database of the file's rows, written afresh by SQLite
+    /// with every table filled in key order, no free pages, and no room set aside on any page
+    /// for encryption (the ship's file sets aside 80 bytes of each 4,096). So the contents are
+    /// a whole number of 4,096-byte pages, and in every ship tried (five, each filled to a
+    /// 4 MiB limit in a different way) came to between 0.77 and 0.99 of that limit. That is
+    /// measured, not proved: how SQLite packs the same rows on its pages is not a fixed
+    /// function of the file's size, so a copy larger than this is not shown to be impossible.
+    /// This allows a sixteenth more than the file's limit, and the 95 bytes of the seal: 1,088
+    /// MiB for the default 1 GiB.
+    pub fn import_bytes_for(max_ship_bytes: u64) -> u64 {
+        max_ship_bytes.saturating_add(max_ship_bytes / 16).saturating_add(seal::EXPORT_OVERHEAD as u64)
+    }
+}
+
+/// A size as an operator writes one: a whole number of bytes, or of KiB, MiB or GiB with `K`,
+/// `M` or `G` after it (`10G`). Nothing else: no spaces, no fractions, no other letters, and
+/// nothing that does not fit in 64 bits.
+pub fn parse_size(written: &str) -> Option<u64> {
+    let (digits, shift) = match written.as_bytes().last()? {
+        b'K' => (&written[..written.len() - 1], 10),
+        b'M' => (&written[..written.len() - 1], 20),
+        b'G' => (&written[..written.len() - 1], 30),
+        _ => (written, 0),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -198,8 +241,13 @@ impl Default for Config {
             max_memory_bytes: 64 << 20,
             max_ship_bytes: 1 << 30,
             max_module_bytes: 16 << 20,
-            max_import_bytes: 256 << 20,
-            max_import_millis: 60_000,
+            max_import_bytes: Config::import_bytes_for(1 << 30),
+            // Measured on a Mac laptop, release build, the packing of the new file included: a
+            // sealed copy of 300 MiB of kv rows came in at 28 to 75 MiB a second (14 to 36
+            // seconds a GiB), but small log entries, each checked against the ship's key, at 7
+            // MiB a second (about 145 seconds a GiB). So a full default ship of small entries
+            // would not fit in a minute; five leave room.
+            max_import_millis: 300_000,
             max_table_elements: 100_000,
             max_event_bytes: 1 << 20,
             max_reply_bytes: 1 << 20,
@@ -318,6 +366,18 @@ pub enum Error {
     /// The event was refused. It changed no state and queued no messages. The audit log records
     /// it on a best-effort basis.
     Rejected(Rejection),
+    /// A ship brought in by import would not fit this runtime: packed as tightly as SQLite packs
+    /// anything, its file needs at least `bytes`, more than `limit`, the runtime's
+    /// `max_ship_bytes`. A runtime with a larger limit can bring it in.
+    ShipTooLarge { ship: String, bytes: u64, limit: u64 },
+    /// A ship's file could not be built, while it was brought in by import, within `room`, the
+    /// room allowed for building it (twice `max_ship_bytes`): either it is far too large for this
+    /// runtime or the disk is full. SQLite reports both alike. This covers SQLite reporting the
+    /// file full while rows are copied in; running out of disk at another moment (making the
+    /// scratch file, or the copy back after packing) comes through as the operating system's or
+    /// SQLite's own error. A larger limit helps only when the ship was too large; a full disk
+    /// needs room on the disk.
+    NotBuilt { ship: String, room: u64 },
     /// Something about a file the ship keeps, or an upload.
     File(FileError),
     Store(rusqlite::Error),
@@ -350,6 +410,13 @@ impl fmt::Display for Error {
             Error::Rejected(Rejection::Denied(why)) => write!(f, "event rejected: not permitted: {why}"),
             Error::Rejected(Rejection::Limit(why)) => write!(f, "event rejected: limit exceeded: {why}"),
             Error::Rejected(Rejection::Trap(why)) => write!(f, "event rejected: {why}"),
+            Error::NotBuilt { ship, room } => write!(
+                f,
+                "{ship} could not be brought in: its file did not fit in the {room} bytes allowed for building it (twice max_ship_bytes), so either it is far too large for this runtime or the disk is full"
+            ),
+            Error::ShipTooLarge { ship, bytes, limit } => {
+                write!(f, "{ship} does not fit: its file needs at least {bytes} bytes, and this runtime lets a ship's file take at most {limit} (max_ship_bytes)")
+            }
             Error::File(why) => write!(f, "file: {why}"),
             Error::Store(e) => write!(f, "store error: {e}"),
             Error::Io(e) => write!(f, "io error: {e}"),
@@ -482,6 +549,10 @@ pub(crate) struct Inner {
     /// `KIND_FILE_ASK`, to stand for a kernel that does not know the kind. 0 for none.
     #[cfg(test)]
     pub(crate) file_ask_kind: std::sync::atomic::AtomicI32,
+    /// For tests: a gate the next call on a ship stops at, with the ship's slot held, once it
+    /// has said so on the first channel, until the second says to go on.
+    #[cfg(test)]
+    pub(crate) event_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// What came of another ship's word on how much of a delivery it holds.
@@ -535,6 +606,71 @@ fn lock_data_dir(data_dir: &Path) -> Result<fs::File, Error> {
         return Err(if err.kind() == io::ErrorKind::WouldBlock { Error::DataDirInUse } else { err.into() });
     }
     Ok(file)
+}
+
+/// The longest part of `path` that exists, through every link, and the parts after it as
+/// written.
+fn existing_part(path: &Path) -> io::Result<(PathBuf, Vec<std::ffi::OsString>)> {
+    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    loop {
+        match fs::canonicalize(existing) {
+            Ok(real) => {
+                rest.reverse();
+                return Ok((real, rest));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_os_string());
+                    existing = parent;
+                }
+                // `..` at the end has no file name: kept as a part, and refused by the caller.
+                (Some(parent), None) => {
+                    rest.push("..".into());
+                    existing = parent;
+                }
+                _ => return Err(e),
+            },
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Remove what a runtime that ended without cleaning up left in `tmp/`: the regular files and
+/// symbolic links directly inside it. Called only with the data directory's lock held, so that
+/// nothing in it belongs to a runtime still running, and only once the storage key has been
+/// checked. `tmp/` is the runtime's own: nothing an operator names may be kept in it (`serve`
+/// refuses such paths, and `export_ship` refuses it as a destination).
+///
+/// If `tmp` is not itself a directory (a symbolic link to one, for instance, which could point
+/// at `ships/`), nothing is removed. That is checked by name and the entries are then removed by
+/// name, so someone who can swap directories inside the data directory while a runtime opens
+/// could still steer it; whoever can do that can already change any ship's files there.
+///
+/// A link is removed as a link, never followed, so nothing outside the directory is touched.
+/// A scratch name may be a second name of a ship's file, since a ship is put in place by a hard
+/// link: removing the name leaves the ship's own. Directories, and anything else that is not a
+/// file or a link, are left as they are; nothing here makes them. A removal that fails, or a
+/// listing that cannot be read, is passed over: the runtime opens all the same, and what is left
+/// stays until a later start removes it. A leftover costs only room: every scratch file is made
+/// with `create_new` (by `store::create` and by `store_blob`) or replaced by a rename, so none is
+/// ever written through. The one way a leftover can get in a
+/// new call's way is a scratch name used again (`Scratch` names hold the process id, which the
+/// system can give again): the call then fails rather than build on what was left
+/// (`store::create` saying the ship exists, which it may not).
+fn clear_scratch(tmp_dir: &Path) {
+    if !fs::symlink_metadata(tmp_dir).is_ok_and(|facts| facts.file_type().is_dir()) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(tmp_dir) else { return };
+    for entry in entries.flatten() {
+        // The type of the entry itself: a link is not followed to learn it.
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_file() || kind.is_symlink() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Make a newly created or renamed entry in `dir` survive a power cut. Syncing a file's
@@ -994,7 +1130,7 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
             let mut path = self.0.clone().into_os_string();
             path.push(suffix);
             let _ = fs::remove_file(path);
@@ -1050,6 +1186,10 @@ impl Runtime {
             None => kept_storage_key(&data_dir.join("storage.key"), used)?,
         };
         check_storage_key(&check, &storage, used)?;
+        // Only now: with the lock held, no other runtime has this directory, so whatever is in
+        // `tmp/` was left by one that is gone; and with the storage key checked, a start that is
+        // refused (the wrong key, another runtime's directory) has removed nothing.
+        clear_scratch(&tmp_dir);
 
         let mut wasm_cfg = wasmtime::Config::new();
         wasm_cfg.consume_fuel(true);
@@ -1118,6 +1258,8 @@ impl Runtime {
                 batch_delay: Mutex::new(None),
                 #[cfg(test)]
                 file_ask_kind: std::sync::atomic::AtomicI32::new(0),
+                #[cfg(test)]
+                event_gate: Mutex::new(None),
             }),
         })
     }
@@ -1950,17 +2092,40 @@ impl Runtime {
     /// Running both the original and an imported copy would give two writers of the same
     /// logs, which nothing here yet prevents.
     ///
+    /// A destination in the runtime's `tmp/` (emptied at every start) is refused: looked at
+    /// before anything is made, and again just after the destination directory is made. The
+    /// second look narrows the gap in which something could swap a part of the destination for
+    /// a link into `tmp/`; it does not close it.
+    ///
     /// Which agent modules a ship needs is known only to its kernel, so the export contains the
     /// modules the kernel lists. A kernel that leaves one out produces a ship that imports
     /// cleanly and then fails when that agent is first called.
     pub fn export_ship(&self, ship: &str, dest: impl AsRef<Path>) -> Result<(), Error> {
         let name = canonical_ship(ship)?;
         let dest = dest.as_ref();
+        // Not into the runtime's scratch directory, or anywhere under it: what is there is
+        // removed when the runtime next starts. Decided before anything is made, from the part of
+        // the path that exists; a part still to be made may not hold `..`, which would make that
+        // decision depend on what is made.
+        let (existing, rest) = existing_part(dest)?;
+        if rest.iter().any(|part| part == "..") {
+            return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "an export's destination may not go up (..) through directories that are not there yet")));
+        }
+        if existing.starts_with(fs::canonicalize(&self.inner.tmp_dir)?) {
+            return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "a ship cannot be exported into its runtime's tmp directory, which is emptied at every start")));
+        }
         fs::create_dir_all(dest)?;
+        let made = fs::canonicalize(dest)?;
+        // Looked at again now that the destination is there: if something swapped a part of it
+        // for a link into `tmp/` between the first look and the making, this sees it. It narrows
+        // that gap and does not close it: the destination can still be swapped after this.
+        if made.starts_with(fs::canonicalize(&self.inner.tmp_dir)?) {
+            return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "a ship cannot be exported into its runtime's tmp directory, which is emptied at every start")));
+        }
         // The copy is called what the ship's own file is called. Written where the runtime
         // keeps its ships, by whatever path that directory was reached, it would replace
         // the ship with a copy of itself that the runtime cannot open.
-        if fs::canonicalize(dest)? == fs::canonicalize(&self.inner.ships_dir)? {
+        if made == fs::canonicalize(&self.inner.ships_dir)? {
             return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "a ship cannot be exported into the directory its runtime keeps ships in")));
         }
         fs::create_dir_all(dest.join("blobs"))?;
@@ -2081,7 +2246,7 @@ impl Runtime {
         // Counted by bytes read, not by reported size, which a special file can misstate.
         let limit = self.inner.cfg.max_import_bytes;
         let mut sealed = Vec::new();
-        if source.take(limit + 1).read_to_end(&mut sealed)? as u64 > limit {
+        if source.take(limit.saturating_add(1)).read_to_end(&mut sealed)? as u64 > limit {
             return Err(Error::BadShipFile(format!("{name}: larger than this runtime will import")));
         }
         // What the stream of files beside the copy is bound to.
@@ -2092,7 +2257,7 @@ impl Runtime {
         let key = SigningKey::from_bytes(&seed);
         let public = key.verifying_key();
         let file_key = self.inner.file_key(&name);
-        let (kernel_hash, unimported) = store::import(
+        let imported = store::import(
             contents,
             &fresh.0,
             &name,
@@ -2105,7 +2270,21 @@ impl Runtime {
             &file_key,
             &seal::recovery_public(code),
             stream.is_some(),
-        )?;
+        );
+        let (kernel_hash, unimported) = match imported {
+            // Full while it was built, though built with room to spare: either the copy holds more
+            // than the room allowed for building it, or the disk itself is full. SQLite says the
+            // same for both, so that is what is said: no size is claimed for a finished file.
+            Err(Error::Store(e)) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) => {
+                return Err(Error::NotBuilt { ship: name, room: store::building_bytes(self.inner.cfg.max_ship_bytes) });
+            }
+            other => other?,
+        };
+        // Packed as tightly as it goes, and only then held to `max_ship_bytes`, within the same
+        // deadline. Packed every time, not only when it is over. In each of the five fills the
+        // tests try, the packed file had no more pages than the original; that is what was
+        // measured, for those five, and nothing is claimed about room for later writes.
+        store::compact(&fresh.0, &name, self.inner.cfg.max_ship_bytes, &file_key, deadline)?;
         let fetch = |hash: &str| -> Result<(), Error> {
             // Check the bytes on disk, not the compiled cache, which could hide a damaged blob.
             if self.inner.read_blob(hash).is_err() {
@@ -2187,6 +2366,24 @@ impl Runtime {
         }
         self.inner.awake_changed.notify_all();
         slept
+    }
+
+    /// Start a thread that puts to sleep, every so often, the ships that have been idle for at
+    /// least `idle`, as `sleep_idle` does. It holds the runtime only weakly, and only while it
+    /// looks, so it keeps nothing open: once the last other holder lets the runtime go, the
+    /// thread ends at its next look. It looks every tenth of `idle`, but never more often than
+    /// every 10 milliseconds nor less often than every 30 seconds, so a ship left idle sleeps
+    /// between `idle` and `idle` and one look's wait after its last use (plus the time a look
+    /// takes). A ship mid-event is never put to sleep, and a ship asleep wakes for the next call
+    /// as any ship does.
+    pub fn sleep_when_idle(runtime: &Arc<Runtime>, idle: Duration) -> JoinHandle<()> {
+        let held = Arc::downgrade(runtime);
+        let every = (idle / 10).clamp(Duration::from_millis(10), Duration::from_secs(30));
+        std::thread::spawn(move || loop {
+            std::thread::sleep(every);
+            let Some(runtime) = held.upgrade() else { return };
+            runtime.sleep_idle(idle);
+        })
     }
 
     /// Ships that are open or being opened.
@@ -2339,7 +2536,9 @@ impl Inner {
             return Ok(());
         }
         let scratch = Scratch::new(&self.tmp_dir);
-        let mut file = fs::File::create(&scratch.0)?;
+        // A new name, never one that is there: a leftover of the same name is not written
+        // through, whatever it is (see `clear_scratch`).
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&scratch.0)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&scratch.0, path)?;
@@ -2427,6 +2626,11 @@ impl Inner {
                 }
             }
             let ship = guard.ship.as_mut().expect("woken above");
+            #[cfg(test)]
+            if let Some((entered, go_on)) = lock(&self.event_gate).take() {
+                let _ = entered.send(());
+                let _ = go_on.recv();
+            }
             // If `f` unwinds with a transaction open, the connection is closed before anything
             // else can use it, which rolls the transaction back: nothing may read, or act on,
             // rows that were never committed.
@@ -2495,6 +2699,66 @@ impl Inner {
             // Still holding the victim's lock: it cannot be reopened until its file is closed.
             drop(ship);
             return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_import_limit_covers_the_copy_of_a_full_default_ship() {
+        let cfg = Config::default();
+        // A copy is the contents of the file and the seal around them, and the contents have
+        // never been seen larger than the file's limit (see `Config::import_bytes_for`).
+        assert!(cfg.max_import_bytes >= cfg.max_ship_bytes + seal::EXPORT_OVERHEAD as u64);
+        assert_eq!(cfg.max_import_bytes, Config::import_bytes_for(cfg.max_ship_bytes));
+        assert_eq!(Config::import_bytes_for(1 << 30), (1 << 30) + (64 << 20) + 95);
+        assert_eq!(Config::import_bytes_for(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn a_ship_part_way_through_a_call_is_not_put_to_sleep() {
+        let dir = std::env::temp_dir().join(format!("urbit-wasm-{}-lib-mid-event", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let rt = Arc::new(Runtime::open(&dir, Config { durability: Durability::Normal, ..Config::default() }).unwrap());
+        let kernel = rt.add_module(&crate::net::router_tests::wasm("kernel")).unwrap();
+        let counter = rt.add_module(&crate::net::router_tests::wasm("counter")).unwrap();
+        rt.create_ship("~zod", &kernel).unwrap();
+        rt.install("~zod", "counter", &counter, &Manifest::default()).unwrap();
+        // A sleeper that would put any idle ship to sleep at once runs throughout.
+        let _sleeper = Runtime::sleep_when_idle(&rt, Duration::ZERO);
+        let (entered, at_gate) = std::sync::mpsc::channel();
+        let (go_on, released) = std::sync::mpsc::channel();
+        *lock(&rt.inner.event_gate) = Some((entered, released));
+        let busy = {
+            let rt = rt.clone();
+            std::thread::spawn(move || rt.deliver("~zod", "counter", b"inc hits"))
+        };
+        // The call holds the ship's slot at the gate: however long it stays there, and however
+        // often the sleeper looks, the ship is not put to sleep, nor by a look forced now.
+        at_gate.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rt.sleep_idle(Duration::ZERO), 0);
+        assert_eq!(rt.awake(), 1);
+        go_on.send(()).unwrap();
+        assert_eq!(String::from_utf8(busy.join().unwrap().unwrap().reply).unwrap(), "1");
+        // Once the call is over it is idle, and a look puts it to sleep (the sleeper's or this).
+        rt.sleep_idle(Duration::ZERO);
+        assert_eq!(rt.awake(), 0);
+        drop(rt);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_size_is_whole_bytes_or_whole_kib_mib_or_gib() {
+        let cases = [("0", Some(0)), ("1", Some(1)), ("1024", Some(1024)), ("0K", Some(0)), ("1K", Some(1024)), ("3M", Some(3 << 20)), ("10G", Some(10 << 30)), ("18446744073709551615", Some(u64::MAX))];
+        for (written, size) in cases {
+            assert_eq!(parse_size(written), size, "{written}");
+        }
+        for written in ["", "K", "1k", "1m", "1g", "1T", "1KB", "1 K", " 1", "1 ", "-1", "+1", "1.5G", "0x10", "18446744073709551616", "17179869184G", "１"] {
+            assert_eq!(parse_size(written), None, "{written}");
         }
     }
 }

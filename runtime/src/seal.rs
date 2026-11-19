@@ -169,6 +169,11 @@ pub fn seal_export(recovery: &[u8; 32], ship: &str, seed: &[u8; 32], contents: &
 const EXPORT_HEAD: usize = EXPORT_MAGIC.len() + 32;
 const TAG_BYTES: usize = 16;
 
+/// How much larger a sealed copy is than the contents of the ship's file it holds: the magic
+/// (15 bytes), the public key made for the copy (32), the ship's signing key (32) and the tag
+/// (16), 95 bytes in all.
+pub const EXPORT_OVERHEAD: usize = EXPORT_HEAD + 32 + TAG_BYTES;
+
 /// Open an exported copy of a ship with its recovery code: the ship's signing key and the
 /// contents of its file. `None` if it is not a copy of that ship sealed to that code, or has
 /// been changed in any way since it was sealed. The copy is opened where it lies, so nothing
@@ -351,6 +356,15 @@ pub fn recovery_key_usable(public: &[u8; 32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sealed_copy_is_its_contents_and_the_stated_overhead() {
+        let recovery = recovery_public("test-test-test-test-test-test-test-test");
+        for length in [0, 1, 4096, 100_000] {
+            assert_eq!(seal_export(&recovery, "zod", &[1; 32], &vec![7; length], [5; 32]).len(), length + EXPORT_OVERHEAD);
+        }
+        assert_eq!(EXPORT_OVERHEAD, 95);
+    }
 
     #[test]
     fn a_key_is_for_one_ship_and_one_use() {

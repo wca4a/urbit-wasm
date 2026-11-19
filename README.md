@@ -10,8 +10,8 @@ of any size on each ship for the owner's devices, and an encrypted link over
 which ships send each other commands, follow each other's logs, and fetch each
 other's files.
 A ship's file is encrypted on disk. A ship's keys can be derived from its Urbit
-ID master ticket, but ships do not yet look each other up in Azimuth, and there
-is no update mechanism yet.
+ID master ticket, ships check each other's keys against Azimuth and find each
+other's addresses through lookup points, and there is no update mechanism yet.
 
 ## What it does
 
@@ -142,6 +142,68 @@ The first build also compiles SQLCipher and a private copy of OpenSSL, which
 needs a C compiler, `perl`, and `make`. On a Mac these come with the Xcode
 command line tools.
 
+### Two ships on one machine
+
+One command starts a lookup point and two ships, `~sampel-palnet` and
+`~norsyr-torryn`, as three programs on this machine, and walks through what
+they can do, acting as each owner's phone or browser would:
+
+```sh
+cargo build -p kernel -p counter -p tally --release --target wasm32-unknown-unknown --target-dir target/wasm
+cargo run -p runtime --release --bin serve -- --two-ships /tmp/two-ships
+```
+
+It shows the two ships finding each other by name alone and trading messages,
+the second ship reporting that the lookup point introduced the first to it, as
+the second asks of its callers; a file on the first ship refused to the second
+until the first's owner allows it, then arriving whole, checked by its
+SHA-256; the second opening it again with the first ship turned off, from the
+copy it kept; and the two finding each other again after the first comes back.
+Each step says what it is doing, and says no more than it has checked: each
+message carries a word for this run and is reported with the number of the
+entry it became in the other ship's journal. The three command lines are
+printed as they could be typed. Waiting for a program to print something, and
+for a message to arrive, gives up after a minute; refusing, allowing and
+moving the file give up after a minute and two seconds for each MiB of it;
+each says what it waited for. Reading the answer to each HTTP request it
+makes (its headers and body, an error's body included) is given at most what
+is left of its step's time. Connecting has a fixed limit of its own, so it
+can take a step past its time by up to 5 seconds; and each write of a request
+is limited by what was left when it connected, the same limit for every write,
+set once, so a request that keeps writing slowly can go on past it. Every
+request is to one of its own programs on this machine. Ctrl-C is looked at
+before and after each request (signing out looks before and not after), while
+a file is read, between the pieces of a file, and in every wait. A request
+that went wrong with Ctrl-C already in is reported as the stop, since Ctrl-C
+stops the ships too and the two cannot be told apart; a step that failed with
+no Ctrl-C keeps its words. Then it leaves the three running, prints each
+ship's address and access code for a browser, and stops them on Ctrl-C
+(`--then-stop` stops them at once instead); stopping a program is a kill and
+then a wait for it to end, which has no time limit. A second run on the same
+directory reuses the ships. A run takes a lock on its directory, so two runs
+never share one. A directory that is not empty and does not hold the
+walk-through's marker file is refused; one that holds the marker is taken as
+its own, whatever else is in it. Keys come from a list it writes in that
+directory (`--pretend-ids`; see Keys from a list, for trying things out), so
+it needs no internet and no real ship.
+
+It does not show two machines, a real home router, the relay carrying anything
+(nothing on one machine needs it), or real Urbit ID: the three programs talk
+over this machine's loopback address. In its last step the second ship's
+message to the first, which came back, took 6.5 seconds in each of five runs on one
+machine (3.3 with `--ports`): the second ship's connection to the first has
+gone quiet, its watcher gives it up after three seconds, and a new one is made
+(see Finding a ship by its name for what makes that longer).
+
+Its other flags: `--show-output` (what the three programs print, each line
+marked with which said it; shown anyway when a step does not work), `--ports
+<first>` (six fixed ports counting up from it, so the addresses stay the same
+between runs), `--file <file>` (share this file instead of a made-up one),
+`--sleep-after <seconds>` (given to the three programs), and `--kernel`,
+`--counter` and `--tally` for the modules.
+
+### Other ways to run it
+
 Tests (these build the kernel and agents themselves):
 
 ```sh
@@ -228,6 +290,12 @@ cargo run -p runtime --release --bin serve -- --dir /tmp/ships --keyfile my-plan
 To state the address yourself instead, add `--announce 203.0.113.7:4433`; and if
 that address is a router that lets nothing in unasked, `--behind-router` too.
 
+To try ships out on machines you control, with no internet, `--pretend-ids
+<file>` reads every ship's key from a list in a file instead of Urbit ID, in
+place of `--ethereum` and `--azimuth-copy` (see Keys from a list, for trying
+things out). Whoever can write that file can be any ship, so it is never for a
+real network.
+
 The server speaks plain HTTP on localhost. Before reaching it from anywhere
 else, put it behind a proxy that provides TLS, buffers request bodies, passes
 addresses through unchanged, and limits how fast one caller may ask. Serve
@@ -265,11 +333,13 @@ source rather than something the tests prove.
 | `runtime/src/lookup.rs` | Lookup points: being one, finding the one for a galaxy, asking it where a ship is, and announcing this runtime's ships to it |
 | `runtime/src/relay.rs` | The relay: the framing of relayed packets, the socket wrapper (sessions and made-up addresses at a ship, carrying at a point), and the point's sessions and byte allowances |
 | `runtime/src/server.rs` | The HTTP server for apps and browsers |
-| `runtime/src/bin/serve.rs` | Command-line wrapper around the HTTP server, with a demo ship |
+| `runtime/src/pretend.rs` | Ships' keys from a list in a file, in place of Urbit ID, for trying things out |
+| `runtime/src/bin/serve.rs` | Command-line wrapper around the HTTP server, with a demo ship; `serve/two_ships.rs` is the two-ship walk-through, and `serve/said.rs` the lines it reads back from the programs it starts |
 | `runtime/src/bin/loadtest.rs` | Load test |
 | `runtime/tests/runtime.rs` | Integration tests |
 | `runtime/tests/files.rs` | Integration tests of files on the ship |
 | `runtime/tests/lookup.rs` | Integration tests of finding ships through lookup points |
+| `runtime/tests/serve.rs` | Tests of the `serve` program, run as a process of its own |
 | `runtime/src/remote_tests.rs` | Tests of fetching a file from another ship, inside the crate so that the ship answering can be made to lie |
 | `runtime/src/kept_tests.rs` | Tests of keeping what was fetched and saving a copy, with the same runtimes and liar, and failures made to happen at chosen points |
 | `kernel/src/lib.rs` | The default kernel: agent registry and routing policy |
@@ -293,7 +363,7 @@ The workspace's default members are `runtime` and `urbit-id`, so a plain
 | `storage.check` | A value derived from the storage key, by which the directory tells its own key. It is not the key and opens nothing |
 | `blobs/<sha256>.wasm` | Module bytes, named by content hash and re-verified against that hash on every load. Not encrypted: they are code, shared between ships |
 | `files/<ship>/<dir>/<n>.<gen>` | The ship's files: one directory per upload, kept under the same name when the upload becomes a file, and one per file kept from another ship, kept under the same name if it is saved; each named with 16 random bytes in hex that are never used again; in each, copy `gen` (16 random bytes in hex) of chunk `n`, encrypted. Nothing here is named by a hash of what it holds (see Files on the ship) |
-| `tmp/` | Scratch files. New and imported ships are built here and then hard-linked into `ships/`, so a failure never leaves a half-made ship under its real name |
+| `tmp/` | The runtime's own scratch files, emptied every time it starts. New and imported ships are built here and then hard-linked into `ships/`, so a failure never leaves a half-made ship under its real name. Cleared when a runtime opens the directory, once it holds `runtime.lock` and its storage key has been checked (so a start that is refused removes nothing), and only if `tmp` is itself a directory and not a link to one: the regular files and symbolic links directly inside it are removed (a link as a link, never what it points at; a second name of a ship's file leaves the ship's own), and directories are left. A removal that fails is passed over, and that entry stays until a later start. Nothing an operator names may be kept here, since all of `tmp/` is the runtime's own: `serve` refuses each of its file flags and module paths whose path as written goes through any entry here (each entry of the path placed where it itself lives) or whose whole path leads here, and a path that goes up (`..`) through directories not there yet, whose place cannot be told. So `tmp/keys/ids` is refused when `tmp/keys` links out of `tmp/`: a link directly inside `tmp/` is removed at start, so the file can no longer be read by that name (the file itself, elsewhere, stays). Deeper down (`tmp/a/b -> /safe`) nothing is removed, since start-up leaves directories in `tmp/` and never looks inside them; that is refused only because it is in `tmp/`. Not covered: a path outside `tmp/` whose own links lead through a link inside `tmp/` (`/safe/alias -> <data>/tmp/keys/ids` with `<data>/tmp/keys -> /safe`) is taken; start-up then removes that link in `tmp/` (which only an operator could have put there; the runtime makes no links), nothing else of the operator's is removed, and the file can no longer be read by that name. Names compared as written (an entry's own name, or one not made yet) are compared ignoring case, so `TMP/x` is refused like `tmp/x` on every file system, since on one that ignores case it is the same entry. `export_ship` refuses `tmp/`, anything under it, and such a `..`, before making any directory, and looks again just after making the destination (which narrows, and does not close, the gap in which a part of it could be swapped for a link into `tmp/`) |
 | `runtime.lock` | Held with an exclusive `flock` for the life of the runtime. A second runtime on the same directory fails with `Error::DataDirInUse` |
 
 Ship names are lowercase letters and hyphens, at most 64 bytes, with an
@@ -396,6 +466,25 @@ the caller waits. `Runtime::sleep_idle(d)` closes every ship idle for at least
 `d`. Waking a ship opens its file, checks the schema version and that the file
 belongs to that ship, loads its kernel, and reads its key. Compiled modules are
 shared across ships through a cache keyed by content hash.
+
+`Runtime::sleep_when_idle(&runtime, idle)` starts a thread that does this for
+`idle` every tenth of `idle` (but no more often than every 10 ms nor less
+often than every 30 seconds), so a ship left alone sleeps once it has been
+idle for `idle`, at the first look after that: one such wait later at most,
+plus however late the thread is scheduled and however long a look takes. It
+holds the runtime only weakly, and only while it looks; once every other
+holder has let the runtime go, the runtime is closed at the end of the
+sleeper's current look, or at its next, and the thread then ends. A ship part
+way through an event is never put to sleep. `serve` starts one with
+`--sleep-after <seconds>`: 300 by default, and 0 for none, which leaves a ship
+open once woken until `max_awake` others push it out. As the code reads,
+nothing a served ship does needs it to stay awake: the network holds every
+ship's key in memory once it starts, a command from another ship wakes the
+ship it is for, and a device waiting on a log waits on a count the runtime
+keeps in memory, not on the ship's file. The second run of the walk-through in
+`tests/serve.rs` gives the three programs `--sleep-after 1` and every step
+still works; how often a ship was in fact put to sleep during it is not seen
+from outside, so that shows only that the sleeper breaks nothing there.
 
 ## The kernel and permissions
 
@@ -1066,6 +1155,47 @@ it and nothing else changes); keeping the raw events and batch inputs beside
 the table so that it can be rebuilt without a node; checking a sample of the
 table against the layer 1 contract; and publishing a snapshot anywhere.
 
+### Keys from a list, for trying things out
+
+`runtime/src/pretend.rs` (`PretendIds`, `serve --pretend-ids <file>`) answers
+the same question as `azimuth.rs`, from a list kept in a file: one ship to a
+line, `~name` and then the 64 hexadecimal digits of its public key, as
+`Runtime::public_key` and `GET /ships/<ship>/key` give it. Blank lines, and
+lines whose first character that is not a space is `#`, are skipped. Each ship
+is listed at revision 1, continuity 0, with no sponsor (nothing reads a
+sponsor but `serve --lookup`, which prints it). Galaxies, stars and planets
+only: a moon's key is its parent's to give, as everywhere else.
+
+- The list is checked whole when it is opened: a line that is not of that
+  shape, a name that is not a galaxy, star or planet, a ship listed twice, or
+  one key under two ships stops the start, naming the line. It is read only as
+  a regular file (a link to one is followed, as for any file an operator
+  names), never a pipe or a device, of at most 1 MiB, and as UTF-8 text.
+- It is read again at every question, so a ship added to it is found without
+  restarting anything. What asks decides how often: a runtime's directory
+  reads a ship's key again once what it holds is five minutes old, when the
+  key is next wanted (a call, a caller), and goes on using the old answer
+  while the new one is read; a lookup point asks for every record it checks. A
+  ship not on the list is answered as listed at revision 1 with no key, not as
+  no ship at all: a directory never takes an answer of an earlier revision
+  than one it holds, and "no such ship" counts as revision 0. So taking a ship
+  off the list, or changing its key, is used at a runtime from the next
+  reading of that ship there after what it holds is five minutes old (a ship
+  never listed has nothing kept for it, and `serve --lookup` shows it as "key
+  none"). A list that can no longer be read, or no longer parses, is an error
+  that says why, never an earlier answer.
+- `serve` takes it in place of `--ethereum` for `--net` and `--lookup`, and in
+  place of `--azimuth-copy` for `--lookup-point` (a point wants a copy so that
+  it answers from a local file, and this is one). It cannot go with
+  `--ethereum`, `--roller` or any `--azimuth-` flag. At start `serve` says
+  that keys come from the list and not from Urbit ID, that whoever can write
+  the file can be any ship, and that this is for trying things out on machines
+  you control; its line about the network says the list, never "with keys from
+  Urbit ID".
+- Whoever can write the file can be any ship to every runtime that reads it.
+  That is what it is for, and why it is only for trying things out. A runtime
+  started without it is not changed, and there is no other way round Urbit ID.
+
 ### Moons
 
 A moon's number is its parent's with 32 more bits in front, and its name ends
@@ -1110,6 +1240,14 @@ written first and the sealed file last, in one rename, so an export that fails
 leaves any earlier copy as it was. A ship cannot be exported into the
 directory its runtime keeps ships in.
 
+A copy is 95 bytes larger than the plain contents of the ship's file it holds
+(`seal::EXPORT_OVERHEAD`: the label, the key made for the copy, the ship's
+signing key and the tag). Those contents are the file's rows written afresh by
+SQLite into a plain database: a whole number of 4,096-byte pages, with no free
+pages and no room set aside on any page for encryption. The default
+`max_import_bytes` is the default `max_ship_bytes` and a margin that
+measurements support but do not prove (see the `Config` table).
+
 Because the copy is sealed to a public key, it can be made with nobody
 present, for example by a host on a schedule, and the host cannot read what it
 made. The seal keeps a copy secret. It does not prove who made it: anyone who
@@ -1121,11 +1259,21 @@ import still checks everything.
 treats what is inside as untrusted:
 
 - It reads only regular files, without following symlinks, up to
-  `max_import_bytes`, and the whole import must finish within
-  `max_import_millis`. The copy is opened and read in memory (up to about
-  twice `max_import_bytes` for a moment). A copy that has been changed in any
-  way, is for another ship, or was sealed to another code is refused before
-  any of it is read as a database.
+  `max_import_bytes`, and gives up once `max_import_millis` has passed: the
+  clock is looked at between steps (before each row is copied, before the
+  packing of the new file, and from inside the packing statement every
+  thousand of SQLite's steps, which stops it there). So one step that blocks,
+  such as reading or opening the copy, can take it past that; one of SQLite's
+  steps can copy a whole row, so with very large rows a great deal can be
+  copied between two of its looks (how much was not measured); two parts of
+  packing cannot be stopped at all (SQLite's copy of the packed database back
+  over the file, which runs no steps, and the file's sync after it); and the
+  stream of files beside the copy is not under it (see Files and export). The
+  copy is opened and read in memory: about twice its size for a moment, so
+  about 2 GiB for a ship at the default `max_ship_bytes` of 1 GiB, and at most
+  about twice `max_import_bytes`. A copy that has been changed in any way, is
+  for another ship, or was sealed to another code is refused before any of it
+  is read as a database.
 - The source's schema must match this runtime's exactly, so it cannot carry
   triggers or views. The schema entries are first counted straight from the
   file's pages, before SQLite parses them, and SQLite length limits are set
@@ -1140,6 +1288,37 @@ treats what is inside as untrusted:
   never reused.
 - Devices and sign-in codes travel with the ship; the count of wrong sign-in
   codes does not.
+- The fresh file is built with room to spare (up to twice `max_ship_bytes`):
+  rows put in one at a time, in key order, can pack SQLite's pages less
+  tightly than the file they came from (a ship's small kv rows, put in in key
+  order, took 926 pages where its original had them in 894). Audit rows are
+  put in oldest first, since newest first left each of their pages about half
+  full (187 pages where the original had 97); with `audit_rows` 0 none is read
+  at all. Then the file is packed as tightly as SQLite packs anything
+  (`VACUUM`, with nothing journalled, since the file is nobody's yet; the
+  packed copy is built in memory, about the packed size), every time, not only
+  when it is over. In each of the five ways of filling a ship tried (see
+  Tests), the packed file had no more pages than the original; that is
+  measured for those five, not claimed for every file. Only then is it held to
+  `max_ship_bytes`. A ship still larger than that, measured once packed, is
+  refused as `Error::ShipTooLarge`, which names that size and the limit. A
+  ship whose file does not fit even in the room it is built with is refused as
+  `Error::NotBuilt`, which says only that: it did not fit in that room (it
+  names it), so either it is far too large for this runtime or the disk is
+  full (SQLite reports the two alike), and it claims no size for a finished
+  file. `NotBuilt` covers SQLite reporting the file full while rows are copied
+  in; running out of disk at another moment (making the scratch file, or the
+  copy back after packing) comes through as the operating system's or
+  SQLite's own error. A runtime with a larger `max_ship_bytes` helps only when
+  the ship was too large; a full disk needs room on the disk. On a
+  failure before the ship is put in place, no ship, key or files directory is
+  left, and removing the scratch file is attempted (a removal that fails is
+  passed over, as for any scratch file); a failure while it is put in place
+  (its key written and the link failing, or the directory's sync failing after
+  the link) can leave what that has always left. Disk taken at the same time:
+  the file as built, up to twice `max_ship_bytes`; SQLite's rollback journal
+  while the rows are copied; the files brought in beside it; and any module
+  stored. There is no HTTP route for import; it is a runtime call.
 - Every module is verified against its hash before it is stored.
 - The copy gets a new incarnation mark, every other ship it exchanged
   commands with is marked to compare notes, and every follower of its logs is
@@ -2310,7 +2489,8 @@ lists for it, the same key the ship must prove when it is called.
 - A point answers five requests. `Announce` carries up to 16 records, each with
   its presence; each is
   checked against the point's own source of keys (in `serve`, the copy of
-  Azimuth, which `--lookup-point` needs), read on threads that may wait (8 at
+  Azimuth, which `--lookup-point` needs, or the list `--pretend-ids` gives),
+  read on threads that may wait (8 at
   once), and kept in the place of the ship's last if it is believed. The
   clock is read again after the check, which may have waited on the source of
   keys: a record that ran out meanwhile, or that a newer one took over from
@@ -2369,9 +2549,68 @@ lists for it, the same key the ship must prove when it is called.
 
   A point that is down or refuses is tried again after `retry_delay`, doubling
   to `max_retry_delay`. The connection the ships are announced over is kept
-  open, with a small packet every `keep_alive` (15 seconds), and if it drops it
-  is made again and the ships are announced again at once, since a point keeps
-  a record only with presence on the connection it came on.
+  open, with a small packet every `keep_alive` (15 seconds), and if it drops
+  it is made again and the ships are announced again at once, since a point
+  keeps a record only with presence on the connection it came on. A point that
+  stops without closing it (killed, or its machine gone) never answers that
+  packet; it is watched as every kept connection is (below), so once the
+  packet has gone unanswered by anything for `silence_timeout` (3 seconds) the
+  connection is closed and made again. Measured on one machine, on loopback: a
+  point killed and started again at its address had a ship announced to it and
+  found 18.5 seconds after it came back (46 before this was noticed); that is
+  about one `keep_alive`, the silence and the announcing, and longer if the
+  point is not back by then, since the tries after it follow `retry_delay`.
+- A connection this runtime keeps to another ship is watched for as long as it
+  is open, by one watcher for it, and given up once nothing comes from the
+  other end while something waits on it, not only when it has been idle for
+  `idle_timeout`. The watcher reads QUIC's own counters for the connection
+  every quarter of a second: what was heard (every frame in a packet that
+  decrypted and was not a repeat, acknowledgements included; a packet that
+  does not authenticate, or one replayed, counts for nothing) and what was
+  asked (every frame built to be sent that the other end must acknowledge:
+  everything but acknowledgements and the frame that closes a connection;
+  stream data, pings, resets, flow control, and QUIC's own loss probes; a
+  socket that cannot send for that long ends the connection too, if nothing
+  is heard either: a peer that is still heard from keeps it). Once
+  something asked has gone `silence_timeout` (3 seconds) with nothing heard,
+  the connection is closed, and every request on it fails at once, saying
+  nothing was heard from the ship for that long. The watcher can be late by up
+  to two looks (the sending is seen at the look after it, the end at the first
+  look after the time is up), plus however late it is scheduled, plus QUIC's
+  current probe timeout if a reply and a new request crossed between two
+  looks. There is no bound that holds whatever happens: if nothing can be sent
+  at all (every stream held, everything sent acknowledged, nothing left to
+  send), the clock does not start until something is, such as when a waiting
+  request runs out of time and resets its streams, or until `idle_timeout`
+  ends the connection. A request that runs out of time never closes a
+  connection itself, so a request with almost no time left cannot take a
+  working connection down with it. With `request_timeout` shorter than
+  `silence_timeout`, a request to a ship that has gone can run out of time
+  more than once on the same connection before the watcher closes it. A ship asked something it is slow to answer
+  has acknowledged the question and has nothing more waiting on it, so
+  slowness alone closes nothing. But a connection that works is closed if
+  nothing at all arrives for three seconds while something waits: a link that
+  drops everything for that long, or a peer whose process is stopped or not
+  scheduled for that long. The cost is a new connection and the request tried
+  again; commands are still delivered exactly once. A relay carries only what
+  each end sends, so a connection through one is watched the same way, and
+  three seconds with nothing from the far ship or from the relay between gives
+  it up. Closing fails every request then in flight on it, as any lost
+  connection does; a relayed connection lets its session go; a try at going
+  direct that began from it finds the entry changed and makes no change. The
+  next call makes a new connection, trying the addresses of the record held
+  and then asking the point. Measured on one machine, on loopback, with a lane
+  not in backoff and one address in the record: a command queued for a ship
+  that was killed and is back at another address arrived 6.5 seconds after it
+  was queued (in each of five runs), and 3.3 seconds when the ship was back at
+  the same address. That is the silence (3 seconds and up to two looks of a
+  quarter of a second, plus QUIC's current probe timeout if a reply and a new
+  request crossed between two looks), `retry_delay` (200 ms), one try at the address
+  in the record held (3 seconds) and a question to the point. What makes it
+  longer: a lane already in backoff waits out its current delay first
+  (doubling up to `max_retry_delay`, 30 seconds); a record may list up to four
+  addresses, each tried for up to 3 seconds; the point answers only once the
+  ship has announced to it again; and a relay adds its own share of the call.
 - Calling a ship with no address given: first the addresses of the record
   already held for it, if it is still good; then, if there is none or none of
   its addresses answered as the ship, the point for its galaxy is asked, the
@@ -3019,6 +3258,43 @@ Urbit ID), `--peer <ship>=<address>` (where another ship is; repeatable),
 `--keyfile <file>` (start the ship that keyfile is for, if it is not there),
 and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 
+`--pretend-ids <file>` reads every ship's key from a list in a file instead of
+Urbit ID (see Keys from a list, for trying things out): it stands in for
+`--ethereum` with `--net` and `--lookup`, and for `--azimuth-copy` with
+`--lookup-point`, cannot go with `--ethereum`, `--roller` or any `--azimuth-`
+flag, and is said when `serve` starts, with the warning that whoever can write
+the file can be any ship. With lookup settings (`--lookup-at`,
+`--lookup-domain` or `--lookup-point`), `serve` says, looking once a second
+and listing `ships/` every ten seconds, when each of its ships is announced
+and at what address, again whenever that changes (with more than 16 ships, one
+line with how many are announced instead), and how many callers the points
+have introduced to its ships (the first five times that changes, then at most
+once every ten seconds). None of the files it is named (`--azimuth-copy`,
+`--azimuth-snapshot`, `--azimuth-write-snapshot`, `--pretend-ids`,
+`--storage-key-file`, `--keyfile`) may be in the data directory's `tmp/`,
+which the runtime empties at every start.
+
+`--sleep-after <seconds>` (300 by default; 0 for never) closes a ship's file
+once it has been idle that long (see Awake and asleep). `--max-file-bytes
+<size>` and `--max-cache-bytes <size>` set `Config::max_file_bytes` and
+`max_cache_bytes`: a whole number of bytes, or with `K`, `M` or `G` after it
+for KiB, MiB or GiB (`10G`); 0 means what it means there (the file store off;
+nothing kept), and anything else stops the start, naming the flag
+(`runtime::parse_size`).
+
+`--two-ships <dir>`, with `--then-stop`, `--show-output`, `--ports <first>`,
+`--file <file>`, `--sleep-after`, `--kernel`, `--counter` and `--tally
+<file>`, is the walk-through under Run, and takes no other flag. It starts
+copies of the very binary it runs from (`std::env::current_exe`), and learns
+where each listens from the lines they print, whose words are kept in one
+place (`runtime/src/bin/serve/said.rs`) for the code that prints them and the
+code that reads them. It reads everything they print for as long as they run,
+and stops them (a kill, then a wait for each to end, with no time limit)
+however it ends that it can control: done, a step that does not work (it then
+says which step, what was expected and what happened, and shows what they said
+last), Ctrl-C, or a panic. It exits 0 when every step worked, 1 when one did
+not, and 130 when stopped part way.
+
 ## Configuration
 
 ### `Config` (runtime)
@@ -3031,8 +3307,8 @@ and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 | `max_memory_bytes` | 64 MiB | WASM memory per instance |
 | `max_ship_bytes` | 1 GiB | Largest a ship's file may grow |
 | `max_module_bytes` | 16 MiB | Largest module accepted |
-| `max_import_bytes` | 256 MiB | Largest exported copy `import_ship` reads |
-| `max_import_millis` | 60,000 | Longest an import may take |
+| `max_import_bytes` | 1 GiB + 64 MiB + 95 bytes | Largest exported copy `import_ship` reads, `Config::import_bytes_for(max_ship_bytes)`: the ship limit, a measured margin, and the seal. A copy is the plain contents of the ship's file and 95 bytes of seal. In five ships each filled to a 4 MiB limit in a different way, the contents came to 0.77 to 0.99 of that limit; that is measured, not proved, so a sixteenth is added and a larger copy is not shown to be impossible. A lower setting is a fair choice (it bounds the memory an untrusted file can take), and nothing refuses one |
+| `max_import_millis` | 300,000 | How long an import may spend bringing a ship's file in, looked at between steps (see Export and import). Measured on a Mac laptop, release build, packing included: copies of 300 MiB of kv rows came in at 28 to 75 MiB a second (14 to 36 seconds a GiB), 100,000 small log entries (a 19 MiB copy), each checked against the ship's key, at about 7 MiB a second (about 145 seconds a GiB), so a minute would not do for a full ship of those |
 | `max_table_elements` | 100,000 | WASM table size per instance |
 | `max_event_bytes` | 1 MiB | Largest command, read request, or log entry payload |
 | `max_reply_bytes` | 1 MiB | Largest handler reply |
@@ -3077,21 +3353,10 @@ and `--lookup <ship>` (print what Urbit ID lists for the ship and exit).
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `addr` | `127.0.0.1:0` | UDP address to listen on; port 0 picks one |
-| `request_timeout` | 10 s | One request to another ship, connecting included |
+| `request_timeout` | 10 s | One request to another ship, connecting included. A request that runs out of time never closes its connection; set shorter than `silence_timeout`, a request to a ship that has gone can run out of time more than once on the same connection before its watcher closes it |
 | `file_timeout` | 30 s | The same for a request for a part of a file, at both ends, in place of `request_timeout` |
 | `idle_timeout` | 30 s | A connection with no traffic is closed |
-| `max_connections` | 1,024 | Incoming connections at once |
-| `max_calls` | 1,024 | Other ships this runtime's ships may be connected to at once |
-| `max_streams` | 8 | Requests in progress on one incoming connection |
-| `max_message_bytes` | 1 MiB + 64 KiB | Largest request or reply taken |
-| `max_reading_bytes` | 64 MiB | Room for incoming requests being read, all connections together |
-| `max_requests` | 64 | Outgoing requests at once |
-| `max_working` | 16 | Pieces of ship work the network has in hand at once, each on a thread |
-| `max_carrying` | 16 | Deliveries to other ships in hand at once |
-| `retry_delay` | 200 ms | First wait after a failed delivery, doubling |
-| `max_retry_delay` | 30 s | Longest wait between tries |
-| `follow_check` | 600 s | How often to check other ships' incarnation marks and compare notes on unanswered commands |
-| `lookup` | off | Finding ships through lookup points, announcing to them, and being one; see below |
+| `silence_timeout` | 3 s | A connection this runtime keeps (to a ship, or to a lookup point) on which something sent has waited this long with nothing at all heard from the other end is closed by its watcher, so that the next call makes a new one (see Finding a ship by its name). A working connection that hears nothing for this long while something waits (a link that drops everything, a peer stopped) is closed too. The watcher can be up to two quarter-second looks late, plus scheduling, plus QUIC's current probe timeout in one case, and its clock starts only once something is sent (see Finding a ship by its name). More than nothing and at most a day |
 
 `Lookup` (`runtime/src/lookup.rs`):
 
@@ -3171,7 +3436,7 @@ twice over, and any time limit that is zero or over a day. A `max_message_bytes`
   its own temporary data directory, and most use `Durability::Normal` to skip
   per-commit syncs.
 - Unit tests in `net.rs`, `seal.rs`, `files.rs`, `remote.rs`, `server.rs`, `store.rs`, `moon.rs`,
-  `whereabouts.rs`, `lookup.rs`, and `azimuth.rs`. The Azimuth tests run against a stand-in JSON-RPC server on
+  `whereabouts.rs`, `lookup.rs`, `pretend.rs`, `lib.rs`, and `azimuth.rs`. The Azimuth tests run against a stand-in JSON-RPC server on
   localhost that replays what Ethereum and the roller really answered for
   `~zod`, and answers like them for made-up ships. One more test asks the real
   Ethereum and the real roller; it is not run by default
@@ -3688,6 +3953,125 @@ and answering a genuine one with a session passed to the ship, and a lying
 point registering no session at a ship beyond what the ship believes and
 allows, with stray relayed packets drawing no answer.
 
+`runtime/tests/runtime.rs` also has: five ships, each filled to a 4 MiB limit
+in a different way (journal lines of about 2,000 bytes, many small kv rows, kv
+rows and journal lines of 20 to 8,019 bytes, small journal lines, journal
+lines of about 60,000 bytes), exported and imported into a runtime with the
+same settings (and the import limit `Config::import_bytes_for` gives at that
+size), each holding all it held, no larger than the limit, with no more used
+pages than the original, and nothing left in `tmp/`; a ship too large for a
+runtime of 2 MiB refused, once packed, with `Error::ShipTooLarge`, naming the
+size and the limit, and for one of 1 MiB with `Error::NotBuilt`, which names
+the room it did not fit in and claims no size, neither ever saying "database
+or disk is full", leaving no ship, key, files or scratch; an import limit of
+the largest number taking a ship without overflow; leftovers in `tmp/` removed
+at start (scratch files and SQLite's files beside them), a second name of a
+ship's file there removed with the ship left whole and working, symbolic links
+there removed without touching what they point at (a file, a directory,
+nothing), a directory there left, a second runtime refused the lock removing
+nothing, a start refused for the wrong storage key removing nothing, and a
+`tmp` that is a link to `ships/` not cleared; a ship refused as an export into
+`tmp/`, into two levels below it not there yet, and through `..` past a
+directory not there yet, with nothing made; and the idle sleeper putting an
+idle ship to sleep no sooner than its idle time and the ship answering the
+next call, never putting to sleep a ship used every 300 ms with an idle time
+of 3 seconds (looks made late, by the test's own clock read before each call,
+are not judged, and the test goes on until ten are), and ending once the
+runtime is let go.
+
+`runtime/tests/serve.rs` runs the real `serve` binary as a process of its own
+(`CARGO_BIN_EXE_serve`), and knows it only by what it prints and what it
+answers over HTTP. Each program it starts is in a process group of its own,
+owned for the whole test, and the whole group is killed however the test ends,
+so the walk-through's three programs go with it even if it is killed outright.
+The group's leader is never reaped before the group is killed (that it has
+ended is seen with `waitid` and `WNOWAIT`), so the group's number cannot have
+been given to another group by then, and nothing is signalled after it is
+reaped. Nothing is ever killed because its command line matched (the list of
+running processes is only read, to show that nothing was left). The walk-through
+(`--two-ships --then-stop`) exits 0, says each of its seven steps and each
+check it makes (the introduction the ship called reports, the refusal in that
+ship's own words, both lengths and fingerprints, the first ship off, both
+messages after it comes back), prints no em dash and no exclamation mark, and
+leaves none of its programs running. Each of the four messages it says
+arrived, as entry N of a ship's journal, is then read with the library from
+that journal: entry N is that message, with this run's word. A second run on
+the same directory reuses the ships, has a word of its own, shares a file the
+test made, whose length and SHA-256 the test checks against both lines the
+walk-through prints for it, and gives the three programs `--sleep-after 1`
+(whether a ship was in fact put to sleep during it is not seen). The
+walk-through refuses a directory that holds something else, an empty file to
+share and one that is not a regular file before it starts anything, and a
+directory another run holds. A ship killed and started again on another port
+is reached again within 15 seconds by two callers in this process, one whose
+requests may take 20 seconds and one whose run out of time after one (each
+took the 30 idle seconds before); and a ship whose lookup point is killed and
+started again at its address is found again within 27 seconds of the kill (46
+before). The ship test times each command from when it was handed over to
+when it arrived (under 15 seconds); it takes a baseline before each try's two
+priming commands, which are sent on the kept connections after it, and a
+caller's first try after the restart more than 15 seconds after that baseline
+could have found the old connection run out by itself, so the try proves
+nothing. The point test times from just before the kill to the ship being
+found again, and a restart more than 15 seconds after the kill proves
+nothing. Either test then starts over, three times at most, and then fails
+saying the machine was too slow to tell. Also: a ship served with `--max-file-bytes 0` refusing an
+upload (403), and one served with `10M` taking one and refusing one larger
+than that (413); `--pretend-ids` saying where keys come from and never "with
+keys from Urbit ID", and `--lookup` answered from the list with no network;
+and flags that do not go together refused at start, naming the flag or the
+list's line, with nothing made, including each file flag and module path
+naming a path in the data directory's `tmp/`, a name there that links to a
+file elsewhere, a path through a link there to a directory elsewhere, a path
+through `TMP` where `tmp` is not made yet, and a path that goes up through a
+directory not there yet.
+They do not show two machines, a real router, the relay carrying anything,
+Linux, or a release build (they run the debug build), nor `--max-cache-bytes`
+reaching a ship: it is read by the same function as `--max-file-bytes` and set
+beside it, and is not tried.
+
+Unit tests for this part: in `pretend.rs`, a list's shape, a ship listed twice
+and one key under two ships, each naming the line, the list read again at
+every question (a ship taken off answered as listed with no key), and a list
+that can no longer be read, is not a regular file, is too large or is not text
+answered with an error and never an earlier answer; in `net.rs`, a directory
+reading a pretend list taking a ship off it, and a new key, at its next
+reading, though it believed the old key for an hour, and keeping nothing for a
+ship never listed; in `remote_tests.rs`, with two real runtimes, a ship slow
+to answer (five and a half seconds, where silence is noticed after two)
+answering on the same connection while other requests on it go through (begun
+once the slow one is known to be held at the other ship), a request that runs
+out of time on a working connection (a command's delivery held past its time)
+closing nothing while a slow request on the same connection finishes, a
+request that runs out of time having heard nothing at all since it was sent
+(everything from the other ship held back by a stand-in for the path between,
+the caller's count of what it heard still for half a second before the
+request and checked unchanged after it, the hold ending a second and a half
+after the request) closing nothing, the same connection answering the next
+request; a ship that vanishes (its network stopped with no goodbye) while slow
+requests hold every stream it allows, after the caller's counters have not
+moved for a second (which makes it very likely, and does not prove, that
+nothing sent before is still waiting to be acknowledged; on a machine that
+held both ships' network threads for that second, the mutation that counts
+only stream data and pings could be caught by a retransmission instead),
+given up after the silence, a
+request waiting for room told that nothing was heard, and the next call making
+a new connection when it is back elsewhere; and datagrams that do not
+authenticate, sent every 50 ms by the stand-in from the vanished ship's
+address with the connection's own ID, so that they do reach the connection
+(at least ten counted), not keeping it; in `store.rs`, packing a new file stopped from inside
+the statement when the question "is time up" is answered yes at its third
+asking (and asked no more), and not started when it is answered yes at once,
+audit rows brought in oldest first filling their pages, none read when
+`audit_rows` is 0 (with a row at the largest number and the count brought
+down, which read would refuse the copy), and a packed file over the limit
+refused naming both sizes; in `lib.rs`, a ship part way through a call (held
+at a gate inside the call) not put to sleep by a sleeper or a forced look, the
+default import limit being at least the ship limit and the seal, and sizes as
+`--max-file-bytes` takes them; in `seal.rs`, a sealed copy being its contents
+and 95 bytes; and in the `serve` binary, every line `said.rs` makes reading
+back as what it was made from.
+
 The load test (`runtime/src/bin/loadtest.rs`) takes `--ships` (500),
 `--active` (50), `--events` (20,000), `--threads` (8), `--max-awake` (64),
 `--sync full|normal` (full), `--wasm`, `--kernel`, and `--dir` (a new
@@ -3853,9 +4237,12 @@ These are stated in the source.
   forgets an idle opening in less than `keep_alive` (15 seconds) loses it; the
   connection is then noticed dead only at the idle timeout.
 - The stand-in router is a program in the tests. No real home router has been
-  tried, nor hole punching or relaying over IPv6. `--behind-router`, `--relay`
-  and its rates have had no run from end to end. The relay's timing (the
-  direct share, the wait for the point's answer) was judged on loopback only.
+  tried, nor hole punching or relaying over IPv6. `--behind-router` has had a
+  run from end to end only over one machine's loopback address, where the ship
+  called is introduced to its caller and acts on it, but would have been
+  reached without. `--relay` has been started there and carried nothing, and
+  its rates have had no run. The relay's timing (the direct share, the wait
+  for the point's answer) was judged on loopback only.
 - A point keeps a moon's latest revision only while it holds that moon's
   record, and builds no history of its own beyond that. The point is not
   trusted and its table is in memory only, so nothing it remembered could be a
@@ -3881,12 +4268,13 @@ These are stated in the source.
   Introductions that are rubbish do the same, to the overall allowances of
   records and of introductions, once they are past their own connection's
   allowances and name a ship that attends.
-- Lookup points and the new `serve` flags have been run only on macOS. The
-  flags (`--lookup-at`, `--lookup-domain`, `--announce`, `--behind-router`,
-  `--lookup-point`) have been checked for what they refuse, but have had no run
-  from end to end. The
-  system's resolver is not exercised by the tests, which look names up through
-  a stand-in.
+- Lookup points and the `serve` flags have been run only on macOS.
+  `--lookup-at`, `--behind-router` and `--lookup-point` (with `--pretend-ids`
+  in place of a copy of Azimuth) have had a run from end to end, in the
+  walk-through, as three programs on one machine; `--lookup-domain` and
+  `--announce` have only been checked for what they refuse. The system's
+  resolver is not exercised by the tests, which look names up through a
+  stand-in.
 - A moon's key cannot be taken back at once. A ship that has not seen a later
   proof goes on accepting an earlier one until the parent changes its own
   key. A parent keeps no list of its moons.
@@ -4032,6 +4420,73 @@ These are stated in the source.
   in a message.
 - The HTTP server speaks plain HTTP and expects a proxy in front of it (see
   Run).
+- `serve` refuses a file flag or module path in the data directory's `tmp/`
+  as written or as it finally leads, but not a path outside `tmp/` whose own
+  links lead through a link inside `tmp/`. If that link is directly inside
+  `tmp/`, start-up removes it (only an operator could have made it), and the
+  file can no longer be read by that name; deeper down nothing is removed.
+  See the `tmp/` row under Data directory.
+- `serve` reads its arguments as UTF-8, so a path that is not valid UTF-8
+  stops it at start with Rust's own message.
+- A ship that stops without closing its connections (its process killed, its
+  machine gone) is noticed by a ship holding a connection to it only once
+  something sent on that connection goes unanswered for `silence_timeout` (3
+  seconds), and the watcher can be up to two quarter-second looks late, plus
+  scheduling, plus QUIC's current probe timeout in one case. There is no bound
+  that holds whatever happens: if nothing can be sent at all (every stream
+  held, everything sent acknowledged, nothing left to send), the clock does not
+  start until something is, such as when a waiting request runs out of time
+  and resets its streams, or until `idle_timeout` ends the connection. A
+  connection with nothing waiting on it is not judged, so it is noticed when
+  it is next used. A connection that works is given up too if
+  nothing at all arrives on it for three seconds while something waits (a link
+  that drops everything for that long, a peer whose process is stopped or not
+  scheduled, a laptop asleep): the requests on it fail and are tried again on
+  a new one, and commands are still delivered exactly once. The figures
+  measured (6.5 seconds for a command to reach a ship that came back
+  elsewhere, 3.3 at the same address, 18.5 seconds for a ship to be found
+  after its point came back) are from one machine, on loopback, with a lane
+  not in backoff and one address in the record; a lane in backoff (up to 30
+  seconds more), up to four addresses in a record (3 seconds each), a point's
+  announcing and a relay all make it longer. They are not bounds.
+- Every import packs the new file (`VACUUM`), which takes time (about 1.4
+  seconds more for a 300 MiB copy of large kv rows, in a release build),
+  memory about the size of the packed file for a moment (after the copy itself
+  is let go of), and disk up to twice `max_ship_bytes` for the file while it
+  is built, besides SQLite's rollback journal while rows are copied and any
+  files and modules brought in. Before packing was added, three of the five
+  ways of filling a 4 MiB ship did not come in to a runtime with the same
+  limit; now all five do, at 942 to 1,021 pages of 1,024, each with no more
+  pages than its original. That is what was measured for those five fills,
+  and no more: that a ship within `max_ship_bytes` always comes in is not
+  proved, and how much room is left for what it writes next was not measured.
+  A ship that SQLite cannot pack within the limit is refused as
+  `Error::ShipTooLarge`, and one that does not fit even the room it is built
+  with as `Error::NotBuilt`.
+- The walk-through (`serve --two-ships`) is three programs on one machine,
+  over its loopback address. It has not been run across two machines, behind a
+  real home router, or on Linux, and nothing in it makes the relay carry a
+  packet. It has been run in a debug build by the tests and by hand, and once
+  by hand in a release build (before silence was noticed). The first message
+  to a ship took 2.1 to 3.6 seconds in runs of the debug build and 0.2 seconds
+  in the release build (where the time goes in the debug build was not
+  measured); a file allowed just after it was refused opens about 5.5 seconds
+  later, since the ship that holds it remembers its agent's no for five
+  seconds. Its directory lock is held only by the walk-through itself: the
+  runtimes it starts each lock their own data directory, as always.
+- A scratch file in `tmp/` that cannot be removed when a runtime starts stays
+  there. Scratch names hold the process id, which the system can give again,
+  so a later runtime may make a scratch file of the same name; every scratch
+  file is made new (`create_new`), so nothing is written through it, and
+  making or bringing in a ship, or storing a module, then fails (making a ship
+  says the ship exists, though it may not).
+- A lookup point given `--pretend-ids` reads and parses the whole list (up to
+  1 MiB) for every record it checks, within its usual allowances of records a
+  second. That is for a list on machines one controls, not for a point anyone
+  can reach.
+- Imports of ships of different names may run at once, with no cap on how
+  many, each holding about twice its copy in memory for a moment. There is no
+  HTTP route for import; a program that calls the runtime decides.
 
 ## License
 

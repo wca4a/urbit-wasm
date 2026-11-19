@@ -9400,3 +9400,355 @@ fn a_connection_that_can_no_longer_be_used_does_not_hold_a_place_among_the_calls
     // still open. It is no use to anyone, and gives up its place.
     assert_eq!(zod_net.ping("~zod", "~bud").unwrap().ship, "bud");
 }
+
+// Restoring a full ship, leftovers in `tmp/`, and putting idle ships to sleep on their own.
+
+/// The defaults scaled down: a ship's file of 4 MiB, the import limit that goes with it, and
+/// logs allowed to fill the ship.
+fn small_ship() -> Config {
+    let max_ship_bytes = 4 << 20;
+    Config { max_ship_bytes, max_import_bytes: Config::import_bytes_for(max_ship_bytes), max_log_bytes: 4 * max_ship_bytes, ..fast() }
+}
+
+/// A ship with the counter agent and its journal, given the commands `command` makes until twenty
+/// in a row are refused for want of room: as full as it will go. Returns how many went in.
+fn filled_with(dir: &TempDir, cfg: Config, mut command: impl FnMut(u64) -> String) -> (Runtime, u64) {
+    let rt = boot_with_journal(dir, cfg);
+    let (mut n, mut went_in, mut refused) = (0u64, 0u64, 0);
+    while refused < 20 {
+        match rt.deliver("~zod", "counter", command(n).as_bytes()) {
+            Ok(_) => (went_in, refused) = (went_in + 1, 0),
+            Err(Error::Rejected(Rejection::Limit(_))) => refused += 1,
+            Err(other) => panic!("filling the ship: {other:?}"),
+        }
+        n += 1;
+    }
+    (rt, went_in)
+}
+
+/// Pages a ship's file holds, and how many of them are free, read straight from the file with
+/// no runtime holding it open.
+fn pages_of(dir: &Path, ship: &str) -> (i64, i64) {
+    let file = live(dir, ship);
+    let pages = file.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+    let free = file.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap();
+    (pages, free)
+}
+
+/// Fill a ship to its 4 MiB limit with `command`, export it, and import it into a runtime with
+/// the same settings. It comes in, holding what the original held (`same` checks that), no
+/// larger than the limit and with no more pages than the original had (which is all that is
+/// measured; nothing is claimed about room for later writes).
+fn restored_whole(label: &str, command: impl FnMut(u64) -> String, same: impl Fn(&Runtime, &Runtime)) {
+    let (a, out, b) = (TempDir::new(&format!("full-{label}-a")), TempDir::new(&format!("full-{label}-out")), TempDir::new(&format!("full-{label}-b")));
+    let cfg = small_ship();
+    let (rt, went_in) = filled_with(&a, cfg.clone(), command);
+    assert!(went_in > 20, "only {went_in} went in");
+    export(&rt, "~zod", &out.0).unwrap();
+    let sealed = fs::metadata(out.0.join("zod.ship")).unwrap().len();
+    assert!(sealed <= cfg.max_import_bytes, "the copy is {sealed} bytes, over the import limit {}", cfg.max_import_bytes);
+    let other = Runtime::open(&b.0, cfg.clone()).unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
+    same(&rt, &other);
+    rt.sleep_idle(Duration::ZERO);
+    other.sleep_idle(Duration::ZERO);
+    let ((pages, free), (now, now_free)) = (pages_of(&a.0, "zod"), pages_of(&b.0, "zod"));
+    assert!(now as u64 * 4096 <= cfg.max_ship_bytes, "imported at {now} pages");
+    assert!(now - now_free <= pages - free, "imported at {now} pages ({now_free} free), where the original held {pages} ({free} free)");
+    assert_eq!(fs::read_dir(b.0.join("tmp")).unwrap().count(), 0);
+}
+
+/// The journal lines of two runtimes' `~zod` are the same.
+fn same_journal(a: &Runtime, b: &Runtime) {
+    let lines = |rt: &Runtime| rt.log_entries("~zod", "counter", "journal", 0, NO_LIMIT).unwrap();
+    assert_eq!(lines(a), lines(b));
+}
+
+/// The counters the `inc` fill wrote are the same on two runtimes (every hundredth looked at,
+/// by the counter's read handler, which writes nothing: the original is full).
+fn same_counters(a: &Runtime, b: &Runtime) {
+    for n in (0..200_000u64).step_by(100) {
+        let key = format!("k{:08}", n.wrapping_mul(2654435761) % 100_000_000);
+        let value = |rt: &Runtime| rt.read("~zod", "counter", "counter", key.as_bytes()).unwrap();
+        assert_eq!(value(a), value(b), "{key}");
+    }
+}
+
+fn scattered_key(n: u64) -> String {
+    format!("inc k{:08}", n.wrapping_mul(2654435761) % 100_000_000)
+}
+
+#[test]
+fn a_ship_full_of_journal_lines_of_about_2000_bytes_is_restored_under_the_same_limit() {
+    restored_whole("journal-2000", |n| format!("journal {}", "j".repeat(2000 + (n % 7) as usize)), same_journal);
+}
+
+#[test]
+fn a_ship_full_of_small_kv_rows_is_restored_under_the_same_limit() {
+    restored_whole("kv", scattered_key, same_counters);
+}
+
+#[test]
+fn a_ship_full_of_kv_rows_and_journal_lines_of_every_size_is_restored_under_the_same_limit() {
+    let mixed = |n: u64| if n % 3 == 0 { scattered_key(n) } else { format!("journal {}", "m".repeat(((n * 7919) % 8000 + 20) as usize)) };
+    restored_whole("mixed", mixed, |a, b| {
+        same_journal(a, b);
+        same_counters(a, b);
+    });
+}
+
+#[test]
+fn a_ship_full_of_small_journal_lines_is_restored_under_the_same_limit() {
+    restored_whole("journal-small", |n| format!("journal {}", "s".repeat(10 + (n % 50) as usize)), same_journal);
+}
+
+#[test]
+fn a_ship_full_of_journal_lines_of_about_60000_bytes_is_restored_under_the_same_limit() {
+    restored_whole("journal-60000", |n| format!("journal {}", "b".repeat(60_000 + (n % 100) as usize)), same_journal);
+}
+
+#[test]
+fn a_ship_too_large_for_a_runtime_is_refused_in_plain_words_leaving_nothing_behind() {
+    let (a, out) = (TempDir::new("too-large-a"), TempDir::new("too-large-out"));
+    let (rt, _) = filled_with(&a, small_ship(), |n| format!("journal {}", "j".repeat(2000 + (n % 7) as usize)));
+    export(&rt, "~zod", &out.0).unwrap();
+    // A runtime that lets a ship take 2 MiB: the file is built, packed, and then measured too
+    // large. One that lets it take 1 MiB: the file outgrows even the room it is built with, which
+    // says only that, and claims no size.
+    for limit in [2u64 << 20, 1 << 20] {
+        let b = TempDir::new(&format!("too-large-b-{limit}"));
+        let other = Runtime::open(&b.0, Config { max_ship_bytes: limit, max_import_bytes: 64 << 20, ..small_ship() }).unwrap();
+        let refused = other.import_ship(&out.0, "~zod", CODE);
+        let words = match &refused {
+            Err(Error::ShipTooLarge { ship, bytes, limit: said }) if limit == 2 << 20 => {
+                assert!(ship == "zod" && *bytes > limit && *said == limit, "{refused:?}");
+                let words = refused.as_ref().unwrap_err().to_string();
+                assert!(words.starts_with("zod does not fit: its file needs at least ") && words.contains(&format!("at most {limit} (max_ship_bytes)")), "{words}");
+                words
+            }
+            Err(Error::NotBuilt { ship, room }) if limit == 1 << 20 => {
+                assert!(ship == "zod" && *room == 2 * limit, "{refused:?}");
+                let words = refused.as_ref().unwrap_err().to_string();
+                assert_eq!(words, format!("zod could not be brought in: its file did not fit in the {} bytes allowed for building it (twice max_ship_bytes), so either it is far too large for this runtime or the disk is full", 2 * limit));
+                words
+            }
+            other => panic!("with a limit of {limit}, got {other:?}"),
+        };
+        assert!(!words.contains("database or disk is full"), "{words}");
+        // Nothing is left: no ship, no key, no files, nothing in tmp/.
+        assert!(matches!(other.public_key("~zod"), Err(Error::UnknownShip(_))));
+        for (place, expected) in [("tmp", 0), ("ships", 0), ("keys", 0)] {
+            assert_eq!(fs::read_dir(b.0.join(place)).unwrap().count(), expected, "{place}");
+        }
+        assert!(!b.0.join("files/zod").exists());
+    }
+}
+
+#[test]
+fn leftovers_in_tmp_are_removed_when_a_runtime_opens() {
+    let dir = TempDir::new("tmp-leftovers");
+    drop(Runtime::open(&dir.0, fast()).unwrap());
+    let tmp = dir.0.join("tmp");
+    for name in ["4242-0", "4242-0-wal", "4242-0-shm", "4242-1", "anything"] {
+        fs::write(tmp.join(name), b"left by a runtime that was killed").unwrap();
+    }
+    let _rt = Runtime::open(&dir.0, fast()).unwrap();
+    assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0);
+}
+
+#[test]
+fn a_ship_whose_file_also_has_a_name_in_tmp_opens_after_the_leftovers_are_cleared() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = TempDir::new("tmp-hard-link");
+    let rt = boot(&dir, fast());
+    assert_eq!(send(&rt, "~zod", "counter", "inc hits 7"), "7");
+    drop(rt);
+    // As a ship is published: its file under its own name, and a second name in tmp/ that a
+    // runtime killed at the wrong moment never removed.
+    let ship = dir.0.join("ships/zod.ship");
+    fs::hard_link(&ship, dir.0.join("tmp/4242-0")).unwrap();
+    assert_eq!(fs::metadata(&ship).unwrap().nlink(), 2);
+    let rt = Runtime::open(&dir.0, fast()).unwrap();
+    assert_eq!(fs::read_dir(dir.0.join("tmp")).unwrap().count(), 0);
+    assert_eq!(fs::metadata(&ship).unwrap().nlink(), 1);
+    assert_eq!(send(&rt, "~zod", "counter", "inc hits"), "8");
+}
+
+#[test]
+fn a_symbolic_link_in_tmp_is_removed_and_what_it_points_at_is_left() {
+    let dir = TempDir::new("tmp-links");
+    let outside = TempDir::new("tmp-links-outside");
+    drop(Runtime::open(&dir.0, fast()).unwrap());
+    let (file, folder) = (outside.0.join("precious"), outside.0.join("folder"));
+    fs::write(&file, b"not the runtime's").unwrap();
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join("inside"), b"not the runtime's either").unwrap();
+    let tmp = dir.0.join("tmp");
+    std::os::unix::fs::symlink(&file, tmp.join("to-a-file")).unwrap();
+    std::os::unix::fs::symlink(&folder, tmp.join("to-a-folder")).unwrap();
+    std::os::unix::fs::symlink(outside.0.join("nothing"), tmp.join("to-nothing")).unwrap();
+    let _rt = Runtime::open(&dir.0, fast()).unwrap();
+    assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0);
+    assert_eq!(fs::read(&file).unwrap(), b"not the runtime's");
+    assert_eq!(fs::read(folder.join("inside")).unwrap(), b"not the runtime's either");
+}
+
+#[test]
+fn a_directory_in_tmp_is_left_as_it_is() {
+    let dir = TempDir::new("tmp-directory");
+    drop(Runtime::open(&dir.0, fast()).unwrap());
+    let inner = dir.0.join("tmp/somebody's");
+    fs::create_dir(&inner).unwrap();
+    fs::write(inner.join("file"), b"kept").unwrap();
+    fs::write(dir.0.join("tmp/4242-0"), b"leftover").unwrap();
+    let _rt = Runtime::open(&dir.0, fast()).unwrap();
+    assert!(!dir.0.join("tmp/4242-0").exists());
+    assert_eq!(fs::read(inner.join("file")).unwrap(), b"kept");
+}
+
+#[test]
+fn a_second_runtime_that_cannot_take_the_lock_removes_nothing_from_tmp() {
+    let dir = TempDir::new("tmp-locked");
+    let first = Runtime::open(&dir.0, fast()).unwrap();
+    // A scratch file of the runtime that is running, as it would be part way through a call.
+    let scratch = dir.0.join("tmp/4242-0");
+    fs::write(&scratch, b"in use").unwrap();
+    assert!(matches!(Runtime::open(&dir.0, fast()), Err(Error::DataDirInUse)));
+    assert_eq!(fs::read(&scratch).unwrap(), b"in use");
+    drop(first);
+    let _rt = Runtime::open(&dir.0, fast()).unwrap();
+    assert!(!scratch.exists());
+}
+
+#[test]
+fn an_import_limit_of_the_largest_number_is_no_limit_and_no_overflow() {
+    let (a, out, b) = (TempDir::new("max-import-a"), TempDir::new("max-import-out"), TempDir::new("max-import-b"));
+    let rt = boot(&a, fast());
+    export(&rt, "~zod", &out.0).unwrap();
+    let other = Runtime::open(&b.0, Config { max_import_bytes: u64::MAX, ..fast() }).unwrap();
+    other.import_ship(&out.0, "~zod", CODE).unwrap();
+}
+
+#[test]
+fn a_tmp_that_is_a_symbolic_link_is_not_cleared() {
+    let dir = TempDir::new("tmp-is-a-link");
+    let rt = boot(&dir, fast());
+    drop(rt);
+    // tmp/ made a link to ships/: clearing it would remove the ship.
+    fs::remove_dir(dir.0.join("tmp")).unwrap();
+    std::os::unix::fs::symlink(dir.0.join("ships"), dir.0.join("tmp")).unwrap();
+    let rt = Runtime::open(&dir.0, fast()).unwrap();
+    assert!(dir.0.join("ships/zod.ship").exists());
+    assert_eq!(send(&rt, "~zod", "counter", "inc hits"), "1");
+}
+
+#[test]
+fn a_start_refused_for_the_wrong_storage_key_removes_nothing_from_tmp() {
+    let dir = TempDir::new("tmp-wrong-key");
+    drop(boot(&dir, fast()));
+    let leftover = dir.0.join("tmp/4242-0");
+    fs::write(&leftover, b"left").unwrap();
+    let wrong = Config { storage_key: Some(StorageKey::from_hex(&"ab".repeat(32)).unwrap()), ..fast() };
+    assert!(Runtime::open(&dir.0, wrong).is_err());
+    assert!(leftover.exists());
+    drop(Runtime::open(&dir.0, fast()).unwrap());
+    assert!(!leftover.exists());
+}
+
+#[test]
+fn a_ship_cannot_be_exported_into_its_runtimes_tmp() {
+    let dir = TempDir::new("export-into-tmp");
+    let rt = boot(&dir, fast());
+    for place in ["tmp", "tmp/a/b"] {
+        let refused = export(&rt, "~zod", &dir.0.join(place));
+        assert!(matches!(&refused, Err(Error::Io(e)) if e.to_string().contains("tmp directory")), "{place}: {refused:?}");
+    }
+    // A destination that goes up through a directory not yet made is refused before anything
+    // is made, wherever it would lead.
+    let refused = export(&rt, "~zod", &dir.0.join("new/../tmp"));
+    assert!(matches!(&refused, Err(Error::Io(e)) if e.to_string().contains("may not go up")), "{refused:?}");
+    assert!(!dir.0.join("new").exists());
+    assert_eq!(fs::read_dir(dir.0.join("tmp")).unwrap().count(), 0);
+}
+
+/// Wait for something that happens on its own time, for up to thirty seconds.
+fn within_thirty_seconds(what: &str, holds: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !holds() {
+        assert!(started.elapsed() < Duration::from_secs(30), "never happened: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn an_idle_ship_is_put_to_sleep_soon_after_and_still_answers_the_next_call() {
+    let dir = TempDir::new("sleeper-idle");
+    let rt = Arc::new(boot(&dir, fast()));
+    let idle = Duration::from_secs(2);
+    let _sleeper = Runtime::sleep_when_idle(&rt, idle);
+    for n in 1..=2 {
+        // Read before the call, so that the ship's last use is no earlier than this.
+        let before = Instant::now();
+        assert_eq!(send(&rt, "~zod", "counter", "inc hits"), n.to_string());
+        // Awake just after its use, if this is looked at well inside `idle` (a stalled machine
+        // may look later, and then nothing is concluded from it).
+        let awake = rt.awake();
+        if before.elapsed() < idle / 2 {
+            assert_eq!(awake, 1, "asleep straight after it was used");
+        }
+        let started = Instant::now();
+        while rt.awake() != 0 {
+            assert!(started.elapsed() < Duration::from_secs(30), "never put to sleep");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Never sooner than `idle` after its last use, however late this looks.
+        assert!(before.elapsed() >= idle, "put to sleep after {:?}", before.elapsed());
+        // Asleep is only a closed file: the next call wakes it, with everything as it was.
+    }
+    assert_eq!(send(&rt, "~zod", "counter", "get hits"), "2");
+}
+
+#[test]
+fn a_ship_in_use_is_not_put_to_sleep() {
+    let dir = TempDir::new("sleeper-busy");
+    let rt = Arc::new(boot(&dir, fast()));
+    let idle = Duration::from_secs(3);
+    let _sleeper = Runtime::sleep_when_idle(&rt, idle);
+    // Used every 300 ms: never idle for 3 seconds, so never put to sleep. Each look is taken 300
+    // ms after a call, once the sleeper (which looks every 300 ms) has had a look at it idle. The
+    // clock is read before each call, so the ship's last use is no earlier than that reading: a
+    // look the test's own clock shows was made within 1.5 seconds of it is judged, and one that
+    // was not (a stalled machine) is not, and the test goes on until ten have been judged.
+    let (mut judged, mut calls) = (0, 0u64);
+    while judged < 10 {
+        calls += 1;
+        assert!(calls <= 1000, "this machine was too slow to tell: only {judged} of 1,000 looks were made in time");
+        let before = Instant::now();
+        assert_eq!(send(&rt, "~zod", "counter", "inc hits"), calls.to_string());
+        std::thread::sleep(Duration::from_millis(300));
+        let awake = rt.awake();
+        if before.elapsed() < idle / 2 {
+            assert_eq!(awake, 1, "asleep 300 ms after call {calls}");
+            judged += 1;
+        }
+    }
+    // (A ship part way through a call is not put to sleep either: the unit test
+    // `a_ship_part_way_through_a_call_is_not_put_to_sleep` holds a call at a gate to show it.)
+}
+
+#[test]
+fn the_sleeper_ends_once_the_runtime_is_let_go() {
+    let dir = TempDir::new("sleeper-ends");
+    let rt = Arc::new(boot(&dir, fast()));
+    let sleeper = Runtime::sleep_when_idle(&rt, Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!sleeper.is_finished());
+    // It holds the runtime only while it looks, so once it is let go of the runtime is closed by
+    // the sleeper's next look at the latest, which ends the sleeper, and the data directory can
+    // be opened again.
+    drop(rt);
+    within_thirty_seconds("the sleeper ends", || sleeper.is_finished());
+    sleeper.join().unwrap();
+    let again = Runtime::open(&dir.0, fast()).unwrap();
+    assert_eq!(send(&again, "~zod", "counter", "inc hits"), "1");
+}

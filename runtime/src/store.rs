@@ -2945,6 +2945,68 @@ fn bad_row(why: &str) -> Error {
     Error::BadShipFile(format!("import: {why}"))
 }
 
+/// How large a file `import` may grow to while it is built: twice the ship's limit. Rows put in
+/// one at a time, in key order, can pack SQLite's pages less tightly than the file they came
+/// from, so the fresh file may need more room than the old one while it is built; `compact`
+/// then packs it as tightly as SQLite packs anything, and only then is it held to the limit.
+pub fn building_bytes(max_ship_bytes: u64) -> u64 {
+    max_ship_bytes.saturating_mul(2)
+}
+
+/// Pack a file just built by `import` as tightly as it goes (`VACUUM`), then check it against
+/// the ship's limit. The file is not yet anyone's: nothing is journalled while it is packed,
+/// so a failure part way leaves it unusable, and the caller throws it away (it is a scratch
+/// file). SQLite builds the packed copy in memory first (`temp_store` is memory for every ship
+/// file, so nothing unencrypted reaches a disk), which takes about the packed size, at most
+/// `max_ship_bytes` for a file that will be kept. A file still larger than `max_ship_bytes`
+/// once packed fails with `Error::ShipTooLarge`, naming both sizes.
+///
+/// `deadline` is looked at before packing starts, and from inside the packing statement every
+/// `PACKING_STEPS` of SQLite's steps, which stops it there (as an import that took too long).
+/// One step can copy a whole row, overflow pages and all, so with very large rows a great deal
+/// can be copied between two looks. Two parts of packing cannot be stopped: SQLite's copy of the packed database back over the
+/// file, which runs no steps, and the file's sync after it.
+pub fn compact(path: &Path, name: &str, max_ship_bytes: u64, file_key: &[u8; 32], deadline: Instant) -> Result<(), Error> {
+    compact_until(path, name, max_ship_bytes, file_key, move || Instant::now() > deadline)
+}
+
+/// SQLite's steps between two looks at whether packing is to stop.
+const PACKING_STEPS: i32 = 1000;
+
+/// `compact`, asking `time_up` whether to stop: once before packing starts, and then every
+/// `PACKING_STEPS` steps of the packing statement.
+fn compact_until(path: &Path, name: &str, max_ship_bytes: u64, file_key: &[u8; 32], mut time_up: impl FnMut() -> bool + Send + 'static) -> Result<(), Error> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    unlock(&conn, file_key)?;
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    let mode: String = conn.query_row("PRAGMA journal_mode = OFF", [], |r| r.get(0))?;
+    if mode != "off" {
+        return Err(bad_row("could not prepare the imported file to be packed"));
+    }
+    if time_up() {
+        return Err(bad_row("took too long"));
+    }
+    conn.progress_handler(PACKING_STEPS, Some(time_up));
+    let packed = conn.execute_batch("VACUUM");
+    conn.progress_handler(PACKING_STEPS, None::<fn() -> bool>);
+    match packed {
+        Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) => return Err(bad_row("took too long")),
+        other => other?,
+    }
+    let size = pragma_number(&conn, "page_count")?.max(0) as u64 * pragma_number(&conn, "page_size")?.max(0) as u64;
+    if size > max_ship_bytes {
+        return Err(Error::ShipTooLarge { ship: name.to_string(), bytes: size, limit: max_ship_bytes });
+    }
+    let mode: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+    if mode != "delete" {
+        return Err(bad_row("could not finish the imported file"));
+    }
+    drop(conn);
+    // What was packed is on disk before the ship is put in place.
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 /// Copy a ship file from an untrusted source into a freshly created file at `dest`.
 ///
 /// The source must have exactly this runtime's schema, so it cannot carry triggers or views, and
@@ -3011,8 +3073,10 @@ pub fn import(
     // A moon keeps its parent's word for its key. Whether that word is good is for the
     // ships it meets to say: a bad one only stops the moon being believed.
     let proof = moon_proof(&from).map_err(|_| bad_row("not a ship file"))?;
-    create(dest, name, &kernel_hash, cfg.max_ship_bytes, incarnation, file_key, Some(recovery), proof.as_ref())?;
-    let to = open(dest, Durability::Full, cfg.max_ship_bytes, file_key)?;
+    // Built with room to spare over the limit (see `building_bytes`); held to it by `compact`.
+    let building = building_bytes(cfg.max_ship_bytes);
+    create(dest, name, &kernel_hash, building, incarnation, file_key, Some(recovery), proof.as_ref())?;
+    let to = open(dest, Durability::Full, building, file_key)?;
     // Leave WAL mode so that a commit means the data is in the main file, which is the only
     // file that gets published. The switch itself fails if earlier writes cannot be folded in.
     let mode: String = to.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
@@ -3633,9 +3697,22 @@ pub fn import(
         notify(&to, follower, Followed { ship, agent, name: log })?;
     }
 
-    let mut stmt = from.prepare("SELECT seq, at_ms, agent, event, ok FROM audit ORDER BY seq DESC LIMIT ?1")?;
-    let mut rows = stmt.query([cfg.audit_rows as i64])?;
-    while let Some(row) = rows.next()? {
+    // The newest `audit_rows` rows, put in oldest first: rows put in at the far end of a table
+    // keyed by number fill each page, where rows put in newest first, each at the near end,
+    // leave each page about half full. The oldest row kept is found first, then the rows from it
+    // on are read in order.
+    // With none kept, none is read at all.
+    let oldest: Option<i64> = match cfg.audit_rows {
+        0 => None,
+        kept => Some(
+            from.query_row("SELECT seq FROM audit ORDER BY seq DESC LIMIT 1 OFFSET ?1", [i64::try_from(kept - 1).unwrap_or(i64::MAX)], |r| r.get(0))
+                .optional()?
+                .unwrap_or(i64::MIN),
+        ),
+    };
+    let mut stmt = from.prepare("SELECT seq, at_ms, agent, event, ok FROM audit WHERE seq >= ?1 ORDER BY seq")?;
+    let mut rows = stmt.query([oldest.unwrap_or(i64::MAX)])?;
+    while let Some(row) = oldest.map(|_| rows.next()).transpose()?.flatten() {
         in_time()?;
         let (seq, at_ms, agent) = (integer(row, 0)?, integer(row, 1)?, text(row, 2)?);
         check_agent(&agent)?;
@@ -3836,6 +3913,130 @@ pub fn import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ship's file at `path`, encrypted under `key`, with `rows` rows of 1,000 bytes in its
+    /// kv table, put in in a scattered order so that it has room to pack.
+    fn scattered(path: &Path, key: &[u8; 32], rows: u64) {
+        create(path, "zod", "kernel", 1 << 40, &[1; 16], key, None, None).unwrap();
+        let conn = open(path, Durability::Normal, 1 << 40, key).unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        for n in 0..rows {
+            let scattered = n.wrapping_mul(2654435761) % 1_000_000_007;
+            conn.execute("INSERT INTO kv VALUES ('counter', ?1, ?2)", params![format!("k{scattered:010}").into_bytes(), vec![7u8; 1000]]).unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("urbit-wasm-{}-store-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn audit_rows_are_brought_in_oldest_first_and_fill_their_pages() {
+        let dir = scratch("audit-order");
+        // The plain contents of a ship's file with 3,000 audit rows of about 500 bytes, of which
+        // the newest 2,000 are kept.
+        let source = Connection::open_in_memory().unwrap();
+        source.execute_batch(SCHEMA).unwrap();
+        source.execute("INSERT INTO meta VALUES ('schema', ?1), ('name', 'zod'), ('kernel', ?2), ('incarnation', ?3)", params![SCHEMA_VERSION, "a".repeat(64), &[1u8; 16][..]]).unwrap();
+        for n in 1..=3000i64 {
+            source.execute("INSERT INTO audit VALUES (?1, ?2, 'counter', ?3, 1)", params![n, n, vec![b'e'; 500]]).unwrap();
+        }
+        let contents = source.serialize(DatabaseName::Main).unwrap().to_vec();
+        let cfg = Config { audit_rows: 2000, ..Config::default() };
+        let key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let dest = dir.join("built");
+        let ok = |_: &str| Ok(());
+        import(contents, &dest, "zod", &cfg, Instant::now() + std::time::Duration::from_secs(60), &key, ok, ok, &[2; 16], &[3; 32], &[5; 32], false).unwrap();
+        let built = open(&dest, Durability::Normal, 1 << 40, &[3; 32]).unwrap();
+        let kept: (i64, i64, i64) = built.query_row("SELECT count(*), min(seq), max(seq) FROM audit", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(kept, (2000, 1001, 3000));
+        // As built, before any packing: 2,000 rows of about 520 bytes take about 260 pages of
+        // 4,016 bytes when each page is filled; put in newest first, each page was left about
+        // half full, and they took about twice that.
+        let pages = built.query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert!(pages < 400, "the file as built has {pages} pages");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A "time is up" answer that says no until it has been asked `times` times, and yes from
+    /// then on, and a count of how often it was asked.
+    fn up_after(times: usize) -> (impl FnMut() -> bool + Send + 'static, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = asked.clone();
+        (move || counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 > times, asked)
+    }
+
+    #[test]
+    fn packing_an_imported_file_stops_when_the_import_runs_out_of_time() {
+        let dir = scratch("compact-deadline");
+        let key = [3u8; 32];
+        let stopped = |why: &Result<(), Error>| matches!(why, Err(Error::BadShipFile(why)) if why.ends_with("took too long"));
+        // Packed in full, counting how often it is asked whether time is up.
+        let whole = dir.join("whole");
+        scattered(&whole, &key, 4_000);
+        let (never, asked) = up_after(usize::MAX);
+        compact_until(&whole, "zod", 1 << 40, &key, never).unwrap();
+        let looks = asked.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(looks >= 4, "asked only {looks} times in all (once before packing, then every {PACKING_STEPS} steps): the progress handler is not asking, or the file is too small for this test");
+        // Told that time is up at the third look, from inside the packing: it stops there, and
+        // is asked no more.
+        let part = dir.join("part");
+        scattered(&part, &key, 4_000);
+        let (soon, asked) = up_after(2);
+        assert!(stopped(&compact_until(&part, "zod", 1 << 40, &key, soon)));
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // Told at once: it does not start.
+        let none = dir.join("none");
+        scattered(&none, &key, 100);
+        let (now, asked) = up_after(0);
+        assert!(stopped(&compact_until(&none, "zod", 1 << 40, &key, now)));
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The deadline given to `compact` is what it asks about.
+        assert!(stopped(&compact(&whole, "zod", 1 << 40, &key, Instant::now() - std::time::Duration::from_millis(1))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_audit_row_is_read_when_none_are_kept() {
+        let dir = scratch("audit-none");
+        let source = Connection::open_in_memory().unwrap();
+        source.execute_batch(SCHEMA).unwrap();
+        source.execute("INSERT INTO meta VALUES ('schema', ?1), ('name', 'zod'), ('kernel', ?2), ('incarnation', ?3)", params![SCHEMA_VERSION, "a".repeat(64), &[1u8; 16][..]]).unwrap();
+        // A row at the largest seq, with an agent that is not a name: read, it would refuse the
+        // import.
+        source.execute("INSERT INTO audit VALUES (?1, 1, 'Not A Name', x'00', 1)", [i64::MAX]).unwrap();
+        // And the count of audit rows brought back down, as a hostile copy can have it.
+        source.execute("UPDATE sqlite_sequence SET seq = 1 WHERE name = 'audit'", []).unwrap();
+        let contents = source.serialize(DatabaseName::Main).unwrap().to_vec();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let check_agent = |agent: &str| if agent == "Not A Name" { Err(Error::InvalidName(agent.into())) } else { Ok(()) };
+        let ok = |_: &str| Ok(());
+        let built = |audit_rows: u64, dest: &str| import(contents.clone(), &dir.join(dest), "zod", &Config { audit_rows, ..Config::default() }, Instant::now() + std::time::Duration::from_secs(60), &key, check_agent, ok, &[2; 16], &[3; 32], &[5; 32], false);
+        // Where rows are kept, the row is read, and its seq refused as out of range.
+        let kept = built(10, "kept");
+        assert!(matches!(&kept, Err(Error::BadShipFile(why)) if why.contains("integer in range")), "{kept:?}");
+        built(0, "none").unwrap();
+        let none = open(&dir.join("none"), Durability::Normal, 1 << 40, &[3; 32]).unwrap();
+        assert_eq!(none.query_row("SELECT count(*) FROM audit", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_packed_file_over_the_limit_is_refused_naming_both_sizes() {
+        let dir = scratch("compact-limit");
+        let key = [3u8; 32];
+        let path = dir.join("ship");
+        scattered(&path, &key, 2_000);
+        match compact(&path, "zod", 1 << 20, &key, Instant::now() + std::time::Duration::from_secs(600)) {
+            Err(Error::ShipTooLarge { ship, bytes, limit }) => assert!(ship == "zod" && bytes > 1 << 20 && limit == 1 << 20, "{bytes} {limit}"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_new_mark_makes_every_copy_ask_afresh_whether_or_not_it_was_already_asking() {

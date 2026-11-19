@@ -1225,7 +1225,7 @@ fn unread_on(net: &Network, from: &str, to: &str, bodies: Vec<peer_request::Body
     let (from, to) = (from.trim_start_matches('~').to_string(), to.trim_start_matches('~').to_string());
     net.threads.get().block_on(async {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let (connection, _) = net.shared.connection(&from, &to, deadline).await.unwrap();
+        let (connection, _, _) = net.shared.connection(&from, &to, deadline).await.unwrap();
         let mut streams = Vec::new();
         for body in bodies {
             let (mut send, receive) = connection.open_bi().await.unwrap();
@@ -1343,6 +1343,316 @@ fn a_ship_that_never_reads_its_replies_holds_at_most_its_places() {
         assert!(ended.elapsed() < Duration::from_secs(5), "{} still in hand", in_hand());
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// QUIC's number for the connection kept from ~nec to ~zod, while one is kept.
+fn kept_to_zod(t: &Two) -> Option<usize> {
+    let slot = lock(&t.b_net.shared.made).get(&("nec".to_string(), "zod".to_string())).cloned()?;
+    let held = slot.try_lock().ok()?;
+    held.as_ref().filter(|made| made.connection.close_reason().is_none()).map(|made| made.connection.stable_id())
+}
+
+/// The connection kept from ~nec to ~zod on `net`, open or not, while one is kept.
+fn kept_from_nec(net: &Network) -> Option<quinn::Connection> {
+    let slot = lock(&net.shared.made).get(&("nec".to_string(), "zod".to_string())).cloned()?;
+    let held = slot.try_lock().ok()?;
+    held.as_ref().map(|made| made.connection.clone())
+}
+
+/// A stand-in for the path between ~nec and ~zod, at the address ~nec is given for ~zod. It
+/// carries every datagram both ways (~nec's address is learnt from the first datagram that
+/// does not come from ~zod) and keeps the last short-header packet ~zod sent, so that it knows
+/// the connection ID ~nec's endpoint routes by. While `holding` is set, what ~zod sends is kept
+/// back, in order, and sent on once it is cleared. Once `forging` is set it carries nothing more
+/// and sends ~nec that last packet every 50 ms with everything after the connection ID changed
+/// each time: a datagram from the peer's address that reaches the connection and does not
+/// authenticate. However the test ends, it is stopped and its thread joined when it is dropped.
+struct StandIn {
+    at: std::net::SocketAddr,
+    last_short: Arc<Mutex<Option<Vec<u8>>>>,
+    holding: Arc<std::sync::atomic::AtomicBool>,
+    forging: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StandIn {
+    fn between(zod_at: std::net::SocketAddr) -> StandIn {
+        let path = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        path.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let flag = || Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut stand_in = StandIn { at: path.local_addr().unwrap(), last_short: Arc::default(), holding: flag(), forging: flag(), stop: flag(), thread: None };
+        let (last_short, holding, forging, stop) = (stand_in.last_short.clone(), stand_in.holding.clone(), stand_in.forging.clone(), stand_in.stop.clone());
+        stand_in.thread = Some(std::thread::spawn(move || {
+            let (mut buffer, mut nec_at, mut n, mut held) = (vec![0u8; 65536], None, 0u8, Vec::<Vec<u8>>::new());
+            while !stop.load(Ordering::SeqCst) {
+                if forging.load(Ordering::SeqCst) {
+                    if let (Some(mut packet), Some(nec)) = (lock(&last_short).clone(), nec_at) {
+                        n = n.wrapping_add(1);
+                        // The first byte and the eight bytes of connection ID are kept.
+                        for byte in &mut packet[9..] {
+                            *byte ^= n | 1;
+                        }
+                        let _ = path.send_to(&packet, nec);
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                if let Some(nec) = nec_at.filter(|_| !holding.load(Ordering::SeqCst)) {
+                    for packet in held.drain(..) {
+                        let _ = path.send_to(&packet, nec);
+                    }
+                }
+                let Ok((read, from)) = path.recv_from(&mut buffer) else { continue };
+                if from == zod_at {
+                    if buffer[0] & 0x80 == 0 {
+                        *lock(&last_short) = Some(buffer[..read].to_vec());
+                    }
+                    if holding.load(Ordering::SeqCst) {
+                        held.push(buffer[..read].to_vec());
+                    } else if let Some(nec) = nec_at {
+                        // Anything still held goes first, so that nothing overtakes it.
+                        for packet in held.drain(..) {
+                            let _ = path.send_to(&packet, nec);
+                        }
+                        let _ = path.send_to(&buffer[..read], nec);
+                    }
+                } else {
+                    nec_at = Some(from);
+                    let _ = path.send_to(&buffer[..read], zod_at);
+                }
+            }
+        }));
+        stand_in
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Wait for something that happens on its own time, for up to sixty seconds.
+fn within_a_minute(what: &str, holds: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !holds() {
+        assert!(started.elapsed() < Duration::from_secs(60), "never happened: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Ask ~zod, on another thread, for the first chunk of `id`, and return how it went.
+fn chunk_asked(t: &Two, id: [u8; 32]) -> std::thread::JoinHandle<Option<Result<PeerReply, FileAskError>>> {
+    let b = t.b.clone();
+    std::thread::spawn(move || b.ask_for_file("~nec", "~zod", PeerRequest { body: Some(chunk_of(&id, 0)) }))
+}
+
+#[test]
+fn a_ship_that_is_slow_but_there_keeps_its_connection_and_other_requests_on_it_go_through() {
+    // ~nec gives up on silence after two seconds; ~zod takes five and a half before it answers.
+    let asking = NetConfig { silence_timeout: Duration::from_secs(2), file_timeout: Duration::from_secs(30), ..NetConfig::default() };
+    let t = two_with("slow-but-there", (fast(), NetConfig::default()), (Config { max_cache_bytes: 0, ..fast() }, asking), &["~nec"]);
+    let open = put(&t.a, "~zod", "counter", &contents(10, 1), "");
+    say(&t.a, "~zod", "counter", &format!("open {}", hex(&open)));
+    t.b_net.ping("~nec", "~zod").unwrap();
+    let kept = kept_to_zod(&t).expect("a connection is kept");
+    // Held, so that a new connection cannot be given the same number and pass for it.
+    let _first = kept_from_nec(&t.b_net).expect("a connection is kept");
+    *lock(&t.a.inner.serve_delay) = Some(Duration::from_millis(5500));
+    let decided = t.a.inner.served_decisions.load(Ordering::SeqCst);
+    let slow = chunk_asked(&t, open);
+    // Once ~zod has taken the request and is holding it, other requests on the same connection
+    // go through meanwhile.
+    within_a_minute("~zod takes the request", || t.a.inner.served_decisions.load(Ordering::SeqCst) > decided);
+    for _ in 0..3 {
+        t.b_net.ping("~nec", "~zod").unwrap();
+    }
+    assert!(!slow.is_finished(), "inconclusive: the slow request ended before the pings were made");
+    // ~zod acknowledged the request and ~nec has nothing more waiting on it, so nothing is
+    // silent however long ~zod takes: the answer comes on the same connection.
+    assert!(matches!(slow.join().unwrap(), Some(Ok(PeerReply { body: Some(peer_reply::Body::FileChunk(_)), .. }))));
+    assert_eq!(kept_to_zod(&t), Some(kept), "the connection was given up");
+    *lock(&t.a.inner.serve_delay) = None;
+}
+
+#[test]
+fn a_request_that_runs_out_of_time_on_a_healthy_connection_closes_nothing() {
+    // ~nec's commands are given a second; a part of a file thirty.
+    let asking = NetConfig { request_timeout: Duration::from_secs(1), file_timeout: Duration::from_secs(30), silence_timeout: Duration::from_secs(2), ..NetConfig::default() };
+    let t = two_with("expiring", (fast(), NetConfig::default()), (Config { max_cache_bytes: 0, ..fast() }, asking), &["~nec"]);
+    let open = put(&t.a, "~zod", "counter", &contents(10, 1), "");
+    say(&t.a, "~zod", "counter", &format!("open {}", hex(&open)));
+    t.b_net.ping("~nec", "~zod").unwrap();
+    let kept = kept_to_zod(&t).expect("a connection is kept");
+    // Held for the whole test, which also keeps its number from being given to a new one.
+    let connection = kept_from_nec(&t.b_net).expect("a connection is kept");
+    // A slow part of a file is in flight on the connection.
+    *lock(&t.a.inner.serve_delay) = Some(Duration::from_secs(4));
+    let decided = t.a.inner.served_decisions.load(Ordering::SeqCst);
+    let slow = chunk_asked(&t, open);
+    within_a_minute("~zod takes the request", || t.a.inner.served_decisions.load(Ordering::SeqCst) > decided);
+    // A command is sent, and its delivery held once written until its time is up: it runs
+    // out of time on a connection that is working.
+    let gate = &t.b_net.shared.deliver_gate;
+    gate.armed.store(true, Ordering::SeqCst);
+    assert_eq!(say(&t.b, "~nec", "tally", "tell zod inc hits"), "sent");
+    within_a_minute("the delivery is written and held", || lock(&gate.holding).is_some());
+    within_a_minute("the held delivery runs out of time", || gate.ended.load(Ordering::SeqCst));
+    assert_eq!(connection.close_reason(), None, "the connection was given up when the held delivery ran out of time");
+    assert!(!slow.is_finished(), "inconclusive: the slow request ended before the held one");
+    // Nothing was closed: the slow request finishes on the same connection, and the command
+    // goes on a later try.
+    assert!(matches!(slow.join().unwrap(), Some(Ok(PeerReply { body: Some(peer_reply::Body::FileChunk(_)), .. }))));
+    assert_eq!(kept_to_zod(&t), Some(kept), "the connection was given up");
+    within_a_minute("the command is delivered on a later try", || t.b.outbound_pending("~nec").unwrap() == 0);
+    assert_eq!(kept_to_zod(&t), Some(kept));
+    *lock(&t.a.inner.serve_delay) = None;
+}
+
+#[test]
+fn a_ship_that_vanishes_while_every_stream_is_held_is_given_up_after_silence() {
+    // ~zod takes four requests at once on a connection; ~nec gives a part of a file five seconds
+    // and gives up on silence after two.
+    let answering = NetConfig { max_streams: 4, ..NetConfig::default() };
+    let asking = NetConfig { file_timeout: Duration::from_secs(5), silence_timeout: Duration::from_secs(2), ..NetConfig::default() };
+    let t = two_with("vanishes", (fast(), answering.clone()), (Config { max_cache_bytes: 0, ..fast() }, asking), &["~nec"]);
+    let Two { a, a_net, b, b_net, directory, _dirs, .. } = t;
+    let open = put(&a, "~zod", "counter", &contents(10, 1), "");
+    say(&a, "~zod", "counter", &format!("open {}", hex(&open)));
+    b_net.ping("~nec", "~zod").unwrap();
+    let kept = |net: &Network| {
+        let slot = lock(&net.shared.made).get(&("nec".to_string(), "zod".to_string())).cloned()?;
+        let held = slot.try_lock().ok()?;
+        held.as_ref().map(|made| (made.connection.stable_id(), made.connection.close_reason().is_none()))
+    };
+    let first = kept(&b_net).expect("a connection is kept");
+    // Four slow parts of a file hold every stream ~zod allows; a ping waits for room behind them.
+    // (The test's delay holds its lock while it waits, so the four wait one after another, and
+    // it is not touched again while they do.)
+    *lock(&a.inner.serve_delay) = Some(Duration::from_secs(20));
+    let decided = a.inner.served_decisions.load(Ordering::SeqCst);
+    let held: Vec<_> = (0..4)
+        .map(|_| {
+            let b = b.clone();
+            std::thread::spawn(move || b.ask_for_file("~nec", "~zod", PeerRequest { body: Some(chunk_of(&open, 0)) }))
+        })
+        .collect();
+    within_a_minute("~zod takes all four", || a.inner.served_decisions.load(Ordering::SeqCst) == decided + 4);
+    // Before ~zod goes, ~nec's counters on the connection settle: nothing moves for four looks
+    // (a second). That makes it very likely, and does not prove, that nothing sent before ~zod
+    // went is still waiting to be acknowledged, so that only what is sent after it has gone
+    // starts the watcher's clock. On a machine that held both ships' network threads still for
+    // that second, M42 could be caught by a retransmission instead.
+    let connection = kept_from_nec(&b_net).expect("a connection is kept");
+    let (settling, mut still, mut last) = (Instant::now(), Instant::now(), super::Traffic::of(&connection));
+    while still.elapsed() < super::SILENCE_LOOK * 4 {
+        assert!(settling.elapsed() < Duration::from_secs(30), "~nec's counters never settled");
+        std::thread::sleep(super::SILENCE_LOOK / 5);
+        let now = super::Traffic::of(&connection);
+        if now != last {
+            (last, still) = (now, Instant::now());
+        }
+    }
+    // ~zod goes, as a machine that is switched off goes: none of the goodbyes a network sends
+    // when it is dropped (what was already on its way may still go, and quinn may still close
+    // a connection of its own accord, see `Network::vanish`).
+    a_net.vanish();
+    let vanished = Instant::now();
+    let pinged = {
+        let net = &b_net;
+        std::thread::scope(|scope| scope.spawn(|| net.ping("~nec", "~zod")).join().unwrap())
+    };
+    // The held requests ran out of time (nothing heard after their resets were sent) or were
+    // ended by the connection's watcher; either way, within the file time and the silence, the
+    // connection is given up, and the waiting ping is told why.
+    let words = match pinged {
+        Err(NetError::Unreachable(words)) => words,
+        other => panic!("the ping came to {other:?}"),
+    };
+    assert!(words.contains("nothing was heard from zod for 2 seconds"), "{words}");
+    assert!(vanished.elapsed() < Duration::from_secs(15), "given up after {:?}", vanished.elapsed());
+    assert_eq!(kept(&b_net).map(|(id, open)| (id == first.0, open)), Some((true, false)), "the connection is still taken to be open");
+    for request in held {
+        assert!(matches!(request.join().unwrap(), Some(Err(_))));
+    }
+    // ~zod comes back at another address; the next call makes a new connection there.
+    let a_net = Network::start(a.clone(), directory.clone(), answering).unwrap();
+    directory.set("~zod", a.public_key("~zod").unwrap(), a_net.addr()).unwrap();
+    b_net.ping("~nec", "~zod").unwrap();
+    let now = kept(&b_net).expect("a connection is kept");
+    assert!(now.1 && now.0 != first.0);
+}
+
+#[test]
+fn datagrams_that_do_not_authenticate_do_not_keep_a_dead_connection() {
+    let asking = NetConfig { request_timeout: Duration::from_secs(20), silence_timeout: Duration::from_secs(2), ..NetConfig::default() };
+    let t = two_with("forged", (fast(), NetConfig::default()), (fast(), asking), &["~nec"]);
+    let Two { a, a_net, b_net, directory, _dirs, .. } = t;
+    let path = StandIn::between(a_net.addr());
+    directory.set("~zod", a.public_key("~zod").unwrap(), path.at).unwrap();
+    b_net.ping("~nec", "~zod").unwrap();
+    assert!(lock(&path.last_short).is_some(), "no short-header packet from ~zod was seen");
+    let connection = kept_from_nec(&b_net).expect("a connection is kept");
+    a_net.vanish();
+    path.forging.store(true, Ordering::SeqCst);
+    let arrived = connection.stats().udp_rx.datagrams;
+    // A ping is sent and waits. Nothing from ~zod authenticates, so the connection is given up
+    // after the silence, though datagrams keep reaching it from ~zod's address.
+    let started = Instant::now();
+    let pinged = b_net.ping("~nec", "~zod");
+    let reached = connection.stats().udp_rx.datagrams - arrived;
+    drop(path);
+    match pinged {
+        Err(NetError::Unreachable(words)) => assert!(words.contains("nothing was heard from zod"), "{words}"),
+        other => panic!("the ping came to {other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(8), "given up after {:?}", started.elapsed());
+    // They did reach the connection (QUIC counts a datagram routed to it before it is
+    // checked), so it was not for want of arriving that they kept nothing.
+    assert!(reached >= 10, "only {reached} datagrams reached the connection");
+}
+
+#[test]
+fn a_request_that_hears_nothing_before_its_time_runs_out_closes_nothing() {
+    // ~nec's requests are given a second; silence is noticed after the usual three.
+    let asking = NetConfig { request_timeout: Duration::from_secs(1), ..NetConfig::default() };
+    let t = two_with("held-back", (fast(), NetConfig::default()), (fast(), asking), &["~nec"]);
+    let Two { a, a_net, b_net, directory, _dirs, .. } = t;
+    let path = StandIn::between(a_net.addr());
+    directory.set("~zod", a.public_key("~zod").unwrap(), path.at).unwrap();
+    b_net.ping("~nec", "~zod").unwrap();
+    // Held for the whole test, so that its number (`stable_id`, the address of quinn's shared
+    // state) cannot be reused by a new connection and pass for it.
+    let first = kept_from_nec(&b_net).expect("a connection is kept");
+    // Everything ~zod sends is held back. What was already past the stand-in may still arrive,
+    // so ~nec's count of what it has heard must first stay still for two looks (half a second).
+    path.holding.store(true, Ordering::SeqCst);
+    let (settling, mut still, mut heard) = (Instant::now(), Instant::now(), super::Traffic::of(&first).heard);
+    while still.elapsed() < super::SILENCE_LOOK * 2 {
+        assert!(settling.elapsed() < Duration::from_secs(30), "~nec kept hearing from ~zod while everything from it was held back");
+        std::thread::sleep(super::SILENCE_LOOK / 5);
+        let now = super::Traffic::of(&first).heard;
+        if now != heard {
+            (heard, still) = (now, Instant::now());
+        }
+    }
+    // A ping is sent and runs out of time having heard nothing at all since it was sent; the
+    // hold lasts a second and a half from then.
+    let sent = Instant::now();
+    let pinged = b_net.ping("~nec", "~zod");
+    assert!(matches!(pinged, Err(NetError::TimedOut)), "the ping came to {pinged:?}");
+    assert_eq!(super::Traffic::of(&first).heard, heard, "the staging did not hold: ~nec heard something from ~zod while the ping waited");
+    std::thread::sleep(Duration::from_millis(1500).saturating_sub(sent.elapsed()));
+    path.holding.store(false, Ordering::SeqCst);
+    // What was held back arrives, within the silence: the connection is the same one, and a
+    // later request on it is answered.
+    b_net.ping("~nec", "~zod").unwrap();
+    let now = kept_from_nec(&b_net).expect("a connection is kept");
+    assert!(first.close_reason().is_none() && now.stable_id() == first.stable_id(), "the connection was given up");
 }
 
 /// A blocking job that outlives its request still holds the request's places until it returns,
@@ -1794,7 +2104,7 @@ fn unread_raw(net: &Network, from: &str, to: &str, requests: Vec<Vec<u8>>) -> Ve
     let (from, to) = (from.trim_start_matches('~').to_string(), to.trim_start_matches('~').to_string());
     net.threads.get().block_on(async {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let (connection, _) = net.shared.connection(&from, &to, deadline).await.unwrap();
+        let (connection, _, _) = net.shared.connection(&from, &to, deadline).await.unwrap();
         let mut streams = Vec::new();
         for request in requests {
             let (mut send, receive) = connection.open_bi().await.unwrap();
