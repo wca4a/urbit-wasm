@@ -9,16 +9,17 @@ use ed25519_dalek::{Signer, SigningKey};
 use rusqlite::Connection;
 use ship_proto::admin_request::Op;
 use ship_proto::{
-    AdminReply, AdminRequest, CheckpointBody, CheckpointReply, EntryBody, Fetch, Fetched, FileAnswer, FileAsk, Grant, Invocation,
-    Kind, LogHead, LogNews, Message, Receipt, RouteReply, RouteRequest, SignedCheckpoint, SignedEntry, Source, Verdict,
+    AdminReply, AdminRequest, Answered, CheckpointBody, CheckpointReply, EntryBody, Fetch, Fetched, FileAnswer, FileAsk, Grant, Invocation,
+    Kind, LogHead, LogNews, Message, Outcome as AskOutcome, Receipt, RouteReply, RouteRequest, SignedCheckpoint, SignedEntry, Source, Verdict,
 };
-use wasmtime::{Store, StoreLimitsBuilder, Trap};
+use wasmtime::{Store, StoreLimitsBuilder, Trap, UpdateDeadline};
 
+use crate::ask::Asked;
 use crate::host::{Ctx, Denied, LimitExceeded, LogsFull};
 use crate::store::{FetchJob, Followed, Replica};
 use crate::{
     check_target, lock, signed_bytes, store, AgentModule, ChainCheck, Error, Inner, Outcome, Rejection, CHECKPOINT_DOMAIN,
-    EPOCH_TICK_MILLIS, WASM_STACK_BYTES,
+    WASM_STACK_BYTES,
 };
 
 /// A transaction that was not kept: why, and whether that is certain (see
@@ -47,6 +48,8 @@ pub struct Ship {
     /// cheap.
     pub outbox_bytes: u64,
     pub inbox_bytes: u64,
+    /// Woken for a question, which does not switch the file to WAL: the next ordinary use does.
+    pub journal_owed: bool,
 }
 
 /// What every call on a ship needs, whether it is the event itself or a read nested inside it.
@@ -57,6 +60,10 @@ pub(crate) struct Env<'a> {
     pub conn: &'a Arc<Mutex<Connection>>,
     pub key: &'a Arc<SigningKey>,
     pub deadline: Instant,
+    /// Set while answering a question from another ship: the compute left for all of it (every
+    /// kernel decision and every handler, nested reads included), and that no module is
+    /// compiled on its way (a module not already compiled stops it, see `ColdModule`).
+    pub budget: Option<&'a std::cell::Cell<u64>>,
 }
 
 /// One thing for an agent to handle: a command, a notice that a log it follows has grown, or a
@@ -69,9 +76,10 @@ struct Event<'a> {
     payload: &'a [u8],
     /// The queue entry this came from, if it was queued.
     queued: Option<i64>,
-    /// For a command from another ship: that ship, and the number it gave the command. It is
-    /// owed a receipt saying what became of it.
-    owed: Option<(&'a str, u64)>,
+    /// For a command from another ship: that ship, the number it gave the command, and the
+    /// largest handler's reply it takes back (0: none wanted). It is owed a receipt saying what
+    /// became of it.
+    owed: Option<(&'a str, u64, u64)>,
     /// For a notification about a log on another ship: how much room the file had before
     /// the notification was taken off the queue.
     spare_before: Option<u64>,
@@ -87,6 +95,7 @@ struct Invoke<'a> {
     depth: u32,
     reads: Vec<Grant>,
     sends: Vec<Grant>,
+    asks: Vec<Grant>,
     fuel: u64,
     outbox_room: u64,
     inbox_room: u64,
@@ -103,6 +112,12 @@ struct Returned {
     appended: u32,
     /// How many commands the event queued for other ships.
     sent: u32,
+    /// How many questions the event put to other ships.
+    asked: u32,
+    /// Inbox room the event gave back, by dropping questions and answers.
+    dropped_bytes: u64,
+    /// The questions (or queued answers) the event dropped.
+    dropped: Vec<u64>,
     /// How many other things the event did that the network has to act on.
     net: u32,
     /// How many times the event took entries held from a log on another ship.
@@ -146,11 +161,13 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
             .tables(1)
             .build(),
         read_only: call.read_only,
+        question: env.budget.is_some(),
         depth: call.depth,
         deadline: env.deadline,
         invocation: call.invocation,
         reads: call.reads,
         sends: call.sends,
+        asks: call.asks,
         pending_reply: None,
         pending_cursor: None,
         effects: 0,
@@ -161,6 +178,9 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
         inbox_room: call.inbox_room,
         appended: 0,
         sent: 0,
+        asked: 0,
+        dropped_bytes: 0,
+        dropped: Vec::new(),
         net: 0,
         took: 0,
         can_checkpoint: call.module.pre.module().get_export("checkpoint").is_some(),
@@ -170,9 +190,44 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
     store.limiter(|ctx| &mut ctx.store_limits);
     // One budget covers the whole call, including any start function run by instantiation.
     store.set_fuel(call.fuel)?;
-    // Fuel does not see the size of bulk operations such as memory.fill, so time is capped too.
-    let left = env.deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
-    store.set_epoch_deadline(left / EPOCH_TICK_MILLIS + 2);
+    // Fuel does not see the size of bulk operations such as memory.fill, so there is a time limit too.
+    // The epoch is only a prompt to look at the clock (see `watch_the_clock`): when the call's
+    // running code next looks after a tick, it compares the real time with its deadline, and
+    // carries on until a later tick if it has time left, or stops as a call out of time always has
+    // (`Trap::Interrupt`, a timeout). Several ticks can pass before it looks. So ticks that come
+    // late, or all at once after the watchdog was held up, cannot stop it early.
+    // A call is never stopped for time before its deadline. After its deadline it is stopped at the
+    // first point where the running code looks (a loop turn, a function entry, a bulk memory step)
+    // and finds both that the watchdog has ticked since the call was last allowed on and that the
+    // deadline has passed. The watchdog ticks about every 10 ms; the system can run it, and the
+    // call's own thread, late; and after a look that came just before the deadline the call can run
+    // on until a later tick; so no number is promised for the overrun. A host call under way is not
+    // cut short. Whatever a call returns after its deadline is not kept.
+    let deadline = env.deadline;
+    #[cfg(test)]
+    let (stops, stopped_agent) = (env.rt.clone(), call.agent.to_string());
+    store.epoch_deadline_callback(move |_| {
+        // One reading of the clock, for the decision and for the record.
+        let now = Instant::now();
+        if now >= deadline {
+            #[cfg(test)]
+            if stops.recording.load(std::sync::atomic::Ordering::SeqCst) {
+                lock(&stops.time_stops).push((stopped_agent.clone(), deadline, now));
+            }
+            Err(Trap::Interrupt.into())
+        } else {
+            Ok(UpdateDeadline::Continue(1))
+        }
+    });
+    store.set_epoch_deadline(1);
+    #[cfg(test)]
+    {
+        let mut waiting = lock(&env.rt.deadline_set_for);
+        if waiting.as_ref().is_some_and(|(agent, _)| agent == call.agent) {
+            let (_, told) = waiting.take().expect("just seen");
+            let _ = told.send(());
+        }
+    }
 
     let instance = call.module.pre.instantiate(&mut store)?;
     let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| anyhow!("module exports no memory"))?;
@@ -197,7 +252,9 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
 
     let (start, len) = ((packed >> 32) as usize, (packed & 0xffff_ffff) as usize);
     if len > call.max_reply {
-        return Err(LimitExceeded(format!("reply is {len} bytes, limit is {}", call.max_reply)).into());
+        let why = format!("reply is {len} bytes, limit is {}", call.max_reply);
+        // Told apart only for the call itself, never for a read nested inside it.
+        return Err(if call.depth == 0 { ReplyTooLarge(why).into() } else { LimitExceeded(why).into() });
     }
     let reply = memory
         .data(&store)
@@ -208,6 +265,9 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
     Ok(Returned {
         appended: ctx.appended,
         sent: ctx.sent,
+        asked: ctx.asked,
+        dropped_bytes: ctx.dropped_bytes,
+        dropped: ctx.dropped,
         net: ctx.net,
         took: ctx.took,
         reply,
@@ -231,12 +291,28 @@ fn kernel_call(env: &Env, export: &str, input: &[u8], read_only: bool) -> anyhow
         depth: 0,
         reads: Vec::new(),
         sends: Vec::new(),
-        fuel: env.rt.cfg.kernel_fuel,
+        asks: Vec::new(),
+        // Answering a question, the kernel is paid from the question's own budget (at most its
+        // usual `kernel_fuel`); otherwise from `kernel_fuel` alone.
+        fuel: env.budget.map_or(env.rt.cfg.kernel_fuel, |left| left.get().min(env.rt.cfg.kernel_fuel)),
         outbox_room: 0,
         inbox_room: 0,
         max_reply: KERNEL_REPLY_BYTES,
     };
-    Ok(invoke(env, call)?.reply)
+    let given = call.fuel;
+    #[cfg(test)]
+    if env.budget.is_some() {
+        env.rt.decisions_begun.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let returned = invoke(env, call)?;
+    if let Some(left) = env.budget {
+        left.set(left.get().saturating_sub(given - returned.fuel_left));
+    }
+    #[cfg(test)]
+    if env.budget.is_some() {
+        lock(&env.rt.question_parts).push(given - returned.fuel_left);
+    }
+    Ok(returned.reply)
 }
 
 /// Ask the kernel whether a call may go ahead. On yes, returns the module to run and the
@@ -253,7 +329,12 @@ fn route_as(env: &Env, source: &Source, agent: &str, kind: i32, interface: &str)
     if !reply.allowed {
         return Err(Denied(reply.reason).into());
     }
-    let module = env.rt.module(&reply.module).map_err(|e| anyhow!("the kernel named an unusable module: {e}"))?;
+    // Answering a question, a module not already compiled is not compiled here: see
+    // `ColdModule`.
+    let module = match env.budget {
+        Some(_) => env.rt.module_compiled(&reply.module)?,
+        None => env.rt.module(&reply.module).map_err(|e| anyhow!("the kernel named an unusable module: {e}"))?,
+    };
     Ok((module, reply))
 }
 
@@ -268,6 +349,8 @@ pub(crate) fn read_agent(
     depth: u32,
 ) -> anyhow::Result<(Vec<u8>, u64)> {
     let (module, grants) = route(env, source, agent, Kind::Read, interface)?;
+    // Answering a question, the kernel's decision was paid from the same budget.
+    let fuel = env.budget.map_or(fuel, |left| left.get().min(fuel));
     let invocation = Invocation { kind: Kind::Read as i32, interface: interface.into(), source: Some(source.clone()) };
     let returned = invoke(
         env,
@@ -281,12 +364,17 @@ pub(crate) fn read_agent(
             depth,
             reads: grants.reads,
             sends: Vec::new(),
+            asks: Vec::new(),
             fuel,
             outbox_room: 0,
             inbox_room: 0,
             max_reply: env.rt.cfg.max_reply_bytes,
         },
     )?;
+    #[cfg(test)]
+    if env.budget.is_some() {
+        lock(&env.rt.question_parts).push(fuel - returned.fuel_left);
+    }
     Ok((returned.reply, returned.fuel_left))
 }
 
@@ -507,7 +595,26 @@ impl Ship {
                 if let Some(receipt) = &message.receipt {
                     // One that answers nothing this ship is waiting on is taken and dropped.
                     if let Some(sent) = store::peer_wait_get(conn, peer, receipt.about)? {
-                        let reason: String = store::short_reason(&receipt.reason).chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+                        let mut reason: String = store::short_reason(&receipt.reason).chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+                        // A reply is handed on with RAN, for a command that asked for one, within
+                        // the bound the command carried (which that ship held it to before its
+                        // command committed). A ship that keeps to the protocol sends nothing
+                        // else; one that does not has what it sent let go, and the receipt and
+                        // the audit log say so. RAN with no reply marked, for a command that
+                        // asked, comes from a ship whose runtime predates replies, or from one
+                        // that broke the protocol; either way it is handed on as RAN, since the
+                        // other ship says it ran, with no reply (and with this ship's reason if a
+                        // reply came and was let go). The agent tells by `Receipt.replied`.
+                        let ran = receipt.verdict == Verdict::Ran as i32;
+                        let carried = receipt.replied || !receipt.reply.is_empty();
+                        let (reply, replied) = if ran && sent.reply > 0 && receipt.replied && receipt.reply.len() as u64 <= sent.reply {
+                            (receipt.reply.clone(), true)
+                        } else {
+                            if carried {
+                                reason = REPLY_NOT_TAKEN.to_string();
+                            }
+                            (Vec::new(), false)
+                        };
                         let mut unqueued = false;
                         if sent.tell {
                             let told = ship_proto::Receipt {
@@ -517,6 +624,8 @@ impl Ship {
                                 ship: peer.to_string(),
                                 agent: sent.agent.clone(),
                                 interface: sent.interface.clone(),
+                                reply,
+                                replied,
                             }
                             .encode_to_vec();
                             let cost = told.len() as u64 + store::MESSAGE_OVERHEAD;
@@ -533,7 +642,7 @@ impl Ship {
                                 added += cost;
                             }
                         }
-                        if receipt.verdict != Verdict::Ran as i32 || unqueued {
+                        if receipt.verdict != Verdict::Ran as i32 || unqueued || reason == REPLY_NOT_TAKEN {
                             let ran = receipt.verdict == Verdict::Ran as i32;
                             let why = if reason.is_empty() { String::new() } else { format!(": {reason}") };
                             let untold = if unqueued { " (the receipt is too large for this ship's queue, so the agent was not told)" } else { "" };
@@ -579,7 +688,7 @@ impl Ship {
                     if added + cost > room || spare < cost + finishing {
                         break;
                     }
-                    store::inbox_push_from(conn, peer, message.seq, &message.from_agent, &message.agent, &message.interface, &message.payload)?;
+                    store::inbox_push_from(conn, peer, message.seq, &message.from_agent, &message.agent, &message.interface, &message.payload, message.reply_most)?;
                     added += cost;
                     spare -= cost;
                     unrun += 1;
@@ -594,7 +703,7 @@ impl Ship {
                     } else {
                         (Verdict::Malformed, "not a command that could be run")
                     };
-                    store::receipt_push(conn, peer, message.seq, verdict, why)?;
+                    store::receipt_push(conn, peer, message.seq, verdict, why, None)?;
                     spare = spare.saturating_sub(store::MAX_RECEIPT_BYTES as u64);
                     answered = true;
                 }
@@ -909,6 +1018,8 @@ impl Ship {
                         ship: peer.to_string(),
                         agent: orphan.agent.clone(),
                         interface: orphan.interface.clone(),
+                        reply: Vec::new(),
+                        replied: false,
                     }
                     .encode_to_vec();
                     let cost = told.len() as u64 + store::MESSAGE_OVERHEAD;
@@ -949,7 +1060,7 @@ impl Ship {
     /// The setting for one operation, with its time limit starting now.
     fn env<'a>(&'a self, rt: &'a Arc<Inner>) -> Env<'a> {
         let deadline = Instant::now() + Duration::from_millis(rt.cfg.max_event_millis);
-        Env { rt, ship: &self.name, kernel: &self.kernel, conn: &self.conn, key: &self.key, deadline }
+        Env { rt, ship: &self.name, kernel: &self.kernel, conn: &self.conn, key: &self.key, deadline, budget: None }
     }
 
     /// Run one command as one transaction: state, outbox, queued commands, and audit row land
@@ -972,6 +1083,28 @@ impl Ship {
     /// that means it is off the queue for good. Any other error means nothing was committed.
     fn execute(&mut self, rt: &Arc<Inner>, event: Event) -> Result<Outcome, Error> {
         let Event { kind, source, agent, interface, payload, queued, owed, spare_before } = event;
+        #[cfg(test)]
+        {
+            if let Some(entered) = lock(&rt.event_started).take() {
+                let _ = entered.send(());
+            }
+            rt.gates.pass("event begun");
+        }
+        // For the tests: when the event began and when it was done with, however it ends.
+        #[cfg(test)]
+        struct Finished(Arc<Inner>, String);
+        #[cfg(test)]
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                self.0.note("event finished", &self.1);
+            }
+        }
+        #[cfg(test)]
+        let _finished = {
+            let of = format!("{}/{}", self.name, agent);
+            rt.note("event entered", &of);
+            Finished(rt.clone(), of)
+        };
         // For a notification: which log it is about. Its publisher may be on another ship.
         let notice = (kind == Kind::Notify).then_some(Followed { ship: &source.ship, agent: &source.agent, name: interface });
         // For a checkpoint request: the log, one of the agent's own, that it is about.
@@ -1020,7 +1153,8 @@ impl Ship {
             // can come about when the module is replaced, or a ship is imported, after asking.
             // Likewise a receipt for a module with no receipt handler.
             let skipped = (asking.is_some() && !can_checkpoint)
-                || (kind == Kind::Receipt && module.pre.module().get_export("receipt").is_none());
+                || (kind == Kind::Receipt && module.pre.module().get_export("receipt").is_none())
+                || (kind == Kind::Answer && module.pre.module().get_export("answer").is_none());
             let mut returned = if skipped { Returned::default() } else { invoke(
                 &env,
                 Invoke {
@@ -1029,6 +1163,7 @@ impl Ship {
                         Kind::Notify => "notify",
                         Kind::Checkpoint => "checkpoint",
                         Kind::Receipt => "receipt",
+                        Kind::Answer => "answer",
                         _ => "handle",
                     },
                     agent,
@@ -1039,6 +1174,7 @@ impl Ship {
                     depth: 0,
                     reads: grants.reads,
                     sends: if asking.is_some() { Vec::new() } else { grants.sends },
+                    asks: if asking.is_some() { Vec::new() } else { grants.asks },
                     fuel: rt.cfg.fuel_per_event,
                     outbox_room: rt.cfg.max_outbox_bytes.saturating_sub(self.outbox_bytes),
                     inbox_room: rt.cfg.max_inbox_bytes.saturating_sub(self.inbox_bytes),
@@ -1057,18 +1193,42 @@ impl Ship {
             if let Some(log) = notice {
                 store::notify_handled(&conn, agent, log, before)?;
             }
-            store::audit(&conn, agent, payload, true, rt.cfg.audit_rows)?;
+            store::audit(&conn, agent, &audited(kind, payload), true, rt.cfg.audit_rows)?;
             // The ship that sent this command is told it ran. That is saved with what the
-            // command did, so the two cannot come apart.
-            if let Some((peer, about)) = owed {
-                store::receipt_push(&conn, peer, about, Verdict::Ran, "")?;
+            // command did, so the two cannot come apart. If it asked for the handler's reply,
+            // the reply goes with the receipt, or the command does not stand: a reply larger
+            // than this ship sends, or one that would leave the file without the room it keeps
+            // for taking a command back and finishing with it (`room_to_take_one`), undoes the
+            // event like any limit, and the receipt says LIMIT. So reply bytes never use that
+            // room, and the working that keeps two full ships moving is as it was.
+            // The reply is held to the smaller of the bound the sender carried with the command
+            // and this ship's own, so the sender never has to let a reply go.
+            if let Some((peer, about, wanted)) = owed {
+                #[cfg(test)]
+                let wanted = if rt.replies_unknown.load(std::sync::atomic::Ordering::SeqCst) { 0 } else { wanted };
+                let reply = (wanted > 0).then_some(&returned.reply[..]);
+                let most = (store::reply_most(&rt.cfg) as u64).min(wanted);
+                if let Some(reply) = reply.filter(|reply| reply.len() as u64 > most) {
+                    return Err(ReplyTooLarge(format!("the reply is {} bytes, and a receipt carries at most {most}", reply.len())).into());
+                }
+                let before = store::spare_bytes(&conn)?;
+                store::receipt_push(&conn, peer, about, Verdict::Ran, "", reply)?;
+                let after = store::spare_bytes(&conn)?;
+                if reply.is_some_and(|reply| !reply.is_empty()) && after < before && after < room_to_take_one(&rt.cfg) {
+                    return Err(NoRoomForReply.into());
+                }
             }
-            // An event that queues commands for other ships must leave room in the ship's
-            // file to take one command back and finish with it. Otherwise two ships that had
-            // each filled up with commands for the other could neither take the other's
-            // first, and both would wait for ever. Checked after everything the event wrote.
-            if returned.sent > 0 && store::spare_bytes(&conn)? < room_to_take_one(&rt.cfg) {
+            // An event that queues commands for other ships, or questions for them, must leave
+            // room in the ship's file to take one command back and finish with it. Otherwise
+            // two ships that had each filled up with commands for the other could neither take
+            // the other's first, and both would wait for ever. Checked after everything the
+            // event wrote.
+            if (returned.sent > 0 || returned.asked > 0) && store::spare_bytes(&conn)? < room_to_take_one(&rt.cfg) {
                 return Err(NoRoomToSend.into());
+            }
+            // The questions it put start their time now, as it commits.
+            if returned.asked > 0 {
+                store::asks_stamp(&conn, store::now_ms())?;
             }
             // Checked last, so the limit covers everything up to the commit itself. The deadline
             // inside the guest is only checked at loops, calls, and bulk operations.
@@ -1102,8 +1262,42 @@ impl Ship {
                 } else if done.sent > 0 || done.net > 0 || owed.is_some() {
                     rt.outbound_ready(&self.name);
                 }
+                // And it has questions to put to other ships; and those it dropped have their
+                // tasks stopped, now, by number.
+                if done.asked > 0 {
+                    rt.asks_ready(&self.name);
+                }
+                if !done.dropped.is_empty() {
+                    rt.asks_dropped(&self.name, self.incarnation, &done.dropped);
+                }
+                #[cfg(test)]
+                {
+                    if kind == Kind::Answer {
+                        if let Ok(answered) = Answered::decode(payload) {
+                            rt.note("answer handled", &format!("{}/{}", self.name, answered.about));
+                        }
+                    }
+                    if kind == Kind::Command {
+                        rt.note("command run", &self.name);
+                    }
+                    let by = format!("{}/{}", self.name, agent);
+                    if done.asked > 0 {
+                        rt.note("asking event committed", &by);
+                    }
+                    if done.sent > 0 {
+                        rt.note("sending event committed", &by);
+                    }
+                    if !done.dropped.is_empty() {
+                        rt.note("drop committed", &self.name);
+                    }
+                    rt.note("event committed", &self.name);
+                    if let Some(hold) = lock(&rt.hold_after_commit).take() {
+                        std::thread::sleep(hold);
+                    }
+                    rt.gates.pass("event committed");
+                }
                 self.outbox_bytes += done.effect_bytes;
-                self.inbox_bytes += done.queued_bytes;
+                self.inbox_bytes = (self.inbox_bytes + done.queued_bytes).saturating_sub(done.dropped_bytes);
                 Ok(Outcome { reply: done.reply, effects: done.effects, queued: done.queued })
             }
             Err(e) => {
@@ -1112,9 +1306,15 @@ impl Ship {
                 // written to the audit log: an agent that keeps trying would fill the file
                 // with the record of being told it is too full.
                 let unrecorded = e.chain().any(|cause| cause.downcast_ref::<NoRoomToSend>().is_some());
-                // What the ship that sent this command is told: it did not run, and why.
-                let (verdict, reason) = verdict_of(&rejection, routed);
-                let owed = owed.map(|(peer, about)| (peer, about, verdict, reason.as_str()));
+                // What the ship that sent this command is told: it did not run, and why. A reply
+                // that could not go with the receipt is named in fixed words of its own.
+                let (verdict, mut reason) = verdict_of(&rejection, routed);
+                if e.chain().any(|cause| cause.downcast_ref::<NoRoomForReply>().is_some()) {
+                    reason = NoRoomForReply.to_string();
+                } else if owed.is_some_and(|(_, _, wanted)| wanted > 0) && e.chain().any(|cause| cause.downcast_ref::<ReplyTooLarge>().is_some()) {
+                    reason = REPLY_TOO_LARGE.to_string();
+                }
+                let owed = owed.map(|(peer, about, _)| (peer, about, verdict, reason.as_str()));
                 let rejection = Error::Rejected(rejection);
                 // An append found the logs full. The append itself is undone like the rest of
                 // the event, but a checkpoint of that log is what would make room, and only an
@@ -1134,8 +1334,8 @@ impl Ship {
                         && notice.is_none_or(|log| store::notify_failed(&conn, agent, log).is_ok())
                         && (!storage_full || store::reclaim(&conn).is_ok())
                         && full.is_none_or(|log| store::ask_checkpoint_when_full(&conn, agent, log).is_ok())
-                        && owed.is_none_or(|(peer, about, verdict, reason)| store::receipt_push(&conn, peer, about, verdict, reason).is_ok())
-                        && (unrecorded || store::audit(&conn, agent, payload, false, rt.cfg.audit_rows).is_ok())
+                        && owed.is_none_or(|(peer, about, verdict, reason)| store::receipt_push(&conn, peer, about, verdict, reason, None).is_ok())
+                        && (unrecorded || store::audit(&conn, agent, &audited(kind, payload), false, rt.cfg.audit_rows).is_ok())
                         && (!frugal || settled_within(&conn, spare_before, &rt.cfg))
                         && conn.execute_batch("COMMIT").is_ok()
                 };
@@ -1161,7 +1361,7 @@ impl Ship {
                     full,
                     storage_full,
                     agent,
-                    payload,
+                    &audited(kind, payload),
                     rt.cfg.audit_rows,
                 );
                 if retried.is_ok() && owed.is_some() {
@@ -1200,10 +1400,10 @@ impl Ship {
         // Anything else is run as a command, which is also the safe reading of a kind this
         // runtime does not know.
         let kind = match Kind::try_from(queued.kind) {
-            Ok(kind @ (Kind::Notify | Kind::Checkpoint | Kind::Receipt)) => kind,
+            Ok(kind @ (Kind::Notify | Kind::Checkpoint | Kind::Receipt | Kind::Answer)) => kind,
             _ => Kind::Command,
         };
-        let owed = (kind == Kind::Command && !queued.ship.is_empty() && queued.ship_seq > 0).then_some((queued.ship.as_str(), queued.ship_seq));
+        let owed = (kind == Kind::Command && !queued.ship.is_empty() && queued.ship_seq > 0).then_some((queued.ship.as_str(), queued.ship_seq, queued.reply));
         let event = Event {
             kind,
             source: &source,
@@ -1307,7 +1507,7 @@ impl Ship {
     fn ask_file(&mut self, rt: &Arc<Inner>, peer: &str, agent: &str, id: &[u8; 32]) -> bool {
         let millis = rt.cfg.file_ask_millis.min(24 * 60 * 60 * 1000);
         let deadline = Instant::now() + Duration::from_millis(millis);
-        let env = Env { rt, ship: &self.name, kernel: &self.kernel, conn: &self.conn, key: &self.key, deadline };
+        let env = Env { rt, ship: &self.name, kernel: &self.kernel, conn: &self.conn, key: &self.key, deadline, budget: None };
         let source = Source { owner: false, agent: String::new(), ship: peer.to_string() };
         #[cfg(test)]
         let kind = match rt.file_ask_kind.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1332,6 +1532,7 @@ impl Ship {
                     depth: 0,
                     reads: grants.reads,
                     sends: Vec::new(),
+                    asks: Vec::new(),
                     fuel: rt.cfg.file_ask_fuel,
                     outbox_room: 0,
                     inbox_room: 0,
@@ -1342,6 +1543,177 @@ impl Ship {
         })();
         // An error, of any kind, is never a yes.
         matches!(asked, Ok(true))
+    }
+
+    /// Answer a question `peer` puts to `agent`'s `interface`, from its agent `from_agent` (or
+    /// its owner, if that is empty): the agent's read handler runs as a `KIND_READ` call from
+    /// that ship, read-only, with its ordinary read grants and none to send or ask, inside a
+    /// transaction that is always rolled back, with `deadline` (kept as any call's is: never
+    /// stopped before it, no number promised past it). One compute budget, `ask_fuel`,
+    /// pays for all of it: the kernel's decision (each at most `kernel_fuel`), the handler, and
+    /// every nested read with its own decision. No module is compiled on its way: one that is
+    /// not already compiled answers `Asked::Cold`. No application data is stored: not the
+    /// question, not an audit row, not a rest (rests are in memory).
+    ///
+    /// Whoever calls this has the ship in hand, has checked that the asker has not given up,
+    /// that there is time left and that the ship is not resting, and sets the rest after it
+    /// (`Inner::with_ship_question`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn answer_ask(&mut self, rt: &Arc<Inner>, peer: &str, from_agent: &str, agent: &str, interface: &str, payload: &[u8], deadline: Instant, max_reply: usize) -> Result<Asked, Error> {
+        self.begin("BEGIN")?;
+        let budget = std::cell::Cell::new(rt.cfg.ask_fuel);
+        let env = Env { rt, ship: &self.name, kernel: &self.kernel, conn: &self.conn, key: &self.key, deadline, budget: Some(&budget) };
+        let source = Source { owner: false, agent: from_agent.to_string(), ship: peer.to_string() };
+        let mut routed = false;
+        let ran = (|| -> anyhow::Result<Vec<u8>> {
+            let (module, grants) = route(&env, &source, agent, Kind::Read, interface)?;
+            routed = true;
+            #[cfg(test)]
+            let decided = rt.cfg.ask_fuel - budget.get();
+            let invocation = Invocation { kind: Kind::Read as i32, interface: interface.into(), source: Some(source.clone()) };
+            let returned = invoke(
+                &env,
+                Invoke {
+                    module: &module,
+                    export: "read",
+                    agent,
+                    invocation: invocation.encode_to_vec(),
+                    input: payload,
+                    read_only: true,
+                    depth: 0,
+                    reads: grants.reads,
+                    sends: Vec::new(),
+                    asks: Vec::new(),
+                    fuel: budget.get(),
+                    outbox_room: 0,
+                    inbox_room: 0,
+                    max_reply,
+                },
+            )?;
+            #[cfg(test)]
+            lock(&rt.question_fuel).push((decided, rt.cfg.ask_fuel - returned.fuel_left));
+            Ok(returned.reply)
+        })();
+        self.rollback();
+        Ok(match ran {
+            Ok(reply) => Asked::Reply(reply),
+            Err(e) => asked_of(&e, routed),
+        })
+    }
+
+    /// What `ask_answered` and `asks_unreachable` write for the question `seq`: it is struck
+    /// off and its answer queued for the agent that asked, in one transaction, so that two
+    /// outcomes arriving at once make one event and not two. `room` is what the queue's quota
+    /// has left before this question's own reservation is given back. Returns `None` if there
+    /// is no such question (answered already, or dropped), else what the answer took of the
+    /// quota and what the question had held.
+    ///
+    /// Whatever the outcome, an answer is always queued here: one with no reply takes no more
+    /// than its question held (`store::ask_reserve`), and one with a reply that does not fit
+    /// in what the quota has with that given back, or that is larger than this ship takes, is
+    /// handed over as LIMIT with no reply instead. (The ship's file can still be full: see
+    /// `ask_answered`.)
+    fn settle_one(conn: &Connection, cfg: &crate::Config, room: u64, seq: u64, outcome: AskOutcome, reply: &[u8], reason: &str) -> Result<Option<(u64, u64)>, Error> {
+        let Some(row) = store::ask_get(conn, seq)? else { return Ok(None) };
+        let reserved = store::ask_reserve(&row.ship, &row.target, &row.interface);
+        let encode = |outcome: AskOutcome, reply: &[u8], reason: &str| {
+            Answered {
+                about: seq,
+                ship: row.ship.clone(),
+                agent: row.target.clone(),
+                interface: row.interface.clone(),
+                outcome: outcome as i32,
+                reply: reply.to_vec(),
+                reason: store::short_reason(reason).to_string(),
+            }
+            .encode_to_vec()
+        };
+        let mut answered = if reply.len() <= cfg.max_answer_bytes { encode(outcome, reply, reason) } else { encode(AskOutcome::Limit, &[], crate::ask::ANSWER_TOO_LARGE_HERE) };
+        if answered.len() as u64 + store::MESSAGE_OVERHEAD > room + reserved {
+            answered = encode(AskOutcome::Limit, &[], crate::ask::NO_ROOM_FOR_ANSWER);
+        }
+        let cost = answered.len() as u64 + store::MESSAGE_OVERHEAD;
+        // By `ask_reserve`, an answer with no reply fits in what its question held.
+        debug_assert!(cost <= reserved || cost <= room + reserved);
+        store::ask_remove(conn, seq)?;
+        store::inbox_push_answer(conn, &row.ship, &row.target, &row.agent, &row.interface, seq, &answered)?;
+        Ok(Some((cost, reserved)))
+    }
+
+    /// What came of the question numbered `seq` that one of this ship's agents put to another
+    /// ship, if this is still the copy of the ship that put it (`incarnation`). Once it is
+    /// queued, whatever network is running now is told there is work, from here, so that an
+    /// answer written by the job of a network since replaced is still run.
+    ///
+    /// An answer with a reply is written as anything written because of another ship is: it
+    /// must leave the room the file keeps for taking a command (`transact_for_peer`); if it
+    /// would not, LIMIT ("no room on this ship for the answer") is written instead. An answer
+    /// with no reply is written however little room the file has left. Its room in the queue
+    /// was held for it (`store::ask_reserve`), but nothing holds pages of the file for it: the
+    /// room the file keeps is checked only for events that send commands or ask questions, so
+    /// events that only write state can use it up, and the write can then fail, as any write
+    /// can for any storage reason (no page to be had, for the queue, an index or a split; an
+    /// I/O error). Then nothing is kept, and the caller writes it again later, for as long as
+    /// that takes (see the README, Questions between ships, and Known limits).
+    pub(crate) fn ask_answered(&mut self, rt: &Arc<Inner>, incarnation: &[u8; 16], seq: u64, outcome: AskOutcome, reply: &[u8], reason: &str) -> Result<Settled, Error> {
+        if *incarnation != self.incarnation {
+            return Ok(Settled::Gone);
+        }
+        #[cfg(test)]
+        if rt.answer_write_failures.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+            return Err(Error::Io(std::io::Error::other("the write of an answer made to fail, for a test")));
+        }
+        let (cfg, room) = (&rt.cfg, rt.cfg.max_inbox_bytes.saturating_sub(self.inbox_bytes));
+        let done = if reply.is_empty() {
+            self.transact(|conn| Self::settle_one(conn, cfg, room, seq, outcome, reply, reason))
+        } else {
+            match self.transact_for_peer(cfg, |conn| Self::settle_one(conn, cfg, room, seq, outcome, reply, reason)) {
+                Err(Error::TooMany(_)) => self.transact(|conn| Self::settle_one(conn, cfg, room, seq, AskOutcome::Limit, &[], crate::ask::NO_ROOM_FOR_ANSWER)),
+                done => done,
+            }
+        };
+        match done? {
+            None => Ok(Settled::Gone),
+            Some((cost, reserved)) => {
+                self.inbox_bytes = (self.inbox_bytes + cost).saturating_sub(reserved);
+                #[cfg(test)]
+                if rt.recording.load(std::sync::atomic::Ordering::SeqCst) {
+                    lock(&rt.answers_written).push((Instant::now(), store::now_ms(), self.name.to_string(), seq));
+                }
+                rt.work_ready(&self.name);
+                Ok(Settled::Queued)
+            }
+        }
+    }
+
+    /// With no network running: every question waiting gets `OUTCOME_UNREACHABLE`, in one
+    /// transaction (each fits in the room it held). Returns how many were answered.
+    pub(crate) fn asks_unreachable(&mut self, rt: &Arc<Inner>) -> Result<usize, Error> {
+        if !store::asks_any(&lock(&self.conn))? {
+            return Ok(0);
+        }
+        let (cfg, room) = (&rt.cfg, rt.cfg.max_inbox_bytes.saturating_sub(self.inbox_bytes));
+        let (count, used, freed) = self.transact(|conn| {
+            let (mut count, mut used, mut freed) = (0, 0u64, 0u64);
+            for (seq, _) in store::asks_list(conn)? {
+                if let Some((cost, reserved)) = Self::settle_one(conn, cfg, (room + freed).saturating_sub(used), seq, AskOutcome::Unreachable, &[], NO_NETWORK)? {
+                    (count, used, freed) = (count + 1, used + cost, freed + reserved);
+                }
+            }
+            Ok((count, used, freed))
+        })?;
+        self.inbox_bytes = (self.inbox_bytes + used).saturating_sub(freed);
+        Ok(count)
+    }
+
+    /// For tests: the kernel's whole answer to a call of `kind` from `source` to `agent`'s
+    /// `interface`, as it encoded it, decoded.
+    #[cfg(test)]
+    pub(crate) fn route_answer(&mut self, rt: &Arc<Inner>, source: &Source, agent: &str, kind: Kind, interface: &str) -> (usize, RouteReply) {
+        let env = self.env(rt);
+        let request = RouteRequest { source: Some(source.clone()), agent: agent.into(), kind: kind as i32, interface: interface.into() };
+        let bytes = kernel_call(&env, "route", &request.encode_to_vec(), true).expect("the kernel answers");
+        (bytes.len(), RouteReply::decode(&*bytes).expect("a route answer"))
     }
 
     /// For tests: whether the kernel lets a call of `kind` from `source` through to `agent`.
@@ -1437,6 +1809,99 @@ pub enum Taken {
 /// What an agent is told of a command whose answer was lost when two ships fell out of step.
 const LOST: &str = "one of the two ships went back to an earlier state, and the record of this went with it";
 
+/// What an event's audit row keeps of its payload. For a receipt or an answer, bounded facts
+/// only: its number, verdict or outcome, where it was sent, and the length of any reply, never
+/// the reply's bytes, which another ship chose, on the success path and every rejection path
+/// alike. So a reply handed to an agent takes no room in the ship's file once its event is done,
+/// and never more than `store::MAX_RECEIPT_BYTES` in the audit log. Anything else is kept as it
+/// is, as before.
+fn audited(kind: Kind, payload: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let facts = match kind {
+        Kind::Receipt => match Receipt::decode(payload) {
+            Ok(r) => format!(
+                "receipt {} {} ~{}/{} {}{}",
+                r.about,
+                verdict_words(r.verdict),
+                r.ship,
+                r.agent,
+                r.interface,
+                if r.replied { format!(", reply of {} bytes", r.reply.len()) } else { String::new() }
+            ),
+            Err(_) => "receipt that does not decode".to_string(),
+        },
+        Kind::Answer => match Answered::decode(payload) {
+            Ok(a) => format!("answer {} {:?} ~{}/{} {}, reply of {} bytes", a.about, a.outcome(), a.ship, a.agent, a.interface, a.reply.len()),
+            Err(_) => "answer that does not decode".to_string(),
+        },
+        _ => return std::borrow::Cow::Borrowed(payload),
+    };
+    let mut facts = facts.into_bytes();
+    facts.truncate(store::MAX_RECEIPT_BYTES);
+    std::borrow::Cow::Owned(facts)
+}
+
+/// What an agent is told of a question waiting when there was no network to put it.
+const NO_NETWORK: &str = "this ship is not on the network";
+
+/// What came of writing down the outcome of a question.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settled {
+    /// Its answer is queued for the agent.
+    Queued,
+    /// There is no such question any more: answered already, dropped, or of another copy.
+    Gone,
+}
+
+/// A module not yet compiled, met while answering a question: the question is not where a
+/// module is compiled (it would take the ship, and the compile would outlive the question).
+/// The question is told "too busy; try again", and the module compiled off its path
+/// (`Runtime::compile_cold`).
+#[derive(Debug)]
+pub(crate) struct ColdModule(pub String);
+
+impl std::fmt::Display for ColdModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the module {} is not compiled yet", self.0)
+    }
+}
+
+impl std::error::Error for ColdModule {}
+
+/// The cache of compiled modules was held by another caller just when a question looked in it.
+/// A question waits for nothing, so it is told "too busy; try again".
+#[derive(Debug)]
+pub(crate) struct Contended;
+
+impl std::fmt::Display for Contended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the cache of compiled modules is busy")
+    }
+}
+
+impl std::error::Error for Contended {}
+
+/// What a question that failed on the ship that answers it comes to. A refusal by the kernel
+/// passes its reason on; once the question has reached the agent, only the kind of failure is
+/// told, in fixed words, as for a command's receipt.
+fn asked_of(err: &anyhow::Error, routed: bool) -> Asked {
+    if let Some(cold) = err.chain().find_map(|cause| cause.downcast_ref::<ColdModule>()) {
+        return Asked::Cold(cold.0.clone());
+    }
+    if err.chain().any(|cause| cause.downcast_ref::<Contended>().is_some()) {
+        return Asked::Busy;
+    }
+    if routed && err.chain().any(|cause| cause.downcast_ref::<ReplyTooLarge>().is_some()) {
+        return Asked::Limit(crate::ask::ANSWER_TOO_LARGE);
+    }
+    match classify(err) {
+        Rejection::Denied(why) if !routed => Asked::Denied(why),
+        Rejection::OutOfFuel => Asked::Failed("it ran out of fuel"),
+        Rejection::Timeout => Asked::Failed(crate::ask::TOOK_TOO_LONG),
+        Rejection::Trap(_) if !routed => Asked::Failed("that ship could not route it"),
+        _ => Asked::Failed("the agent failed"),
+    }
+}
+
 /// What a log followed on another ship stops with when what that ship sends cannot be a
 /// continuation of what this ship holds.
 const NOT_A_CONTINUATION: &str = "what that ship sends does not carry on from the log this ship has been following";
@@ -1479,7 +1944,9 @@ fn largest_taken(cfg: &crate::Config) -> u64 {
 }
 
 /// Room in a ship's file to take the largest command another ship may send it, and to finish
-/// with it.
+/// with it. A receipt that carries a reply is never larger than such a command with its receipt
+/// (see `store::reply_most`), so this is room to take one of those too; and a reply goes with a
+/// receipt only if this room is left after it (see `Ship::execute`).
 pub(crate) fn room_to_take_one(cfg: &crate::Config) -> u64 {
     let largest = largest_taken(cfg).min(cfg.max_event_bytes as u64 + store::MESSAGE_OVERHEAD);
     largest + store::MAX_RECEIPT_BYTES as u64 + STORAGE_SLACK_BYTES
@@ -1514,6 +1981,39 @@ fn storage_full(err: &anyhow::Error) -> bool {
     err.chain().filter_map(|cause| cause.downcast_ref::<rusqlite::Error>()).any(full)
 }
 
+/// A handler's reply larger than may go: for a command from another ship that asked for its
+/// reply, more than `max_receipt_reply_bytes`; otherwise more than the call's own limit.
+#[derive(Debug)]
+pub(crate) struct ReplyTooLarge(pub String);
+
+impl std::fmt::Display for ReplyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "limit exceeded: {}", self.0)
+    }
+}
+
+impl std::error::Error for ReplyTooLarge {}
+
+/// A command from another ship that asked for its reply would, with the reply, have left the
+/// ship's file without the room it keeps for taking a command back (`room_to_take_one`).
+#[derive(Debug)]
+struct NoRoomForReply;
+
+impl std::fmt::Display for NoRoomForReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "that ship had no room to keep the reply")
+    }
+}
+
+impl std::error::Error for NoRoomForReply {}
+
+/// What the sender of a command that asked for its reply is told when the reply was too large.
+const REPLY_TOO_LARGE: &str = "the reply is larger than that ship sends with a receipt";
+
+/// What an agent is told, with a receipt saying RAN, when the reply that came with it was not
+/// one this ship takes: not asked for, with another verdict, or larger than its own limit.
+const REPLY_NOT_TAKEN: &str = "the reply that came with this receipt was not one this ship takes, and was let go";
+
 /// An event queued commands for other ships and would have left the ship's file without room
 /// to take one back. See `room_to_take_one`.
 #[derive(Debug)]
@@ -1536,6 +2036,12 @@ fn classify(err: &anyhow::Error) -> Rejection {
     }
     if let Some(limit) = err.chain().find_map(|cause| cause.downcast_ref::<LimitExceeded>()) {
         return Rejection::Limit(limit.0.clone());
+    }
+    if let Some(limit) = err.chain().find_map(|cause| cause.downcast_ref::<ReplyTooLarge>()) {
+        return Rejection::Limit(limit.0.clone());
+    }
+    if err.chain().any(|cause| cause.downcast_ref::<NoRoomForReply>().is_some()) {
+        return Rejection::Limit(NoRoomForReply.to_string());
     }
     if err.chain().any(|cause| cause.downcast_ref::<LogsFull>().is_some()) {
         return Rejection::Limit("the log is full".into());

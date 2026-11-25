@@ -1,4 +1,4 @@
-use ship_sdk::{agent, emit, files, kv, log};
+use ship_sdk::{agent, ask, emit, files, invocation, kv, log};
 
 fn read(key: &str) -> i64 {
     kv::get(key.as_bytes())
@@ -36,6 +36,11 @@ fn handle(event: &[u8]) -> Vec<u8> {
             value.to_string()
         }
         (Some("get"), Some(key), None) => read(key).to_string(),
+        // Add one, and answer with `len` bytes: a reply worth carrying back with a receipt.
+        (Some("inc-big"), Some(key), Some(len)) => {
+            write(key, read(key) + 1);
+            "r".repeat(len.parse().unwrap_or(0))
+        }
         // What the ship holds of a file this agent claims, by its id in hexadecimal.
         (Some("file"), Some(id), None) => match file_id(id).and_then(|id| files::info(&id)) {
             Some(info) => format!("{} {} {}{}", info.length, info.chunks, info.media_type, if info.open { " open" } else { "" }),
@@ -159,9 +164,54 @@ fn handle(event: &[u8]) -> Vec<u8> {
     reply.into_bytes()
 }
 
-/// Read handler: the payload is a key, the reply its current value.
+/// Read handler: the payload is a key, the reply its current value. The same handler answers
+/// questions from other ships when the manifest opens its interface to them.
+///
+/// A payload starting with `?` is a probe, for the tests of questions: `?who` says who is
+/// asking, `?big <n>` answers with `n` bytes, `?trap` and `?spin` fail, and `?write`, `?send`,
+/// `?send-far <ship>`, `?emit`, `?append`, `?mark <id>` and `?ask <ship>` each try to change
+/// something, which a read may not.
 fn value(key: &[u8]) -> Vec<u8> {
-    read(&String::from_utf8_lossy(key)).to_string().into_bytes()
+    let text = String::from_utf8_lossy(key);
+    let mut words = text.split_whitespace();
+    match (words.next(), words.next()) {
+        (Some("?who"), None) => {
+            let source = invocation().source.unwrap_or_default();
+            match (source.owner, source.ship.is_empty()) {
+                (true, _) => "owner".into(),
+                (false, true) => source.agent.into_bytes(),
+                (false, false) => format!("~{}/{}", source.ship, source.agent).into_bytes(),
+            }
+        }
+        (Some("?big"), Some(len)) => vec![b'a'; len.parse().unwrap_or(0)],
+        (Some("?trap"), None) => panic!("asked to fail"),
+        (Some("?spin"), None) => loop {
+            std::hint::black_box(0u8);
+        },
+        (Some("?write"), None) => {
+            write("meddled", 1);
+            b"wrote".to_vec()
+        }
+        (Some("?send"), None) => {
+            ship_sdk::send("counter", "counter", b"inc meddled");
+            b"sent".to_vec()
+        }
+        (Some("?send-far"), Some(ship)) => {
+            ship_sdk::send_to(ship, "counter", "counter", b"inc meddled");
+            b"sent".to_vec()
+        }
+        (Some("?emit"), None) => {
+            emit(b"meddled");
+            b"emitted".to_vec()
+        }
+        (Some("?append"), None) => {
+            log::append("counter", b"meddled");
+            b"appended".to_vec()
+        }
+        (Some("?mark"), Some(id)) => file_id(id).map_or(false, |id| files::open(&id)).to_string().into_bytes(),
+        (Some("?ask"), Some(ship)) => ask::to(ship, "counter", "counter", b"hits", 1000).to_string().into_bytes(),
+        _ => read(&text).to_string().into_bytes(),
+    }
 }
 
 /// Checkpoint handler: the state behind the `counter` log is its latest entry. The journal is

@@ -47,15 +47,15 @@ fn nothing() -> Manifest {
 
 /// The counter agent offers one interface, `counter`.
 fn counter_manifest(public: bool) -> Manifest {
-    Manifest { provides: vec![Provide { interface: "counter".into(), public, remote: false }], uses: vec![] }
+    Manifest { provides: vec![Provide { interface: "counter".into(), public, remote: false, asked: false }], uses: vec![] }
 }
 
 /// The tally agent offers `tally` and, when `uses_counter` is set, declares that it reads from
 /// and sends to the counter.
 fn tally_manifest(uses_counter: bool) -> Manifest {
-    let uses = Use { agent: "counter".into(), interface: "counter".into(), read: true, send: true, ship: String::new() };
+    let uses = Use { agent: "counter".into(), interface: "counter".into(), read: true, send: true, ship: String::new(), ask: false };
     Manifest {
-        provides: vec![Provide { interface: "tally".into(), public: false, remote: false }],
+        provides: vec![Provide { interface: "tally".into(), public: false, remote: false, asked: false }],
         uses: if uses_counter { vec![uses] } else { vec![] },
     }
 }
@@ -1060,7 +1060,7 @@ fn deeply_nested_reads_do_not_overflow_the_thread_stack() {
     };
     let dir = TempDir::new("stack");
     let rt = Runtime::open(&dir.0, fast()).unwrap();
-    let offers_x = Manifest { provides: vec![Provide { interface: "x".into(), public: false, remote: false }], uses: vec![] };
+    let offers_x = Manifest { provides: vec![Provide { interface: "x".into(), public: false, remote: false, asked: false }], uses: vec![] };
     for (ship, at_the_bottom) in [("~zod", "nop"), ("~bus", "unreachable")] {
         let hash = rt.add_module(&wat::parse_str(nesting(at_the_bottom)).unwrap()).unwrap();
         rt.create_ship(ship, &kernel(&rt)).unwrap();
@@ -1088,8 +1088,8 @@ fn deeply_nested_reads_do_not_overflow_the_thread_stack() {
 #[test]
 fn reading_and_sending_are_separate_permissions() {
     let uses = |read, send| Manifest {
-        provides: vec![Provide { interface: "tally".into(), public: false, remote: false }],
-        uses: vec![Use { agent: "counter".into(), interface: "counter".into(), read, send, ship: String::new() }],
+        provides: vec![Provide { interface: "tally".into(), public: false, remote: false, asked: false }],
+        uses: vec![Use { agent: "counter".into(), interface: "counter".into(), read, send, ship: String::new(), ask: false }],
     };
     let dir = TempDir::new("read-only-grant");
     let rt = boot_pair(&dir, fast(), counter_manifest(false), uses(true, false));
@@ -1195,20 +1195,20 @@ fn the_kernel_refuses_manifests_that_would_leave_the_ship_unroutable() {
     // The same interface listed twice, once private and once public.
     let twice = Manifest {
         provides: vec![
-            Provide { interface: "x".into(), public: false, remote: false },
-            Provide { interface: "x".into(), public: true, remote: false },
+            Provide { interface: "x".into(), public: false, remote: false, asked: false },
+            Provide { interface: "x".into(), public: true, remote: false, asked: false },
         ],
         uses: vec![],
     };
     assert!(matches!(rt.install("~zod", "twice", &hash, &twice), Err(Error::InstallRefused(_))));
-    let same_use = Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false, ship: String::new() };
+    let same_use = Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false, ship: String::new(), ask: false };
     let twice = Manifest { provides: vec![], uses: vec![same_use.clone(), Use { send: true, ..same_use }] };
     assert!(matches!(rt.install("~zod", "twice", &hash, &twice), Err(Error::InstallRefused(_))));
 
     // Every public interface is visible to every agent. Keep adding agents that each offer many
     // until the kernel says no, then check that what it accepted still works.
     let wide = |agent: usize| Manifest {
-        provides: (0..64).map(|i| Provide { interface: format!("{}-{agent}-{i}", "x".repeat(100)), public: true, remote: false }).collect(),
+        provides: (0..64).map(|i| Provide { interface: format!("{}-{agent}-{i}", "x".repeat(100)), public: true, remote: false, asked: false }).collect(),
         uses: vec![],
     };
     let mut accepted = 0;
@@ -1228,7 +1228,7 @@ fn the_kernel_refuses_manifests_that_would_leave_the_ship_unroutable() {
     let dir = TempDir::new("registry-limit");
     let rt = boot(&dir, fast());
     let private = |agent: usize| Manifest {
-        provides: (0..64).map(|i| Provide { interface: format!("{}-{agent}-{i}", "x".repeat(100)), public: false, remote: false }).collect(),
+        provides: (0..64).map(|i| Provide { interface: format!("{}-{agent}-{i}", "x".repeat(100)), public: false, remote: false, asked: false }).collect(),
         uses: vec![],
     };
     let mut accepted = 0;
@@ -1260,7 +1260,7 @@ fn a_read_whose_answer_is_large_still_runs_only_once() {
     let dir = TempDir::new("read-once");
     let rt = boot_pair(&dir, fast(), nothing(), tally_manifest(false));
     let hash = rt.add_module(&wat::parse_str(slow).unwrap()).unwrap();
-    let public = Manifest { provides: vec![Provide { interface: "slow".into(), public: true, remote: false }], uses: vec![] };
+    let public = Manifest { provides: vec![Provide { interface: "slow".into(), public: true, remote: false, asked: false }], uses: vec![] };
     rt.install("~zod", "slow", &hash, &public).unwrap();
     drop(rt);
 
@@ -1287,7 +1287,7 @@ fn the_runtime_keeps_its_own_bounds_whatever_a_kernel_grants() {
     use ship_proto::{AdminReply, Grant, Message, ReadRequest, RouteReply, SendRequest};
     // The agent's command sends when its input is 1 and reads when it is 2, using requests
     // prepared here. This kernel grants both, so only the runtime's own checks stand in the way.
-    let send_request = SendRequest { agent: "../up".into(), interface: "x".into(), payload: b"p".to_vec(), ship: String::new() }.encode_to_vec();
+    let send_request = SendRequest { agent: "../up".into(), interface: "x".into(), payload: b"p".to_vec(), ship: String::new(), reply: false }.encode_to_vec();
     let read_request = ReadRequest { agent: "other".into(), interface: "x".into(), payload: vec![0; 100] }.encode_to_vec();
     // A log name one byte longer than the runtime allows.
     let long_name = "x".repeat(129);
@@ -1362,7 +1362,7 @@ fn small_limits_do_not_break_routing_or_the_ships_own_export() {
 fn a_full_ship_rejects_growth_and_stays_consistent() {
     // A small storage limit, so that a big write makes the database itself report "full" in the
     // middle of an event. This is the same path any storage error takes.
-    let cfg = Config { max_ship_bytes: 164 << 10, ..fast() };
+    let cfg = Config { max_ship_bytes: 172 << 10, ..fast() };
     let dir = TempDir::new("full");
     let rt = boot_pair(&dir, cfg.clone(), counter_manifest(false), tally_manifest(true));
     send(&rt, "~zod", "counter", "inc hits 3");
@@ -1429,7 +1429,7 @@ fn an_uncollected_reply_cannot_be_collected_after_another_read() {
     let hash = rt.add_module(&wat::parse_str(&source).unwrap()).unwrap();
     let reads_tally = Manifest {
         provides: vec![],
-        uses: vec![Use { agent: "tally".into(), interface: "tally".into(), read: true, send: false, ship: String::new() }],
+        uses: vec![Use { agent: "tally".into(), interface: "tally".into(), read: true, send: false, ship: String::new(), ask: false }],
     };
     rt.install("~zod", "picky", &hash, &reads_tally).unwrap();
     assert_eq!(rt.deliver("~zod", "picky", b"x").unwrap().reply, [1]);
@@ -1829,7 +1829,7 @@ fn the_kernel_decides_who_is_told_about_new_entries() {
     );
     let may_read = |allowed| Manifest {
         provides: vec![],
-        uses: if allowed { vec![Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false, ship: String::new() }] } else { vec![] },
+        uses: if allowed { vec![Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false, ship: String::new(), ask: false }] } else { vec![] },
     };
     for (label, still_allowed) in [("notify-allowed", true), ("notify-revoked", false)] {
         let dir = TempDir::new(label);
@@ -1983,7 +1983,7 @@ fn a_followers_place_moves_only_when_it_has_the_entries() {
     };
     let reads_counter = Manifest {
         provides: vec![],
-        uses: vec![Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false, ship: String::new() }],
+        uses: vec![Use { agent: "counter".into(), interface: "counter".into(), read: true, send: false, ship: String::new(), ask: false }],
     };
     let collect = "(drop (call $take (i32.const 4096) (i32.const 60000)))";
     for (label, then, expected) in [("place-uncollected", "", 0), ("place-collected", collect, 4)] {
@@ -2035,7 +2035,7 @@ fn a_followers_own_handler_cannot_pile_up_notifications() {
             append.len(),
         )
     };
-    let offers_e = Manifest { provides: vec![Provide { interface: "e".into(), public: false, remote: false }], uses: vec![] };
+    let offers_e = Manifest { provides: vec![Provide { interface: "e".into(), public: false, remote: false, asked: false }], uses: vec![] };
     for (label, when_prompted) in [("pile-refollow", "$refollow"), ("pile-append", "$again")] {
         let dir = TempDir::new(label);
         let rt = boot(&dir, Config { max_queued_per_deliver: 0, ..fast() });
@@ -2089,7 +2089,7 @@ fn checkpointing() -> Config {
 
 /// The counter agent offering both its state log and its journal, which is a history.
 fn counter_with_journal() -> Manifest {
-    let provide = |interface: &str| Provide { interface: interface.into(), public: false, remote: false };
+    let provide = |interface: &str| Provide { interface: interface.into(), public: false, remote: false, asked: false };
     Manifest { provides: vec![provide("counter"), provide("journal")], uses: vec![] }
 }
 
@@ -3006,7 +3006,7 @@ fn a_full_ship_lets_go_of_log_entries_a_checkpoint_covers() {
     // more than this ship's file has room for. Some of that is already covered by a checkpoint
     // and only kept for followers that are a little behind.
     let dir = TempDir::new("cp-storage");
-    let rt = boot(&dir, Config { max_ship_bytes: 236 << 10, ..fast() });
+    let rt = boot(&dir, Config { max_ship_bytes: 244 << 10, ..fast() });
     let mut refused = 0;
     for expected in 1..=40 {
         match rt.deliver("~zod", "counter", b"log-big 30000") {
@@ -3034,7 +3034,7 @@ fn a_full_ship_can_let_go_of_a_logs_only_entry() {
     // One big entry, covered by a checkpoint taken straight after it. A second entry would fit
     // in the log many times over, but not in what is left of this ship's file.
     let (dir, b, out) = (TempDir::new("cp-last"), TempDir::new("cp-last-b"), TempDir::new("cp-last-out"));
-    let cfg = Config { max_ship_bytes: 204 << 10, checkpoint_min_bytes: 0, ..fast() };
+    let cfg = Config { max_ship_bytes: 212 << 10, checkpoint_min_bytes: 0, ..fast() };
     let rt = boot(&dir, cfg.clone());
     assert_eq!(send(&rt, "~zod", "counter", "log-big 60000"), "1");
     let key = rt.public_key("~zod").unwrap();
@@ -4552,8 +4552,24 @@ fn a_ship_reads_only_so_many_requests_at_once() {
         slow.write_all(&request[1..]).await.unwrap();
         slow.finish().unwrap();
         let answer = slow_reply.read_to_end(4096).await.unwrap();
-        assert!(ship_proto::PeerReply::decode(&*answer).unwrap().body.is_some());
-        assert!(exchange(&connection, &request).await.is_some_and(|reply| reply.body.is_some()));
+        let pong = ship_proto::PeerReply::decode(&*answer).unwrap();
+        assert!(matches!(&pong.body, Some(ship_proto::peer_reply::Body::Pong(p)) if p.nonce == [1, 2, 3] && p.ship == "nec" && p.caller == "bus"), "{pong:?}");
+        // The room the first held is given back once the server sees the first reply taken,
+        // which can be a moment after it arrived here: within one deadline of five seconds for
+        // the whole of it (looked at after every answer, the one that ends it too), only the
+        // exact "too busy" refusal is asked again, and what ends it must be the same pong for the
+        // same ping. No answer, or any other, fails at once.
+        let room_back_by = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let reply = exchange(&connection, &request).await.expect("an answer");
+            assert!(tokio::time::Instant::now() < room_back_by, "past the deadline: {reply:?}");
+            if reply.body.is_some() {
+                assert_eq!(reply, pong);
+                break;
+            }
+            assert_eq!(reply.refused, "too busy; try again", "{reply:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     });
 
     // A request that arrives a byte at a time is the same request, and one that is too long
@@ -4753,14 +4769,14 @@ fn a_runtime_calls_only_so_many_ships_at_once() {
 
 /// The counter agent, with its interface open to commands from other ships.
 fn open_counter() -> Manifest {
-    Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true }], uses: vec![] }
+    Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true, asked: false }], uses: vec![] }
 }
 
 /// The tally agent, open to other ships, and allowed to send to the counter and tally agents
 /// on `ship`: one ship by name, or "*" for any.
 fn far_tally(ship: &str) -> Manifest {
-    let to = |agent: &str| Use { ship: ship.into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
-    Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true }], uses: vec![to("counter"), to("tally")] }
+    let to = |agent: &str| Use { ship: ship.into(), agent: agent.into(), interface: agent.into(), read: false, send: true, ask: false };
+    Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true, asked: false }], uses: vec![to("counter"), to("tally")] }
 }
 
 /// A network that tries again soon, for tests where ships come and go.
@@ -4864,6 +4880,7 @@ fn delivery(messages: &[(u64, &str, &str)]) -> Vec<u8> {
             interface: "counter".into(),
             payload: payload.as_bytes().to_vec(),
             receipt: None,
+            reply_most: 0,
         })
         .collect();
     ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Deliver(ship_proto::Deliver { messages })) }.encode_to_vec()
@@ -5272,7 +5289,7 @@ fn commands_in_hand_and_what_has_been_taken_go_with_a_ship_that_moves() {
     // A receipt waiting to go is about a command taken from that ship, says what became of
     // it, and names no agent. There is one for a command, and none for one still queued.
     let receipt_out = |seq: u64, payload: &str, source: &str, flag: u8| {
-        format!("INSERT INTO peer_out VALUES ('nec', {seq}, '{source}', '', '', x'{payload}', {flag}); UPDATE peers SET sent = {seq} WHERE peer = 'nec';")
+        format!("INSERT INTO peer_out (peer, seq, source, agent, interface, payload, receipt) VALUES ('nec', {seq}, '{source}', '', '', x'{payload}', {flag}); UPDATE peers SET sent = {seq} WHERE peer = 'nec';")
     };
     accepted("receipt-out", &receipt_out(6, "08011001", "", 1));
     refused("receipt-about", &receipt_out(6, "08091001", "", 1));
@@ -5282,7 +5299,7 @@ fn commands_in_hand_and_what_has_been_taken_go_with_a_ship_that_moves() {
     refused("receipt-flag", &receipt_out(6, "08011001", "", 2));
     refused("receipt-twice", &[receipt_out(6, "08011001", "", 1), receipt_out(7, "08011001", "", 1)].concat());
     refused("receipt-queued", &[receipt_out(6, "08011001", "", 1), queued("nec", 1, 1)].concat());
-    refused("receipt-awaited", &[receipt_out(6, "08011001", "", 1), "INSERT INTO peer_wait VALUES ('nec', 6, 'tally', 'counter', 'counter', 1);".to_string()].concat());
+    refused("receipt-awaited", &[receipt_out(6, "08011001", "", 1), "INSERT INTO peer_wait (peer, seq, source, agent, interface, tell) VALUES ('nec', 6, 'tally', 'counter', 'counter', 1);".to_string()].concat());
     // A verdict this runtime has no name for is not one it would have given.
     refused("receipt-strange", &receipt_out(6, "0801104d", "", 1));
     // A receipt has a size limit of its own, apart from the one on what agents send.
@@ -5336,8 +5353,8 @@ fn every_command_sent_to_another_ship_is_answered_once() {
     let directory = Directory::new();
     // ~zod's tally agent may send to three agents on other ships. ~nec has the first open to
     // other ships, the second closed, and no third.
-    let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
-    let sender = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: false }], uses: vec![to("counter"), to("tally"), to("ghost")] };
+    let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true, ask: false };
+    let sender = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: false, asked: false }], uses: vec![to("counter"), to("tally"), to("ghost")] };
     let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), sender);
     let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), tally_manifest(true));
 
@@ -5391,8 +5408,8 @@ fn an_agent_with_no_receipt_handler_is_not_run_for_one() {
     let directory = Directory::new();
     // The counter agent has no receipt handler. Here it may send to counters on other ships.
     let passing = Manifest {
-        provides: vec![Provide { interface: "counter".into(), public: false, remote: true }],
-        uses: vec![Use { ship: "*".into(), agent: "counter".into(), interface: "counter".into(), read: false, send: true }],
+        provides: vec![Provide { interface: "counter".into(), public: false, remote: true, asked: false }],
+        uses: vec![Use { ship: "*".into(), agent: "counter".into(), interface: "counter".into(), read: false, send: true, ask: false }],
     };
     let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), passing, far_tally("*"));
     let (nec, _nec_net) = crewed(&b, "~nec", &directory, fast(), open_counter(), far_tally("*"));
@@ -5801,8 +5818,8 @@ fn a_ship_with_small_events_that_has_had_receipts_can_still_move() {
     // ~zod takes no event of more than thirty bytes. A receipt is the runtime's own record
     // and may be larger than that, and so may what the audit log says about it.
     let small = Config { max_event_bytes: 30, max_checkpoint_bytes: 30, max_unanswered: 64, ..fast() };
-    let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
-    let sender = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: false }], uses: vec![to("ghost")] };
+    let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true, ask: false };
+    let sender = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: false, asked: false }], uses: vec![to("ghost")] };
     let rt = Arc::new(Runtime::open(&a.0, small.clone()).unwrap());
     let tally = rt.add_module(&wasm("tally")).unwrap();
     rt.create_ship("~zod", &kernel(&rt)).unwrap();
@@ -5855,7 +5872,7 @@ fn a_ship_whose_file_is_nearly_full_takes_no_commands_until_it_has_room() {
     let (a, b) = (TempDir::new("cmd-full-a"), TempDir::new("cmd-full-b"));
     let directory = Directory::new();
     let (zod, _zod_net) = crewed(&a, "~zod", &directory, fast(), open_counter(), far_tally("*"));
-    let provide = |interface: &str, remote: bool| Provide { interface: interface.into(), public: false, remote };
+    let provide = |interface: &str, remote: bool| Provide { interface: interface.into(), public: false, remote, asked: false };
     let counter = Manifest { provides: vec![provide("counter", true), provide("journal", false)], uses: vec![] };
     let (nec, _nec_net) = crewed(&b, "~nec", &directory, Config { max_ship_bytes: 400 << 10, ..fast() }, counter, far_tally("*"));
 
@@ -5903,8 +5920,8 @@ fn a_batch_is_sized_by_what_is_sent_names_and_all() {
     // ~zod's tally agent may send to an agent with as long a name as a name may be.
     let long = "a".repeat(64);
     let sender = Manifest {
-        provides: vec![Provide { interface: "tally".into(), public: false, remote: false }],
-        uses: vec![Use { ship: "*".into(), agent: long.clone(), interface: long.clone(), read: false, send: true }],
+        provides: vec![Provide { interface: "tally".into(), public: false, remote: false, asked: false }],
+        uses: vec![Use { ship: "*".into(), agent: long.clone(), interface: long.clone(), read: false, send: true, ask: false }],
     };
     let (zod, _zod_net) = crewed_on(&a, "~zod", &directory, small.clone(), net.clone(), open_counter(), sender);
 
@@ -5925,7 +5942,7 @@ fn a_batch_is_sized_by_what_is_sent_names_and_all() {
 fn receipts_that_do_not_all_fit_are_taken_as_far_as_they_do() {
     let (a, b) = (TempDir::new("receipt-part-a"), TempDir::new("receipt-part-b"));
     let directory = Directory::new();
-    let provide = |interface: &str, remote: bool| Provide { interface: interface.into(), public: false, remote };
+    let provide = |interface: &str, remote: bool| Provide { interface: interface.into(), public: false, remote, asked: false };
     let counter = Manifest { provides: vec![provide("counter", true), provide("journal", false)], uses: vec![] };
     let (zod, _zod_net) = crewed(&a, "~zod", &directory, Config { max_ship_bytes: 600 << 10, ..fast() }, counter, far_tally("*"));
     let patient = Config { max_queued_per_deliver: 0, ..fast() };
@@ -5961,7 +5978,7 @@ fn two_ships_that_have_filled_up_with_commands_for_each_other_still_get_through(
     let directory = Directory::new();
     // Two ships with small files. Each sends the other as much as it is let, while the
     // other is not there to take any of it.
-    let small = Config { max_ship_bytes: 340 << 10, ..fast() };
+    let small = Config { max_ship_bytes: 348 << 10, ..fast() };
     let padding = "p".repeat(2000);
     let fill = |rt: &Runtime, ship: &str, other: &str| {
         let command = format!("tell {other} inc hits 1 {padding}");
@@ -6029,9 +6046,9 @@ use ship_proto::peer_request::Body as Asked;
 /// The tally agent, open to other ships, allowed to follow the counter's log on `ship` and to
 /// send to the counter and tally agents there: one ship by name, or "*" for any.
 fn following_tally(ship: &str) -> Manifest {
-    let counter = Use { ship: ship.into(), agent: "counter".into(), interface: "counter".into(), read: true, send: true };
-    let tally = Use { ship: ship.into(), agent: "tally".into(), interface: "tally".into(), read: false, send: true };
-    Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true }], uses: vec![counter, tally] }
+    let counter = Use { ship: ship.into(), agent: "counter".into(), interface: "counter".into(), read: true, send: true, ask: false };
+    let tally = Use { ship: ship.into(), agent: "tally".into(), interface: "tally".into(), read: false, send: true, ask: false };
+    Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true, asked: false }], uses: vec![counter, tally] }
 }
 
 /// How many entries of the counter's log on `publisher` the tally agent on `ship` has taken.
@@ -7914,7 +7931,7 @@ fn what_arrives_on_a_connection_that_has_been_replaced_is_not_acted_on() {
     // gets to either, ~bus connects again. A ship that has come back as an earlier copy of
     // itself does exactly that, and what it said on the old connection it said as it was.
     let addr = zod_net.addr();
-    let command = ship_proto::PeerMessage { seq: 1, from_agent: "tally".into(), agent: "counter".into(), interface: "counter".into(), payload: b"inc hits".to_vec(), receipt: None };
+    let command = ship_proto::PeerMessage { seq: 1, from_agent: "tally".into(), agent: "counter".into(), interface: "counter".into(), payload: b"inc hits".to_vec(), receipt: None, reply_most: 0 };
     let delivery = PeerRequest { body: Some(Body::Deliver(Deliver { messages: vec![command.clone()] })) }.encode_to_vec();
     let account = PeerRequest { body: Some(Body::Resync(Resync { standing: Some(stands(8, 5, 9, &[])) })) }.encode_to_vec();
     let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();

@@ -2,6 +2,7 @@
 //! what may run, and the WASM agents installed on it. A ship handles one event at a time, and
 //! each event is one transaction.
 
+mod ask;
 pub mod files;
 mod host;
 mod kept;
@@ -44,12 +45,122 @@ pub use urbit_id;
 use urbit_id::{Keyfile, NetworkKeys, Wallet};
 pub use store::RemoteFollow;
 pub use files::{FileError, FileInfo, FilesKept, PreparedChunk, UploadState};
+pub use ask::AskError;
 
 use host::Ctx;
 use ship::Ship;
 
 /// How often the watchdog advances the clock that event deadlines are measured against.
 pub(crate) const EPOCH_TICK_MILLIS: u64 = 10;
+
+/// The watchdog behind every time limit on WASM (events, reads, questions): every
+/// `EPOCH_TICK_MILLIS` it sleeps, it moves the engine's epoch on by one, until `stop`. The
+/// epoch is not the measure of time, only a prompt to look at it: a call's running code, when
+/// it next looks after a tick, compares the real clock with its own deadline
+/// (`ship::invoke_here`), carrying on until a later tick if there is time left. Several ticks
+/// can pass before running code looks. So a late or stalled watchdog can only make a call stop
+/// late, never early.
+///
+/// A call is never stopped for time before its deadline. After its deadline it is stopped at
+/// the first point where the running code looks (a loop turn, a function entry, a bulk memory
+/// step) and finds both that the watchdog has ticked since the call was last allowed on and
+/// that the deadline has passed. The watchdog ticks about every 10 ms; the system can run it,
+/// and the call's own thread, late; and after a look that came just before the deadline the
+/// call can run on until a later tick; so no number is promised for the overrun. A host call
+/// under way is not cut short. Whatever a call returns after its deadline is not kept.
+fn watch_the_clock(engine: &Engine, stop: &AtomicBool, #[cfg(test)] watching: &Watching) {
+    let tick = Duration::from_millis(EPOCH_TICK_MILLIS);
+    while !stop.load(Ordering::SeqCst) {
+        #[cfg(test)]
+        std::thread::sleep(Duration::from_millis(watching.lag.load(Ordering::Relaxed)));
+        std::thread::sleep(tick);
+        #[cfg(test)]
+        if watching.paused.load(Ordering::SeqCst) {
+            continue;
+        }
+        engine.increment_epoch();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For tests: what the ship this thread wakes is woken for (`Inner::ship_wakes`).
+    pub(crate) static WAKE_CAUSE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("an ordinary call") };
+}
+
+/// For tests: run `f` with `cause` as what a ship woken by it is woken for. The cause before
+/// is put back however `f` ends, a panic included.
+#[cfg(test)]
+fn woken_for<R>(cause: &'static str, f: impl FnOnce() -> R) -> R {
+    struct Restore(&'static str);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAKE_CAUSE.with(|held| held.set(self.0));
+        }
+    }
+    let _restore = Restore(WAKE_CAUSE.with(|held| held.replace(cause)));
+    f()
+}
+
+/// For tests: points in the code where a test can be told that the code has got there, and can
+/// hold it there until the test lets it go (dropping the sender lets it go too). Each is armed
+/// for one pass. `pass` blocks the thread; `pass_async` waits as a future, so that a task held
+/// there can be dropped meanwhile.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Gates {
+    held: Mutex<HashMap<&'static str, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    held_async: Mutex<HashMap<&'static str, (std::sync::mpsc::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
+}
+
+#[cfg(test)]
+impl Gates {
+    /// Arm `name`: the next pass says so on the first channel, and waits for the second.
+    pub(crate) fn arm(&self, name: &'static str) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, told) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        lock(&self.held).insert(name, (entered, held));
+        (told, release)
+    }
+
+    pub(crate) fn arm_async(&self, name: &'static str) -> (std::sync::mpsc::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (entered, told) = std::sync::mpsc::channel();
+        let (release, held) = tokio::sync::oneshot::channel();
+        lock(&self.held_async).insert(name, (entered, held));
+        (told, release)
+    }
+
+    pub(crate) fn pass(&self, name: &'static str) {
+        let armed = lock(&self.held).remove(name);
+        if let Some((entered, held)) = armed {
+            let _ = entered.send(());
+            let _ = held.recv();
+        }
+    }
+
+    pub(crate) async fn pass_async(&self, name: &'static str) {
+        let armed = lock(&self.held_async).remove(name);
+        if let Some((entered, held)) = armed {
+            let _ = entered.send(());
+            let _ = held.await;
+        }
+    }
+
+}
+
+/// For tests: what happened when, kept only while a test has switched recording on
+/// (`Inner::recording`): (what, of what, when, when in milliseconds since 1970).
+#[cfg(test)]
+pub(crate) type Note = (&'static str, String, Instant, u64);
+
+/// For tests: how the watchdog is made late (milliseconds more each sleep, as a system that
+/// wakes sleepers late does), or held still.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Watching {
+    pub(crate) lag: AtomicU64,
+    pub(crate) paused: AtomicBool,
+}
 
 /// Native stack each WASM instance may use.
 pub(crate) const WASM_STACK_BYTES: usize = 512 << 10;
@@ -76,7 +187,9 @@ pub struct Config {
     pub fuel_per_event: u64,
     /// Compute budget for each decision the kernel makes, separate from the agent's.
     pub kernel_fuel: u64,
-    /// Wall-clock cap on one event. Fuel cannot see how large a bulk memory operation is.
+    /// Wall-clock deadline for one event (see `watch_the_clock` for how it is kept: never
+    /// before it, no number promised past it). Fuel cannot see how large a bulk memory operation
+    /// is.
     pub max_event_millis: u64,
     pub max_memory_bytes: usize,
     /// How large a ship's file may grow. A write that would pass it is rejected, like any other
@@ -181,8 +294,30 @@ pub struct Config {
     /// (`KIND_FILE_ASK`), apart from the event budget: the question is asked while the ship
     /// is held, on behalf of a ship that may be a stranger.
     pub file_ask_fuel: u64,
-    /// Wall-clock cap on that question, the kernel's decision included.
+    /// Wall-clock deadline for that question, the kernel's decision included, kept as any is
+    /// (`watch_the_clock`).
     pub file_ask_millis: u64,
+    /// Compute budget for answering one question from another ship (an ask), apart from the
+    /// event budget: the agent's read handler answers it while the ship is held.
+    pub ask_fuel: u64,
+    /// Wall-clock deadline for answering one question from another ship, counted from one
+    /// reading of the clock when the question arrived, so waiting for the ship and the kernel's
+    /// decision are included; kept as any is (`watch_the_clock`). The asker's own time, if
+    /// shorter, is the deadline instead.
+    pub ask_millis: u64,
+    /// The largest question (its payload) a ship asks or answers.
+    pub max_ask_bytes: usize,
+    /// The largest answer (the read handler's reply) a ship gives or takes.
+    pub max_answer_bytes: usize,
+    /// The longest time a question may be given to be answered, by `Runtime::ask` or by an
+    /// agent's `ask_to`.
+    pub max_ask_millis: u64,
+    /// Questions one ship's agents may have waiting at once, counting those whose answers are
+    /// queued and not yet handed over. An `ask_to` past it is refused, and its event with it.
+    pub max_asks_waiting: usize,
+    /// The largest handler's reply a receipt carries, for a command sent with its reply wanted.
+    /// A larger one means the command does not stand: it is undone, and the receipt says LIMIT.
+    pub max_receipt_reply_bytes: usize,
     pub durability: Durability,
     pub limits: Limits,
     /// The key everything this runtime keeps on disk for its ships is encrypted under: each
@@ -280,6 +415,15 @@ impl Default for Config {
             save_slice_millis: 10_000,
             file_ask_fuel: 10_000_000,
             file_ask_millis: 500,
+            // The same as the event budget: a question is answered by the agent's read handler,
+            // which an owner's own read gives that much.
+            ask_fuel: 100_000_000,
+            ask_millis: 2_000,
+            max_ask_bytes: 64 << 10,
+            max_answer_bytes: 256 << 10,
+            max_ask_millis: 60_000,
+            max_asks_waiting: 256,
+            max_receipt_reply_bytes: 16 << 10,
             durability: Durability::Full,
             limits: Limits {
                 max_key_bytes: 1024,
@@ -449,6 +593,10 @@ pub(crate) struct AgentModule {
 struct Slot {
     ship: Option<Ship>,
     last_used: Instant,
+    /// The ship was woken for a question, which runs none of the ship's upkeep: the first look
+    /// through its files directory (and the batch of removals with it) is owed to the next
+    /// ordinary call.
+    look_owed: bool,
 }
 
 type SlotRef = Arc<Mutex<Slot>>;
@@ -479,7 +627,11 @@ pub(crate) struct Inner {
     /// which is let go while the files are read. Nothing else is locked while this is held.
     exporting: Mutex<HashSet<String>>,
     exporting_done: Condvar,
-    modules: Mutex<HashMap<String, Arc<AgentModule>>>,
+    /// Compiled modules, and which are being compiled now (see `Modules`). Nothing is compiled,
+    /// and no blob read or written, while this is held.
+    modules: Mutex<Modules>,
+    /// Told whenever a module stops being compiled, for a caller waiting for that compile.
+    module_loaded: Condvar,
     slots: Mutex<HashMap<String, SlotRef>>,
     /// Ships that are open or being opened. Its size never exceeds `max_awake`.
     ///
@@ -521,6 +673,97 @@ pub(crate) struct Inner {
     /// Per ship, until when it asks no agent about a file (see `files::resting`). In memory
     /// only; one entry per ship of this runtime at most. Taken under a ship's slot.
     pub(crate) ask_rest: Mutex<HashMap<String, Instant>>,
+    /// Until when each ship rests from questions from other ships, from all and from each
+    /// (see `ask::AskRests`). In memory only. Taken under a ship's slot.
+    pub(crate) ask_rests: Mutex<ask::AskRests>,
+    /// Set by the network while it runs: put a question to another ship and wait for the
+    /// answer, for `Runtime::ask`.
+    ask_hook: std::sync::RwLock<Option<AskHook>>,
+    /// For tests: each question answered here, when it ended and how long it held the ship.
+    #[cfg(test)]
+    pub(crate) answered: Mutex<Vec<(Instant, Duration, String)>>,
+    /// Whether a module is being compiled off a question's path now (`Runtime::compile_cold`).
+    pub(crate) compiling: AtomicBool,
+    /// For tests: how many compiles have begun; a pause the next compile takes once begun
+    /// (it says so, then waits to be let go); and how many compiles to make panic.
+    #[cfg(test)]
+    pub(crate) compiles: AtomicU64,
+    #[cfg(test)]
+    pub(crate) compile_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    pub(crate) compile_panics: AtomicU64,
+    /// For tests: how long waking a ship for a question takes besides opening it.
+    #[cfg(test)]
+    pub(crate) question_wake_delay: Mutex<Option<Duration>>,
+    /// For tests: how many writes of what came of a question to make fail.
+    #[cfg(test)]
+    pub(crate) answer_write_failures: AtomicU64,
+    /// For tests: how many tries a question's tasks have sent on the wire; and how many times
+    /// one has read its question and gone on to put it (done with its ship until what came of it
+    /// is written).
+    #[cfg(test)]
+    pub(crate) question_tries: AtomicU64,
+    #[cfg(test)]
+    pub(crate) question_puts: AtomicU64,
+    /// For tests: how long the next event that commits keeps its ship after committing; and
+    /// where to say that the next event has begun (with its ship in hand).
+    #[cfg(test)]
+    pub(crate) hold_after_commit: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    pub(crate) event_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// For tests, records kept as things happen: each ship woken from sleep (when, by the clock
+    /// and in milliseconds since 1970, which ship, and what woke it: see `WAKE_CAUSE`); each
+    /// answer to a question written (when, likewise, which ship, its number); each call stopped
+    /// for time (its agent, the deadline it was given, when it was stopped); how many questions
+    /// have begun waking their ship; and where to say that a call of a given agent has had its
+    /// deadline set.
+    #[cfg(test)]
+    pub(crate) ship_wakes: Mutex<Vec<(Instant, u64, String, &'static str)>>,
+    /// For tests: whether the histories above and `notes` are kept (off unless a test turns it
+    /// on); the gates; the notes; how many questions have been written to a stream (counted
+    /// just before the write); how many kernel decisions have been begun for questions; and
+    /// ships whose inspection at network start is made to fail, how many more times.
+    #[cfg(test)]
+    pub(crate) recording: AtomicBool,
+    #[cfg(test)]
+    pub(crate) gates: Gates,
+    #[cfg(test)]
+    pub(crate) notes: Mutex<Vec<Note>>,
+    /// For tests: how many times a question's write was entered (counted just before it is
+    /// begun, not when the connection takes its bytes), so an unchanged count means none began.
+    #[cfg(test)]
+    pub(crate) ask_writes: AtomicU64,
+    #[cfg(test)]
+    pub(crate) decisions_begun: AtomicU64,
+    #[cfg(test)]
+    pub(crate) inspection_faults: Mutex<HashMap<String, u32>>,
+    /// For tests: names in the ships' directory whose entries the listing reports as errors,
+    /// every time.
+    #[cfg(test)]
+    pub(crate) listing_faults: Mutex<HashSet<String>>,
+    #[cfg(test)]
+    pub(crate) answers_written: Mutex<Vec<(Instant, u64, String, u64)>>,
+    #[cfg(test)]
+    pub(crate) time_stops: Mutex<Vec<(String, Instant, Instant)>>,
+    #[cfg(test)]
+    pub(crate) question_wakes: AtomicU64,
+    #[cfg(test)]
+    pub(crate) deadline_set_for: Mutex<Option<(String, std::sync::mpsc::Sender<()>)>>,
+    /// For tests: the compute each question answered took, as (the kernel's first decision,
+    /// all of it).
+    #[cfg(test)]
+    pub(crate) question_fuel: Mutex<Vec<(u64, u64)>>,
+    /// For tests: what each kernel decision, and each nested read's handler, took while
+    /// answering questions, in the order they ran.
+    #[cfg(test)]
+    pub(crate) question_parts: Mutex<Vec<u64>>,
+    /// For tests: run commands from other ships as a runtime from before replies does, sending
+    /// no reply whatever the command asked.
+    #[cfg(test)]
+    pub(crate) replies_unknown: AtomicBool,
+    /// For tests: the watchdog made late, or held still.
+    #[cfg(test)]
+    pub(crate) watching: Arc<Watching>,
     /// One record per kept file's directory this runtime has kept into: whether it was looked
     /// through, its strays, its copies on their way, and whether it is retired (`kept::KeptDirs`).
     /// In memory only. Taken under a ship's slot or alone; nothing else is locked while it is held.
@@ -555,6 +798,10 @@ pub(crate) struct Inner {
     pub(crate) event_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
+/// How often a question waiting for its ship looks again whether it can have it, whether its
+/// time has run out, and whether its asker has given up.
+const QUESTION_LOOK: Duration = Duration::from_millis(5);
+
 /// What came of another ship's word on how much of a delivery it holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Acked {
@@ -567,13 +814,87 @@ pub(crate) enum Acked {
 }
 
 /// What a look through every ship's file finds: the ships with something to be done, each
-/// (ship, other ship) where the first follows logs on the second, and each where the first
-/// has commands the second has yet to answer.
-pub(crate) type WorkFound = (Vec<String>, Vec<(String, String)>, Vec<(String, String)>);
+/// (ship, other ship) where the first follows logs on the second, each where the first
+/// has commands the second has yet to answer, and the ships with questions waiting.
+pub(crate) type WorkFound = (Vec<String>, Vec<(String, String)>, Vec<(String, String)>, Vec<String>);
 
-/// Called with a ship's name when it has something waiting to go to other ships. The second
-/// argument says the ship may also have events queued that nothing is about to run.
-type OutboundHook = Arc<dyn Fn(&str, bool) + Send + Sync>;
+/// What one look through the ships' files came to (`Runtime::ships_with_work`).
+pub(crate) struct Scan {
+    /// What the ships looked at have to be done.
+    pub found: WorkFound,
+    /// The ships looked at.
+    pub inspected: Vec<String>,
+    /// The ships that could not be looked at, to be looked at again.
+    pub failed: Vec<String>,
+    /// Some entry of the ships' directory could not be read: it is to be listed again.
+    pub list_again: bool,
+}
+
+/// What came of waking a ship.
+enum Woken {
+    Failed(Error),
+    /// For a question: its kernel is not compiled (this is its hash).
+    Cold(String),
+    /// For a question: the cache of compiled modules was held by another caller just then.
+    Busy,
+}
+
+/// The compiled modules of a runtime, and which are being compiled now. One module is compiled
+/// by one caller at a time, whoever asks (an ordinary call, `add_module`, or a compile off a
+/// question's path): the others wait for it (ordinary callers) or go without (questions, and
+/// the compile off their path). A blob read and verified that fails to compile is remembered
+/// with why, and not compiled again by an ordinary call or a question for the runtime's life
+/// (an explicit `add_module` of those bytes tries again); the cache is never emptied.
+#[derive(Default)]
+struct Modules {
+    compiled: HashMap<String, Arc<AgentModule>>,
+    loading: HashSet<String>,
+    failed: HashMap<String, String>,
+}
+
+/// One caller's mark that it is compiling a module. However the caller ends (a result, an
+/// error, or a panic), the mark goes and everyone waiting is told.
+struct Loading<'a> {
+    inner: &'a Inner,
+    hash: String,
+}
+
+impl Loading<'_> {
+    fn done(self, module: Arc<AgentModule>) {
+        lock(&self.inner.modules).compiled.entry(self.hash.clone()).or_insert(module);
+    }
+
+    fn failed(self, why: &str) {
+        lock(&self.inner.modules).failed.insert(self.hash.clone(), why.to_string());
+    }
+}
+
+impl Drop for Loading<'_> {
+    fn drop(&mut self) {
+        lock(&self.inner.modules).loading.remove(&self.hash);
+        self.inner.module_loaded.notify_all();
+    }
+}
+
+/// Called with a ship's name when it has something for the network: see `Ready`.
+type OutboundHook = Arc<dyn Fn(&str, Ready) + Send + Sync>;
+
+/// What a ship has for the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ready {
+    /// Something waiting to go to other ships.
+    Outbound,
+    /// That, and maybe events queued that nothing is about to run.
+    Work,
+    /// New questions to put to other ships.
+    Asks,
+    /// The question with this number, on this copy of the ship, was dropped (and the drop has
+    /// committed).
+    Dropped([u8; 16], u64),
+}
+
+/// Put a question to another ship, and wait for its answer. The network sets it.
+pub(crate) type AskHook = Arc<dyn Fn(ask::Question) -> Result<Vec<u8>, AskError> + Send + Sync>;
 
 /// Ask, from the first ship (one here), the second for something about a file, and wait for its
 /// reply. The network sets it.
@@ -1175,6 +1496,11 @@ impl Runtime {
         sync_dir(data_dir)?;
         files::seams::synced(&data_dir.join("files"));
         cfg.max_awake = cfg.max_awake.max(1);
+        // Held to what any ship's file, an export of it and the wire can carry; import checks
+        // what was kept under earlier settings against these same ceilings.
+        cfg.max_receipt_reply_bytes = cfg.max_receipt_reply_bytes.min(store::MOST_RECEIPT_REPLY_BYTES);
+        cfg.max_ask_bytes = cfg.max_ask_bytes.min(store::MOST_ASK_BYTES);
+        cfg.max_answer_bytes = cfg.max_answer_bytes.min(store::MOST_ANSWER_BYTES);
         let dir_lock = lock_data_dir(data_dir)?;
         // Taken out of the configuration, which is kept and can be read back and printed.
         let check = data_dir.join("storage.check");
@@ -1199,13 +1525,19 @@ impl Runtime {
         let linker = host::linker(&engine).map_err(|e| Error::BadModule(format!("{e:#}")))?;
 
         let stop = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let watching = Arc::new(Watching::default());
         let watchdog = {
             let (engine, stop) = (engine.clone(), stop.clone());
+            #[cfg(test)]
+            let watched = watching.clone();
             std::thread::spawn(move || {
-                while !stop.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(EPOCH_TICK_MILLIS));
-                    engine.increment_epoch();
-                }
+                watch_the_clock(
+                    &engine,
+                    &stop,
+                    #[cfg(test)]
+                    &watched,
+                )
             })
         };
 
@@ -1228,7 +1560,8 @@ impl Runtime {
                 naming_done: Condvar::new(),
                 exporting: Mutex::new(HashSet::new()),
                 exporting_done: Condvar::new(),
-                modules: Mutex::new(HashMap::new()),
+                modules: Mutex::new(Modules::default()),
+                module_loaded: Condvar::new(),
                 slots: Mutex::new(HashMap::new()),
                 awake: Mutex::new(HashMap::new()),
                 lifecycle: Mutex::new(()),
@@ -1242,6 +1575,61 @@ impl Runtime {
                 file_answers: Mutex::new(files::Answers::default()),
                 file_hook: std::sync::RwLock::new(None),
                 ask_rest: Mutex::new(HashMap::new()),
+                ask_rests: Mutex::new(ask::AskRests::default()),
+                ask_hook: std::sync::RwLock::new(None),
+                #[cfg(test)]
+                answered: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                replies_unknown: AtomicBool::new(false),
+                compiling: AtomicBool::new(false),
+                #[cfg(test)]
+                compiles: AtomicU64::new(0),
+                #[cfg(test)]
+                compile_gate: Mutex::new(None),
+                #[cfg(test)]
+                compile_panics: AtomicU64::new(0),
+                #[cfg(test)]
+                question_wake_delay: Mutex::new(None),
+                #[cfg(test)]
+                answer_write_failures: AtomicU64::new(0),
+                #[cfg(test)]
+                question_tries: AtomicU64::new(0),
+                #[cfg(test)]
+                question_puts: AtomicU64::new(0),
+                #[cfg(test)]
+                hold_after_commit: Mutex::new(None),
+                #[cfg(test)]
+                event_started: Mutex::new(None),
+                #[cfg(test)]
+                ship_wakes: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                recording: AtomicBool::new(false),
+                #[cfg(test)]
+                gates: Gates::default(),
+                #[cfg(test)]
+                notes: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                ask_writes: AtomicU64::new(0),
+                #[cfg(test)]
+                decisions_begun: AtomicU64::new(0),
+                #[cfg(test)]
+                inspection_faults: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                listing_faults: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                answers_written: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                time_stops: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                question_wakes: AtomicU64::new(0),
+                #[cfg(test)]
+                deadline_set_for: Mutex::new(None),
+                #[cfg(test)]
+                watching,
+                #[cfg(test)]
+                question_fuel: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                question_parts: Mutex::new(Vec::new()),
                 kept_dirs: Mutex::new(kept::KeptDirs::default()),
                 keeping_after: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
@@ -1265,17 +1653,20 @@ impl Runtime {
     }
 
     /// Store a module by content hash and compile it. Ships that install it share the compiled code.
+    ///
+    /// Compiled and stored with the cache let go, under the module's own loading mark, so that
+    /// another call's module, and every question, is not held up meanwhile; a call for the same
+    /// module waits for this one instead of compiling it again.
     pub fn add_module(&self, wasm: &[u8]) -> Result<String, Error> {
         if wasm.len() > self.inner.cfg.max_module_bytes {
             return Err(Error::BadModule("module is larger than this runtime allows".into()));
         }
         let hash = sha256_hex(wasm);
-        let mut modules = lock(&self.inner.modules);
-        if !modules.contains_key(&hash) {
-            let compiled = self.inner.compile(wasm)?;
-            self.inner.store_blob(&hash, wasm)?;
-            modules.insert(hash.clone(), Arc::new(compiled));
-        }
+        let inner = &self.inner;
+        let Some(loading) = inner.claim(&hash, true)? else { return Ok(hash) };
+        let compiled = inner.compile(wasm)?;
+        inner.store_blob(&hash, wasm)?;
+        loading.done(Arc::new(compiled));
         Ok(hash)
     }
 
@@ -1429,6 +1820,11 @@ impl Runtime {
             // checkpoint request on its account, which is what lets a full log recover.
             // Whatever is left runs on a later call.
             if matches!(outcome, Ok(_) | Err(Error::Rejected(_))) {
+                // With no network to put them, questions waiting are answered as unreachable,
+                // so that their answers run with the rest.
+                if !self.inner.networked.load(Ordering::SeqCst) {
+                    let _ = ship.asks_unreachable(&self.inner);
+                }
                 for _ in 0..cfg.max_queued_per_deliver {
                     if !matches!(ship.run_queued(&self.inner), Ok(true)) {
                         break;
@@ -1467,15 +1863,178 @@ impl Runtime {
         })
     }
 
-    /// Run up to `max` queued commands. Returns how many ran.
+    /// Run up to `max` queued commands. Returns how many ran. With no network running,
+    /// questions waiting are first answered as unreachable, as `deliver` does.
     pub fn run_pending(&self, ship: &str, max: usize) -> Result<usize, Error> {
         self.inner.with_ship(ship, |ship| {
+            if !self.inner.networked.load(Ordering::SeqCst) {
+                ship.asks_unreachable(&self.inner)?;
+            }
             let mut ran = 0;
             while ran < max && ship.run_queued(&self.inner)? {
                 ran += 1;
             }
             Ok(ran)
         })
+    }
+
+    /// From `from`, one of this runtime's ships, put a question to `agent`'s `interface` on the
+    /// ship `to`, and wait for the answer: what that agent's read handler says, or why there is
+    /// none. `from_agent` names the agent on `from` that asks; `None` is the ship's owner. It
+    /// needs the network, and only reads: the other ship stores no application data of it (see
+    /// the README for SQLite's own housekeeping of the file), and the agent there is told which
+    /// ship (and agent) asks, and decides what to say.
+    ///
+    /// `within` is how long to wait, at most `max_ask_millis`; `request_timeout` does not
+    /// apply. Within it, a connection that fails or goes silent is made again, and a ship that
+    /// says it is too busy asked again, since asking twice is harmless; any answer from the
+    /// other ship ends it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ask(&self, from: &str, from_agent: Option<&str>, to: &str, agent: &str, interface: &str, payload: &[u8], within: Duration) -> Result<Vec<u8>, AskError> {
+        // The one deadline, taken first, so that nothing done here (looking for the asking
+        // ship's file, copying the payload) adds to the time.
+        let deadline = Instant::now().checked_add(within).ok_or(AskError::BadWithin)?;
+        #[cfg(test)]
+        self.inner.note_at("ask deadline", from, deadline);
+        let cfg = &self.inner.cfg;
+        let (Ok(from), Ok(to)) = (canonical_ship(from), canonical_ship(to)) else { return Err(AskError::BadName) };
+        let from_agent = from_agent.unwrap_or("");
+        let named = (from_agent.is_empty() || check_agent_name(from_agent).is_ok()) && check_target(agent, interface).is_ok();
+        if from == to || !named || !self.inner.ship_path(&from).exists() {
+            return Err(AskError::BadName);
+        }
+        if within.is_zero() || within > Duration::from_millis(cfg.max_ask_millis) {
+            return Err(AskError::BadWithin);
+        }
+        if payload.len() > cfg.max_ask_bytes {
+            return Err(AskError::TooLarge);
+        }
+        let hook = self.inner.ask_hook.read().unwrap_or_else(PoisonError::into_inner).clone();
+        let Some(hook) = hook else { return Err(AskError::NoNetwork) };
+        let question = ask::Question { from, from_agent: from_agent.to_string(), to, agent: agent.to_string(), interface: interface.to_string(), payload: payload.to_vec(), deadline };
+        #[cfg(test)]
+        self.inner.gates.pass("ask hook");
+        hook(question)
+    }
+
+    /// Have `hook` used to put questions to other ships, or with `None` stop that.
+    pub(crate) fn set_ask_hook(&self, hook: Option<AskHook>) {
+        *self.inner.ask_hook.write().unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// Answer a question `peer` puts to an agent on `ship` (see `Ship::answer_ask`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn answer_ask(
+        &self,
+        ship: &str,
+        peer: &str,
+        from_agent: &str,
+        agent: &str,
+        interface: &str,
+        payload: &[u8],
+        deadline: Instant,
+        max_reply: usize,
+        given_up: &AtomicBool,
+    ) -> Result<ask::Asked, Error> {
+        let peer = canonical_ship(peer)?;
+        self.inner.with_ship_question(ship, &peer, deadline, given_up, |ship| ship.answer_ask(&self.inner, &peer, from_agent, agent, interface, payload, deadline, max_reply))
+    }
+
+    /// Compile a module a question met not compiled (`ship::ColdModule`), off the question's
+    /// path: at most one such compile at a time in the runtime (another asked for meanwhile is
+    /// not done, and is asked for again by the next question that meets it), and only if no
+    /// one has compiled it, is compiling it, or has found it fails to compile (see `Modules`).
+    /// The cache of compiled modules is never emptied, so each module is compiled at most once
+    /// in a runtime's life by whichever caller comes first (an explicit `add_module` of a module
+    /// remembered as failing aside).
+    pub(crate) fn compile_cold(&self, hash: &str) {
+        let inner = &self.inner;
+        if check_hash(hash).is_err() {
+            return;
+        }
+        // The right to compile off a question's path, given back however this ends.
+        struct Compiling<'a>(&'a AtomicBool);
+        impl Drop for Compiling<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        if inner.compiling.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _compiling = Compiling(&inner.compiling);
+        // Looked at again now that the right is had: compiled, being compiled, or failed
+        // meanwhile, it is not compiled here.
+        if let Ok(Some(loading)) = inner.claim(hash, false) {
+            let _ = inner.load(hash, loading);
+        }
+    }
+
+    /// The questions a ship's agents have waiting (which copy of the ship it is, and each
+    /// question's number and when its time runs out, in milliseconds since 1970), handed to
+    /// `then` with the ship still held, so that what `then` does is done before anything else
+    /// can change the ship's questions.
+    pub(crate) fn asks_listed_with<R>(&self, ship: &str, until: Option<Instant>, then: impl FnOnce([u8; 16], Vec<(u64, u64)>) -> R) -> Result<Option<R>, Error> {
+        // Tried for until `until` (and given up, `None`), for the network's look, which must not
+        // sit on a working place for a ship held by something else; or waited for, without it.
+        let never = AtomicBool::new(false);
+        let look = || match until {
+            Some(until) => self.inner.with_ship_waiting(ship, Some((Some(until), &never)), |ship| Ok(then(ship.incarnation, store::asks_list(&lock(&ship.conn))?))),
+            None => self.inner.with_ship(ship, |ship| Ok(Some(then(ship.incarnation, store::asks_list(&lock(&ship.conn))?)))),
+        };
+        #[cfg(test)]
+        return woken_for("the network's look at its questions", look);
+        #[cfg(not(test))]
+        look()
+    }
+
+    /// One question waiting, if it is, on this copy of the ship; for the question's own task,
+    /// which waits for the ship only until `until` or until `stop` is set (`None` then).
+    pub(crate) fn ask_row(&self, ship: &str, incarnation: &[u8; 16], seq: u64, until: Instant, stop: &AtomicBool) -> Result<Option<Option<store::AskRow>>, Error> {
+        let read = || {
+            self.inner.with_ship_waiting(ship, Some((Some(until), stop)), |ship| {
+                if ship.incarnation != *incarnation {
+                    return Ok(None);
+                }
+                Ok(store::ask_get(&lock(&ship.conn), seq)?)
+            })
+        };
+        #[cfg(test)]
+        {
+            let read = woken_for("a question's task reading it", read);
+            self.inner.note("question read returned", &format!("{}/{}", ship.trim_start_matches('~'), seq));
+            self.inner.gates.pass("question read");
+            return read;
+        }
+        #[cfg(not(test))]
+        read()
+    }
+
+    /// For tests: write down what came of a question (see `Ship::ask_answered`), as the
+    /// question's task does.
+    #[cfg(test)]
+    pub(crate) fn ask_answered(&self, ship: &str, incarnation: &[u8; 16], seq: u64, outcome: ship_proto::Outcome, reply: &[u8], reason: &str) -> Result<ship::Settled, Error> {
+        self.inner.with_ship(ship, |ship| ship.ask_answered(&self.inner, incarnation, seq, outcome, reply, reason))
+    }
+
+    /// The same, for the question's own task: waiting for the ship only until `stop` is set
+    /// (`None` then, with nothing written).
+    pub(crate) fn ask_answered_unless(&self, ship: &str, incarnation: &[u8; 16], seq: u64, answered: (ship_proto::Outcome, &[u8], &str), stop: &AtomicBool) -> Result<Option<ship::Settled>, Error> {
+        let (outcome, reply, reason) = answered;
+        // No time limit: only `stop` ends the wait, since what came of it must be written.
+        let write = || self.inner.with_ship_waiting(ship, Some((None, stop)), |ship| ship.ask_answered(&self.inner, incarnation, seq, outcome, reply, reason));
+        #[cfg(test)]
+        {
+            let of = format!("{}/{}", ship.trim_start_matches('~'), seq);
+            self.inner.note("settlement waiting for its ship", &of);
+            let written = woken_for("writing what came of a question", write);
+            if matches!(written, Ok(None)) {
+                self.inner.note("settlement given up", &of);
+            }
+            return written;
+        }
+        #[cfg(not(test))]
+        write()
     }
 
     /// Read from an agent on the owner's behalf. A read cannot change anything.
@@ -1869,31 +2428,81 @@ impl Runtime {
 
     /// The ships that have messages waiting to go to other ships, or events queued, and for
     /// every ship the other ships on which its agents follow logs, and those that have yet
-    /// to answer its commands. Looks in every ship's file, so it is for when the network
-    /// starts, not for every moment.
-    pub(crate) fn ships_with_work(&self) -> Result<WorkFound, Error> {
-        let (mut found, mut following, mut awaiting) = (Vec::new(), Vec::new(), Vec::new());
-        for entry in fs::read_dir(&self.inner.ships_dir)? {
-            let file = entry?.file_name();
-            let Some(ship) = file.to_str().and_then(|file| file.strip_suffix(".ship")).and_then(|ship| canonical_ship(ship).ok()) else {
-                continue;
-            };
+    /// to answer its commands. Looks in every ship's file (or, with `only`, those ships'; and
+    /// never in those in `done`), so it is for when the network starts, not for every moment.
+    /// Also returns the ships looked at, and those that could not be, to be looked at again. An
+    /// entry of the directory that cannot be read is passed over, and the directory is to be
+    /// listed again (`list_again`); the names listed before and after it are looked at. A
+    /// directory that cannot be listed at all is an error.
+    pub(crate) fn ships_with_work(&self, only: Option<&[String]>, done: &HashSet<String>) -> Result<Scan, Error> {
+        let (mut found, mut following, mut awaiting, mut asking, mut failed, mut inspected) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut list_again = false;
+        let ships: Vec<String> = match only {
+            Some(ships) => ships.to_vec(),
+            None => {
+                let mut ships = Vec::new();
+                for entry in fs::read_dir(&self.inner.ships_dir)? {
+                    #[cfg(test)]
+                    let entry = entry.and_then(|entry| match lock(&self.inner.listing_faults).contains(entry.file_name().to_str().unwrap_or("")) {
+                        true => Err(std::io::Error::other("a listing fault, for a test")),
+                        false => Ok(entry),
+                    });
+                    let Ok(entry) = entry else {
+                        list_again = true;
+                        continue;
+                    };
+                    let file = entry.file_name();
+                    if let Some(ship) = file.to_str().and_then(|file| file.strip_suffix(".ship")).and_then(|ship| canonical_ship(ship).ok()) {
+                        ships.push(ship);
+                    }
+                }
+                ships
+            }
+        };
+        let ships = ships.into_iter().filter(|ship| !done.contains(ship));
+        #[cfg(test)]
+        self.inner.note("ships listed", "");
+        for ship in ships {
             // Asked of the ship itself if it is awake, so a write in progress is not read around.
-            let (mut follows, mut waits) = (Vec::new(), Vec::new());
+            let (mut follows, mut waits, mut asks) = (Vec::new(), Vec::new(), false);
             let has_work = |ship: &mut ship::Ship| {
                 let conn = lock(&ship.conn);
                 follows = store::follow_peers(&conn)?;
                 waits = store::wait_peers(&conn)?;
+                asks = store::asks_any(&conn)?;
                 Ok(!store::peers_waiting(&conn, self.inner.cfg.max_follow_bytes)?.is_empty() || store::inbox_len(&conn)? > 0)
             };
-            let busy = self.inner.with_ship(&ship, has_work).unwrap_or(false);
+            #[cfg(test)]
+            {
+                let mut faults = lock(&self.inner.inspection_faults);
+                if let Some(left) = faults.get_mut(&ship).filter(|left| **left > 0) {
+                    *left -= 1;
+                    failed.push(ship);
+                    continue;
+                }
+            }
+            // A ship that cannot be looked at now is not taken to have nothing: it is said, to
+            // be looked at again.
+            let busy = match self.inner.with_ship(&ship, has_work) {
+                Ok(busy) => busy,
+                Err(_) => {
+                    failed.push(ship);
+                    continue;
+                }
+            };
+            #[cfg(test)]
+            self.inner.note("ship inspected", &ship);
             following.extend(follows.into_iter().map(|peer| (ship.clone(), peer)));
             awaiting.extend(waits.into_iter().map(|peer| (ship.clone(), peer)));
-            if busy {
-                found.push(ship);
+            if asks {
+                asking.push(ship.clone());
             }
+            if busy {
+                found.push(ship.clone());
+            }
+            inspected.push(ship);
         }
-        Ok((found, following, awaiting))
+        Ok(Scan { found: (found, following, awaiting, asking), inspected, failed, list_again })
     }
 
     /// The other ships that a ship has something to take up with, and what: messages
@@ -2308,6 +2917,7 @@ impl Runtime {
                 incarnation: [0; 16],
                 outbox_bytes: 0,
                 inbox_bytes: 0,
+                journal_owed: false,
             };
             staged.modules(&self.inner)?
         };
@@ -2392,7 +3002,7 @@ impl Runtime {
     }
 
     pub fn compiled_modules(&self) -> usize {
-        lock(&self.inner.modules).len()
+        lock(&self.inner.modules).compiled.len()
     }
 }
 
@@ -2400,14 +3010,30 @@ impl Inner {
     /// An event on this ship has queued commands for other ships.
     pub(crate) fn outbound_ready(&self, ship: &str) {
         if let Some(hook) = self.outbound_hook.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
-            hook(ship, false);
+            hook(ship, Ready::Outbound);
         }
     }
 
     /// A ship has appeared that may have messages for other ships and events queued.
     pub(crate) fn work_ready(&self, ship: &str) {
         if let Some(hook) = self.outbound_hook.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
-            hook(ship, true);
+            hook(ship, Ready::Work);
+        }
+    }
+
+    /// An event on this ship has put questions to other ships.
+    pub(crate) fn asks_ready(&self, ship: &str) {
+        if let Some(hook) = self.outbound_hook.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            hook(ship, Ready::Asks);
+        }
+    }
+
+    /// An event on this ship that has committed dropped these questions.
+    pub(crate) fn asks_dropped(&self, ship: &str, incarnation: [u8; 16], dropped: &[u64]) {
+        if let Some(hook) = self.outbound_hook.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            for seq in dropped {
+                hook(ship, Ready::Dropped(incarnation, *seq));
+            }
         }
     }
 
@@ -2546,6 +3172,17 @@ impl Inner {
     }
 
     fn compile(&self, wasm: &[u8]) -> Result<AgentModule, Error> {
+        #[cfg(test)]
+        {
+            self.compiles.fetch_add(1, Ordering::SeqCst);
+            if let Some((entered, go_on)) = lock(&self.compile_gate).take() {
+                let _ = entered.send(());
+                let _ = go_on.recv();
+            }
+            if self.compile_panics.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                panic!("a compile made to panic, for a test");
+            }
+        }
         let bad = |e: anyhow::Error| Error::BadModule(format!("{e:#}"));
         // Validate the module as given before rewriting it, so a rewrite can never rescue bad input.
         Module::validate(&self.engine, wasm).map_err(bad)?;
@@ -2566,16 +3203,136 @@ impl Inner {
         Ok(module)
     }
 
-    /// The compiled module for `hash`, loading and verifying its blob on first use.
-    pub(crate) fn module(&self, hash: &str) -> Result<Arc<AgentModule>, Error> {
+    /// The compiled module for `hash` if it is compiled already, for a question's path, which
+    /// compiles nothing and waits for nothing: `ship::ColdModule` if it is not compiled (or is
+    /// being compiled), `ship::Contended` if the cache is held by another caller just then
+    /// (only ever briefly: nothing is compiled under it), or an error for a module that failed
+    /// to compile before.
+    pub(crate) fn module_compiled(&self, hash: &str) -> anyhow::Result<Arc<AgentModule>> {
         check_hash(hash)?;
-        let mut modules = lock(&self.modules);
-        if let Some(module) = modules.get(hash) {
+        let modules = match self.modules.try_lock() {
+            Ok(modules) => modules,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(ship::Contended.into()),
+        };
+        if let Some(module) = modules.compiled.get(hash) {
             return Ok(module.clone());
         }
-        let module = Arc::new(self.compile(&self.read_blob(hash)?)?);
-        modules.insert(hash.to_string(), module.clone());
-        Ok(module)
+        if modules.failed.contains_key(hash) {
+            return Err(anyhow::anyhow!("the kernel named an unusable module"));
+        }
+        Err(ship::ColdModule(hash.to_string()).into())
+    }
+
+    /// The compiled module for `hash`, loading and verifying its blob on first use. If another
+    /// caller is compiling it now, this waits for that compile (it would have compiled it
+    /// anyway) instead of compiling it a second time; a module that failed to compile from its
+    /// stored blob before fails again at once, with the same words.
+    pub(crate) fn module(&self, hash: &str) -> Result<Arc<AgentModule>, Error> {
+        check_hash(hash)?;
+        loop {
+            let mut modules = lock(&self.modules);
+            if let Some(module) = modules.compiled.get(hash) {
+                return Ok(module.clone());
+            }
+            if let Some(why) = modules.failed.get(hash) {
+                return Err(Error::BadModule(why.clone()));
+            }
+            if modules.loading.contains(hash) {
+                drop(self.module_loaded.wait(modules).unwrap_or_else(PoisonError::into_inner));
+                continue;
+            }
+            modules.loading.insert(hash.to_string());
+            drop(modules);
+            return self.load(hash, Loading { inner: self, hash: hash.to_string() });
+        }
+    }
+
+    /// For tests: keep a note that `what` happened to `of` now, if a test is recording.
+    #[cfg(test)]
+    pub(crate) fn note(&self, what: &'static str, of: &str) {
+        if self.recording.load(Ordering::SeqCst) {
+            lock(&self.notes).push((what, of.to_string(), Instant::now(), store::now_ms()));
+        }
+    }
+
+    /// For tests: the same, with a number of the caller's in place of the wall clock's.
+    #[cfg(test)]
+    pub(crate) fn note_value(&self, what: &'static str, of: &str, value: u64) {
+        if self.recording.load(Ordering::SeqCst) {
+            lock(&self.notes).push((what, of.to_string(), Instant::now(), value));
+        }
+    }
+
+    /// For tests: the same, with the moment given (one taken where it happened).
+    #[cfg(test)]
+    pub(crate) fn note_at(&self, what: &'static str, of: &str, at: Instant) {
+        if self.recording.load(Ordering::SeqCst) {
+            lock(&self.notes).push((what, of.to_string(), at, store::now_ms()));
+        }
+    }
+
+    /// For tests: the notes of `what` about `of`, oldest first, from the `from`th note on.
+    #[cfg(test)]
+    pub(crate) fn notes_of(&self, what: &str, of: &str, from: usize) -> Vec<(Instant, u64)> {
+        lock(&self.notes).iter().skip(from).filter(|(kind, about, _, _)| *kind == what && about == of).map(|(_, _, at, ms)| (*at, *ms)).collect()
+    }
+
+    /// For tests: how many notes there are so far (to read only fresh ones after).
+    #[cfg(test)]
+    pub(crate) fn notes_len(&self) -> usize {
+        lock(&self.notes).len()
+    }
+
+    /// For tests: forget every compiled module, as a runtime just started has none.
+    #[cfg(test)]
+    pub(crate) fn forget_modules(&self) {
+        lock(&self.modules).compiled.clear();
+    }
+
+    /// The mark that `hash` is being compiled, for one caller: `None` if it is compiled
+    /// already, or (with `wait` false) is being compiled or has failed. With `wait`, a caller
+    /// waits for another's compile of it to end and looks again.
+    fn claim(&self, hash: &str, wait: bool) -> Result<Option<Loading<'_>>, Error> {
+        let mut modules = lock(&self.modules);
+        loop {
+            if modules.compiled.contains_key(hash) || (!wait && (modules.loading.contains(hash) || modules.failed.contains_key(hash))) {
+                return Ok(None);
+            }
+            if !modules.loading.contains(hash) {
+                modules.loading.insert(hash.to_string());
+                return Ok(Some(Loading { inner: self, hash: hash.to_string() }));
+            }
+            modules = self.module_loaded.wait(modules).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Read `hash`'s blob and compile it, with no lock held, under the caller's mark. A blob
+    /// that is read and verified and then fails to compile is remembered as failing (a failure
+    /// for want of memory too), so no ordinary call or question compiles it again in this
+    /// runtime's life, only an explicit `add_module` of those bytes; one that cannot be read is
+    /// not remembered (that costs
+    /// a failed read, not a compile, and the blob may yet be stored). So what is remembered is
+    /// bounded by the blobs stored.
+    fn load(&self, hash: &str, loading: Loading<'_>) -> Result<Arc<AgentModule>, Error> {
+        let bytes = self.read_blob(hash)?;
+        match self.compile(&bytes) {
+            Ok(module) => {
+                let module = Arc::new(module);
+                loading.done(module.clone());
+                Ok(module)
+            }
+            Err(e) => {
+                // The reason as it was given, so that a later call is told it in the same
+                // words, not wrapped a second time.
+                let why = match &e {
+                    Error::BadModule(why) => why.clone(),
+                    other => other.to_string(),
+                };
+                loading.failed(&why);
+                Err(e)
+            }
+        }
     }
 
     fn slot(&self, name: &str) -> Result<SlotRef, Error> {
@@ -2586,15 +3343,51 @@ impl Inner {
         if !self.ship_path(name).exists() {
             return Err(Error::UnknownShip(name.to_string()));
         }
-        let slot = Arc::new(Mutex::new(Slot { ship: None, last_used: Instant::now() }));
+        let slot = Arc::new(Mutex::new(Slot { ship: None, last_used: Instant::now(), look_owed: false }));
         slots.insert(name.to_string(), slot.clone());
         Ok(slot)
     }
 
     fn wake(&self, name: &str) -> Result<Ship, Error> {
-        let conn = store::open(&self.ship_path(name), self.cfg.durability, self.cfg.max_ship_bytes, &self.file_key(name))?;
-        store::check_meta(&conn, name)?;
-        let kernel = self.kernel(&store::kernel(&conn)?)?;
+        self.wake_with(name, false).map_err(|woken| match woken {
+            Woken::Failed(e) => e,
+            Woken::Cold(hash) => Error::UnknownModule(hash),
+            Woken::Busy => Error::UnknownModule("the cache of compiled modules was busy".into()),
+        })
+    }
+
+    /// Open a ship's file and load what it runs with. With `compiled_only`, for a question, a
+    /// kernel not already compiled is not compiled: `Woken::Cold` with its hash, and the file is
+    /// closed again.
+    fn wake_with(&self, name: &str, compiled_only: bool) -> Result<Ship, Woken> {
+        // For a question, the file is not switched to WAL (that writes its header): a question
+        // stores no application data on the ship. The next ordinary use switches it.
+        let (conn, journal_owed) = if compiled_only {
+            store::open_for_question(&self.ship_path(name), self.cfg.durability, self.cfg.max_ship_bytes, &self.file_key(name)).map_err(Woken::Failed)?
+        } else {
+            store::open_switching(&self.ship_path(name), self.cfg.durability, self.cfg.max_ship_bytes, &self.file_key(name)).map_err(Woken::Failed)?
+        };
+        store::check_meta(&conn, name).map_err(Woken::Failed)?;
+        let hash = store::kernel(&conn).map_err(Woken::Failed)?;
+        let kernel = if compiled_only {
+            match self.module_compiled(&hash) {
+                Ok(module) => {
+                    require_exports(&module, &["route", "admin"]).map_err(Woken::Failed)?;
+                    module
+                }
+                Err(e) if e.downcast_ref::<ship::Contended>().is_some() => return Err(Woken::Busy),
+                Err(e) if e.downcast_ref::<ship::ColdModule>().is_some() => return Err(Woken::Cold(hash)),
+                Err(e) => return Err(Woken::Failed(Error::BadModule(format!("{e:#}")))),
+            }
+        } else {
+            self.kernel(&hash).map_err(Woken::Failed)?
+        };
+        let mut ship = self.woken(name, conn, kernel).map_err(Woken::Failed)?;
+        ship.journal_owed = journal_owed;
+        Ok(ship)
+    }
+
+    fn woken(&self, name: &str, conn: rusqlite::Connection, kernel: Arc<AgentModule>) -> Result<Ship, Error> {
         let key = {
             let _together = lock(&self.lifecycle);
             Arc::new(self.load_key(name)?)
@@ -2602,20 +3395,63 @@ impl Inner {
         let (outbox_bytes, inbox_bytes) = (store::outbox_bytes(&conn)?, store::inbox_bytes(&conn)?);
         let incarnation = store::incarnation(&conn)?;
         lock(&self.incarnations).insert(name.to_string(), incarnation);
-        Ok(Ship { name: name.into(), conn: Arc::new(Mutex::new(conn)), kernel, key, incarnation, outbox_bytes, inbox_bytes })
+        Ok(Ship { name: name.into(), conn: Arc::new(Mutex::new(conn)), kernel, key, incarnation, outbox_bytes, inbox_bytes, journal_owed: false })
     }
 
     fn with_ship<R>(&self, name: &str, f: impl FnOnce(&mut Ship) -> Result<R, Error>) -> Result<R, Error> {
+        Ok(self.with_ship_waiting(name, None, f)?.expect("waited for without limit"))
+    }
+
+    /// `with_ship`, but with `wait` (a time or none, and a flag) waiting for the ship only until
+    /// that time, if there is one, or until the flag is set: its slot is tried every
+    /// `QUESTION_LOOK` rather than waited on, and a place among the awake ships likewise
+    /// (`reserve_until`). With no time, only the flag ends the wait. `None` if it gave up, with
+    /// nothing done. For a question's own task (`net::pursue`), which must not sit holding a
+    /// working place, waiting for its ship, once its question is dropped (or, to read the
+    /// question, once its time has passed).
+    fn with_ship_waiting<R>(&self, name: &str, wait: Option<(Option<Instant>, &AtomicBool)>, f: impl FnOnce(&mut Ship) -> Result<R, Error>) -> Result<Option<R>, Error> {
         let name = canonical_ship(name)?;
         let slot = self.slot(&name)?;
         let mut rubbish = None;
         let result = {
-            let mut guard = lock(&slot);
+            let mut guard = match wait {
+                None => lock(&slot),
+                Some((until, stop)) => loop {
+                    if stop.load(Ordering::SeqCst) || until.is_some_and(|until| Instant::now() >= until) {
+                        return Ok(None);
+                    }
+                    match slot.try_lock() {
+                        Ok(guard) => break guard,
+                        Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(QUESTION_LOOK),
+                    }
+                },
+            };
             if guard.ship.is_none() {
-                self.reserve(&name, &slot);
+                match wait {
+                    None => self.reserve(&name, &slot),
+                    Some((until, stop)) => {
+                        if !self.reserve_until(&name, &slot, until, stop) {
+                            return Ok(None);
+                        }
+                    }
+                }
                 match self.wake(&name) {
                     Ok(ship) => {
-                        rubbish = self.first_look(&name, &ship);
+                        #[cfg(test)]
+                        if self.recording.load(Ordering::SeqCst) {
+                            lock(&self.ship_wakes).push((Instant::now(), store::now_ms(), name.clone(), WAKE_CAUSE.with(std::cell::Cell::get)));
+                        }
+                        // A wake for a wait that can be called off (a question's task reading
+                        // its question, or writing what came of it) runs none of the upkeep owed
+                        // at first wake: that would take the ship again afterwards, with nothing
+                        // to call it off. It stays owed, for the next ordinary call.
+                        if wait.is_none() {
+                            rubbish = self.first_look(&name, &ship);
+                            guard.look_owed = false;
+                        } else {
+                            guard.look_owed = !lock(&self.swept).contains(&name);
+                        }
                         guard.ship = Some(ship);
                     }
                     Err(e) => {
@@ -2624,8 +3460,19 @@ impl Inner {
                         return Err(e);
                     }
                 }
+            } else if guard.look_owed && wait.is_none() {
+                // Woken for a question, or for a question's task, which ran none of this.
+                rubbish = self.first_look(&name, guard.ship.as_ref().expect("awake"));
+                guard.look_owed = false;
             }
             let ship = guard.ship.as_mut().expect("woken above");
+            // Woken for a question, which left the file's journal as it was: switched now, by
+            // the first ordinary use, as any ordinary open would.
+            // Owed only until SQLite says the file is in WAL: where it cannot be, the ship goes
+            // on in the old mode, and the switch is tried at each use.
+            if ship.journal_owed && store::to_wal(&lock(&ship.conn))? {
+                ship.journal_owed = false;
+            }
             #[cfg(test)]
             if let Some((entered, go_on)) = lock(&self.event_gate).take() {
                 let _ = entered.send(());
@@ -2658,6 +3505,10 @@ impl Inner {
         };
         // This ship is idle again, so a thread waiting for a place can now evict it.
         self.awake_changed.notify_one();
+        #[cfg(test)]
+        if wait.is_some() {
+            self.gates.pass("task let its ship go");
+        }
         if let Some(rubbish) = rubbish {
             // Every attempt is made; the ship is looked through only once all have worked.
             let failed = rubbish.iter().filter(|path| files::remove_entry(path).is_err()).count();
@@ -2667,40 +3518,220 @@ impl Inner {
             // And one batch of what its rows say is to be removed.
             self.empty_trash(&name);
         }
-        result
+        result.map(Some)
+    }
+
+    /// Have a ship in hand for a question from `peer`, and run `f` on it, with the question
+    /// waiting for nothing once its time has passed or its asker has given up (what `f` runs is
+    /// stopped for time as any call is, `watch_the_clock`). Until the ship is had (its
+    /// slot taken, and a place among the awake ships if it is asleep) the question looks every
+    /// `QUESTION_LOOK` (5 ms) whether `deadline` has passed (`Asked::Failed`, "it took too
+    /// long") or `given_up` is set (`Asked::GivenUp`), and gives up then; and whether the ship is
+    /// resting from questions (`Asked::Busy`), refused then without the ship being taken. With
+    /// the slot taken:
+    /// given up, past its time, or the ship resting from questions from all ships or from
+    /// `peer` (`Asked::Busy`), and nothing more is done. Otherwise the ship is woken if it is
+    /// asleep, running none of its upkeep (owed to the next ordinary call), and with no module
+    /// compiled (`Asked::Cold`, or `Asked::Busy` if the cache of compiled modules is held just
+    /// then); then, given up or past its time by now (waking can be slow), nothing is run;
+    /// else `f` runs.
+    ///
+    /// However this ends (an answer, an error, or a panic), as `with_ship` does: a place among
+    /// the awake ships taken for a ship that was not woken is given back, a connection left in
+    /// a transaction is closed, and the ship is let go. And for a question admitted past the
+    /// look at the rests under the slot, the time from that look (the reading of the clock it
+    /// was decided on) to letting the slot go is the `t` the ship rests for a few times after
+    /// (`ask::rest_after`), on every way out from then on; a question refused before that (given
+    /// up, past its time, or resting) is charged nothing.
+    pub(crate) fn with_ship_question(
+        &self,
+        name: &str,
+        peer: &str,
+        deadline: Instant,
+        given_up: &AtomicBool,
+        f: impl FnOnce(&mut Ship) -> Result<ask::Asked, Error>,
+    ) -> Result<ask::Asked, Error> {
+        let name = canonical_ship(name)?;
+        let slot = self.slot(&name)?;
+        #[cfg(test)]
+        let mut waited = false;
+        let mut guard = loop {
+            if given_up.load(Ordering::SeqCst) {
+                return Ok(ask::Asked::GivenUp);
+            }
+            if Instant::now() >= deadline {
+                return Ok(ask::Asked::Failed(ask::TOOK_TOO_LONG));
+            }
+            // A ship resting from questions refuses this one without being taken at all. (It
+            // is looked at again once taken, as a rest can begin while this waits.)
+            if ask::resting(&self.ask_rests, &name, peer, Instant::now()) {
+                return Ok(ask::Asked::Busy);
+            }
+            match slot.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    #[cfg(test)]
+                    if !waited {
+                        waited = true;
+                        self.note("question waiting for its slot", peer);
+                    }
+                    std::thread::sleep(QUESTION_LOOK)
+                }
+            }
+        };
+        // When the question was admitted past the look at the rests under the slot, if it was:
+        // where its `t` starts.
+        let mut admitted = None;
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.question_held(&name, peer, deadline, given_up, &slot, &mut guard, &mut admitted, f)));
+        // Whatever came of it.
+        let unwound = ran.is_err();
+        let open_transaction = guard.ship.as_ref().is_some_and(|ship| !lock(&ship.conn).is_autocommit());
+        if unwound || open_transaction {
+            drop(guard.ship.take());
+        }
+        if guard.ship.is_none() {
+            lock(&self.awake).remove(&name);
+        }
+        guard.last_used = Instant::now();
+        let ended = Instant::now();
+        if let Some(admitted) = admitted {
+            ask::rest_after(&self.ask_rests, &name, peer, ended.duration_since(admitted), ended);
+            #[cfg(test)]
+            lock(&self.answered).push((ended, ended.duration_since(admitted), peer.to_string()));
+        }
+        drop(guard);
+        self.awake_changed.notify_one();
+        match ran {
+            Ok(result) => result,
+            Err(unwound) => std::panic::resume_unwind(unwound),
+        }
+    }
+
+    /// The part of `with_ship_question` done with the slot taken.
+    #[allow(clippy::too_many_arguments)]
+    fn question_held(
+        &self,
+        name: &str,
+        peer: &str,
+        deadline: Instant,
+        given_up: &AtomicBool,
+        slot: &SlotRef,
+        guard: &mut MutexGuard<'_, Slot>,
+        admitted: &mut Option<Instant>,
+        f: impl FnOnce(&mut Ship) -> Result<ask::Asked, Error>,
+    ) -> Result<ask::Asked, Error> {
+        let stopped = || {
+            if given_up.load(Ordering::SeqCst) {
+                Some(ask::Asked::GivenUp)
+            } else if Instant::now() >= deadline {
+                Some(ask::Asked::Failed(ask::TOOK_TOO_LONG))
+            } else {
+                None
+            }
+        };
+        if let Some(stopped) = stopped() {
+            return Ok(stopped);
+        }
+        // The look at the rests that admits it, and the start of its `t`: one reading of the
+        // clock for both, so no part of a rest it was admitted after is in its `t`.
+        let now = Instant::now();
+        if ask::resting(&self.ask_rests, name, peer, now) {
+            return Ok(ask::Asked::Busy);
+        }
+        *admitted = Some(now);
+        if guard.ship.is_none() {
+            if !self.reserve_until(name, slot, Some(deadline), given_up) {
+                return Ok(stopped().unwrap_or(ask::Asked::Failed(ask::TOOK_TOO_LONG)));
+            }
+            #[cfg(test)]
+            {
+                self.question_wakes.fetch_add(1, Ordering::SeqCst);
+                self.gates.pass("question wake");
+                if let Some(wait) = *lock(&self.question_wake_delay) {
+                    std::thread::sleep(wait);
+                }
+            }
+            match self.wake_with(name, true) {
+                Ok(ship) => {
+                    #[cfg(test)]
+                    if self.recording.load(Ordering::SeqCst) {
+                        lock(&self.ship_wakes).push((Instant::now(), store::now_ms(), name.to_string(), "a question from another ship"));
+                    }
+                    guard.ship = Some(ship);
+                    guard.look_owed = !lock(&self.swept).contains(name);
+                }
+                Err(Woken::Cold(hash)) => return Ok(ask::Asked::Cold(hash)),
+                Err(Woken::Busy) => return Ok(ask::Asked::Busy),
+                Err(Woken::Failed(e)) => return Err(e),
+            }
+        }
+        // Waking can take a while; what it took is not a reason to start the handler late.
+        if let Some(stopped) = stopped() {
+            return Ok(stopped);
+        }
+        f(guard.ship.as_mut().expect("woken above"))
+    }
+
+    /// `reserve`, giving up (false) once `deadline` (if any) passes or `given_up` is set.
+    fn reserve_until(&self, name: &str, slot: &SlotRef, deadline: Option<Instant>, given_up: &AtomicBool) -> bool {
+        #[cfg(test)]
+        let mut waited = false;
+        loop {
+            if given_up.load(Ordering::SeqCst) || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return false;
+            }
+            if self.try_reserve(name, slot) {
+                return true;
+            }
+            #[cfg(test)]
+            if !waited {
+                waited = true;
+                self.note("waiting for an awake place", name);
+            }
+            let awake = lock(&self.awake);
+            let _ = self.awake_changed.wait_timeout(awake, QUESTION_LOOK);
+        }
+    }
+
+    /// One try at `reserve`: true if a place was had.
+    fn try_reserve(&self, name: &str, slot: &SlotRef) -> bool {
+        let mut awake = lock(&self.awake);
+        if awake.len() < self.cfg.max_awake {
+            awake.insert(name.to_string(), slot.clone());
+            #[cfg(test)]
+            self.note("reserved for a wake", name);
+            return true;
+        }
+        let idle = awake
+            .iter()
+            .filter_map(|(other, other_slot)| {
+                let guard = other_slot.try_lock().ok()?;
+                guard.ship.as_ref()?;
+                Some((guard.last_used, other.clone(), other_slot.clone()))
+            })
+            .min_by_key(|(last_used, _, _)| *last_used);
+        let Some((_, victim_name, victim)) = idle else { return false };
+        let Ok(mut guard) = victim.try_lock() else { return false };
+        let Some(ship) = guard.ship.take() else { return false };
+        awake.remove(&victim_name);
+        awake.insert(name.to_string(), slot.clone());
+        #[cfg(test)]
+        self.note("reserved for a wake", name);
+        drop(awake);
+        drop(ship);
+        true
     }
 
     /// Claim a place among the awake ships before opening `name`, closing the least recently
     /// used idle ship if the runtime is full. Waits if every awake ship is mid-event.
     fn reserve(&self, name: &str, slot: &SlotRef) {
-        loop {
-            let mut awake = lock(&self.awake);
-            if awake.len() < self.cfg.max_awake {
-                awake.insert(name.to_string(), slot.clone());
-                return;
-            }
-            let idle = awake
-                .iter()
-                .filter_map(|(other, other_slot)| {
-                    let guard = other_slot.try_lock().ok()?;
-                    guard.ship.as_ref()?;
-                    Some((guard.last_used, other.clone(), other_slot.clone()))
-                })
-                .min_by_key(|(last_used, _, _)| *last_used);
-            let Some((_, victim_name, victim)) = idle else {
-                let _ = self.awake_changed.wait_timeout(awake, Duration::from_millis(2));
-                continue;
-            };
-            let Ok(mut guard) = victim.try_lock() else { continue };
-            let Some(ship) = guard.ship.take() else { continue };
-            awake.remove(&victim_name);
-            awake.insert(name.to_string(), slot.clone());
-            drop(awake);
-            // Still holding the victim's lock: it cannot be reopened until its file is closed.
-            drop(ship);
-            return;
+        while !self.try_reserve(name, slot) {
+            let awake = lock(&self.awake);
+            let _ = self.awake_changed.wait_timeout(awake, Duration::from_millis(2));
         }
     }
+
 }
 
 #[cfg(test)]
@@ -2745,8 +3776,15 @@ mod tests {
         go_on.send(()).unwrap();
         assert_eq!(String::from_utf8(busy.join().unwrap().unwrap().reply).unwrap(), "1");
         // Once the call is over it is idle, and a look puts it to sleep (the sleeper's or this).
-        rt.sleep_idle(Duration::ZERO);
-        assert_eq!(rt.awake(), 0);
+        // The sleeper may be part way through putting it to sleep (holding its slot, closing its
+        // file) when this looks, which then passes it over and sees it still counted awake: so
+        // this looks again until it is asleep, for a few seconds at most.
+        let looking = Instant::now();
+        while rt.awake() != 0 {
+            assert!(looking.elapsed() < Duration::from_secs(5), "the idle ship was not put to sleep");
+            rt.sleep_idle(Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         drop(rt);
         let _ = fs::remove_dir_all(&dir);
     }

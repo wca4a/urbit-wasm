@@ -39,6 +39,66 @@ extern "C" {
     fn host_file_info(id: *const u8, id_len: u32, buf: *mut u8, buf_cap: u32) -> i64;
     #[link_name = "file_mark"]
     fn host_file_mark(req: *const u8, req_len: u32) -> i64;
+    #[link_name = "ask_to"]
+    fn host_ask_to(req: *const u8, req_len: u32) -> i64;
+    #[link_name = "ask_drop"]
+    fn host_ask_drop(number: u64) -> i64;
+}
+
+/// Questions to agents on other ships. A question only reads: the other agent's read handler
+/// answers it, nothing it does there is kept, and a question stores no application data on the
+/// other ship. (Opening that ship for it, or putting another ship to sleep to make room for it,
+/// can recover a transaction that a crash interrupted, copy pages that ordinary work had already
+/// committed from the log beside the file into the file, and create or remove the files SQLite
+/// keeps beside the ship's file; see the README.) An event is one transaction and cannot wait,
+/// so the answer comes later, as an event of its own: an agent declared with `answer = f` is
+/// handed an `Answered` for each question, exactly once, unless it dropped the question first.
+pub mod ask {
+    pub use ship_proto::{Answered, Outcome};
+    use ship_proto::{AskRequest, Message};
+
+    /// How long a question is given if the agent has no better idea: ten seconds.
+    pub const DEFAULT_WITHIN_MILLIS: u64 = 10_000;
+
+    /// Put a question to `agent`'s `interface` on another ship, and return the number its answer
+    /// will carry. It is sent only if this event commits. Its time, `within_millis`, is stamped
+    /// just before the event commits (whole milliseconds of the runtime's wall clock, so a slow
+    /// commit uses some of it) and turned into a steady-clock deadline once, when the question's
+    /// task starts, before it reads the row; a later change of the clock does not move it, though a
+    /// restart reads the stamped time afresh. Only the network's giving up keeps that time: writing
+    /// the answer down needs the ship (a busy ship delays it), and the `answer` handler runs when
+    /// the ship next runs its queue, behind what is queued before it. The event is rejected if this
+    /// agent's manifest does not name that ship (or "*"), agent, and interface with `ask` set, if
+    /// `ship` is empty or this ship, if `within_millis` is 0 or more than the runtime allows, if
+    /// the payload is larger than it allows, or if the ship has as many questions waiting as it
+    /// may.
+    ///
+    /// The answer, or why there is none (the other ship refused, its agent failed or the question
+    /// could not be routed there, it or its answer was too large or this ship had no room for the
+    /// reply, no answer came in time, no try ever reached it, or what came back was not understood:
+    /// see `Outcome`), is handed to the `answer` handler. A try that finds the destination absent
+    /// from the directory ends the question as `Unreachable`, even if an earlier try reached it,
+    /// while a try already awaiting its reply can still complete. Each try tells the other ship
+    /// what is left of the time: at the poll in which the connection accepts a question's first
+    /// bytes, the allowance in those bytes is no more than the whole milliseconds left to the
+    /// asker's deadline by the clock reading taken in that poll, and no first bytes are accepted in
+    /// a poll whose clock reading leaves less than a millisecond. The first-write rule uses the
+    /// clock reading taken in the accepting poll, and time spent encoding, waiting inside the
+    /// writer, or descheduled after that reading can carry actual acceptance past the deadline.
+    /// Asking is harmless to repeat, so the runtime asks again, within the time, if the connection
+    /// fails, and after a restart if the time has not run out.
+    pub fn to(ship: &str, agent: &str, interface: &str, payload: &[u8], within_millis: u64) -> u64 {
+        let request = AskRequest { ship: ship.into(), agent: agent.into(), interface: interface.into(), payload: payload.to_vec(), within_millis };
+        let request = request.encode_to_vec();
+        unsafe { super::host_ask_to(request.as_ptr(), request.len() as u32) as u64 }
+    }
+
+    /// Give up on a question. True if it was still waiting (or its answer was queued and had not
+    /// yet been handed over); from the moment this event commits, no answer for it is handed to
+    /// this agent, whatever arrives. False if there was nothing to drop.
+    pub fn drop(number: u64) -> bool {
+        unsafe { super::host_ask_drop(number) > 0 }
+    }
 }
 
 /// Files on the ship. An agent keeps a reference to a file (`FileRef`: the ship, the file's
@@ -240,7 +300,7 @@ pub mod log {
 /// Send a command to another agent on this ship. It runs later, as that agent's own event, and
 /// only if this event commits. The event is rejected if this agent has no permission.
 pub fn send(agent: &str, interface: &str, payload: &[u8]) {
-    let request = SendRequest { ship: String::new(), agent: agent.into(), interface: interface.into(), payload: payload.to_vec() };
+    let request = SendRequest { ship: String::new(), agent: agent.into(), interface: interface.into(), payload: payload.to_vec(), reply: false };
     let request = request.encode_to_vec();
     unsafe { host_send(request.as_ptr(), request.len() as u32) }
 }
@@ -263,7 +323,34 @@ pub fn send(agent: &str, interface: &str, payload: &[u8]) {
 /// Naming this ship itself is the same as `send`: the command is queued here, the number
 /// returned is 0, and there is no receipt.
 pub fn send_to(ship: &str, agent: &str, interface: &str, payload: &[u8]) -> u64 {
-    let request = SendRequest { ship: ship.into(), agent: agent.into(), interface: interface.into(), payload: payload.to_vec() };
+    send_to_as(ship, agent, interface, payload, false)
+}
+
+/// The same, and the handler's reply comes back with the receipt (`Receipt.reply`, with
+/// `Receipt.replied` set) if the command runs. The command carries the largest reply this
+/// ship takes back; if the reply is larger than that or than the other ship allows, or that
+/// ship has no room just then to keep it, the command does not stand: its effects are undone
+/// there, and the receipt says LIMIT. So the receipt says RAN with the whole reply, or the
+/// command did not run, from a ship that follows the protocol.
+/// This holds while neither ship makes its message, inbox or reply limits smaller while the
+/// command or its receipt is outstanding.
+///
+/// The whole reply comes back with RAN from a receiving ship that follows the protocol. A
+/// receipt can say RAN with `Receipt.replied` unset when the other ship's runtime predates
+/// replies, or when it broke the protocol (a reply over the bound the command was sent with, or
+/// a reply not marked): the command is still reported as run, because the other ship said so;
+/// no reply is handed on; and when a reply came and was let go, the reason says so. An agent
+/// that needs the reply checks `Receipt.replied`.
+///
+/// On a ship that takes back no reply at all (its `max_receipt_reply_bytes` is 0, or its queue
+/// is too small for any receipt with a reply), this is refused here and the event with it,
+/// as a send past a limit is: the command is not sent.
+pub fn send_to_for_reply(ship: &str, agent: &str, interface: &str, payload: &[u8]) -> u64 {
+    send_to_as(ship, agent, interface, payload, true)
+}
+
+fn send_to_as(ship: &str, agent: &str, interface: &str, payload: &[u8], reply: bool) -> u64 {
+    let request = SendRequest { ship: ship.into(), agent: agent.into(), interface: interface.into(), payload: payload.to_vec(), reply };
     let request = request.encode_to_vec();
     unsafe { host_send_to(request.as_ptr(), request.len() as u32) as u64 }
 }
@@ -295,6 +382,12 @@ pub unsafe fn __handle(ptr: *mut u8, len: u32, handler: fn(&[u8]) -> Vec<u8>) ->
 #[doc(hidden)]
 pub fn __receipt(bytes: &[u8], handler: fn(&Receipt)) -> Vec<u8> {
     handler(&Receipt::decode(bytes).expect("the runtime sent a malformed receipt"));
+    Vec::new()
+}
+
+#[doc(hidden)]
+pub fn __answer(bytes: &[u8], handler: fn(&ask::Answered)) -> Vec<u8> {
+    handler(&ask::Answered::decode(bytes).expect("the runtime sent a malformed answer"));
     Vec::new()
 }
 
@@ -337,7 +430,17 @@ macro_rules! export_fn {
 }
 
 /// Declare an agent: a command handler, then any of `read = f`, `notify = f`, `checkpoint = f`,
-/// `receipt = f`, `file_ask = f`.
+/// `receipt = f`, `answer = f`, `file_ask = f`.
+///
+/// The answer handler is `fn(&ask::Answered)`. It is called once for each question this agent
+/// put to another ship with `ask::to` and did not drop, with the number `ask::to` returned and
+/// what came of it: the other agent's reply, or why there is none. It runs as an event of its
+/// own and may do anything a command handler may. An agent with no answer handler is never
+/// told; its questions are still answered and forgotten.
+///
+/// A read handler answers questions from other ships too, if the manifest opens its interface
+/// to them (`Provide.asked`): `invocation()` then names the asking ship, and the asking agent
+/// (empty when that ship's owner asks). What each ship may be told is the agent's to decide.
 ///
 /// The file_ask handler is `fn(&files::FileAsk) -> bool`. It is called when another ship asks
 /// for a file this agent claims and has not marked open: `FileAsk.ship` is the ship asking,
@@ -350,21 +453,31 @@ macro_rules! export_fn {
 ///
 /// The receipt handler is `fn(&Receipt)`. It is called once for each command this agent sent
 /// to another ship with `send_to`, when that ship says what became of it: whether it ran, and
-/// if not, why. It runs as an event of its own and may do anything a command handler may.
+/// if not, why. It runs as an event of its own and may do anything a command handler may. For a
+/// command sent with `send_to_for_reply`, a receipt saying RAN carries the handler's reply in
+/// `Receipt.reply`, with `Receipt.replied` set (so an empty reply is told from none).
+/// The whole reply comes back with RAN from a receiving ship that follows the protocol. A
+/// receipt can say RAN with `Receipt.replied` unset when the other ship's runtime predates
+/// replies, or when it broke the protocol (a reply over the bound the command was sent with, or
+/// a reply not marked): the command is still reported as run, because the other ship said so;
+/// no reply is handed on; and when a reply came and was let go, the reason says so. An agent
+/// that needs the reply checks `Receipt.replied`.
+/// This holds while neither ship makes its message, inbox or reply limits smaller while the
+/// command or its receipt is outstanding.
 ///
 /// The command, read, and notify handlers are `fn(&[u8]) -> Vec<u8>`. A read handler cannot
 /// write, send, or emit. The notify handler is called when a log this agent follows has new
 /// entries; `invocation()` says which.
 ///
-/// The checkpoint handler is `fn(&str) -> Option<Vec<u8>>`. The runtime calls it with the name
-/// of one of this agent's logs once that log has grown enough, and it can only read. Returning
-/// the present state behind the log lets the runtime drop old entries: a follower that is far
-/// behind is handed that state in place of them. The runtime signs what is returned as the
-/// state as of the log's newest entry, and has no way to check that it is. So an agent must
-/// only change the state behind a log in the same event that appends the entry describing the
-/// change, and the state must be one a follower can use in place of every entry before it. Returning `None` says the log is a history
-/// whose every entry matters, and it is then kept whole. An agent with no checkpoint handler is
-/// never asked, and its logs are kept whole.
+/// The checkpoint handler is `fn(&str) -> Option<Vec<u8>>`. The runtime calls it with the name of
+/// one of this agent's logs once that log has grown enough, and it can only read. Returning the
+/// present state behind the log lets the runtime drop old entries: a follower that is far behind is
+/// handed that state in place of them. The runtime signs what is returned as the state as of the
+/// log's newest entry, and has no way to check that it is. So an agent must only change the state
+/// behind a log in the same event that appends the entry describing the change, and the state must
+/// be one a follower can use in place of every entry before it. Returning `None` says the log is a
+/// history whose every entry matters, and it is then kept whole. An agent with no checkpoint
+/// handler is never asked, and its logs are kept whole.
 #[macro_export]
 macro_rules! agent {
     ($command:path $(, $role:ident = $handler:path)* $(,)?) => {
@@ -396,6 +509,14 @@ macro_rules! __export_role {
             #[export_name = "file_ask"]
             pub unsafe extern "C" fn __ship_export(ptr: *mut u8, len: u32) -> u64 {
                 $crate::__handle(ptr, len, |asked| $crate::__file_ask(asked, $handler))
+            }
+        };
+    };
+    (answer, $handler:path) => {
+        const _: () = {
+            #[export_name = "answer"]
+            pub unsafe extern "C" fn __ship_export(ptr: *mut u8, len: u32) -> u64 {
+                $crate::__handle(ptr, len, |answered| $crate::__answer(answered, $handler))
             }
         };
     };

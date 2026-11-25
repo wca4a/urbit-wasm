@@ -58,7 +58,7 @@ const CODE: &str = "test-test-test-test-test-test-test-test";
 
 /// The counter agent offers `counter`. The same module runs twice: as `counter` and `keeper`.
 fn manifest() -> Manifest {
-    Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: false }], uses: vec![] }
+    Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: false, asked: false }], uses: vec![] }
 }
 
 /// A runtime with `~zod`, running the counter module as `counter` and as `keeper`.

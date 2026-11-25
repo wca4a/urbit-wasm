@@ -2137,7 +2137,7 @@ mod fault_tests {
         let rt = Runtime::open(&dir.0, cfg).unwrap();
         let (kernel, counter) = (rt.add_module(&wasm("kernel")).unwrap(), rt.add_module(&wasm("counter")).unwrap());
         rt.create_ship("~zod", &kernel).unwrap();
-        let manifest = Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: false }], uses: vec![] };
+        let manifest = Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: false, asked: false }], uses: vec![] };
         rt.install("~zod", "counter", &counter, &manifest).unwrap();
         rt
     }

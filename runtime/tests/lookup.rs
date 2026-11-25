@@ -139,9 +139,9 @@ fn keyed_ship_on(dir: &TempDir, ship: &str, seed: [u8; 32], urbit: &Arc<Listings
 /// The same, with the counter and tally agents installed, open to other ships, and the tally
 /// allowed to send to both on any ship.
 fn crew(dir: &TempDir, ship: &str, urbit: &Arc<Listings>, cfg: NetConfig) -> (Arc<Runtime>, Network, Arc<Directory>) {
-    let open_counter = Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true }], uses: vec![] };
-    let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
-    let far_tally = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true }], uses: vec![to("counter"), to("tally")] };
+    let open_counter = Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true, asked: false }], uses: vec![] };
+    let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true, ask: false };
+    let far_tally = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true, asked: false }], uses: vec![to("counter"), to("tally")] };
     let rt = Arc::new(Runtime::open(&dir.0, fast()).unwrap());
     let (counter, tally) = (rt.add_module(&wasm("counter")).unwrap(), rt.add_module(&wasm("tally")).unwrap());
     rt.create_ship(ship, &kernel(&rt)).unwrap();

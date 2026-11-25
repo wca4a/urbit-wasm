@@ -26,6 +26,10 @@ enum Kind {
   // FileAsk; the reply a FileAnswer. The agent can only read while answering, and nothing it
   // does is kept.
   KIND_FILE_ASK = 6;
+  // Tells an agent what came of a question it put to an agent on another ship with `ask_to`.
+  // The payload is an Answered. Runs as its own event, like a command. Exactly one for each
+  // question, unless the agent dropped it first.
+  KIND_ANSWER = 7;
 }
 
 // Who is asking.
@@ -62,6 +66,10 @@ message Provide {
   // Agents on other ships may send commands to it. The owner agrees to this at install. The
   // agent is told which ship is asking, and it is the agent that decides what each may do.
   bool remote = 3;
+  // Agents on other ships, and other ships' owners, may ask it questions: its read handler
+  // answers, read-only, and nothing it does is kept. Apart from `remote`: an owner can open an
+  // interface to one and not the other. The agent is told which ship (and agent) is asking.
+  bool asked = 4;
 }
 
 message Use {
@@ -73,6 +81,9 @@ message Use {
   // ship. For another ship, `send` lets this agent send that agent commands, and `read` lets
   // it follow that agent's log of this name. The owner agrees to both at install.
   string ship = 5;
+  // Only with `ship` set: this agent may ask that agent's interface on that ship (or on any
+  // ship, with "*") questions, with `ask_to`. Apart from `read` and `send`.
+  bool ask = 6;
 }
 
 // What an agent offers and what it needs. Approved by the owner at install.
@@ -97,6 +108,8 @@ message RouteReply {
   // What the called agent may read and send while handling this call.
   repeated Grant reads = 4;
   repeated Grant sends = 5;
+  // The interfaces on other ships the called agent may ask questions of.
+  repeated Grant asks = 6;
 }
 
 message Install {
@@ -133,6 +146,90 @@ message SendRequest {
   // The ship the agent is on. Empty for this ship. A command for another ship is kept until
   // that ship has it, and reaches it exactly once.
   string ship = 4;
+  // For another ship: the sender wants the handler's reply back with the receipt. If the
+  // command runs, its receipt carries the reply (`Receipt.replied` set); a reply larger than
+  // either ship allows means the command does not stand, and the receipt says LIMIT.
+  // The whole reply comes back with RAN from a receiving ship that follows the protocol. A
+  // receipt can say RAN with `Receipt.replied` unset when the other ship's runtime predates
+  // replies, or when it broke the protocol (a reply over the bound the command was sent with,
+  // or a reply not marked): the command is still reported as run, because the other ship said
+  // so; no reply is handed on; and when a reply came and was let go, the reason says so. An
+  // agent that needs the reply checks `Receipt.replied`. This holds while neither ship makes
+  // its message, inbox or reply limits smaller while the command or its receipt is
+  // outstanding.
+  // A ship that takes back no reply at all (its largest is 0) refuses to send such a
+  // command, since 0 in `PeerMessage.reply_most` means no reply is wanted.
+  bool reply = 5;
+}
+
+// Agent to runtime: put a question to an agent on another ship. The answer, or why there is
+// none, comes later as a KIND_ANSWER event.
+message AskRequest {
+  // Another ship: not empty, and not the asking agent's own.
+  string ship = 1;
+  string agent = 2;
+  string interface = 3;
+  bytes payload = 4;
+  // How long the question is given. Its time is stamped just before the asking event commits (whole
+  // milliseconds of this runtime's wall clock, so a slow commit uses some of it), and turned into a
+  // steady-clock deadline once, when the question's task starts, before it reads the row: a later
+  // change of the clock does not move it, though a restart reads the stamped time afresh. Each try
+  // tells the other ship what is left of it, in whole milliseconds, looked at again with the
+  // deadline on every poll of the write before any of the question's bytes are taken: at the poll
+  // in which the connection accepts a question's first bytes, the allowance in those bytes is no
+  // more than the whole milliseconds left to the asker's deadline by the clock reading taken in
+  // that poll, and no first bytes are accepted in a poll whose clock reading leaves less than a
+  // millisecond. The first-write rule uses the clock reading taken in the accepting poll, and time
+  // spent encoding, waiting inside the writer, or descheduled after that reading can carry actual
+  // acceptance past the deadline. (When the other ship has them is not promised.) Only the
+  // network's giving up keeps this time; writing the answer down and running the `answer` handler
+  // come after it (see the README's Known limits).
+  uint64 within_millis = 5;
+}
+
+// What came of a question an agent put to another ship.
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  // The other agent answered, within the time: `reply` holds what it said.
+  OUTCOME_REPLY = 1;
+  // The other ship would not let the question be asked. `reason` is its kernel's words, or
+  // the runtime's own when a name in the question is not a name (refused before the kernel
+  // is asked).
+  OUTCOME_DENIED = 2;
+  // The other agent failed (it trapped, or ran out of fuel or time), or the other ship could
+  // not route the question to it or read its own file for it. Fixed words only.
+  OUTCOME_FAILED = 3;
+  // The question or its answer was larger than one of the two ships allows (in a message, or
+  // as a question or an answer), or this ship had no room in its queue or file for the
+  // answer's reply (the reply is then let go and only this is handed over).
+  OUTCOME_LIMIT = 4;
+  // No answer came within the time the question was given: some try reached the other ship
+  // and no answer was taken in time (whatever it said after the time, an answer or a refusal,
+  // is not taken), the other ship was too busy each time, or no try could be begun for want of
+  // a place among this runtime's requests out.
+  OUTCOME_NO_ANSWER = 5;
+  // Tries were begun but none ever reached the other ship within that time, or it is not known. A
+  // try that finds the destination absent from the directory ends the question as `Unreachable`,
+  // even if an earlier try reached it, while a try already awaiting its reply can still complete.
+  OUTCOME_UNREACHABLE = 6;
+  // The other ship does not know this kind of question (it runs an older runtime), or what
+  // came back is not an answer.
+  OUTCOME_NOT_UNDERSTOOD = 7;
+}
+
+// Runtime to agent, as a KIND_ANSWER event: what came of the question numbered `about`.
+message Answered {
+  // The number `ask_to` returned.
+  uint64 about = 1;
+  // Where the question was put.
+  string ship = 2;
+  string agent = 3;
+  string interface = 4;
+  Outcome outcome = 5;
+  // Set only with OUTCOME_REPLY.
+  bytes reply = 6;
+  // A few words: the other ship's reason with OUTCOME_DENIED, this runtime's own otherwise.
+  string reason = 7;
 }
 
 // A log is an append-only, numbered list of entries published by one agent under one of its
@@ -469,6 +566,8 @@ message PeerRequest {
     FileWanted file_leaves = 8;
     FileWanted file_upper = 9;
     FileWanted file_chunk = 10;
+    // A question for an agent here that only reads. See Ask.
+    Ask ask = 11;
   }
 }
 
@@ -484,6 +583,7 @@ message PeerReply {
     FileHashes file_leaves = 8;
     FileHashes file_upper = 9;
     FileBytes file_chunk = 10;
+    Answer ask = 11;
   }
   // Set, with no body, when the request was not one the other ship would answer.
   string refused = 15;
@@ -552,6 +652,11 @@ message PeerMessage {
   bytes payload = 5;
   // Set when this is a receipt and not a command. The fields above are then empty.
   Receipt receipt = 6;
+  // For a command: the largest handler's reply, in bytes, the sender takes back with the
+  // receipt. 0 (or absent) means no reply is wanted. The ship that runs the command holds the
+  // reply to the smaller of this and its own limit; a larger one undoes the command, and the
+  // receipt says LIMIT.
+  uint64 reply_most = 7;
 }
 
 // What became of a command on the ship it was sent to.
@@ -580,13 +685,28 @@ message Receipt {
   // The number of the command this is about: the one `send_to` returned to the sender.
   uint64 about = 1;
   Verdict verdict = 2;
-  // A few words on why, for a command that did not run. For reading, not for parsing.
+  // A few words on why, for a command that did not run, or for one that RAN whose reply came
+  // and was let go (see `replied`). For reading, not for parsing.
   string reason = 3;
   // Where the command was sent. Filled in by the sender's own runtime from its record of
   // the command when it hands the receipt to the agent. Empty on the wire.
   string ship = 4;
   string agent = 5;
   string interface = 6;
+  // The handler's reply. Set only with VERDICT_RAN, and only for a command sent with
+  // `reply` set (`SendRequest.reply`).
+  bytes reply = 7;
+  // Set, with VERDICT_RAN, when the receipt carries the handler's reply (which may be empty),
+  // so that an empty reply and no reply are told apart.
+  // The whole reply comes back with RAN from a receiving ship that follows the protocol. A
+  // receipt can say RAN with `Receipt.replied` unset when the other ship's runtime predates
+  // replies, or when it broke the protocol (a reply over the bound the command was sent with,
+  // or a reply not marked): the command is still reported as run, because the other ship said
+  // so; no reply is handed on; and when a reply came and was let go, the reason says so. An
+  // agent that needs the reply checks `Receipt.replied`. This holds while neither ship makes
+  // its message, inbox or reply limits smaller while the command or its receipt is
+  // outstanding.
+  bool replied = 8;
 }
 
 // Some messages, in order of their numbers.
@@ -640,6 +760,56 @@ message FileHashes {
 message FileBytes {
   string denied = 1;
   bytes data = 2;
+}
+
+// A question from one ship to an agent on another, answered by that agent's read handler,
+// read-only: nothing it does is kept, and nothing is kept of the question on the ship that
+// answers: it stores no application data there. (Opening that ship for it, or putting another
+// ship to sleep to make room for it, can recover a transaction that a crash interrupted, copy
+// pages that ordinary work had already committed from the log beside the file into the file,
+// and create or remove the files SQLite keeps beside the ship's file; see the README.) Asking
+// twice is harmless.
+message Ask {
+  // The agent on the asking ship that asks. Empty when that ship's owner asks, through one of
+  // their devices.
+  string from_agent = 1;
+  string agent = 2;
+  string interface = 3;
+  bytes payload = 4;
+  // How long the asker will wait: what is left of its own deadline, in whole milliseconds. At the
+  // poll in which the connection accepts a question's first bytes, the allowance in those bytes is
+  // no more than the whole milliseconds left to the asker's deadline by the clock reading taken in
+  // that poll, and no first bytes are accepted in a poll whose clock reading leaves less than a
+  // millisecond. The first-write rule uses the clock reading taken in the accepting poll, and time
+  // spent encoding, waiting inside the writer, or descheduled after that reading can carry actual
+  // acceptance past the deadline. The ship that answers counts it from one reading of its clock
+  // when the question's stream is taken up, cut to its own limit, as the handler's deadline. 0 from
+  // a peer is no time at all: the ship asked takes a place and an allowance as for any question,
+  // then answers `failed` ("it took too long") without running anything; it is not "the default" or
+  // "no limit". A call is never stopped for time before its deadline. After its deadline it is
+  // stopped at the first point where the running code looks (a loop turn, a function entry, a bulk
+  // memory step) and finds both that the watchdog has ticked since the call was last allowed on and
+  // that the deadline has passed. The watchdog ticks about every 10 ms; the system can run it, and
+  // the call's own thread, late; and after a look that came just before the deadline the call can
+  // run on until a later tick; so no number is promised for the overrun. A host call under way is
+  // not cut short. Whatever a call returns after its deadline is not kept.
+  uint64 within_millis = 5;
+}
+
+// The answer to an Ask: exactly one of these. A ship too busy answers the bare `refused` that
+// every request may get instead.
+message Answer {
+  oneof outcome {
+    // What the agent's read handler said.
+    bytes reply = 1;
+    // Not allowed. The kernel's reason, or the runtime's own for a name that is not one.
+    string denied = 2;
+    // The handler trapped, or ran out of fuel or time, or the question could not be routed
+    // to it or the ship's file read for it. Fixed words; details are not kept.
+    string failed = 3;
+    // The question or the reply was larger than this ship allows. Fixed words.
+    string limit = 4;
+  }
 }
 
 // A ship that follows to the ship that publishes: the entries of a log after number `after`.

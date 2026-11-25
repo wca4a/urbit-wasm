@@ -95,8 +95,8 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use ship_proto::{
-    peer_reply, peer_request, Deliver, Delivered, Fetch, FileBytes, FileFacts, FileHashes, FileWanted, Heard, Hello, Introduction, Message, MoonProof,
-    News, PeerReply, PeerRequest, Ping, Pong, Resync, Resynced, Standing, Welcome,
+    peer_reply, peer_request, Ask, Deliver, Delivered, Fetch, FileBytes, FileFacts, FileHashes, FileWanted, Heard, Hello, Introduction, Message, MoonProof,
+    News, Outcome, PeerReply, PeerRequest, Ping, Pong, Resync, Resynced, Standing, Welcome,
 };
 use tokio::sync::Semaphore;
 
@@ -110,7 +110,9 @@ use crate::whereabouts;
 use crate::files::{Part, Served};
 use crate::ship::Taken;
 use crate::store::{PeerWork, Stand, MAX_BATCH_MESSAGES, MAX_FETCH_ENTRIES, MAX_NEWS_LOGS};
-use crate::{canonical_ship, lock, Acked, Error, Runtime};
+use crate::ask::{self, AskError, Asked, Question};
+use crate::ship::Settled;
+use crate::{canonical_ship, lock, Acked, Error, Ready, Runtime};
 
 /// The name of this protocol, agreed while connecting. A connection that does not ask for it
 /// is not one of ours.
@@ -868,6 +870,16 @@ pub struct NetConfig {
     /// being one. Off by default: with none of it set, nothing of it is sent, listened for,
     /// or kept. See `crate::lookup`.
     pub lookup: Lookup,
+    /// How many questions from any one other ship may be being answered here at once, running
+    /// or waiting for the ship they are for, all ships of this runtime together. Past it, or
+    /// past `max_asks`, a question is told "too busy; try again" before anything runs.
+    pub max_asks_each: usize,
+    /// How many questions from other ships may be being answered here at once, in all.
+    pub max_asks: usize,
+    /// How many questions from any one other ship are started here a second (as many at a
+    /// stroke), and from all ships together. Past either, "too busy; try again".
+    pub asks_per_second_each: u32,
+    pub asks_per_second: u32,
 }
 
 impl Default for NetConfig {
@@ -891,6 +903,10 @@ impl Default for NetConfig {
             max_retry_delay: Duration::from_secs(30),
             follow_check: Duration::from_secs(600),
             lookup: Lookup::default(),
+            max_asks_each: 2,
+            max_asks: 8,
+            asks_per_second_each: 8,
+            asks_per_second: 32,
         }
     }
 }
@@ -911,6 +927,8 @@ pub enum NetError {
     TimedOut,
     /// The other ship answered with something that makes no sense.
     Garbled,
+    /// The other ship's answer is larger than this runtime reads as one message.
+    TooLarge,
 }
 
 impl fmt::Display for NetError {
@@ -922,6 +940,7 @@ impl fmt::Display for NetError {
             NetError::Refused(why) => write!(f, "the ship refused: {why}"),
             NetError::TimedOut => write!(f, "the ship did not answer in time"),
             NetError::Garbled => write!(f, "the ship's answer made no sense"),
+            NetError::TooLarge => write!(f, "the ship's answer is larger than this runtime reads"),
         }
     }
 }
@@ -1173,6 +1192,15 @@ struct Shared {
     /// Places among the requests for files being answered, all connections together. See
     /// `MOST_FILES_ANSWERING`.
     files_answering: Arc<Semaphore>,
+    /// Questions from other ships being answered here, and how many each may still start.
+    questions: Arc<Mutex<Questions>>,
+    /// For tests: whether the look at every ship's file when the network started is done.
+    #[cfg(test)]
+    started_up: AtomicBool,
+    /// Places among this runtime's requests out that agents' questions may hold: a quarter of
+    /// `max_requests`, and at least one, so that they cannot take the places every other
+    /// request needs.
+    agents_asking: Arc<Semaphore>,
     /// For tests: what this runtime, answering for files, does in place of answering honestly.
     #[cfg(test)]
     pub(crate) liar: Mutex<Option<Liar>>,
@@ -1295,6 +1323,22 @@ struct Carrier {
     /// Each (ship, other ship) where the first is comparing notes with the second, at its
     /// own asking, right now.
     resyncing: Mutex<HashSet<Pair>>,
+    /// Ships that may have questions waiting that nothing is putting yet. Drained by a task of
+    /// its own (`start_looks`), not by the carrier, so a notice here never waits for the
+    /// carrier's look at another ship's commands.
+    asking: Mutex<HashSet<String>>,
+    /// Rung when a ship is put in `asking`.
+    asks_news: tokio::sync::Notify,
+    /// The questions being put now, by ship, then by (that ship's copy's mark, number), each
+    /// with the means to stop its task once the question is gone (dropped). Kept by ship, so a
+    /// look at one ship's questions does work in proportion to that ship's own.
+    putting: Mutex<HashMap<String, HashMap<([u8; 16], u64), Arc<Cancel>>>>,
+    /// The ships whose questions are being looked at now, each by one task of its own, with
+    /// whether a notice came meanwhile (look again once it is done).
+    looking: Mutex<HashMap<String, bool>>,
+    /// For tests: how many drops the network has been told of.
+    #[cfg(test)]
+    drops_told: AtomicU64,
 }
 
 #[derive(Default)]
@@ -1323,6 +1367,45 @@ impl Carrier {
     fn run_at(&self, ship: &str) {
         lock(&self.queued).insert(ship.to_string());
         self.news.notify_one();
+    }
+
+    /// There may be questions waiting on this ship that nothing is putting.
+    fn asks_at(&self, ship: &str) {
+        lock(&self.asking).insert(ship.to_string());
+        self.asks_news.notify_one();
+    }
+
+    /// The question numbered `seq` on this copy (`incarnation`) of `ship` was dropped, and the
+    /// drop has committed: its task, if it has one, is told to stop now, without the ship being
+    /// taken (each of its waits notices as `put_question` says). It is stopped at its next poll:
+    /// a write that poll had already begun may still go out; nothing comes of its answer.
+    fn dropped(&self, ship: &str, incarnation: [u8; 16], seq: u64) {
+        // Told with the dropping event's ship still held (`Ship::execute`), so after any look
+        // through the ship's questions that saw this one, which registered its means to stop
+        // with that ship held (`start_questions`), and before any look that cannot see it.
+        if let Some(cancel) = lock(&self.putting).get(ship).and_then(|of_ship| of_ship.get(&(incarnation, seq))) {
+            cancel.stop();
+        }
+        #[cfg(test)]
+        self.drops_told.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// For tests: how many questions are registered as being put, on every ship.
+    #[cfg(test)]
+    fn putting_count(&self) -> usize {
+        lock(&self.putting).values().map(HashMap::len).sum()
+    }
+
+    /// For tests: whether `ship`'s questions are being looked at now.
+    #[cfg(test)]
+    fn looking_at(&self, ship: &str) -> bool {
+        lock(&self.looking).contains_key(ship)
+    }
+
+    /// For tests: whether the question numbered `seq` on `ship` is registered as being put.
+    #[cfg(test)]
+    fn putting_has(&self, ship: &str, seq: u64) -> bool {
+        lock(&self.putting).get(ship).is_some_and(|of_ship| of_ship.keys().any(|(_, number)| *number == seq))
     }
 }
 
@@ -1375,6 +1458,20 @@ impl Network {
         // commands that nobody could ever say were lost.
         if cfg.max_message_bytes / 2 < runtime.inner.cfg.max_unanswered.saturating_mul(8) {
             return Err(io::Error::other("max_message_bytes must have room for max_unanswered command numbers, twice over"));
+        }
+        // Questions between ships: the time limits are ones a clock keeps, and the places and
+        // allowances are more than nothing. (A question or an answer larger than a message
+        // carries is held to what it carries: see `question_most` and `answer_most`. A receipt
+        // with its reply is never larger than a command: see `store::reply_most`.)
+        let rcfg = &runtime.inner.cfg;
+        if rcfg.ask_fuel == 0 || rcfg.ask_millis == 0 || Duration::from_millis(rcfg.ask_millis) > MAX_TIMEOUT {
+            return Err(io::Error::other("ask_fuel and ask_millis must be more than nothing, and ask_millis at most a day"));
+        }
+        if rcfg.max_ask_millis == 0 || Duration::from_millis(rcfg.max_ask_millis) > MAX_TIMEOUT {
+            return Err(io::Error::other("max_ask_millis must be more than nothing and at most a day"));
+        }
+        if cfg.max_asks == 0 || cfg.max_asks_each == 0 || cfg.asks_per_second == 0 || cfg.asks_per_second_each == 0 {
+            return Err(io::Error::other("max_asks, max_asks_each, asks_per_second and asks_per_second_each must be more than nothing"));
         }
         if cfg.follow_check.is_zero() || cfg.follow_check > MAX_TIMEOUT {
             return Err(io::Error::other("follow_check must be more than nothing and at most a day"));
@@ -1474,6 +1571,7 @@ impl Network {
             true => Some(Arc::new(Finder::new(cfg.lookup.clone(), &cfg, endpoint.clone(), &provider, bound, pushed, relayed.clone())?)),
             false => None,
         };
+        let (cfg_rates, max_requests) = ((cfg.asks_per_second, cfg.asks_per_second_each), cfg.max_requests);
         // Taken last of the things that can fail, so that a start that fails gives it back.
         let claim = Claim::take(&runtime).ok_or_else(|| io::Error::other("this runtime already has a network running"))?;
         let shared = Arc::new(Shared {
@@ -1509,11 +1607,16 @@ impl Network {
             direct_tries: Arc::new(Semaphore::new(MOST_DIRECT_TRIES)),
             punching: Punching::new(),
             files_answering: Arc::new(Semaphore::new(MOST_FILES_ANSWERING)),
+            questions: Arc::new(Mutex::new(Questions::new(cfg_rates))),
+            #[cfg(test)]
+            started_up: AtomicBool::new(false),
+            agents_asking: Arc::new(Semaphore::new((max_requests / 4).max(1))),
             #[cfg(test)]
             liar: Mutex::new(None),
         });
         tokio.spawn(answer_calls(shared.clone()));
         tokio.spawn(carry(shared.clone()));
+        tokio.spawn(start_looks(shared.clone()));
         // This runtime's ships are announced to the lookup points for their galaxies, at the
         // addresses given, or else at the one each point sees this runtime's connection come
         // from; and introductions those points pass on are weighed.
@@ -1525,11 +1628,14 @@ impl Network {
         }
         // From now on the runtime says when a ship has queued commands for other ships.
         let told = carrier.clone();
-        shared.runtime.set_outbound_hook(Some(Arc::new(move |ship: &str, queued: bool| {
-            told.look_at(ship);
-            if queued {
+        shared.runtime.set_outbound_hook(Some(Arc::new(move |ship: &str, ready: Ready| match ready {
+            Ready::Outbound => told.look_at(ship),
+            Ready::Work => {
+                told.look_at(ship);
                 told.run_at(ship);
             }
+            Ready::Asks => told.asks_at(ship),
+            Ready::Dropped(incarnation, seq) => told.dropped(ship, incarnation, seq),
         })));
         // And anything outside the network (the HTTP server) may ask other ships for parts of
         // files through it. Held weakly, so that the runtime holds nothing of the network.
@@ -1538,23 +1644,67 @@ impl Network {
             let shared = weak.upgrade().ok_or(FileAskError::Stopped)?;
             ask_for_file(&shared, &handle, from, to, request)
         })));
+        // And put questions to other ships for `Runtime::ask`, held weakly in the same way.
+        let (weak, handle) = (Arc::downgrade(&shared), tokio.handle().clone());
+        shared.runtime.set_ask_hook(Some(Arc::new(move |question: Question| {
+            let shared = weak.upgrade().ok_or(AskError::NoNetwork)?;
+            ask_for_answer(&shared, &handle, question)
+        })));
         // Ships may have had commands waiting since before this network started: to go to
         // other ships, or taken from other ships and not yet run. A command that was taken
         // just before a runtime stopped has been acknowledged, so nobody will send it again,
         // and running it is up to this runtime.
+        //
+        // A ship that cannot be looked at (its file could not be opened or read just then), or
+        // a directory that cannot be listed (or an entry of it that cannot be read), is looked
+        // at again, with growing waits, for as long as the network runs, and nothing is taken
+        // to be empty because it could not be read. What one look through the ships finds is
+        // handed on when that whole look has returned: one ship held for a long while in it
+        // holds up the handing on of what was found in the ships looked at before it too.
         let starting = shared.clone();
         tokio.spawn(async move {
-            let runtime = starting.runtime.clone();
-            let found = work(&starting, move || runtime.ships_with_work()).await;
-            let (busy, following, awaiting) = found.and_then(Result::ok).unwrap_or_default();
-            lock(&starting.carrier.awaiting).extend(awaiting);
-            for ship in busy {
-                starting.carrier.look_at(&ship);
-                starting.carrier.run_at(&ship);
+            // The ships already looked at, whose work has been handed on: never looked at, nor
+            // handed on, again, however often the directory is listed.
+            let mut done: HashSet<String> = HashSet::new();
+            let mut only: Option<Vec<String>> = None;
+            let mut delay = starting.cfg.retry_delay;
+            loop {
+                let (runtime, ships, skip) = (starting.runtime.clone(), only.clone(), done.clone());
+                let found = match work(&starting, move || runtime.ships_with_work(ships.as_deref(), &skip)).await {
+                    // The network is stopping.
+                    None => return,
+                    Some(Ok(found)) => Some(found),
+                    // The directory could not be listed: tried again.
+                    Some(Err(_)) => None,
+                };
+                if let Some(crate::Scan { found: (busy, following, awaiting, asking), inspected, failed, list_again }) = found {
+                    lock(&starting.carrier.awaiting).extend(awaiting);
+                    // Questions that were waiting when the runtime stopped: each is asked
+                    // again if its time has not run out, and answered as having had no answer
+                    // if it has.
+                    for ship in asking {
+                        starting.carrier.asks_at(&ship);
+                    }
+                    for ship in busy {
+                        starting.carrier.look_at(&ship);
+                        starting.carrier.run_at(&ship);
+                    }
+                    // And every ship that follows logs elsewhere is known, so that the ships
+                    // it follows can be asked now and then whether they are still what they
+                    // were.
+                    lock(&starting.carrier.watching).extend(following.into_iter().map(|pair| (pair, None)));
+                    done.extend(inspected);
+                    if failed.is_empty() && !list_again {
+                        #[cfg(test)]
+                        starting.started_up.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    // Listed again (which finds the ships that failed too), or only those.
+                    only = if list_again { None } else { Some(failed) };
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(starting.cfg.max_retry_delay);
             }
-            // And every ship that follows logs elsewhere is known, so that the ships it
-            // follows can be asked now and then whether they are still what they were.
-            lock(&starting.carrier.watching).extend(following.into_iter().map(|pair| (pair, None)));
         });
         Ok(Network { shared, threads, _claim: claim })
     }
@@ -1680,6 +1830,7 @@ impl Network {
         let mut this = std::mem::ManuallyDrop::new(self);
         this.shared.runtime.set_outbound_hook(None);
         this.shared.runtime.set_file_hook(None);
+        this.shared.runtime.set_ask_hook(None);
         if let Some(tokio) = this.threads.0.take() {
             tokio.shutdown_background();
         }
@@ -1692,8 +1843,11 @@ impl Network {
 
 impl Drop for Network {
     fn drop(&mut self) {
+        #[cfg(test)]
+        self.shared.runtime.inner.note("network stopping", "");
         self.shared.runtime.set_outbound_hook(None);
         self.shared.runtime.set_file_hook(None);
+        self.shared.runtime.set_ask_hook(None);
         self.shared.endpoint.close(VarInt::from_u32(0), b"stopping");
         // Give the goodbyes a moment to go out, so the ships at the other end know at once and
         // do not hold a dead connection until it times out. Only a moment: a ship that is not
@@ -1709,13 +1863,17 @@ impl Drop for Network {
     }
 }
 
+/// How much the other end may send on one stream before this end has read any of it: a whole
+/// message, or a small fixed amount where messages are smaller than that. How large a message
+/// is taken is checked separately, as it is read.
+pub(crate) fn stream_room(cfg: &NetConfig) -> u64 {
+    cfg.max_message_bytes.clamp(16 << 10, u32::MAX as usize) as u64
+}
+
 /// How a connection carries data. `streams` is how many requests the other end may have in
 /// progress on it at once.
 pub(crate) fn transport(cfg: &NetConfig, streams: u32) -> io::Result<TransportConfig> {
-    // The other end may send this much on one stream before this end has read any of it: a
-    // whole message, or a small fixed amount where messages are smaller than that. How large
-    // a message is taken is checked separately, as it is read.
-    let stream_room = cfg.max_message_bytes.clamp(16 << 10, u32::MAX as usize) as u64;
+    let stream_room = stream_room(cfg);
     let room = |bytes: u64| VarInt::from_u64(bytes).map_err(io::Error::other);
     let mut transport = TransportConfig::default();
     transport.max_concurrent_bidi_streams(VarInt::from_u32(streams));
@@ -2038,37 +2196,170 @@ impl Shared {
 
     /// The same, with `within` for the whole of it in place of `request_timeout`.
     async fn ask_within(self: &Arc<Self>, from: &str, to: &str, request: PeerRequest, within: Duration) -> Result<(PeerReply, [u8; 32]), NetError> {
-        let from = canonical_ship(from).map_err(|_| NetError::NotHere(from.to_string()))?;
-        let to = canonical_ship(to).map_err(|_| NetError::Unlisted(to.to_string()))?;
         let deadline = tokio::time::Instant::now().checked_add(within).ok_or(NetError::TimedOut)?;
+        self.ask_traced(from, to, request, deadline, within).await.map_err(|(error, _)| error)
+    }
+
+    /// The same, with at most `connecting` of `within` to have a connection, and saying with
+    /// an error whether a connection was had for the request (and so whether it was sent, or
+    /// began to be).
+    ///
+    /// `deadline` is one absolute moment, taken by the caller before any of this, so time spent
+    /// before this was first run, or making the connection, comes out of it.
+    async fn ask_traced(self: &Arc<Self>, from: &str, to: &str, request: PeerRequest, deadline: tokio::time::Instant, connecting: Duration) -> Result<(PeerReply, [u8; 32]), (NetError, bool)> {
+        let from = canonical_ship(from).map_err(|_| (NetError::NotHere(from.to_string()), false))?;
+        let to = canonical_ship(to).map_err(|_| (NetError::Unlisted(to.to_string()), false))?;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err((NetError::TimedOut, false));
+        }
+        let connected_by = now.checked_add(connecting).map_or(deadline, |by| by.min(deadline));
+        let connected = tokio::time::timeout_at(connected_by, self.connection(&from, &to, connected_by)).await.map_err(|_| NetError::TimedOut).and_then(|made| made);
+        let (connection, key, silenced) = connected.map_err(|error| (error, false))?;
+        self.exchange(&to, connection, key, silenced, request, deadline).await.map_err(|error| (error, true))
+    }
+
+    /// Send one request on `connection` and read its reply, by `deadline`.
+    async fn exchange(&self, to: &str, connection: Connection, key: [u8; 32], silenced: Arc<AtomicBool>, mut request: PeerRequest, deadline: tokio::time::Instant) -> Result<(PeerReply, [u8; 32]), NetError> {
+        #[cfg(test)]
+        let asking = matches!(request.body, Some(peer_request::Body::Ask(_)));
+        #[cfg(test)]
+        if asking {
+            self.runtime.inner.gates.pass_async("question stream to open").await;
+        }
         let lost = |why: &dyn fmt::Display| NetError::Unreachable(why.to_string());
-        let (connection, key, silenced) = tokio::time::timeout_at(deadline, self.connection(&from, &to, deadline)).await.map_err(|_| NetError::TimedOut)??;
         // Whatever went wrong, if the connection's watcher gave it up for silence, that is what
         // is said.
         let quiet = || NetError::Unreachable(format!("nothing was heard from {to} for {} seconds, so the connection to it was given up", self.cfg.silence_timeout.as_secs_f64()));
         let said = |error: NetError| if silenced.load(Ordering::SeqCst) { quiet() } else { error };
         let opened = tokio::time::timeout_at(deadline, connection.open_bi()).await.map_err(|_| said(NetError::TimedOut))?;
-        let (mut send, mut receive) = opened.map_err(|e| said(lost(&e)))?;
+        let (send, mut receive) = opened.map_err(|e| said(lost(&e)))?;
+        // Reset, not finished, if this is dropped part way (its question dropped meanwhile, or
+        // its caller gone): letting go of a stream finishes it, and the request would go on.
+        let mut send = Resetting(Some(send));
+        // A question's time on the wire is what is left of it as it is sent, in whole
+        // milliseconds: with less than one left, nothing is sent.
+        let question = matches!(request.body, Some(peer_request::Body::Ask(_)));
+        if let Some(peer_request::Body::Ask(ask)) = &mut request.body {
+            let Some(allowed) = wire_allowance(ask.within_millis, deadline.saturating_duration_since(tokio::time::Instant::now())) else {
+                return Err(NetError::TimedOut);
+            };
+            ask.within_millis = allowed;
+            // For the tests: the first, provisional allowance; `write_question` can lower it
+            // before the connection takes the question's first bytes.
+            #[cfg(test)]
+            self.runtime.inner.note_value("question allowance", to, allowed);
+        }
         // The streams are held out here, so that if time runs out part way they can be told
         // to stop. Merely letting go of them would leave the request to go on being sent. A
         // request that runs out of time never closes the connection: only its watcher does.
+        let deliver = matches!(request.body, Some(peer_request::Body::Deliver(_)));
         let exchanged = tokio::time::timeout_at(deadline, async {
-            send.write_all(&request.encode_to_vec()).await.map_err(|e| lost(&e))?;
-            send.finish().map_err(|e| lost(&e))?;
+            // A question is not begun once its time has passed (a timeout lets work that is
+            // ready go first, so this is looked at here).
+            if question && tokio::time::Instant::now() >= deadline {
+                return Err(NetError::TimedOut);
+            }
+            // For the tests: counts the entries to a question's write (not the bytes accepted).
             #[cfg(test)]
-            let _held = match matches!(request.body, Some(peer_request::Body::Deliver(_))) && self.deliver_gate.armed.swap(false, Ordering::SeqCst) {
+            if asking {
+                self.runtime.inner.ask_writes.fetch_add(1, Ordering::SeqCst);
+                self.runtime.inner.note("question written", to);
+            }
+            // The request is written, and the reply side read at the same time: a whole refusal
+            // that comes while the request is still being written (the other end stopped reading
+            // it, too large, say, and said so) ends it, and the rest is not written (the stream
+            // is reset as it is let go of). Any other reply that comes before the request is all
+            // written is not taken: a ship that keeps to the protocol answers only a request it
+            // has had whole. A question's first bytes go with the allowance and the deadline
+            // looked at as they go (`write_question`).
+            let max = self.cfg.max_message_bytes;
+            let write = async {
+                if question {
+                    write_question(send.stream(), &mut request, deadline.into_std(), Instant::now, |request| request.encode_to_vec()).await.map_err(|failed| match failed {
+                        FirstWrite::TimedOut => NetError::TimedOut,
+                        FirstWrite::Failed(e) => lost(&e),
+                    })?;
+                } else {
+                    send.stream().write_all(&request.encode_to_vec()).await.map_err(|e| lost(&e))?;
+                }
+                send.stream().finish().map_err(|e| lost(&e))
+            };
+            let mut write = std::pin::pin!(write);
+            let mut read = std::pin::pin!(read_whole_sized(&mut receive, max));
+            let mut early: Option<Result<Vec<u8>, Unread>> = None;
+            let wrote = std::future::poll_fn(|cx| {
+                if let std::task::Poll::Ready(wrote) = std::future::Future::poll(write.as_mut(), cx) {
+                    return std::task::Poll::Ready(Some(wrote));
+                }
+                if early.is_none() {
+                    if let std::task::Poll::Ready(read) = std::future::Future::poll(read.as_mut(), cx) {
+                        let refusal = read.as_ref().is_ok_and(|answer| is_refusal(answer));
+                        early = Some(read);
+                        if refusal {
+                            // The request is not all written: given up, and reset.
+                            return std::task::Poll::Ready(None);
+                        }
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+            let Some(wrote) = wrote else {
+                let Some(Ok(answer)) = early else { unreachable!("taken only as a refusal") };
+                return Ok((answer, false));
+            };
+            #[cfg(test)]
+            let _held = match deliver && wrote.is_ok() && self.deliver_gate.armed.swap(false, Ordering::SeqCst) {
                 true => Some(self.deliver_gate.hold(connection.stable_id()).await),
                 false => None,
             };
-            read_whole(&mut receive, self.cfg.max_message_bytes).await.ok_or_else(|| lost(&"the reply could not be read, or was too large"))
+            #[cfg(not(test))]
+            let _ = deliver;
+            match (wrote, early) {
+                // A reply that came before the request was all written, and was not a refusal:
+                // not an answer to it.
+                (Ok(()), Some(Ok(_))) => Err(NetError::Garbled),
+                (Ok(()), Some(Err(Unread::TooLarge))) => Err(NetError::TooLarge),
+                (Ok(()), Some(Err(Unread::Broken))) => Err(lost(&"the reply could not be read")),
+                (Ok(()), None) => match read.await {
+                    Ok(answer) => Ok((answer, true)),
+                    // Too large to read: the same however often it is asked, so not tried again.
+                    Err(Unread::TooLarge) => Err(NetError::TooLarge),
+                    Err(Unread::Broken) => Err(lost(&"the reply could not be read")),
+                },
+                // The request could not all be written: the other end may have stopped reading
+                // it because it refused it, and said so on the reply side, which is read (under
+                // the same deadline) before giving up. A connection lost fails that read at once.
+                // Only a whole refusal is taken; anything else leaves the write's error, if the
+                // reply read completes before the exchange's deadline (otherwise the exchange ends
+                // at its deadline).
+                (Err(wrote), Some(_)) => Err(wrote),
+                (Err(wrote), None) => match read.await {
+                    Ok(answer) if is_refusal(&answer) => Ok((answer, false)),
+                    _ => Err(wrote),
+                },
+            }
         })
         .await;
         let Ok(answer) = exchanged else {
-            let _ = send.reset(VarInt::from_u32(3));
             let _ = receive.stop(VarInt::from_u32(3));
             return Err(said(NetError::TimedOut));
         };
-        let answer = answer.map_err(said)?;
+        if matches!(answer, Err(NetError::TooLarge)) {
+            let _ = receive.stop(VarInt::from_u32(3));
+            return Err(NetError::TooLarge);
+        }
+        let (answer, finished) = answer.map_err(said)?;
+        // Done with: finished, not reset (a request refused before it was all written is reset,
+        // as `send` is let go of).
+        if finished {
+            send.0 = None;
+        }
+        #[cfg(test)]
+        if asking {
+            self.runtime.inner.gates.pass_async("question reply read").await;
+        }
         // Counted before it is decoded, as a request is: an answer can be all padding too.
         if !repeats_within(&answer, 3, 1, MAX_FETCH_ENTRIES) {
             return Err(NetError::Garbled);
@@ -3044,8 +3335,12 @@ async fn answer_request(shared: Arc<Shared>, connection: Connection, pair: Pair,
             return Read::Refuse(TOO_BUSY);
         };
         // Not read whole: the room, and whatever of it was read, go as this returns.
-        let Some(bytes) = read_whole(&mut receive, shared.cfg.max_message_bytes).await else {
-            return Read::Refuse("the request could not be read, or was too large");
+        let bytes = match read_whole_sized(&mut receive, shared.cfg.max_message_bytes).await {
+            Ok(bytes) => bytes,
+            // Said in words of its own, so the asker can tell a request too large (the same
+            // however often it is sent) from one that broke.
+            Err(Unread::TooLarge) => return Read::Refuse(TOO_LARGE_TO_READ),
+            Err(Unread::Broken) => return Read::Refuse("the request could not be read"),
         };
         // Who is calling was settled when the connection was made. It is checked again here,
         // with the whole request in hand and just before acting on it: the directory may
@@ -3062,7 +3357,18 @@ async fn answer_request(shared: Arc<Shared>, connection: Connection, pair: Pair,
     .await;
     let (room, bytes) = match read {
         Ok(Read::Whole(room, bytes)) => (room, bytes),
-        Ok(Read::Refuse(why)) => return reply_small(&mut send, &mut receive, Held::nothing(), &refused(why), request_deadline).await,
+        Ok(Read::Refuse(why)) => {
+            reply_small(&mut send, &mut receive, Held::nothing(), &refused(why), request_deadline).await;
+            // For the tests: a refusal of a request too large to read is sent, and the request's
+            // receiving side not yet let go of (so the asker is told nothing to stop its write).
+            #[cfg(test)]
+            if why == TOO_LARGE_TO_READ {
+                shared.runtime.inner.note("refusal sent", &pair.0);
+                shared.runtime.inner.gates.pass_async("refusal sent").await;
+                shared.runtime.inner.note("request let go of", &pair.0);
+            }
+            return;
+        }
         Ok(Read::Quiet) => return,
         Err(_) => {
             // Out of time. Say so on the wire, so nothing of this request lingers at either end.
@@ -3092,6 +3398,14 @@ async fn answer_request(shared: Arc<Shared>, connection: Connection, pair: Pair,
     let request = match request {
         Ok(request) => request,
         Err(refusal) => return reply_small(&mut send, &mut receive, Held { room: Some(room), bytes: None, body: None }, &refusal, request_deadline).await,
+    };
+    // A question, answered by an agent's read handler with a time and places of its own.
+    let request = match request {
+        PeerRequest { body: Some(peer_request::Body::Ask(asked)) } => {
+            let held = Held { room: Some(room), bytes: None, body: None };
+            return answer_question(&shared, &pair, asked, held, &mut send, &mut receive, started).await;
+        }
+        request => request,
     };
     let body = match request {
         PeerRequest { body: Some(body) } if is_file_request(&body) => body,
@@ -3198,8 +3512,9 @@ enum Read {
 /// What the ship's words are for an envelope with more than one body field.
 pub(crate) const ONE_AT_A_TIME: &str = "one request at a time";
 
-/// The field numbers of `PeerRequest`'s body, and of its four file kinds.
-const BODY_FIELDS: std::ops::RangeInclusive<u64> = 1..=10;
+/// The field numbers of `PeerRequest`'s body (a question, `ask`, is 11), and of its four file
+/// kinds.
+const BODY_FIELDS: std::ops::RangeInclusive<u64> = 1..=11;
 const FILE_FIELDS: std::ops::RangeInclusive<u64> = 7..=10;
 
 /// How many body fields an encoded request holds, and the number of the last, found without
@@ -3299,6 +3614,92 @@ fn is_file_request(body: &peer_request::Body) -> bool {
     )
 }
 
+/// The time a question is told it has on the wire (`Ask.within_millis`): what the asker gave
+/// it (`given`, 0 for no more than is left), or what is left of its deadline (`left`) if that is
+/// less, in whole milliseconds, never rounded up. `None` with less than one whole millisecond
+/// left: nothing is sent.
+fn wire_allowance(given: u64, left: Duration) -> Option<u64> {
+    let whole = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+    if whole == 0 {
+        return None;
+    }
+    Some(if given == 0 || whole < given { whole } else { given })
+}
+
+/// Whether a whole reply is a refusal (the bare form, with no body), which may come before the
+/// request it refuses was all written. Told from the envelope's outer fields alone, by their tags
+/// and lengths (`walk_fields`), with nothing decoded or kept: a refusal if and only if every field
+/// is the refusal (`PeerReply.refused`, field 15, length-delimited), there is at least one, and the
+/// last (the one a decoding keeps) is not empty. Anything else (a body, a field this runtime does
+/// not know, bytes that are not fields from end to end, nothing at all) is not.
+pub(crate) fn is_refusal(answer: &[u8]) -> bool {
+    const REFUSED: u64 = 15;
+    let mut reason = None;
+    walk_fields(answer, |field, wire, body| {
+        reason = Some(!body.is_empty());
+        field == REFUSED && wire == 2
+    }) && reason == Some(true)
+}
+
+/// Why a question's write ended without its bytes all being taken.
+#[derive(Debug)]
+pub(crate) enum FirstWrite {
+    /// Less than a whole millisecond was left before any byte was taken: nothing was written.
+    TimedOut,
+    Failed(io::Error),
+}
+
+/// Write a question (`request`, an `Ask`) to `writer`. On every poll at which no byte of it has
+/// been taken yet, the clock is read once (`clock`): with less than one whole millisecond left to
+/// `deadline`, it ends (`FirstWrite::TimedOut`), nothing written; if the allowance encoded in it
+/// (`Ask.within_millis`) is more than the whole milliseconds now left, it is encoded again with
+/// that; then the write is polled. Once any byte has been taken the bytes are fixed and the rest is
+/// written as it comes. So at the poll in which the connection accepts a question's first bytes,
+/// the allowance in those bytes is no more than the whole milliseconds left to the asker's deadline
+/// by the clock reading taken in that poll, and no first bytes are accepted in a poll whose clock
+/// reading leaves less than a millisecond. The first-write rule uses the clock reading taken in the
+/// accepting poll, and time spent encoding, waiting inside the writer, or descheduled after that
+/// reading can carry actual acceptance past the deadline.
+pub(crate) async fn write_question<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    request: &mut PeerRequest,
+    deadline: Instant,
+    clock: impl Fn() -> Instant,
+    encode: impl Fn(&PeerRequest) -> Vec<u8>,
+) -> Result<(), FirstWrite> {
+    let mut encoded = encode(request);
+    let mut taken = 0;
+    std::future::poll_fn(|cx| loop {
+        if taken == 0 {
+            let left = deadline.saturating_duration_since(clock());
+            let Some(peer_request::Body::Ask(ask)) = &mut request.body else { unreachable!("a question") };
+            let Some(allowed) = wire_allowance(ask.within_millis, left) else {
+                return std::task::Poll::Ready(Err(FirstWrite::TimedOut));
+            };
+            if allowed != ask.within_millis {
+                ask.within_millis = allowed;
+                encoded = encode(request);
+            }
+        }
+        match std::pin::Pin::new(&mut *writer).poll_write(cx, &encoded[taken..]) {
+            std::task::Poll::Ready(Ok(0)) => return std::task::Poll::Ready(Err(FirstWrite::Failed(io::ErrorKind::WriteZero.into()))),
+            std::task::Poll::Ready(Ok(n)) => {
+                taken += n;
+                if taken == encoded.len() {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+            }
+            std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(FirstWrite::Failed(e))),
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        }
+    })
+    .await
+}
+
+/// What a ship says to a request larger than it reads as one message. (It still says "too
+/// large", as the refusal it replaces did.)
+pub(crate) const TOO_LARGE_TO_READ: &str = "the request is too large: larger than this ship reads as one message";
+
 /// Read a whole message from a stream, up to `max` bytes. `None` if it is longer, or the
 /// stream fails.
 ///
@@ -3306,21 +3707,70 @@ fn is_file_request(body: &peer_request::Body) -> bool {
 /// the pieces as they arrive would not do: each piece can keep alive the whole packet it came
 /// in, so a message sent a byte at a time could hold many times its own size in memory.
 pub(crate) async fn read_whole(receive: &mut RecvStream, max: usize) -> Option<Vec<u8>> {
+    read_whole_sized(receive, max).await.ok()
+}
+
+/// `read_whole`, saying why a message could not be read.
+pub(crate) async fn read_whole_sized(receive: &mut RecvStream, max: usize) -> Result<Vec<u8>, Unread> {
     let (mut whole, mut piece) = (Vec::new(), [0u8; 8192]);
     loop {
-        match receive.read(&mut piece).await.ok()? {
-            None => return Some(whole),
-            Some(read) if whole.len() + read > max => return None,
+        match receive.read(&mut piece).await.map_err(|_| Unread::Broken)? {
+            None => return Ok(whole),
+            Some(read) if whole.len() + read > max => return Err(Unread::TooLarge),
             Some(read) => whole.extend_from_slice(&piece[..read]),
         }
     }
 }
 
+/// Why a whole message could not be read: it is larger than the most that is read as one, or
+/// the stream broke (reset, or its connection lost) before its end.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unread {
+    TooLarge,
+    Broken,
+}
+
+/// A request's sending half that is reset if it is let go of before it is done with (`.0` set
+/// to `None` once it is).
+struct Resetting(Option<SendStream>);
+
+impl Resetting {
+    fn stream(&mut self) -> &mut SendStream {
+        self.0.as_mut().expect("held until done with")
+    }
+}
+
+impl Drop for Resetting {
+    fn drop(&mut self) {
+        if let Some(send) = &mut self.0 {
+            let _ = send.reset(VarInt::from_u32(3));
+        }
+    }
+}
+
 async fn reply(send: &mut SendStream, reply: &PeerReply) {
-    let _ = send.write_all(&reply.encode_to_vec()).await;
+    send_encoded(send, reply.encode_to_vec()).await;
+}
+
+/// Send a reply already encoded, and wait for the caller to take it. The caller lets go of
+/// what it was encoded from first, so only this one copy is held while it is sent.
+async fn send_encoded(send: &mut SendStream, encoded: Vec<u8>) {
+    let _ = send.write_all(&encoded).await;
+    drop(encoded);
     let _ = send.finish();
     // Wait for the caller to take the reply, so closing does not cut it short.
     let _ = send.stopped().await;
+}
+
+/// `reply_small` for a reply given whole: encoded, and what it was encoded from let go, before
+/// anything is awaited, so an answer's reply is held once while it is sent, not twice.
+async fn reply_owned(send: &mut SendStream, receive: &mut RecvStream, answer: PeerReply, deadline: tokio::time::Instant) {
+    let encoded = answer.encode_to_vec();
+    drop(answer);
+    if tokio::time::timeout_at(deadline, send_encoded(send, encoded)).await.is_err() {
+        let _ = send.reset(VarInt::from_u32(3));
+        let _ = receive.stop(VarInt::from_u32(3));
+    }
 }
 
 /// Who is at each end of a connection from another ship, as things stand now: the calling
@@ -3584,6 +4034,681 @@ fn ask_for_file(shared: &Arc<Shared>, handle: &tokio::runtime::Handle, from: &st
     }
 }
 
+/// The questions from other ships being answered here, and the allowances for starting more.
+struct Questions {
+    /// How many are being answered (running, or waiting for their ship), in all and from each
+    /// asking ship. A ship with none is not listed.
+    running: usize,
+    each: HashMap<String, usize>,
+    /// How many may still be started just now, in all and by each asking ship. Only so many
+    /// asking ships are counted; past that, those whose allowance is whole are forgotten.
+    started: Bucket,
+    started_each: HashMap<String, Bucket>,
+    per_second_each: u32,
+}
+
+/// How many asking ships' allowances are kept. Past it, those whose allowance is whole are
+/// forgotten, and if none is, a question from a ship not counted is told to try again.
+const MOST_ASKERS: usize = 1024;
+
+impl Questions {
+    fn new((per_second, per_second_each): (u32, u32)) -> Questions {
+        Questions { running: 0, each: HashMap::new(), started: Bucket::new(per_second), started_each: HashMap::new(), per_second_each }
+    }
+}
+
+/// A question's place among those being answered, given back when it is dropped: when the
+/// blocking job that answers it returns, or when it is turned away.
+/// A question's place among those being answered. It holds only the table of places (not the
+/// network), so a job that holds it holds nothing that keeps the network's socket bound.
+struct QuestionPlace(Arc<Mutex<Questions>>, String, #[cfg(test)] Arc<crate::Inner>);
+
+impl QuestionPlace {
+    /// A place for a question from `caller`, if one is free and the allowances to start one
+    /// have room; otherwise the question is too busy to be answered. The asking ship's own
+    /// allowance is charged before the overall one, and stays charged if the overall one then
+    /// has no room.
+    fn take(shared: &Arc<Shared>, caller: &str) -> Option<QuestionPlace> {
+        let cfg = &shared.cfg;
+        let mut questions = lock(&shared.questions);
+        if questions.running >= cfg.max_asks || questions.each.get(caller).copied().unwrap_or(0) >= cfg.max_asks_each {
+            return None;
+        }
+        if !questions.started_each.contains_key(caller) && questions.started_each.len() >= MOST_ASKERS {
+            questions.started_each.retain(|_, bucket| !bucket.whole());
+            if questions.started_each.len() >= MOST_ASKERS {
+                return None;
+            }
+        }
+        let per_second_each = questions.per_second_each;
+        if !questions.started_each.entry(caller.to_string()).or_insert_with(|| Bucket::new(per_second_each)).take() || !questions.started.take() {
+            return None;
+        }
+        questions.running += 1;
+        *questions.each.entry(caller.to_string()).or_default() += 1;
+        Some(QuestionPlace(
+            shared.questions.clone(),
+            caller.to_string(),
+            #[cfg(test)]
+            shared.runtime.inner.clone(),
+        ))
+    }
+}
+
+impl Drop for QuestionPlace {
+    fn drop(&mut self) {
+        let mut questions = lock(&self.0);
+        questions.running = questions.running.saturating_sub(1);
+        if let Some(count) = questions.each.get_mut(&self.1) {
+            *count -= 1;
+            if *count == 0 {
+                questions.each.remove(&self.1);
+            }
+        }
+        #[cfg(test)]
+        self.2.note("question place given back", &self.1);
+    }
+}
+
+/// What goes round a question's payload, or an answer's reply, in one message: names, a number,
+/// and framing, with room to spare.
+const QUESTION_ENVELOPE_BYTES: usize = 1024;
+
+/// The largest question this runtime puts or answers: `max_ask_bytes`, held to what one message
+/// carries (`max_message_bytes`, less what goes round it).
+fn question_most(shared: &Shared) -> usize {
+    shared.runtime.inner.cfg.max_ask_bytes.min(shared.cfg.max_message_bytes.saturating_sub(QUESTION_ENVELOPE_BYTES))
+}
+
+/// The largest answer this runtime gives or takes: `max_answer_bytes`, held the same way.
+fn answer_most(shared: &Shared) -> usize {
+    shared.runtime.inner.cfg.max_answer_bytes.min(shared.cfg.max_message_bytes.saturating_sub(QUESTION_ENVELOPE_BYTES))
+}
+
+/// The answer to a question, as it goes on the wire.
+fn answer_sent(answer: ship_proto::Answer) -> PeerReply {
+    PeerReply { body: Some(peer_reply::Body::Ask(answer)), refused: String::new() }
+}
+
+/// Answer a question from `pair.0` to an agent on `pair.1`. In order: a question larger than
+/// `max_ask_bytes` is answered `limit`, and one whose names are not names `denied`, each
+/// before anything is looked up; then a place among the questions being answered (`max_asks`,
+/// `max_asks_each`) and the allowances to start one (`asks_per_second`,
+/// `asks_per_second_each`), or "too busy". Then the request's room for reading is given back
+/// (what is left of it is this runtime's own size: names it checked and a payload within its
+/// limit), and the ship's blocking job answers it (`Ship::answer_ask`) with its deadline: the
+/// moment the question arrived (`started`, one reading of the clock) and the shorter of
+/// `ask_millis` and the asker's `within_millis`. The network waits for the job until 250 ms
+/// after that deadline and answers "it took too long" if it has not returned; the job holds
+/// the place until it returns. If the asker gives up first (it stops the stream, or
+/// its connection is lost), the job is marked given up, and runs nothing if it has not begun.
+/// Every answer is this runtime's own, of a size it bounds, and is written with nothing of the
+/// request held.
+async fn answer_question(shared: &Arc<Shared>, pair: &Pair, asked: Ask, held: Held, send: &mut SendStream, receive: &mut RecvStream, started: tokio::time::Instant) {
+    let request_deadline = started + shared.cfg.request_timeout;
+    let rcfg = &shared.runtime.inner.cfg;
+    if asked.payload.len() > question_most(shared) {
+        drop(asked);
+        let answer = Asked::Limit(ask::QUESTION_TOO_LARGE).sent().expect("an answer");
+        return reply_small(send, receive, held, &answer_sent(answer), request_deadline).await;
+    }
+    let Ask { from_agent, agent, interface, payload, within_millis } = asked;
+    // Names are checked before anything is looked up, and copied to exactly their length.
+    let named = (from_agent.is_empty() || crate::check_agent_name(&from_agent).is_ok()) && crate::check_target(&agent, &interface).is_ok();
+    if !named {
+        drop((from_agent, agent, interface, payload));
+        let answer = Asked::Denied("not a question this ship can be asked: a name in it is not one".to_string()).sent().expect("an answer");
+        return reply_small(send, receive, held, &answer_sent(answer), request_deadline).await;
+    }
+    let (from_agent, agent, interface) = (String::from(from_agent.as_str()), String::from(agent.as_str()), String::from(interface.as_str()));
+    let Some(place) = QuestionPlace::take(shared, &pair.0) else {
+        drop(payload);
+        return reply_small(send, receive, held, &refused(TOO_BUSY), request_deadline).await;
+    };
+    held.give_back();
+    // The time is counted from when the question arrived, waiting for the ship included.
+    let within = Duration::from_millis(within_millis.min(rcfg.ask_millis));
+    #[cfg(test)]
+    {
+        shared.runtime.inner.note_at("question arrived", &pair.0, started.into_std());
+        shared.runtime.inner.gates.pass_async("question deadline to set").await;
+    }
+    // From the one moment the request was taken up: never earlier than that and its time.
+    let deadline = started.into_std() + within;
+    #[cfg(test)]
+    shared.runtime.inner.note_at("question deadline", &pair.0, deadline);
+    let given_up = Arc::new(AtomicBool::new(false));
+    let give_up = GiveUp(given_up.clone());
+    let (runtime, ship, peer, most) = (shared.runtime.clone(), pair.1.clone(), pair.0.clone(), answer_most(shared));
+    // The place is held by the job until it returns, and here until the answer has been sent
+    // or its stream reset: whichever is later gives it back.
+    let place = Arc::new(place);
+    let held_by_job = place.clone();
+    let mut job = Box::pin(tokio::time::timeout_at(
+        started + within + Duration::from_millis(250),
+        work(shared, move || {
+            // Given back when the job returns or unwinds, not before.
+            let _place = held_by_job;
+            runtime.answer_ask(&ship, &peer, &from_agent, &agent, &interface, &payload, deadline, most, &given_up)
+        }),
+    ));
+    let mut stopped = std::pin::pin!(send.stopped());
+    let done = std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(done) = std::future::Future::poll(job.as_mut(), cx) {
+            return std::task::Poll::Ready(Some(done));
+        }
+        std::future::Future::poll(stopped.as_mut(), cx).map(|_| None)
+    })
+    .await;
+    drop(give_up);
+    #[cfg(test)]
+    if done.is_none() {
+        shared.runtime.inner.note("question given up", &pair.0);
+    }
+    drop(job);
+    let reply_by = tokio::time::Instant::now() + shared.cfg.request_timeout;
+    let answer = match done {
+        // Given up on by the asker: nothing is said.
+        None | Some(Ok(Some(Ok(Asked::GivenUp)))) => {
+            let _ = send.reset(VarInt::from_u32(3));
+            let _ = receive.stop(VarInt::from_u32(3));
+            return;
+        }
+        Some(Ok(Some(Ok(Asked::Busy)))) => return reply_small(send, receive, Held::nothing(), &refused(TOO_BUSY), reply_by).await,
+        // A module it needs is not compiled: too busy; it is compiled off this path, and the
+        // asker asks again.
+        Some(Ok(Some(Ok(Asked::Cold(hash))))) => {
+            let compiler = shared.clone();
+            tokio::spawn(async move {
+                let runtime = compiler.runtime.clone();
+                let _ = work(&compiler, move || runtime.compile_cold(&hash)).await;
+            });
+            return reply_small(send, receive, Held::nothing(), &refused(TOO_BUSY), reply_by).await;
+        }
+        Some(Ok(Some(Ok(asked)))) => asked.sent().expect("an answer"),
+        // The job had not returned 250 ms after its deadline (still waiting for the ship, or
+        // in what cannot be cut short).
+        Some(Err(_)) => Asked::Failed(ask::TOOK_TOO_LONG).sent().expect("an answer"),
+        // The ship's file could not be read, or the network is stopping.
+        Some(Ok(_)) => Asked::Failed("that ship could not answer just now").sent().expect("an answer"),
+    };
+    reply_owned(send, receive, answer_sent(answer), reply_by).await;
+    drop(place);
+}
+
+/// Put a question for `Runtime::ask`, from an ordinary thread, and wait for its answer. Only
+/// so many requests go out at once (`max_requests`, shared with every other request this
+/// runtime's callers make); with none free, `Busy`.
+fn ask_for_answer(shared: &Arc<Shared>, handle: &tokio::runtime::Handle, question: Question) -> Result<Vec<u8>, AskError> {
+    let Ok(turn) = shared.asking.clone().try_acquire_owned() else { return Err(AskError::Busy) };
+    // The one absolute deadline, taken as `Runtime::ask` was called, carried to the task: a task
+    // first run late has only what is left of it, and sends nothing once it has passed.
+    let deadline = tokio::time::Instant::from_std(question.deadline);
+    let (report, outcome) = std::sync::mpsc::channel();
+    let asking = shared.clone();
+    let task = handle.spawn(async move {
+        #[cfg(test)]
+        asking.runtime.inner.gates.pass_async("asking task begun").await;
+        let Question { from, from_agent, to, agent, interface, payload, .. } = question;
+        let answer = put_question(&asking, (&from, &from_agent), (&to, &agent, &interface), &payload, deadline, false, None).await;
+        drop(turn);
+        let _ = report.send(answer);
+    });
+    // The question ends within its time on the network's threads; this waits until two
+    // seconds past its deadline for that, and no longer. What it gives up on is called off.
+    match outcome.recv_timeout((deadline + Duration::from_secs(2)).saturating_duration_since(tokio::time::Instant::now())) {
+        Ok(answer) => answer,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            task.abort();
+            Err(AskError::NoAnswer)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(AskError::NoNetwork),
+    }
+}
+
+/// Put one question until an answer comes or `deadline` passes, each try's connection made
+/// within `request_timeout`. Asking twice is harmless, so a connection that fails or goes silent is
+/// made again, and a ship too busy asked again, and the question put again, a little later
+/// each time (from `retry_delay`, or 20 ms after "too
+/// busy", doubling up to a second). Any answer from the other ship ends it. A busy refusal is
+/// retried. Every other refusal ends the question. Out of time: `Busy` if the last try was
+/// refused as too busy (a later connection failure or timeout clears that, so expiry then gives
+/// `NoAnswer`, a try having reached the other ship). Otherwise expiry gives `NoAnswer` if any
+/// try reached the other ship or no try began, and `Unreachable` if at least one try began and
+/// none reached the other ship.
+/// Whatever the other ship says after the deadline (an answer or a refusal) is `NoAnswer`.
+///
+/// `per_try`, for an agent's question: each try first takes a place among the requests agents'
+/// questions may hold (`agents_asking`), and then one among all requests out, and gives both
+/// back when the try ends; none is held while it waits to try again. Without it (for
+/// `Runtime::ask`, whose caller holds a place among all requests for the whole of it), none.
+///
+/// `cancel`, for an agent's question: once it is stopped, nothing more is tried, and a try under
+/// way is given up: connecting, waiting for the answer, or waiting for a place among agents'
+/// questions as soon as the stop is signalled; waiting for a place among all requests out at
+/// its next look (every 20 ms); and `NoAnswer` is returned. A question whose drop commits is
+/// stopped at its task's next poll: a write that poll had already begun may still go out;
+/// nothing comes of its answer.
+#[allow(clippy::too_many_arguments)]
+async fn put_question(
+    shared: &Arc<Shared>,
+    (from, from_agent): (&str, &str),
+    (to, agent, interface): (&str, &str, &str),
+    payload: &[u8],
+    deadline: tokio::time::Instant,
+    per_try: bool,
+    cancel: Option<&Cancel>,
+) -> Result<Vec<u8>, AskError> {
+    let most = answer_most(shared);
+    // Larger than one message carries: never sent.
+    if payload.len() > question_most(shared) {
+        return Err(AskError::TooLarge);
+    }
+    // `reached`: some try, this one or an earlier one, had a connection to the other ship (and
+    // so sent the question, or began to); it is never unset by a later try that had none.
+    let (mut reached, mut busy, mut delay, mut tried) = (false, false, shared.cfg.retry_delay, false);
+    // Out of time: too busy if the last try was refused so; no answer if any try was sent, or if
+    // no try could even be begun for want of a local place; unreachable if no try could ever be
+    // sent.
+    let out_of_time = |busy: bool, reached: bool, tried: bool| if busy { AskError::Busy } else if reached || !tried { AskError::NoAnswer } else { AskError::Unreachable };
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(out_of_time(busy, reached, tried));
+        }
+        if cancel.is_some_and(Cancel::stopped) {
+            return Err(AskError::NoAnswer);
+        }
+        let places = if per_try {
+            let Some(Ok(Ok(ours))) = unless_stopped(cancel, tokio::time::timeout_at(deadline, shared.agents_asking.clone().acquire_owned())).await else {
+                return Err(out_of_time(busy, reached, tried));
+            };
+            let all = loop {
+                if let Ok(all) = shared.asking.clone().try_acquire_owned() {
+                    break all;
+                }
+                if tokio::time::Instant::now() >= deadline || cancel.is_some_and(Cancel::stopped) {
+                    return Err(out_of_time(busy, reached, tried));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            Some((ours, all))
+        } else {
+            None
+        };
+        if tokio::time::Instant::now() >= deadline {
+            continue;
+        }
+        tried = true;
+        // Its time on the wire is set as it is sent (`exchange`), from `deadline`.
+        let asked = Ask { from_agent: from_agent.into(), agent: agent.into(), interface: interface.into(), payload: payload.to_vec(), within_millis: 0 };
+        let request = PeerRequest { body: Some(peer_request::Body::Ask(asked)) };
+        // Making the connection for each try has at most `request_timeout` of what is left, so
+        // that a try at an address nothing answers at (a ship gone, and since back elsewhere)
+        // does not take all of it. Once sent, the question has all that is left.
+        let Some(asked) = unless_stopped(cancel, shared.ask_traced(from, to, request, deadline, shared.cfg.request_timeout)).await else {
+            return Err(AskError::NoAnswer);
+        };
+        #[cfg(test)]
+        if per_try {
+            shared.runtime.inner.question_tries.fetch_add(1, Ordering::SeqCst);
+        }
+        match asked {
+            // Whatever the other ship said (an answer, or a refusal of any kind), if it comes
+            // after the deadline it is not taken: it came too late. (Looked at here, since a
+            // timeout lets work that is ready go first.)
+            Ok(_) | Err((NetError::Refused(_) | NetError::Garbled, _)) if tokio::time::Instant::now() >= deadline => return Err(AskError::NoAnswer),
+            Ok((PeerReply { body: Some(peer_reply::Body::Ask(answer)), .. }, _)) => return ask::taken(answer, most),
+            Ok(_) => return Err(AskError::NotUnderstood),
+            // Too large for one of the two ships to read as one message: the same however often
+            // it is sent.
+            Err((NetError::TooLarge, _)) => return Err(AskError::Limit),
+            Err((NetError::Refused(why), _)) if why == TOO_LARGE_TO_READ => return Err(AskError::Limit),
+            Err((NetError::Refused(why), _)) if why == TOO_BUSY => {
+                // A ship resting from questions rests for a few times as long as one takes:
+                // asked again soon, then less and less often.
+                if !busy {
+                    delay = Duration::from_millis(20);
+                }
+                (reached, busy) = (true, true);
+            }
+            // Any other refusal: the other ship does not know this kind of request (an older
+            // runtime answers it so), or would not read it.
+            Err((NetError::Refused(_) | NetError::Garbled, _)) => return Err(AskError::NotUnderstood),
+            Err((NetError::Unlisted(_), _)) => return Err(AskError::Unreachable),
+            Err((NetError::NotHere(_), _)) => return Err(AskError::BadName),
+            Err((NetError::TimedOut, connected)) => (reached, busy) = (reached || connected, false),
+            Err((NetError::Unreachable(_), connected)) => (reached, busy) = (reached || connected, false),
+        }
+        drop(places);
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if unless_stopped(cancel, tokio::time::sleep(delay.min(left))).await.is_none() {
+            return Err(AskError::NoAnswer);
+        }
+        delay = (delay * 2).min(Duration::from_secs(1));
+    }
+}
+
+/// The means to stop the task putting one question: set once the question is no longer
+/// waiting (its agent dropped it), and looked at before every try and while one is under way.
+#[derive(Default)]
+struct Cancel {
+    gone: AtomicBool,
+    told: tokio::sync::Notify,
+}
+
+impl Cancel {
+    fn stop(&self) {
+        self.gone.store(true, Ordering::SeqCst);
+        self.told.notify_waiters();
+    }
+
+    fn stopped(&self) -> bool {
+        self.gone.load(Ordering::SeqCst)
+    }
+}
+
+/// `work`, unless `cancel` stops first: `None` then, and `work` is dropped (a request under
+/// way has its streams reset as it goes).
+async fn unless_stopped<T>(cancel: Option<&Cancel>, work: impl std::future::Future<Output = T>) -> Option<T> {
+    let Some(cancel) = cancel else { return Some(work.await) };
+    let told = cancel.told.notified();
+    let mut told = std::pin::pin!(told);
+    told.as_mut().enable();
+    let mut work = std::pin::pin!(work);
+    std::future::poll_fn(|cx| {
+        // The stop is looked at first, on every poll: work that became ready meanwhile (a
+        // stream opened, an answer read) is not gone on with once the question is dropped.
+        if cancel.stopped() || std::future::Future::poll(told.as_mut(), cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        std::future::Future::poll(work.as_mut(), cx).map(Some)
+    })
+    .await
+}
+
+/// A question's registration among those being put: its means to stop, kept in the carrier's
+/// table from the moment the look registers it until this is dropped. Owned first by what the
+/// look hands on, then by the question's task; however that ends (finished, called off,
+/// unwound, or let go when the network stops) dropping this stops it first (so a worker thread
+/// still waiting for the ship on its behalf gives up) and then takes it out of the table, if it
+/// is still the one there.
+struct Registration {
+    carrier: Arc<Carrier>,
+    ship: String,
+    key: ([u8; 16], u64),
+    cancel: Arc<Cancel>,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.cancel.stop();
+        let mut putting = lock(&self.carrier.putting);
+        if let Some(of_ship) = putting.get_mut(&self.ship) {
+            if of_ship.get(&self.key).is_some_and(|held| Arc::ptr_eq(held, &self.cancel)) {
+                of_ship.remove(&self.key);
+            }
+            if of_ship.is_empty() {
+                putting.remove(&self.ship);
+            }
+        }
+    }
+}
+
+/// See that `ship`'s questions are looked at (`look_at_questions`), by a task of the ship's own,
+/// not by the carrier: one ship that is busy for a long while holds up no other ship's look
+/// (though each look waiting holds a thread of the shared blocking pool, as there).
+/// One look per ship at a time; a notice that comes while one runs makes it look once more when
+/// it is done (a flag, not a count), so nothing committed after its read is missed, and the
+/// looks are no more than the notices.
+/// The questions' own consumer of notices: for each ship put in `asking`, see that its questions
+/// are being put (`start_questions`). A task beside the carrier, so that a notice is acted on at
+/// once, whatever the carrier is waiting for (the ship of another ship's commands, say). It ends
+/// when the network's threads do.
+async fn start_looks(shared: Arc<Shared>) {
+    loop {
+        let ships: Vec<String> = lock(&shared.carrier.asking).drain().collect();
+        for ship in ships {
+            start_questions(&shared, ship);
+        }
+        // A notice that came since the drain left a permit, so this does not wait past it.
+        shared.carrier.asks_news.notified().await;
+    }
+}
+
+fn start_questions(shared: &Arc<Shared>, ship: String) {
+    {
+        let mut looking = lock(&shared.carrier.looking);
+        if let Some(again) = looking.get_mut(&ship) {
+            *again = true;
+            return;
+        }
+        looking.insert(ship.clone(), false);
+    }
+    // The ship's entry among those being looked at goes however the task ends: taken out
+    // here, with the decision whether to look again, on the ordinary way out; by this guard
+    // if the task unwinds or is dropped, so no ship is left marked as being looked at (and one
+    // told of again meanwhile is put back to be looked at).
+    struct Looking(Arc<Carrier>, String, bool);
+    impl Drop for Looking {
+        fn drop(&mut self) {
+            // A notice that came meanwhile is not lost: the ship is put back to be looked at.
+            if self.2 && lock(&self.0.looking).remove(&self.1) == Some(true) {
+                self.0.asks_at(&self.1);
+            }
+        }
+    }
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let mut entry = Looking(shared.carrier.clone(), ship.clone(), true);
+        loop {
+            // `false`: the network is stopping.
+            let went_on = look_at_questions(&shared, &ship).await;
+            let mut looking = lock(&shared.carrier.looking);
+            let again = looking.get_mut(&ship).is_some_and(std::mem::take);
+            if !went_on || !again {
+                looking.remove(&ship);
+                entry.2 = false;
+                return;
+            }
+        }
+    });
+}
+
+/// Look at the questions waiting on `ship`: see that each is being put, by one task of its own,
+/// and stop the tasks of questions of `ship` that are no longer waiting. `false` if the network
+/// is stopping.
+///
+/// The look registers, with the ship still held, the means to stop each task it is to start
+/// (lock order: the ship, then `putting`; a drop is told in that same order, from inside the
+/// dropping event). So a drop that commits after the look finds the question's means to stop
+/// and stops it, whether or not its task has started yet, and one that committed before the
+/// look is not in it. The tasks are started once the ship is let go.
+///
+/// The look waits for the ship on a thread of the blocking pool, holding none of the working
+/// places (`work`): a ship that is busy for a long while holds up no other ship's look, and
+/// takes no place another ship's work needs; but it holds one thread of that shared pool until
+/// the ship, or room to wake it, becomes available, and that wait is not cut short when the
+/// network stops, so enough such waits at once can delay work for other ships. (It waits as an
+/// ordinary call waits, in turn: a look that only tried now and then would lose the ship for as
+/// long as something else kept taking it.) There is at most one look per ship at a time. Its
+/// thread holds the carrier and the runtime, not the network, so a look still waiting when the
+/// network stops keeps no socket bound. A ship whose file cannot be read is looked at again,
+/// with growing waits, for as long as it takes.
+async fn look_at_questions(shared: &Arc<Shared>, ship: &str) -> bool {
+    let mut delay = Duration::from_millis(20);
+    loop {
+        let (runtime, name, carrier) = (shared.runtime.clone(), ship.to_string(), shared.carrier.clone());
+        let looked = tokio::task::spawn_blocking(move || {
+            // For the tests: about to wait for the ship, on this thread.
+            #[cfg(test)]
+            runtime.inner.note("look waiting for its ship", &name);
+            let ship = name.clone();
+            runtime.asks_listed_with(&name, None, move |incarnation, waiting| {
+                let mut putting = lock(&carrier.putting);
+                let of_ship = putting.entry(ship.clone()).or_default();
+                let listed: HashSet<u64> = waiting.iter().map(|(seq, _)| *seq).collect();
+                for ((mark, seq), cancel) in of_ship.iter() {
+                    if *mark != incarnation || !listed.contains(seq) {
+                        cancel.stop();
+                    }
+                }
+                let mut start = Vec::new();
+                for (seq, deadline) in waiting {
+                    // A question whose event has committed always has its time set.
+                    if deadline == 0 {
+                        continue;
+                    }
+                    if let std::collections::hash_map::Entry::Vacant(place) = of_ship.entry((incarnation, seq)) {
+                        let cancel = place.insert(Arc::new(Cancel::default())).clone();
+                        start.push((Registration { carrier: carrier.clone(), ship: ship.clone(), key: (incarnation, seq), cancel }, deadline));
+                    }
+                }
+                if of_ship.is_empty() {
+                    putting.remove(&ship);
+                }
+                start
+            })
+        })
+        .await;
+        let start = match looked {
+            // The look panicked: it ended, and a notice that came meanwhile is acted on (looked
+            // again); nothing else is done until the next notice.
+            Err(e) if e.is_panic() => return true,
+            // The network is stopping.
+            Err(_) => return false,
+            Ok(Ok(Some(start))) => start,
+            // Its file could not be read: looked at again in a while.
+            Ok(Ok(None)) | Ok(Err(_)) => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(shared.cfg.max_retry_delay.min(Duration::from_secs(1)));
+                continue;
+            }
+        };
+        #[cfg(test)]
+        {
+            shared.runtime.inner.note("looked at questions", ship);
+            for (registration, _) in &start {
+                shared.runtime.inner.note("question registered", &format!("{}/{}", ship, registration.key.1));
+            }
+            shared.runtime.inner.gates.pass_async("questions registered").await;
+        }
+        for (registration, deadline) in start {
+            tokio::spawn(pursue(shared.clone(), registration, deadline));
+        }
+        return true;
+    }
+}
+
+/// Put one question an agent asked, and write down what came of it, exactly once: its answer,
+/// or why there is none. The question is asked until an answer comes or its time runs out at
+/// `deadline_ms` (milliseconds since 1970, so it holds across restarts); a question whose time
+/// had run out before this began is answered `OUTCOME_NO_ANSWER` without being asked. What came
+/// of it is written in one transaction with the question struck off (`Ship::ask_answered`), so
+/// if the agent dropped it meanwhile nothing is written. That write leaves out a reply for
+/// which there is no room (LIMIT, in its place), so it fails only when the file cannot be
+/// written at all; then what came of it is kept, not asked again, and written again with
+/// growing waits until it goes in. Once the question is dropped (`cancel`), this stops,
+/// wherever it is waiting.
+async fn pursue(shared: Arc<Shared>, registration: Registration, deadline_ms: u64) {
+    #[cfg(test)]
+    struct Ended(Arc<crate::Inner>, String);
+    #[cfg(test)]
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            self.0.note("question task ended", &self.1);
+        }
+    }
+    #[cfg(test)]
+    let _ended = Ended(shared.runtime.inner.clone(), format!("{}/{}", registration.ship, registration.key.1));
+    let (ship, (incarnation, seq), cancel) = (registration.ship.clone(), registration.key, registration.cancel.clone());
+    let _registration = registration;
+    // Turned into a deadline of the steady clock once, here, as the task starts and before it
+    // reads the row: the steady clock first, then the wall clock, so a pause between the two
+    // can only make it earlier.
+    let anchor = tokio::time::Instant::now();
+    let left = Duration::from_millis(deadline_ms.saturating_sub(crate::store::now_ms()));
+    let deadline = anchor + left;
+    #[cfg(test)]
+    shared.runtime.inner.note_at("question task deadline", &format!("{}/{}", ship, seq), deadline.into_std());
+    let no_answer = || (Outcome::NoAnswer, Vec::new(), "no answer came in time".to_string());
+    let mut outcome: Option<(Outcome, Vec<u8>, String)> = None;
+    let mut delay = shared.cfg.retry_delay;
+    loop {
+        if outcome.is_none() {
+            outcome = Some(if tokio::time::Instant::now() >= deadline {
+                no_answer()
+            } else {
+                let (runtime, name, stop, until) = (shared.runtime.clone(), ship.clone(), cancel.clone(), deadline.into_std());
+                // The ship is waited for only until the question's time or its drop.
+                let read = unless_stopped(Some(&cancel), work(&shared, move || runtime.ask_row(&name, &incarnation, seq, until, &stop.gone))).await;
+                let row = match read {
+                    Some(Some(Ok(Some(Some(row))))) => row,
+                    // Dropped (here, or while the ship was waited for), or the network stopping;
+                    // or dropped, answered already, or of another copy of the ship.
+                    None | Some(None) | Some(Some(Ok(Some(None)))) => return,
+                    // Its time came while the ship was waited for: no answer came in time.
+                    Some(Some(Ok(None))) => {
+                        if cancel.stopped() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Some(Some(Err(_))) => {
+                        let wait = delay.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                        if unless_stopped(Some(&cancel), tokio::time::sleep(wait)).await.is_none() {
+                            return;
+                        }
+                        delay = (delay * 2).min(shared.cfg.max_retry_delay);
+                        continue;
+                    }
+                };
+                #[cfg(test)]
+                shared.runtime.inner.question_puts.fetch_add(1, Ordering::SeqCst);
+                let asked = put_question(&shared, (&ship, &row.agent), (&row.ship, &row.target, &row.interface), &row.payload, deadline, true, Some(&cancel)).await;
+                drop(row);
+                // Dropped meanwhile: nothing to write, and nothing more is asked.
+                if cancel.stopped() {
+                    return;
+                }
+                match asked {
+                    Ok(reply) => (Outcome::Reply, reply, String::new()),
+                    Err(error) => {
+                        let (outcome, reason) = error.outcome();
+                        (outcome, Vec::new(), reason)
+                    }
+                }
+            });
+        }
+        let (said, reply, reason) = outcome.clone().expect("set above");
+        let (runtime, name, stop) = (shared.runtime.clone(), ship.clone(), cancel.clone());
+        // Dropped meanwhile: nothing more is tried, and the ship is waited for no longer. (A
+        // write already under way finds the question gone, in its own transaction, and writes
+        // nothing.)
+        let settled = unless_stopped(Some(&cancel), work(&shared, move || runtime.ask_answered_unless(&name, &incarnation, seq, (said, &reply, &reason), &stop.gone))).await;
+        match settled {
+            // Queued, and the network told so by `ask_answered` itself; or nothing to write; or
+            // the network is stopping; or dropped.
+            Some(Some(Ok(Some(Settled::Queued | Settled::Gone)))) | Some(Some(Ok(None))) | Some(None) | None => return,
+            // The write failed, for whatever reason the ship's file could not be written (no
+            // page to be had, an I/O error). Nothing was kept, and the question is still
+            // waiting. Tried again, with growing waits, for as long as it takes, unless it is
+            // dropped; a reply is let go for LIMIT, which takes less room. (A restart meanwhile
+            // finds the question still waiting: asked again if its time has not run out, and
+            // answered NO_ANSWER if it has.)
+            Some(Some(Err(_))) => {
+                if outcome.as_ref().is_some_and(|(_, reply, _)| !reply.is_empty()) {
+                    outcome = Some((Outcome::Limit, Vec::new(), ask::NO_ROOM_FOR_ANSWER.to_string()));
+                }
+                if unless_stopped(Some(&cancel), tokio::time::sleep(delay)).await.is_none() {
+                    return;
+                }
+                delay = (delay * 2).min(shared.cfg.max_retry_delay);
+            }
+        }
+    }
+}
+
 /// Whether an encoded request or reply is one that can be walked through field by field and
 /// in which field `outer`, a message, holds at most `most` of its field `inner`: the
 /// messages in a delivery, the logs in a piece of news, the entries in an answer. This reads
@@ -3613,6 +4738,10 @@ fn walk_fields<'a>(mut bytes: &'a [u8], mut each: impl FnMut(u64, u64, &'a [u8])
         for shift in (0..64).step_by(7) {
             let (&byte, rest) = bytes.split_first()?;
             *bytes = rest;
+            // The tenth byte holds only the one bit left of 64: more is a number too large.
+            if shift == 63 && byte & 0x7f > 1 {
+                return None;
+            }
             value |= u64::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
                 return Some(value);
@@ -3664,7 +4793,13 @@ async fn carry(shared: Arc<Shared>) {
         let ships: Vec<String> = lock(&carrier.waiting).drain().collect();
         for ship in ships {
             let (runtime, name) = (shared.runtime.clone(), ship.clone());
-            let peers = work(&shared, move || runtime.outbound_peers(&name)).await;
+            let peers = work(&shared, move || {
+                // For the tests: about to wait for the ship, to find which ships its commands are for.
+                #[cfg(test)]
+                runtime.inner.note("finding where commands go", &name);
+                runtime.outbound_peers(&name)
+            })
+            .await;
             for (peer, work) in peers.and_then(Result::ok).unwrap_or_default() {
                 start_lane(&shared, &ship, &peer, work);
             }
@@ -4185,6 +5320,12 @@ mod remote_tests;
 #[cfg(test)]
 #[path = "router_tests.rs"]
 pub(crate) mod router_tests;
+
+/// Questions between ships, and receipts that bring a reply: real runtimes, inside the crate
+/// so that a network can vanish and the parts can be reached.
+#[cfg(test)]
+#[path = "ask_tests.rs"]
+mod ask_tests;
 
 #[cfg(test)]
 mod tests {

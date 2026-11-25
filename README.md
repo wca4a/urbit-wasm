@@ -7,8 +7,8 @@ written in Rust.
 Experimental. There is a runtime, a kernel, logs that agents can follow, an
 HTTP server that lets an app or a browser sign in to a ship, a store of files
 of any size on each ship for the owner's devices, and an encrypted link over
-which ships send each other commands, follow each other's logs, and fetch each
-other's files.
+which ships send each other commands, ask each other questions, follow each
+other's logs, and fetch each other's files.
 A ship's file is encrypted on disk. A ship's keys can be derived from its Urbit
 ID master ticket, ships check each other's keys against Azimuth and find each
 other's addresses through lookup points, and there is no update mechanism yet.
@@ -92,6 +92,25 @@ other's addresses through lookup points, and there is no update mechanism yet.
 - Every command sent to another ship is answered with one receipt: it ran, or
   it did not and why. A refusal is written to the sender's audit log, and an
   agent can ask to be handed its receipts.
+- A command can ask for the handler's reply, which then comes back with its
+  receipt: from a ship that follows the protocol, the receipt says it ran and
+  carries the whole reply, or the command did not stand (an agent that needs
+  the reply checks `Receipt.replied`; see Commands between ships).
+- An agent, or a ship's owner through one of their devices, can ask an agent
+  on another ship a question. A question only reads: the other agent's read
+  handler answers it, nothing it does there is kept, and the ship that answers
+  stores no data of the question (SQLite's own housekeeping of the file aside:
+  see Questions between ships). Both owners agree, as for commands. The answer
+  comes within a time limit, or a clear reason why not: refused, failed, too
+  large, no answer in time, not reachable. An agent cannot wait inside an
+  event, so it is handed the answer later, as an event of its own, exactly once
+  for each question unless it gave the question up.
+- A ship asked questions by other ships rests from them for a few times as
+  long as each takes, so the measured times of the questions it lets in past
+  its look at the rests add up to at most a quarter of any stretch of its
+  time, all asking ships together, and a tenth for any one ship, each plus the
+  length of one such question (see Questions between ships for what is and is
+  not counted).
 - An agent can follow a log published on another ship. Its ship fetches the
   entries, checks each against the publishing ship's key and against the entry
   before it, and keeps them until the agent takes them: each once, in order,
@@ -158,7 +177,14 @@ the second ship reporting that the lookup point introduced the first to it, as
 the second asks of its callers; a file on the first ship refused to the second
 until the first's owner allows it, then arriving whole, checked by its
 SHA-256; the second opening it again with the first ship turned off, from the
-copy it kept; and the two finding each other again after the first comes back.
+copy it kept; the two finding each other again after the first comes back;
+and, in an eighth step, the second ship's owner asking the first ship's
+counter agent a question over HTTP and being answered (the answer checked
+against what the first ship's owner was told the counter stands at, and how
+long the question took printed), a question to an interface not open to
+questions refused in the second ship's own words with the first ship's reason,
+and a command sent with its reply wanted coming back with the reply on its
+receipt (checked to be one more than the answer).
 Each step says what it is doing, and says no more than it has checked: each
 message carries a word for this run and is reported with the number of the
 entry it became in the other ship's journal. The three command lines are
@@ -189,7 +215,7 @@ it needs no internet and no real ship.
 
 It does not show two machines, a real home router, the relay carrying anything
 (nothing on one machine needs it), or real Urbit ID: the three programs talk
-over this machine's loopback address. In its last step the second ship's
+over this machine's loopback address. In its seventh step the second ship's
 message to the first, which came back, took 6.5 seconds in each of five runs on one
 machine (3.3 with `--ports`): the second ship's connection to the first has
 gone quiet, its watcher gives it up after three seconds, and a new one is made
@@ -316,7 +342,8 @@ source rather than something the tests prove.
 | File | What it holds |
 | --- | --- |
 | `runtime/src/lib.rs` | `Runtime`: the public API, `Config` and its defaults, ship lifecycle (create, wake, sleep, export, import), sign-in, log verification for clients (`verify_log`, `verify_checkpoint`), module compilation |
-| `runtime/src/ship.rs` | An awake ship: runs one event as one transaction, calls the kernel, runs handlers in fresh instances, takes commands and log entries from other ships, settles a ship that has fallen out of step |
+| `runtime/src/ship.rs` | An awake ship: runs one event as one transaction, calls the kernel, runs handlers in fresh instances, takes commands and log entries from other ships, settles a ship that has fallen out of step, answers other ships' questions and writes down what came of its own |
+| `runtime/src/ask.rs` | Questions between ships: what the ship that answers and the ship that asks share, the outcomes, `AskError`, and the rests |
 | `runtime/src/host.rs` | The host functions agents import, and the fuel each costs |
 | `runtime/src/store.rs` | The SQLite schema and every query; import validation |
 | `runtime/src/seal.rs` | Keys: the storage key, the keys derived from it, the recovery key, and sealing and opening an exported copy and its stream of files |
@@ -342,10 +369,11 @@ source rather than something the tests prove.
 | `runtime/tests/serve.rs` | Tests of the `serve` program, run as a process of its own |
 | `runtime/src/remote_tests.rs` | Tests of fetching a file from another ship, inside the crate so that the ship answering can be made to lie |
 | `runtime/src/kept_tests.rs` | Tests of keeping what was fetched and saving a copy, with the same runtimes and liar, and failures made to happen at chosen points |
+| `runtime/src/ask_tests.rs` | Tests of questions between ships and of receipts that bring a reply, with two real runtimes, inside the crate so that a network can vanish and the parts that decide can be read |
 | `kernel/src/lib.rs` | The default kernel: agent registry and routing policy |
 | `proto/ship.proto` | Every message: runtime and kernel, runtime and agent, client and ship, ship and ship |
 | `sdk/src/lib.rs` | Guest-side bindings and the `agent!` macro |
-| `agents/counter`, `agents/tally` | Toy agents. `counter` keeps counters and publishes a log; `tally` reads and sends to `counter`, follows logs, and takes receipts |
+| `agents/counter`, `agents/tally` | Toy agents. `counter` keeps counters, publishes a log, and answers questions with its read handler; `tally` reads and sends to `counter`, follows logs, takes receipts, asks questions of other ships and takes their answers |
 
 The workspace's default members are `runtime` and `urbit-id`, so a plain
 `cargo build` or `cargo test` covers those two. The SDK, kernel, and agents only link for
@@ -426,11 +454,12 @@ calls:
 | Kind | Export | Notes |
 | --- | --- | --- |
 | `KIND_COMMAND` | `handle` | Changes state. Runs as its own event |
-| `KIND_READ` | `read` | Runs read-only: any write, send, emit, or log change is denied |
+| `KIND_READ` | `read` | Runs read-only: any write, send, emit, ask, or log change is denied. Also answers questions from other ships (see Questions between ships) |
 | `KIND_NOTIFY` | `notify` | A log the agent follows has entries for it. No payload |
 | `KIND_CHECKPOINT` | `checkpoint` | The runtime asks for the state behind one of the agent's logs. Read-only, with no send grants |
 | `KIND_RECEIPT` | `receipt` | What became of a command the agent sent to another ship. Skipped if the module has no `receipt` export |
 | `KIND_FILE_ASK` | `file_ask` | Another ship asks for a file the agent claims. Read-only, with no send grants, a budget of its own, and never queued or kept; see Fetching a file from another ship |
+| `KIND_ANSWER` | `answer` | What came of a question the agent put to another ship with `ask_to`. Skipped if the module has no `answer` export (the question is forgotten all the same) |
 
 ### Compute, time, and memory limits
 
@@ -443,8 +472,25 @@ These stop a hostile or buggy agent from stalling a ship or the process.
   handler returns, so straight-line code that overran cannot commit.
 - Time. Fuel cannot see how large a bulk memory operation is, so each event
   also has a wall-clock deadline of `max_event_millis`. A watchdog thread
-  advances wasmtime's epoch every 10 ms, and the deadline is checked again
-  just before commit, so a late result is not used. Before compiling, the
+  advances wasmtime's epoch by one each time it has slept 10 ms. The epoch is
+  only a prompt to look at the clock, never the measure of time: when a call's
+  running code next looks after a tick (`Store::epoch_deadline_callback`), it
+  compares the real time with its own deadline, carrying on until the next
+  tick if it has time left and stopping, as a call out of time always has, if
+  not. Several ticks can pass before running code looks. So a
+  watchdog the system wakes late (macOS has been seen stretching a 10 ms sleep
+  to 13 ms), or does not run for a while, can make a call stop late, but never
+  early, and never by a sum of sleeps.
+  A call is never stopped for time before its deadline. After its deadline it
+  is stopped at the first point where the running code looks (a loop turn, a
+  function entry, a bulk memory step) and finds both that the watchdog has
+  ticked since the call was last allowed on and that the deadline has passed.
+  The watchdog ticks about every 10 ms; the system can run it, and the call's
+  own thread, late; and after a look that came just before the deadline the
+  call can run on until a later tick; so no number is promised for the
+  overrun. A host call under way is not cut short. Whatever a call returns
+  after its deadline is not kept.
+  (The deadline is checked again just before commit.) Before compiling, the
   runtime rewrites each module so that every `memory.fill`, `memory.copy`,
   `memory.init`, `table.fill`, `table.copy`, and `table.init` is preceded by an
   empty loop. Wasmtime checks fuel and epochs at loop headers, so this forces a
@@ -508,8 +554,10 @@ A manifest lists what an agent offers and what it uses:
 | `Provide.interface` | An interface this agent offers. A log is named after one |
 | `Provide.public` | Any agent on the ship may use it without declaring it |
 | `Provide.remote` | Agents on other ships may send commands to it |
+| `Provide.asked` | Agents on other ships, and other ships' owners, may ask it questions. Apart from `remote` |
 | `Use.agent`, `Use.interface` | Something this agent uses |
 | `Use.read`, `Use.send` | Whether it reads (or follows a log), sends commands, or both |
+| `Use.ask` | With `ship` set: whether it may ask that interface on that ship questions. Apart from `read` and `send` |
 | `Use.ship` | Empty for this ship; otherwise a ship name or `*` for any ship |
 
 The default kernel's `route` rules:
@@ -518,9 +566,14 @@ The default kernel's `route` rules:
 - An agent on this ship may use an interface that the target provides and that
   is public, its own, or declared in its manifest with the matching `read` or
   `send` flag.
-- An agent on another ship may only send a `KIND_COMMAND`, and only to an
-  interface marked `remote`. What each ship may then do is up to the agent,
-  which is told the calling ship in `Invocation.source`.
+- An agent on another ship may send a `KIND_COMMAND` only to an interface
+  marked `remote`, and an agent on another ship or another ship's owner may
+  put a question (a `KIND_READ`) only to an interface marked `asked`; either
+  with `owner` set is refused, as is any other kind from another ship that the
+  rules in this list do not let through. The refusal says the interface "is
+  not open to other ships", and is passed back to the ship that asked. What
+  each ship may then do is up to the agent, which is told the calling ship in
+  `Invocation.source`.
 - Another ship (not the owner, not an agent here) may put a `KIND_FILE_ASK`
   to any installed agent. As with sharing a log, who may have a file is the
   agent's decision alone, and nothing at install names ships. A kernel from
@@ -530,8 +583,13 @@ The default kernel's `route` rules:
   the publisher's interface. One about a log on another ship needs a `Use`
   naming that ship (or `*`), agent, and log with `read` set.
 - A checkpoint request must be for one of the agent's own interfaces.
+- A `KIND_ANSWER`, like a `KIND_RECEIPT`, goes to any installed agent: the
+  runtime only hands on an answer to a question it holds a record of.
 - On success, the reply carries the agent's grants: its own and every public
-  interface, its declared local uses, and its declared remote uses.
+  interface, its declared local uses, and its declared remote uses; and in
+  `RouteReply.asks`, the interfaces on other ships it may ask, exactly the
+  declared uses with `ask` and a ship. The bound the kernel keeps on its
+  answer counts every grant three times (to read, to send, to ask).
 
 Whatever a kernel grants, the runtime also enforces its own name rules, and
 never runs anything under the name `kernel`. A ship imported from elsewhere
@@ -543,7 +601,7 @@ brings its own kernel, which decides policy for that ship only.
 
 An agent module exports `memory`, `alloc(len: u32) -> u32`, and
 `handle(ptr: u32, len: u32) -> u64`, plus any of `read`, `notify`,
-`checkpoint`, `receipt`, and `file_ask` with the same signature. The runtime calls `alloc`,
+`checkpoint`, `receipt`, `answer`, and `file_ask` with the same signature. The runtime calls `alloc`,
 writes the input there, calls the handler, and reads the reply from the
 returned value: pointer in the high 32 bits, length in the low 32.
 
@@ -564,7 +622,9 @@ bigger buffer.
 | `read(req, req_len, buf, cap) -> i64` | `ReadRequest`. Runs another agent's read handler now, in a fresh instance, read-only |
 | `take_reply(buf, cap) -> i64` | Collect a read or `log_next` reply that did not fit the first buffer, so the call is not run twice |
 | `send(req, req_len)` | `SendRequest`. Queue a command for another agent, run after this event commits |
-| `send_to(req, req_len) -> i64` | The same; for another ship, returns the number the command goes under, which its receipt will carry |
+| `send_to(req, req_len) -> i64` | The same; for another ship, returns the number the command goes under, which its receipt will carry. With `SendRequest.reply` set, the handler's reply comes back on the receipt (see Commands between ships, exactly once) |
+| `ask_to(req, req_len) -> i64` | `AskRequest {ship, agent, interface, payload, within_millis}`. Put a question to an agent on another ship; returns the number its answer will carry. Written down in this event's transaction and put only if it commits; the answer comes as a `KIND_ANSWER` event (see Questions between ships). A change, so refused while reading |
+| `ask_drop(number) -> i64` | Give up on one of this agent's questions: `1` if it was waiting or its answer was queued and not yet handed over (that answer is taken off the queue), else `0`. From the moment the event commits no answer for it is handed over |
 | `log_append(req, req_len) -> i64` | `AppendRequest`. Add a signed entry to one of this agent's own logs; returns its number |
 | `log_follow(req, req_len)` | `FollowRequest`. Follow a log, on this ship or another, from entry 1 |
 | `log_unfollow(req, req_len)` | Stop following. No permission needed |
@@ -573,46 +633,54 @@ bigger buffer.
 | `file_info(id, id_len, buf, cap) -> i64` | `FileInfo` of a file this agent claims on this ship, by its 32-byte id, with whether its claim is marked open. `-1` for any other id, whether the ship holds it or not. Read-only, and no grant is needed: it is the agent's own data. No host function reads or writes a file's bytes |
 | `file_mark(req, req_len) -> i64` | `FileMark {id, open}`. Mark this agent's own claim on a file open to every ship, or take the mark off. `1` if the agent claims that file, else `0` and nothing changes (not an error). A change, so refused while reading, and kept only if the event commits |
 
-The calls that change something are refused during a read or a checkpoint.
+The calls that change something are refused during a read, a checkpoint, a
+file question, or a question from another ship.
 
 ### SDK
 
 `sdk/` wraps the host functions for Rust agents:
 
 - `kv::get`, `kv::put`, `kv::delete`; `emit`; `invocation`; `read`; `send`;
-  `send_to`.
+  `send_to`; `send_to_for_reply`, the same with the reply wanted back.
+- `ask::to(ship, agent, interface, payload, within_millis)`, returning the
+  question's number, and `ask::drop(number)`; `Answered` and `Outcome` from the
+  protocol, and `ask::DEFAULT_WITHIN_MILLIS` (10,000).
 - `log::append`, `log::follow`, `log::follow_on(ship, ..)`, `log::unfollow_on`,
   `log::next`, `log::next_on(ship, ..)`, `log::share`, `log::unshare`.
   `next` returns a `Batch` with `entries`, `more`, an optional `checkpoint` to
   replace local state with, and an optional `stopped` reason for a log on
   another ship.
-- `Receipt` and `Verdict`, re-exported from the protocol.
+- `Receipt` (with `reply`) and `Verdict`, re-exported from the protocol.
 - `files::info(id)`, `files::open(id)`, `files::close(id)`, and `FileRef`,
   `FileInfo`, `FileAsk` and `FileAnswer` from the protocol. A `FileRef` (ship,
   id, length, agent) is plain data an agent keeps in place of a file: the id
   fixes the bytes and the length, and the ship and agent say where to ask.
 - `agent!(handle, read = f, notify = f, checkpoint = f, receipt = f,
-  file_ask = f)` exports `alloc`, `handle`, and whichever roles are named.
-  Command, read, and notify handlers are `fn(&[u8]) -> Vec<u8>`; a checkpoint
-  handler is `fn(&str) -> Option<Vec<u8>>`; a receipt handler is
-  `fn(&Receipt)`; a file_ask handler is `fn(&FileAsk) -> bool`.
+  answer = f, file_ask = f)` exports `alloc`, `handle`, and whichever roles
+  are named. Command, read, and notify handlers are `fn(&[u8]) -> Vec<u8>`; a
+  checkpoint handler is `fn(&str) -> Option<Vec<u8>>`; a receipt handler is
+  `fn(&Receipt)`; an answer handler is `fn(&ask::Answered)`; a file_ask
+  handler is `fn(&FileAsk) -> bool`. A read handler answers other ships'
+  questions with nothing new: `invocation()` names the asking ship and agent.
 
 ## Storage
 
 Each ship is one SQLite file, and the file is the ship's source of truth. The
-schema version is `12`, stored in the `meta` table; a file with any other
+schema version is `13`, stored in the `meta` table; a file with any other
 version is refused. There is no migration: ship files and exports made before
-version 12 (before a ship kept files fetched from other ships) do not open.
+version 13 (before questions between ships and replies on receipts) do not
+open.
 
 | Table | Purpose |
 | --- | --- |
 | `meta` | Schema version, ship name, kernel module hash, and the ship's incarnation mark |
 | `kv` | Agent state, keyed by (agent, key). The kernel's registry lives here under agent `kernel` |
 | `outbox` | Messages agents emitted, waiting for whatever embeds the runtime to drain them |
-| `inbox` | Queued events: commands between agents, commands from other ships (with that ship's number for them), notifications, checkpoint requests, receipts |
+| `inbox` | Queued events: commands between agents, commands from other ships (with that ship's number for them, and whether it wants the reply back), notifications, checkpoint requests, receipts, answers to questions (with the question's number, found by an index of their own) |
 | `peers` | Per other ship: last number sent, last number received, bytes waiting, whether it needs to hear where this ship stands, and which round of comparing notes this is |
-| `peer_out` | Commands and receipts waiting to go to other ships, numbered per ship |
-| `peer_wait` | Commands sent to other ships that have no receipt yet |
+| `peer_out` | Commands and receipts waiting to go to other ships, numbered per ship, each command with whether it wants its reply back |
+| `peer_wait` | Commands sent to other ships that have no receipt yet, and whether each wants its reply |
+| `asks` | Questions this ship's agents have put to other ships and that have no answer yet: the asking agent, where it was put, the payload, the time it was given, and when that runs out (milliseconds since 1970). Numbered from `meta.ask_gen` |
 | `logs` | Per log: newest entry number and hash, bytes held, how many early entries are dropped, bytes since the last checkpoint, and flags for a pending checkpoint request and for history logs |
 | `log_entries` | Signed entries, as signed |
 | `checkpoints` | The newest signed checkpoint of each log |
@@ -633,7 +701,13 @@ version 12 (before a ship kept files fetched from other ships) do not open.
 | `kept_chunks` | Every chunk of a kept file, by directory and chunk number: its hash, from the moment the file is kept, and the copy's generation once the piece is held (NULL until then) |
 | `saves` | Which agents are saving which kept file, and when each last called (`touched`) |
 
-Files are opened with `journal_mode = WAL` and `trusted_schema = OFF`. With
+Files are opened with `trusted_schema = OFF` and, for ordinary work, in
+`journal_mode = WAL` (a file still in SQLite's older rollback mode, as a ship
+is when it is first published, is switched on that open). A file opened only
+for another ship's question is left in the mode it is in: switching writes the
+file's header, which a question does not do (see Questions between ships for
+what opening a file for a question can do); the switch is made by the first
+ordinary work on that ship. With
 `Durability::Full` (the default), SQLite uses `synchronous = FULL` and
 `fullfsync = ON`; with `Durability::Normal`, `synchronous = NORMAL`, which can
 lose the last few events on power loss but not corrupt the file. A ship's size
@@ -1452,7 +1526,8 @@ stated at the top of `files.rs`, keeps them in step:
   commit, so the commit record is on disk when it returns; in WAL mode that is
   what makes a commit survive a power cut). The same transaction records what it
   stopped naming in `file_trash`. Making an upload is not synced: losing that
-  commit loses only a directory no row names, which the first wake removes.
+  commit loses only a directory no row names, which the first ordinary use tries
+  to remove.
 - A name on disk is never used for other bytes: directories and chunk copies
   are named with random bytes when they are made, and nothing is written over.
 - After a failure, only what can be shown never to be named, and never to come
@@ -1467,14 +1542,17 @@ stated at the top of `files.rs`, keeps them in step:
 - If anything unwinds while the ship is held, the ship's connection is closed
   before anything else can use it (`with_ship`), which rolls back whatever
   transaction was open: nothing reads, or acts on, rows never committed.
-- Anything no row names is rubbish that a later step is sure to try again.
-  What is in `file_trash` is removed after every operation that puts something
-  there (a chunk's commit, finish, abandon, an upload start that expires
-  others, delete), at the start of upload start, finish and delete, and when
-  the ship first wakes in the life of a runtime, 16 things at a time. An entry
-  is struck off only after its removal is durable: the directory it was in is
-  synced first. A whole directory durably removed takes with it every record
-  of what was in it. Until then its bytes count against the allowance.
+- Anything no row names is rubbish that a later step is sure to try again. What
+  is in `file_trash` is removed after every operation that puts something there
+  (a chunk's commit, finish, abandon, an upload start that expires others,
+  delete), at the start of upload start, finish and delete, and at the next
+  ordinary use of the ship after it first wakes in the life of a runtime, 16
+  things at a time: a wake for a question (one from another ship, or the asking
+  ship's own task reading its question's row or writing what came of it) leaves
+  it owed (see Who looks, and when, under Questions between ships). An entry is
+  struck off only after its removal is durable: the directory it was in is
+  synced first. A whole directory durably removed takes with it every record of
+  what was in it. Until then its bytes count against the allowance.
 - One mechanism covers chunk copies no row names in a file's directory (left
   by a chunk upload whose commit failed, or that could not remove its own
   copy). A copy's name is made under the ship's slot, and only while its
@@ -1493,8 +1571,8 @@ stated at the top of `files.rs`, keeps them in step:
   expired takes its directory with it. Copies swept this way are of unknown
   size and are not counted against the allowance; they arise only from failed
   disk operations, at most one chunk per failed operation. A directory no row
-  names goes when the ship first wakes, and the ship is looked through again
-  at its next wake unless every such removal worked. An entry a row names is
+  names is looked for on the first ordinary use, and the ship is looked through
+  again at its next wake unless every such removal worked. An entry a row names is
   kept on its name alone, whatever else is odd about it; for any other entry,
   an error reading the listing or the entry's type makes that look remove
   nothing, and the ship is looked at again at its next wake. An entry no row
@@ -1610,7 +1688,8 @@ Bounds, with their working:
   about 16 MiB; and, after a crash or a failure that could not clean up after
   itself, at most one copy no row names per chunk upload that was in progress,
   until its upload finishes or its directory goes, and directories made for
-  uploads whose rows never committed, until the ship first wakes.
+  uploads whose rows never committed, until cleanup succeeds on an ordinary use
+  of the ship.
 - Memory per request is about one chunk, never a file: a chunk upload is read
   whole (a `PUT` carries at most one chunk, 1 MiB, whatever `max_body_bytes`
   says, and is refused before it is read if it says it is longer) and sealed
@@ -1759,8 +1838,11 @@ damaged or vanished chunk is a refusal at the transport level ("the file could
 not be read; try again"), never bytes. Serving writes nothing of its own and
 keeps nothing: no row, no file. A request that is the first thing to wake a
 ship in a runtime's life sets off the clearing of leftovers part 1 owes at
-first wake, as anything that wakes it does (a command or a log fetch from
-another ship already did). That clearing removes what the ship had recorded
+first wake, as the next ordinary use of the ship does (a command or a log fetch
+from another ship already did); a wake for a question (one from another ship,
+or the asking ship's own task reading its question's row or writing what came
+of it) leaves it owed for the next ordinary use (see Who looks, and when, under
+Questions between ships). That clearing removes what the ship had recorded
 to be removed and directories under `files/<ship>/` that no row names (such
 as an upload's directory whose row never committed); it only ever removes,
 and is the one thing a stranger's request can change.
@@ -1786,9 +1868,10 @@ many ships ask (one owner can prove many ships: a planet and its moons),
 questions take at most a quarter of it plus the length of one question: every
 question but the last that falls in the stretch is followed, inside the
 stretch, by a rest three times as long. A single question is cut off at
-`file_ask_millis` (500 ms), as the cut-off is noticed: at the agent's next
-check of the clock (a loop or a call; the runtime's clock moves every 10 ms)
-or when it returns, so a question can run a little past it. A request that
+`file_ask_millis` (500 ms), as any call is stopped for time (see Time, above:
+never before it; after it, at the first point where the running code looks and
+finds the watchdog has ticked since it was last allowed on, with no number
+promised for the overrun), or when it returns. A request that
 would need a fresh question during that
 rest is answered exactly as any no (the same `denied`, and not remembered); a
 remembered answer and an open mark are honoured as always. In memory only, one
@@ -1940,9 +2023,9 @@ Bounds, with their working:
   decision and one lookup, at most 4 at a time on its connection. Questions to
   agents, from however many callers, take at most a quarter of any stretch of
   the ship's time plus one question, by the rest above; a single question at
-  most `file_ask_millis` (500 ms) with the kernel's decision, and a little
-  more, as the cut-off is noticed (above). These were not measured on other machines or
-  in a release build.
+  most `file_ask_millis` (500 ms) with the kernel's decision, and however far
+  past that it runs before it is stopped, for which no number is promised (see
+  Time). These were not measured on other machines or in a release build.
 - On B, threads: each of the three routes that waits on A does so holding a
   worker, so it holds a place among the downloads, as a local file's contents
   do, and of those places requests to other ships may hold at most half, and
@@ -2304,7 +2387,7 @@ with a failing disk.
   stays until the next life's first keep into that directory looks it
   through, or until the directory goes; a look that fails leaves it until the
   life after. A directory made for a kept file whose row never committed stays
-  until the ship first wakes.
+  until cleanup succeeds on an ordinary use of the ship.
 - Throwing away under the slot, per request: at most 64 kept files and 65,538
   rows, in the request's transactions; clearing everything, the same per
   transaction, letting the ship go between them. Not measured.
@@ -3049,7 +3132,7 @@ matching answer, or only `refused` with a reason.
 | Request | Reply | Purpose |
 | --- | --- | --- |
 | `Ping { nonce }` | `Pong { nonce, ship, caller, incarnation }` | Who are you, who do you take me for, and which copy of yourself are you |
-| `Deliver { messages }` | `Delivered { last }` | Numbered commands and receipts, in order. `last` is the highest number the receiver now holds |
+| `Deliver { messages }` | `Delivered { last }` | Numbered commands and receipts, in order. `last` is the highest number the receiver now holds. A command with `reply` set wants the handler's reply on its receipt (`Receipt.reply`) |
 | `Fetch { agent, log, after, max_bytes, joining }` | `Fetched { entries, head, checkpoint, denied, incarnation }` | Entries of a log after `after`, as signed; or the checkpoint if they were dropped; or a refusal |
 | `News { logs }` | `Heard { unknown }` | The publisher says these logs grew (or are closed to you). The follower says which it no longer follows |
 | `Resync { standing }` | `Resynced { standing }` | Two ships say where each stands, to get back in step after a restore |
@@ -3058,10 +3141,13 @@ matching answer, or only `refused` with a reason.
 | `file_leaves: FileWanted { agent, id, index }` | `file_leaves: FileHashes { denied, hashes }` | The chunk hashes of group `index` (chunks `index * 32768` on), 32 bytes each, one after another |
 | `file_upper: FileWanted { agent, id }` | `file_upper: FileHashes { denied, hashes }` | The index hash of every group, for a file of more than 32,768 chunks |
 | `file_chunk: FileWanted { agent, id, index }` | `file_chunk: FileBytes { denied, data }` | Chunk `index`, whole |
+| `ask: Ask { from_agent, agent, interface, payload, within_millis }` | `ask: Answer { reply \| denied \| failed \| limit }` | A question for an agent's read handler, from an agent on the asking ship (or, with `from_agent` empty, its owner). Exactly one of the four in the answer; see Questions between ships |
 
 A refusal of a file is `denied` alone, the same words whatever the reason. An
 older runtime answers the four file kinds with `refused`, as any kind it does
-not know.
+not know, and a question (field 11) the same way, which the asker reports as
+not understood. A ship too busy for a question answers the bare `refused: "too
+busy; try again"`.
 
 A request holds one body, of one kind. For every request after the greeting
 (the first stream's `Hello`, which is read and bounded on its own, at most
@@ -3130,6 +3216,89 @@ sender always learns what became of it.
   everything behind it.
 - After a failed attempt, the next one waits `retry_delay`, doubling up to
   `max_retry_delay`.
+- A command can ask for the handler's reply (`SendRequest.reply`; the SDK's
+  `send_to_for_reply`). It then carries the largest reply its sender takes
+  (`PeerMessage.reply_most`, the sender's `store::reply_most` when it sent it,
+  kept with the waiting command so a later change of settings cannot shrink
+  it; this, and the receipt fitting one delivery below, hold while the limits
+  in force are not made smaller than they were when the command was sent: see
+  Known limits). The ship that runs it holds the reply to the smaller of that and its own
+  limit. Its receipt then says `RAN` and carries the whole reply, marked as one
+  (`Receipt.reply` and `Receipt.replied`, so an empty reply and no reply are
+  told apart), or the command did not stand: the event is rejected like any
+  other that breaks a limit (everything it did undone) and the receipt says
+  `LIMIT`, in fixed words, when the reply is larger than either ship allows
+  ("the reply is larger than that ship sends with a receipt") or would have
+  left its file without the room it keeps for taking a command back and
+  finishing with it ("that ship had no room to keep the reply"). Every other
+  verdict, and `LOST`, carries no reply.
+  The whole reply comes back with RAN from a receiving ship that follows the
+  protocol. A receipt can say RAN with `Receipt.replied` unset when the other
+  ship's runtime predates replies, or when it broke the protocol (a reply over
+  the bound the command was sent with, or a reply not marked): the command is
+  still reported as run, because the other ship said so; no reply is handed
+  on; and when a reply came and was let go, the reason says so. An agent that
+  needs the reply checks `Receipt.replied`.
+  A ship that takes back no reply at all (`max_receipt_reply_bytes` 0, or a
+  queue too small for any receipt with a reply, 592 bytes or less) does not
+  send a command that wants one, since 0 in `reply_most` means no reply is
+  wanted; the send is refused there ("this ship takes back no reply ..."),
+  and the event with it. A command without `reply` is the same bytes on the wire as before,
+  apart from the absent field.
+
+Room for a receipt with a reply, with its working:
+
+- How large: the reply is held to `max_receipt_reply_bytes` (16 KiB), and to
+  no more than a command may carry (`max_event_bytes`) or than a ship takes
+  from another as one message (its queue, and a quarter of its file, less the
+  receipt and 64 bytes) (`store::reply_most`), on both ships (the bound the
+  command carries). So a receipt with its reply is at most 528 bytes more than
+  the reply, never larger than the largest command with its own receipt.
+- On the ship that runs the command: the room it keeps for every receipt it
+  owes is unchanged (512 bytes each), because a reply goes with a receipt only
+  if, after the receipt is written, the file still has the room it keeps for
+  taking one command back and finishing with it (`room_to_take_one`), or the
+  receipt took no room. So reply bytes never use that room, and the working
+  that keeps two ships full of commands for each other moving is as it was.
+  The cost: a ship short of room answers commands that want replies with
+  `LIMIT` until it has room again.
+- In a `Deliver`: a batch always carries at least one message, and the largest
+  receipt is no larger than the largest command, which `Network::start` sees
+  fits one message with room to spare (4 KiB), so a receipt fits one, as long
+  as the limits are not made smaller while it is outstanding (Known limits).
+- On the ship that sent the command: the receipt is taken as every receipt is,
+  queued for its agent as a `KIND_RECEIPT` event within the queue's room (one
+  that does not fit waits with the other ship). Its reply takes room in the
+  file only while that event waits: running it, or refusing it, removes its
+  row, and its audit row keeps bounded facts only (its number, verdict, where
+  it went, and the reply's length, at most 512 bytes), on the success path and
+  on every rejection path; the same holds for an answer to a question
+  (`KIND_ANSWER`). (What the agent's handler keeps is the agent's, as for any
+  event.) So replies taken use the sender's file only while queued, at most a
+  queue's worth (`max_inbox_bytes`) at once, and give it back when run. Two
+  ships full of commands for each other each keep, by the rule on sending, the
+  room to take the other's first command; replies taken from third ships can
+  use it only until their events run, which needs nothing from either ship,
+  so it comes back and the two meet as before. A receipt whose reply breaks the
+  protocol (not `RAN`, not asked for, or over the bound the command carried)
+  is handed on without it, with a reason saying so, and that is written to the
+  audit log; a ship that keeps to the protocol never sends one.
+- Export and import: a command keeps the bound it was sent with, which a
+  later, lower setting does not shrink, so import checks kept bounds, and
+  receipts with replies (queued, or owed to another ship), against a fixed
+  ceiling that no configuration may pass (`store::MOST_RECEIPT_REPLY_BYTES`,
+  1 MiB; `max_receipt_reply_bytes` is held to it when a runtime opens) and
+  against the queue's total, not against the setting of the day. So a ship's
+  own export, written by this version, comes in under its own settings after
+  its limit on replies was lowered (though delivering a receipt held over
+  such a change is not supported: Known limits). (Files written by earlier, uncommitted
+  versions of this schema are not supported.) Import's row bound covers the
+  ceiling, so it is at least 4 MiB and 64 KiB whatever the settings. In the same way a queued
+  answer is checked against `store::MOST_ANSWER_BYTES` (4 MiB) and a
+  question's payload against `store::MOST_ASK_BYTES` (1 MiB), the ceilings
+  `max_answer_bytes` and `max_ask_bytes` are held to; every bound import works
+  out is worked out without overflowing, whatever the settings. Comparing
+  notes after a restore and `LOST` make receipts of their own, with no reply.
 
 | Verdict | Meaning |
 | --- | --- |
@@ -3139,6 +3308,531 @@ sender always learns what became of it.
 | `LIMIT` | It hit one of the receiving ship's limits |
 | `MALFORMED` | It could not be run at all |
 | `LOST` | Made up by the sender's own ship after a restore, when nobody can say whether it ran |
+
+### Questions between ships
+
+A command changes things, runs exactly once, and answers with a verdict (and,
+if asked, the handler's reply). A question is the other kind of call: it only
+reads, may be asked any number of times, and answers within a time limit or
+says why not. Code: answering in `ship.rs` (`Ship::answer_ask`) and `net.rs`
+(`answer_question`), asking in `net.rs` (`put_question`, `pursue`), writing down
+what came of an agent's question in `ship.rs` (`Ship::ask_answered`), shared
+pieces in `ask.rs`, the route in `server.rs`.
+
+**Who may ask.** Both owners agree. The interface asked must be marked
+`Provide.asked`, apart from `remote` (commands): an owner can open one without
+the other. An agent that asks needs a `Use` naming the ship (or `*`), agent and
+interface with `ask` set. Another ship's owner, asking through one of their
+devices, needs only `asked`. What each ship may be told is then the agent's to
+decide: its read handler is told who asks in `Invocation.source` (`ship` the
+asking ship, proved on the connection; `agent` the asking agent, empty for an
+owner; `owner` never set).
+
+**Answering.** On the ship asked, in `answer_question`, after the checks every
+request has (see Wire messages): a question whose payload is larger than
+`max_ask_bytes` (and than one message carries) is answered `limit`, and one
+whose names are not names `denied`, before anything is looked up; then it
+takes a place and an allowance (below) or is told "too busy; try again". The
+request's room for reading is given back, and a blocking job answers it. Its
+deadline is the moment it arrived (one reading of the clock, taken when its
+stream is taken up, before it is read) plus the shorter of `ask_millis` (2,000 ms) and the
+asker's `within_millis`, so waiting for the ship and the kernel's decision are
+inside it, and however late the job is run, the deadline is never earlier
+than that.
+
+Waiting for the ship (`Inner::with_ship_question`): the job does not block on
+the ship's lock. It tries for it, and for a place among the ships kept awake
+if the ship is asleep, every 5 ms (`QUESTION_LOOK`), and gives up, with
+nothing run, at the first of those looks that finds the question's time has
+passed ("it took too long") or the asker has given up (it stopped the stream, or its connection was lost:
+nothing is said). With the ship in hand, it checks both again, and whether the
+ship is resting from questions (below): too busy. Then, if the ship was
+asleep, it is woken for the question alone: its file opened and checked and
+its kernel loaded, and nothing else. The upkeep owed when a ship is first woken
+(clearing what an earlier run left in its directory, and a batch of its trash)
+is not done on a question's path; it is left for the next ordinary call on that
+ship, or the startup look. Waking can be slow, so the asker's giving up and the
+question's time are looked at once more just before the handler would start:
+either, and no handler runs. However the question ends (an answer, an error,
+or a panic), the ship is let go as an ordinary call lets it go: a place among
+the awake ships taken for a ship that was not woken is given back, a
+connection left in a transaction is closed, and, for a question admitted past
+the look at the rests, the time from that look is charged to the rests
+(below). Questions are given no turn against ordinary work: a ship
+kept busy by ordinary calls leaves its questions waiting until their time,
+when they end "it took too long" (or, refused before, "too busy").
+
+No module is compiled on a question's path either, and a question waits for
+no compile. If the ship's kernel, or a module the kernel has let the question
+reach (the agent asked, or an agent it reads from in turn), is not already
+compiled, or is being compiled by another caller, the question is answered "too
+busy; try again", which the asker already retries within its time; so is a
+question that finds the cache of compiled modules held by another caller just
+then (only ever briefly: nothing is compiled, and no module file read or
+written, while it is held). This is the side that answers questions: the
+owner's own question over HTTP is first signed in by an ordinary call on its
+own ship, which, like any ordinary call, waits for that ship and for its
+kernel to be compiled. A module not compiled is then compiled off the
+path, in a job of its own (`Runtime::compile_cold`): at most one such compile
+at a time in the runtime (another met meanwhile is not done, and is met again
+by the next question that needs it).
+
+Every caller shares one record of what is compiled and what is being compiled
+(`Modules` in `lib.rs`): an ordinary call, `add_module`, or a compile off a
+question's path. One module is compiled by one caller at a time, whoever asks;
+an ordinary call that needs a module another caller is compiling waits for
+that compile (it would have compiled the module itself), and a question or a
+compile off a question's path goes without. Whoever wins the right to compile
+looks again first, so a module compiled meanwhile is not compiled twice, and
+the right is given back by a guard however the compile ends, a panic included.
+A module whose file is read and checked against its hash and then fails to
+compile is remembered as failing, with why, and is not compiled again by an
+ordinary call or a question in the runtime's life (an ordinary call for it
+fails at once, in the same words); only the owner's explicit `add_module` of
+those bytes tries it again. A failure for want of memory is remembered the
+same way, until a restart or such an `add_module`. One whose file cannot be
+read is not remembered, since that costs a failed read, not a compile. What is remembered is therefore bounded by the module files
+stored. The cache of compiled modules is never emptied, so what another ship
+can cause is this: each module stored that its questions reach, the kernel
+first, compiled at most once in the runtime's life, one at a time, and a read
+of a file that is not there for each question that names one.
+
+Then the agent's read handler runs as a `KIND_READ` call from that ship,
+through the kernel, read-only (every write, send, emit, ask, log change and
+`file_mark` is refused), with its ordinary read grants and none to send or ask,
+and that time, inside a transaction that is always rolled back. One compute
+budget, `ask_fuel` (100,000,000), pays for the whole question: the kernel's
+decision (each at most `kernel_fuel`, as always), the handler, and every nested
+read with its own decision. The answer is the reply (at most
+`max_answer_bytes`, 256 KiB, and what one message carries), or `denied` with
+the kernel's reason, or `failed` or `limit` in fixed words: a handler that
+traps, runs out of fuel or time, or tries to change something is "the agent
+failed", "it ran out of fuel" or "it took too long"; a reply too large is "the
+answer is larger than that ship gives". The answer is written with nothing of
+the request held, and the ship rests.
+
+**Nothing is kept on the ship asked.** No row, no audit row: not for an
+answer, nor for a refusal or a failure, as for a file question. So a failure's
+details are kept nowhere (see Known limits). Nor does a question change
+anything a ship does when it is first woken: that upkeep waits, as above.
+
+What a question does leave behind. In memory: the asking ship's allowances and
+the ship's rests (above); its place while it runs; the ship it woke, kept awake
+like any ship woken until it is put to sleep; and a module compiled for it off
+its path, or a compile failure remembered (above). On disk. A question stores no
+application data. Opening a ship for it, or putting another ship to sleep to
+make room for it, can recover a transaction that a crash interrupted, copy pages
+that ordinary work had already committed from the log beside the file into the
+file, and create or remove the files SQLite keeps beside the ship's file. Beyond
+that housekeeping, which any open of the file would do, a question changes
+nothing in the file: on the ship asked it executes no statement that changes a
+page (no reservation, counter, audit row or rest is written to the file; its
+rests and allowances are in memory), and its transaction is rolled back. A ship
+never opened by ordinary work since it was published is still in SQLite's older
+rollback mode, and a question's open leaves it so (switching would write the
+header; the first ordinary work switches it). A ship in WAL mode has SQLite's
+two files beside its own, `-wal` and `-shm`, while any connection has it open:
+on a clean file the question's connection reads through them and adds nothing to
+the `-wal`, for the reason above. When the last connection on a ship closes,
+SQLite copies what the `-wal` holds into the file and removes both: what is
+copied then is what ordinary work committed before, not anything of the
+question's. The tests compare the whole file, byte for byte, before a question
+and after it with the ship put to sleep again (its file closed, so nothing is
+left in a `-wal`): for a ship just created and for one brought in from a copy,
+each first called by a question (in the older mode, never opened by ordinary
+work, and still in it after), and for that copy once ordinary work had switched
+it to WAL. That shows the bytes of a cleanly closed file are the same after; it
+cannot see a write that is put back before the file closes, and it does not
+cover a file that needs crash repair.
+
+**Bounds on the ship asked, with their working.** A caller must not be able to
+hold a ship, or its threads, or the runtime's room for reading requests:
+
+- Places: at most `max_asks_each` (2) questions from any one other ship and
+  `max_asks` (8) in all are being answered at once, running or waiting for
+  their ship, all ships of the runtime together. Each holds one of the
+  network's `max_working` (16) places for work on ships while its job runs or
+  waits, so questions hold at most 8 of the 16, and commands, receipts and
+  logs keep the rest. A question's place is given back when its job has
+  returned and its answer has been sent or its stream reset, whichever is
+  later. A question given up on gives its place back within one look (5 ms,
+  and the time the thread takes to be scheduled) of the asker giving up while
+  it waits for its ship or for a place among the awake ships; once it has the
+  ship, its handler runs until it is stopped for time (never before its time,
+  and no number promised for how far past it; see Time) or returns. So a place
+  is held for the question's time (at most `ask_millis`), however far past it
+  the handler runs before it is stopped, and then `request_timeout` to send
+  the answer; and its job keeps it through what cannot be cut short (a host
+  call under way when its time comes, and opening a ship's file for it),
+  however long that takes. (The network stops waiting for the job
+  250 ms after its time and answers "it took too long"; the job's place is
+  given back when the job does return.) The tests see places come back within
+  500 ms of the askers giving up.
+- Allowances: questions are started (an allowance charged at the rate limiter,
+  before the question's job waits for the ship) for any one other ship at most
+  `asks_per_second_each` (8) at a stroke and then 8 more for each second, and
+  `asks_per_second` (32) at a stroke and 32 a second in all: over any `T`
+  seconds, at most `8 + 8T` starts from any one ship and `32 + 32T` in all. Past a
+  place or an allowance: "too busy; try again", before any WASM runs. Allowances
+  are kept for 1,024 asking ships at most; past that, those that are whole are
+  forgotten, and a new caller is told it is too busy if none is.
+- Rests: counting alone would let a slow handler hold a ship: at the rate the
+  allowances let through (`8 + 8T` from one caller over `T` seconds), each
+  question of up to `ask_millis` (2 s), that is about 16 seconds of the ship's
+  time a second from one caller, and 64 from all. So after a question that held
+  the ship for `t`, the ship rests from every ship's questions for `3t` and from
+  that ship's for `9t`, and a question that would begin in a rest is too busy:
+  that is looked at before the ship is taken (each time the question looks
+  whether it can have the ship), so a question refused for a rest normally never
+  holds the ship at all, and once more after it is taken, since a rest can begin
+  while it waits. `t` is measured from the look at the rests that admits the
+  question once it has taken the ship's lock (the one reading of the clock that
+  look is decided on) to just before its rest is written (the lock is let go a
+  moment after that), so waking the ship, the kernel's decision and the handler
+  are all in it, no part of a rest it was admitted after is, and it is charged
+  however the question ends from then on (an answer, an error, a panic, or "too
+  busy" because a module it needs is not compiled). A
+  question refused before that look admits it (given up, past its time, or in a
+  rest) is charged nothing for the time it held the lock. A rest is only ever
+  made longer.
+
+  The bound, once, and what it is true of: the measured times `t` of the
+  questions admitted past the look at the rests (those that go on to wake the
+  ship or run) add up to at most a quarter of any stretch of the ship's time,
+  all asking ships together, and a tenth for questions from any one ship, each
+  bound plus the length of one such measured time. It is a bound on those
+  measured times, not on every moment the ship's lock is held: the moments
+  before the measurement starts and after it ends, while the lock is still held,
+  are not in it, and the system can run the thread late in them. A measured time
+  is the question's time (`ask_millis`) and however far past it the handler runs
+  before it is stopped (see Time under limits: never before its time, and no
+  number promised for the overrun) and, for a ship woken for it, the opening of
+  the file, which is not cut short. Apart from that, a question refused after it
+  has taken the ship (a rest begun while it waited, or the asker gone or its
+  time passed by then) holds the lock only for those looks: it wakes nothing and
+  runs no WASM, is not charged to the rests, and has no time promised for it
+  (lock contention and the system's scheduling have no fixed bound); the
+  fraction above does not cover it. The bound on such refusals is the start
+  rate: a question's allowance is charged at the rate limiter, before its job
+  waits for the slot, so over any `T` seconds at most `8 + 8T` questions from
+  any one ship and `32 + 32T` in all are started (a burst and then a rate,
+  `asks_per_second_each` and `asks_per_second`); questions already waiting when
+  such a stretch begins can also end in it, at most `max_asks_each` (2) from one
+  ship and `max_asks` (8) in all by default, the places they hold. One owner can
+  prove many ships (a planet and its moons), and each counts apart. The rests
+  are in memory only.
+- Room for reading: a question holds the request's room only until it is
+  checked and decided to be taken; its payload is then within the runtime's own
+  limit, and its names checked.
+- Memory: a question's payload and its reply are held only while it holds its
+  place (above), so at most 8 at once. Each holds its payload (at most 64 KiB)
+  while its job runs; its reply (at most 256 KiB) as the handler's reply, and
+  for a moment also encoded for the wire (two copies), after which the first
+  is let go before anything is awaited, so one copy is held while it is sent
+  (`reply_owned` in `net.rs`). So at most 8 x (64 KiB + 2 x 256 KiB) = 4.5 MiB,
+  and 8 x 256 KiB = 2 MiB once all are being sent, besides what a read
+  handler's instance takes (as for any read) and what QUIC buffers for a
+  stream (its send window).
+
+**Asking: three ways in.**
+
+1. `Runtime::ask(from, from_agent, to, agent, interface, payload, within)`
+   blocks for the answer, and needs the network. `within` is more than nothing
+   and at most `max_ask_millis` (60 s); `request_timeout` does not apply to it,
+   but making the connection for each try has at most `request_timeout` of what
+   is left, so a try at an address nothing answers at does not take all of it.
+   Within it, a connection that fails or goes silent (see Finding a ship by its
+   name) is made again, and a ship that says it is too busy asked again, sooner
+   after "too busy" (from 20 ms) than after a lost connection (from
+   `retry_delay`), doubling up to a second; asking twice is harmless. Any answer
+   from the other ship ends it, a refusal included, except a refusal as too
+   busy, which is asked again as above. It returns the reply, or `AskError`:
+   `Denied(reason)`, `Failed`, `Limit`, `Busy` (the last try before the time ran
+   out was refused as too busy, whatever earlier tries met, or this runtime had
+   as many requests out as it may),
+   `NoAnswer` (some try reached the other ship and no answer was taken in time),
+   `Unreachable` (no try ever had a connection in time, or the
+   directory does not list the ship; a try that finds the destination absent
+   from the directory ends the question as `Unreachable`, even if an earlier try
+   reached it, while a try already awaiting its reply can still complete),
+   `NotUnderstood` (an older runtime, or an answer that is not one); or, before
+   anything is sent, `NoNetwork`, `TooLarge` (more than `max_ask_bytes`),
+   `BadWithin`, `BadName` (the asking ship not this runtime's, the ship asked
+   this same ship, or a name not one). It takes one of the runtime's
+   `max_requests` places for the whole of it. Its time is one deadline, taken
+   first thing when the call is made (before the asking ship's file is looked
+   for or the payload copied), and carried through every try: a task the system
+   runs late has only what is left of it, begins no write of the question once
+   it has passed, and takes nothing the other ship says after it, a reply or a
+   refusal (that is `NoAnswer`). The time the other ship is told
+   (`within_millis`) is in whole milliseconds, never rounded up, and is looked
+   at again, with the deadline, on every poll of the write before the connection
+   has taken any of the question's bytes: at the poll in which the connection
+   accepts a question's first bytes, the allowance in those bytes is no more
+   than the whole milliseconds left to the asker's deadline by the clock reading
+   taken in that poll, and no first bytes are accepted in a poll whose clock
+   reading leaves less than a millisecond. The first-write rule uses the clock
+   reading taken in the accepting poll, and time spent encoding, waiting inside
+   the writer, or descheduled after that reading can carry actual acceptance
+   past the deadline. (When the other ship has them is not promised.) The
+   question ends within its time on the network's threads; the caller waits for
+   that until two seconds past the deadline at most, is told `NoAnswer` if
+   nothing came by then (`NoNetwork` if the network stopped), and what it gave
+   up on is called off. The reply side is read while the request is still being
+   written: a whole refusal that comes before the request is all written (the
+   other ship stopped reading it, as too large, say) ends it, and is `Limit` for
+   a size refusal; any other reply that comes before the request is all written
+   is not taken. If the write fails, a whole refusal read after it is taken in
+   the same way; anything else leaves the write's error, if the reply read
+   completes before the exchange's deadline; otherwise the exchange ends at its
+   deadline. A completed reply whose outer fields parse as a refusal but which is
+   malformed (a reason that is not valid UTF-8 in a structurally valid refusal,
+   say) ends the exchange as not understood, replacing the write's error; a
+   reply whose outer fields do not parse is not taken as a refusal, and the
+   write's error stands.
+2. `POST /ask/<ship>/<agent>/<interface>`, under the ship and signed in as
+   every route, asks as the ship's owner (`from_agent` empty). The body is the
+   payload; `?within=<seconds>`, given once, is how long it is given, in whole
+   seconds, from 1 to `max_ask_millis` rounded down to whole seconds. Left out,
+   it is the shorter of 10 seconds and `max_ask_millis`; given more than once
+   (even with one good value among them) or in any other form (`?within` with
+   no value, empty, not decodable, not a whole number, 0 or past the most), it
+   is refused with 400 and nothing is asked. So with
+   `max_ask_millis` under one second, leaving it out still works (with that
+   time), and no value may be given. Answers: 200 with the reply
+   (`application/octet-stream`, an attachment); 403 for a refusal, "the other
+   ship would not let it be asked: " and the other ship's reason (cut to 200
+   bytes, control characters made spaces); 502 for a failure or an answer too
+   large, each in words of its own; 501 for an older runtime; 503 with
+   `Retry-After: 1` when too busy, 503 without it when the other ship could not
+   be reached, 503 with `Retry-After: 5` with no network; 504 when no answer
+   came in time; 413 for a payload larger than `max_ask_bytes`, 400 for a name,
+   a `within`, or this same ship. Every answer past the sign-in and origin
+   checks carries `nosniff` and `Content-Security-Policy: sandbox;
+   default-src 'none'`; a refusal at those checks (401, or 403 for the origin)
+   carries `nosniff`, as every answer of the server does. It waits holding a
+   worker, as a long poll does, so it counts among the requests waiting (at
+   most half the workers at once) for as long as it waits; past that, 503 "too
+   many requests waiting at once; try again shortly" with `Retry-After: 1`. Its
+   answer is bounded and buffered whole before it is sent, as any small answer
+   is, so it takes no download place.
+3. From inside an agent's handler, `ask_to` (the SDK's `ask::to`): an event is
+   one transaction and cannot wait, so the answer comes later, as below.
+
+**An agent's questions.** `ask_to` is checked against `RouteReply.asks`, and
+refused (and the event with it, as `send_to` past its limits) for this ship or
+an empty name (agents here are read), a payload over `max_ask_bytes`, a
+`within_millis` of 0 or over `max_ask_millis`, more than
+`limits.max_effects_per_event` questions in one event, or a ship that already
+has `max_asks_waiting` (256) questions waiting, counting answers queued and not
+yet handed over, or when the queue cannot hold room for its answer ("this
+ship's queue has no room for the question's answer"; below). It is refused
+while reading, as every call that changes something is. The question is written to `asks` in the event's own
+transaction, with its time, and is put only if the event commits; an event that
+asks, as one that sends, must leave the room the file keeps for taking a
+command. Its time is wall-clock, stamped as the event commits: just before
+`COMMIT`, every question the event wrote is given `now + within_millis` as its
+deadline, in whole milliseconds since 1970, so it holds across a restart, the
+ship sleeping, and an export (and a slow commit uses some of it; see Who
+looks, and when, for how the network keeps it).
+
+Exactly one `KIND_ANSWER` event for each question, unless the agent dropped it.
+The event calls the agent's `answer` export with an `Answered {about, ship,
+agent, interface, outcome, reply, reason}`; the outcome is `REPLY` (with the
+reply), `DENIED` (with the other ship's reason), `FAILED`, `LIMIT`,
+`NO_ANSWER`, `UNREACHABLE` or `NOT_UNDERSTOOD`. Whatever comes of a question,
+an answer, its time running out, or no network, it is written down by striking
+the question off `asks` and queueing the event in one transaction
+(`Ship::ask_answered`), and only if the question is still there, on the copy
+of the ship that put it (its incarnation mark). So an answer and the time
+running out at once make one event, not two and not none, and after a dropped
+question nothing is queued, whatever arrives. Once the event is queued, the
+network running now is told there is work, from inside `Ship::ask_answered`
+through the runtime's own hook, so an answer written by a task of a network
+since stopped and replaced still runs. A module with no `answer` export has
+the event skipped, as for a receipt.
+
+Room for the answer, with its working. Every question waiting holds room in
+the ship's queue (`max_inbox_bytes`) for its answer, from the moment the event
+that asked commits until its answer is queued: as much as an answer to it with
+no reply takes, counted as the queue counts (`store::ask_reserve`: an
+`Answered` with that question's names, the largest number, the largest
+outcome, a reason of 200 bytes, the most any reason is cut to, and the 64
+bytes every queued message counts for). It is counted in the queue's total
+wherever that is counted (`store::inbox_bytes`), by the running ship and by
+import alike. So:
+
+- `ask_to` is refused when the room cannot be had now (with what the event has
+  queued so far), or never could be (a queue too small), as above.
+- Writing down what came of a question gives that room back and queues the
+  answer in one step. An answer with no reply always fits in it. One with a
+  reply that does not fit in the queue's room with the reservation given back,
+  or that is larger than this ship takes (`max_answer_bytes`), is handed over
+  as `LIMIT` ("no room on this ship for the answer", or "the answer is larger
+  than this ship takes"), which does. An answer with a reply must also leave
+  the room the file keeps for taking a command, as anything written because of
+  another ship does; if it would not, it too is handed over as `LIMIT` with no
+  room. So a question's answer is never held back for want of room in the
+  queue.
+- The file itself is the exception: nothing holds pages of the file for an
+  answer. The room the file keeps for taking a command (`room_to_take_one`) is
+  checked only for events that send commands or ask questions; events that
+  only write state (and receipts owed, answers without replies, comparing
+  notes, `LOST`) can use it up. So the write of what came of a question can
+  fail, as any write can, for any storage reason: no page to be had (for the
+  queue's rows, an index, or a split of either), or an I/O error. Then nothing
+  is kept, the question stays waiting, and its task writes what came of it
+  again (a reply let go, `LIMIT` in its place, as that takes less room), with
+  waits growing from `retry_delay` to `max_retry_delay`. It does not spin, it
+  stops when the question is dropped (above), and a restart meanwhile finds
+  the question still waiting (and answers it then, `NO_ANSWER` if its time has
+  run out). There is no bound on how long this takes: the answer is written
+  when the file can be written again. What makes that happen is the owner's to
+  do: let the ship's agents run what is queued and drop state they keep,
+  delete files or empty the trash, or move the ship to a runtime with a larger
+  `max_ship_bytes` (see Known limits).
+- Import: the `NO_ANSWER` made for every question waiting in a copy takes the
+  room its question held, so the answers never keep a ship's own export,
+  written by this version, from being imported under the same settings, full
+  queue and questions waiting included. (That is the answer queue's room only:
+  the import's own time limit and its limit on the packed file still apply, as
+  for any import; see Export and import, and Known limits.)
+
+Who looks, and when: each question waiting has one task of its own in the
+network, started when the event that asked commits (the event says so to the
+network) or, for questions waiting when the network starts, from the one look
+through every ship's file the network makes then (as for commands). The task
+puts the question as `Runtime::ask` does, but each try takes a place among the
+requests agents' questions may hold (a quarter of `max_requests`, and at least
+one) and then one among all, and gives both back when the try ends, so agents'
+questions never hold the places every other request needs. (With
+`max_requests` at 1 those are the same one place, and an agent's question
+waiting can hold it: the owner's own question is then told it is too busy. The
+place kept for the owner is there from 2 up.)
+
+The notices that a ship may have questions waiting are taken by a task of the
+network's own (`start_looks`), beside the carrier that finds where commands go,
+so a notice is acted on at once whatever the carrier is waiting for. (The
+carrier still finds which ships a ship's commands are for one ship at a time;
+see Known limits.) The network looks at each ship's questions on its own: one
+look per ship at a time (a ship told of again while it is being looked at is
+looked at once more after), each waiting for its own ship on a thread of the
+blocking pool, holding none of the network's working places. So a ship kept busy
+for a long while (running a long queue, say) does not keep another ship's
+question from being registered. Question notices and registration proceed
+independently of command discovery, but reading a registered question needs a
+shared working place, so it can expire unsent while those places are occupied.
+And each ship with a look outstanding can occupy one thread of a shared pool of
+blocking threads until the ship, or room to wake it, becomes available, and that
+wait is not cut short when the network stops. Enough such waits at once can
+delay work for other ships. A look holds the ship for as long as it takes to go
+through that ship's own questions. A question dropped (`ask_drop`) stops being
+put once the dropping event commits: the event tells the network the question's
+number and the copy of the ship it is on, straight from the commit, and its task
+is told to stop by that, without the ship being taken again (`Ready::Dropped`).
+The look through a ship's questions registers each task's means to stop while it
+still holds the ship, and starts the tasks after; a drop is told from inside the
+dropping event, with its ship held. So a drop that commits after the look finds
+the means to stop, whether or not the task has started yet, and stops it; one
+that committed before the look is not in it. One look, however many drops come
+meanwhile: a steady stream of them cannot keep the network looking. The stop is
+signalled at the commit, and each wait notices it as follows: waiting for a
+connection or an answer, and every wait between tries, end as soon as it is
+signalled; waiting for one of the places agents' questions may hold ends then
+too, and waiting for one among all requests out notices at its next look (it
+looks every 20 ms); a question whose drop commits is stopped at its task's next
+poll: a write that poll had already begun may still go out, but nothing comes of
+its answer (a stream already opened for it is reset, not finished); and waiting
+for the ship (to read the question, or to write what came of it) notices within
+one look (the ship is tried every 5 ms, not waited on, and given up on when the
+question is dropped or, for the read, when its time has passed). What is let
+finish: a read or write of the ship already under way on a worker thread, which
+keeps its working place, and for a write the reply it holds, until it ends;
+there are at most `max_working` (16) of those, and the write checks, in its own
+transaction, that the question is still there on that copy of the ship, so a
+drop and an answer at once make no event. So does any task of a question that is
+no longer waiting when its ship's questions are next looked through stop. When
+the network stops, every task is stopped the same way, and a write of what came
+of a question that is waiting for its ship then gives up within one look,
+without writing (the question stays waiting, for the next network or for
+`deliver`, below). Neither an individual task's row read nor its settlement
+write (writing down what came of its question) does the upkeep a ship owes when
+it is first woken (as for a question asked of the ship): that waits for its next
+ordinary use. The look through all of a ship's waiting questions is an ordinary
+call, and can do it.
+
+Its time is stamped in the asking event's transaction just before `COMMIT`, in
+whole milliseconds of the wall clock, so a commit that takes long uses some of
+it. The task turns that into a deadline of the machine's steady clock once, when
+the question's task starts, before it reads the row (the steady clock read
+first, then the wall clock, so a pause between the two can only make it
+earlier), so changing the wall clock afterwards does not move it (a restart
+reads the stamped time afresh). When its time runs out, its own timer ends it:
+what came of it is written then, or, with no answer heard, `NO_ANSWER` (some try
+reached the other ship, or the last was refused as too busy, or no try could be
+begun for want of a place among the requests out on this runtime) or
+`UNREACHABLE` (tries were begun and none ever reached the other ship, except as
+follows: a try that finds the destination absent from the directory ends the
+question as `Unreachable`, even if an earlier try reached it, while a try
+already awaiting its reply can still complete.) Whatever the other ship says
+after the time (a reply, or a refusal of any kind) is not taken: `NO_ANSWER`.
+The allowance on the wire and the deadline are looked at on every poll of a
+try's write before any of its bytes are taken: at the poll in which the
+connection accepts a question's first bytes, the allowance in those bytes is no
+more than the whole milliseconds left to the asker's deadline by the clock
+reading taken in that poll, and no first bytes are accepted in a poll whose
+clock reading leaves less than a millisecond. The first-write rule uses the
+clock reading taken in the accepting poll, and time spent encoding, waiting
+inside the writer, or descheduled after that reading can carry actual acceptance
+past the deadline. A question to a ship the directory does not list is
+`UNREACHABLE`: that try sends no request. That ends the network's part; two more
+steps follow, each with no time limit of its own. Writing what came of it down
+(queueing the answer event) needs a working place, the ship, and, if it is
+asleep, room among the awake ships, so a ship kept busy (or full, as above)
+delays it; and the agent's `answer` handler runs only when the ship runs its
+queue, behind what is queued before it, and within the number of queued events
+one `deliver` runs (`max_queued_per_deliver`, 64). The network does no periodic
+question scan of sleeping ships, but an outstanding notice can wake a ship after
+its last question was dropped, and a queued answer can wake it again to run its
+queue or check for outbound work. Questions are also looked for, waiting or not,
+by the network's one look through every ship's file when it starts (among its
+other work), by the check for waiting questions when a ship runs its queue with
+no network, and, with the questions table read whether or not it is empty, by an
+ordinary wake of a ship and by an import. (A look that could not read a ship's
+file is tried again with growing waits, as is a start-up inspection that could
+not: retries of work already begun, not a scan.) The network can wake a sleeping
+asking ship to list its waiting questions, to read a question before sending it,
+and to queue its outcome. In the tests a question given 2 s to a ship that had
+vanished was answered between 1.9 and 3.5 seconds after it was put (the test's
+bounds), and one given 1.5 s to a ship put to sleep meanwhile had the ship woken
+for its answer no earlier than its time, and the answer handed over (by the
+runtime's own records) less than 3.5 seconds after it was put.
+
+After a restart, each question waiting is asked again if its time has not run
+out, and is answered `NO_ANSWER` without being asked if it has. A ship whose
+file cannot be opened or read when the network starts (or a directory that
+cannot be listed, or an entry of it that cannot be read) is looked at again,
+with growing waits, for as long as the network runs, for its questions as for
+its commands and receipts: nothing is taken to be empty because it could not
+be read. The ships already looked at are not looked at again, however often
+the directory is listed. After an
+import (a new incarnation), every question waiting in the copy is answered
+`NO_ANSWER` there and then, as the copy is brought in ("this ship was brought
+in from a copy, and questions waiting in it are not asked again"), and the
+numbering carries on from the copy's (`meta.ask_gen`). Question numbers are
+unique within one incarnation's history, not across a restore: a copy brought
+in from an export carries on from that export's numbering, so numbers the
+original gave out after the export was made can be given again. With no network running, every question waiting is
+answered `UNREACHABLE` ("this ship is not on the network") when the ship next
+runs its queue through `Runtime::deliver` or `run_pending`, before what is
+queued runs. Offline queue processing settles the questions outstanding when
+the pass starts. Their answer handlers run when the queue reaches them,
+possibly on a later call.
+
+`ask_drop(number)` strikes the question off, and its answer too if that is
+queued and not yet handed over (giving back its room in the queue, or the room
+the question held): 1 if either was there, else 0. Once the event commits, the
+question stops being put, as above.
 
 ### Following a log on another ship
 
@@ -3219,6 +3913,7 @@ starting at `/`).
 | `/agents/<agent>/files/...` | device | The agent's files (see Files on the ship), and saving a copy of a file on another ship for the agent (`POST .../files/save`, `GET .../files/saves`, `DELETE .../files/saves/<id>`; see Keeping what was opened, and saving a copy) |
 | `GET /files/from/<ship>/<agent>/<id>...` | device | A file on another ship (see Fetching a file from another ship) |
 | `GET /files/kept`, `DELETE /files/kept`, `DELETE /files/kept/<id>` | device | What the ship keeps of files fetched from other ships, and clearing it (see Keeping what was opened, and saving a copy) |
+| `POST /ask/<ship>/<agent>/<interface>?within=` | device | A question for an agent on another ship, as this ship's owner; the reply as the body (see Questions between ships) |
 
 - Codes. A one-time code is 128 random bits in hex, made by
   `new_signin_code` on the machine the ship runs on. The reusable access code
@@ -3303,7 +3998,7 @@ not, and 130 when stopped part way.
 | --- | --- | --- |
 | `fuel_per_event` | 100,000,000 | Compute budget for one event |
 | `kernel_fuel` | 50,000,000 | Budget for each kernel decision |
-| `max_event_millis` | 5,000 | Wall-clock cap on one event |
+| `max_event_millis` | 5,000 | Wall-clock deadline for one event: never stopped before it, stopped after it as under Time (no number promised for the overrun), and nothing it returns after it kept |
 | `max_memory_bytes` | 64 MiB | WASM memory per instance |
 | `max_ship_bytes` | 1 GiB | Largest a ship's file may grow |
 | `max_module_bytes` | 16 MiB | Largest module accepted |
@@ -3340,7 +4035,14 @@ not, and 130 when stopped part way.
 | `max_kept` | 1,024 | Files kept from other ships per ship, in the cache and being saved together |
 | `save_slice_millis` | 10,000 | How long one call to save a copy fetches missing pieces before it answers (one fetch begun is let finish) |
 | `file_ask_fuel` | 10,000,000 | Compute budget for asking an agent whether another ship may have a file |
-| `file_ask_millis` | 500 | Wall-clock cap on that question, the kernel's decision included |
+| `file_ask_millis` | 500 | Wall-clock deadline for that question, the kernel's decision included, kept as under Time |
+| `ask_fuel` | 100,000,000 | Compute budget for answering one question from another ship: the kernel's decisions, the handler and every nested read together, apart from the event budget (the same number as `fuel_per_event`) |
+| `ask_millis` | 2,000 | Wall-clock deadline for answering one question, counted from one reading of the clock when it arrived: waiting for the ship and the kernel's decision included, kept as under Time. The asker's `within_millis`, if shorter, is the deadline |
+| `max_ask_bytes` | 64 KiB | Largest question (payload) a ship asks or answers; also held to what one message carries, less 1 KiB, and to 1 MiB (`store::MOST_ASK_BYTES`) when the runtime opens |
+| `max_answer_bytes` | 256 KiB | Largest answer (reply) a ship gives or takes; held the same way, and to 4 MiB (`store::MOST_ANSWER_BYTES`) when the runtime opens |
+| `max_ask_millis` | 60,000 | Longest time a question may be given, by `Runtime::ask`, the HTTP route or `ask_to` |
+| `max_asks_waiting` | 256 | Questions a ship's agents may have waiting, counting answers queued and not yet handed over |
+| `max_receipt_reply_bytes` | 16 KiB | Largest reply a receipt carries; also held to `max_event_bytes` and to what a ship takes as one message (see Commands between ships, exactly once), and to 1 MiB (`store::MOST_RECEIPT_REPLY_BYTES`) when the runtime opens. At 0 (or with a queue too small for any receipt with a reply) a command that wants its reply is refused |
 | `durability` | `Full` | `Full` or `Normal` (see Storage) |
 | `storage_key` | none | The key everything kept on disk for ships is encrypted under. If none, one is made and kept in the data directory (see Encryption at rest) |
 | `limits.max_key_bytes` | 1,024 | Largest `kv` key |
@@ -3357,6 +4059,10 @@ not, and 130 when stopped part way.
 | `file_timeout` | 30 s | The same for a request for a part of a file, at both ends, in place of `request_timeout` |
 | `idle_timeout` | 30 s | A connection with no traffic is closed |
 | `silence_timeout` | 3 s | A connection this runtime keeps (to a ship, or to a lookup point) on which something sent has waited this long with nothing at all heard from the other end is closed by its watcher, so that the next call makes a new one (see Finding a ship by its name). A working connection that hears nothing for this long while something waits (a link that drops everything, a peer stopped) is closed too. The watcher can be up to two quarter-second looks late, plus scheduling, plus QUIC's current probe timeout in one case, and its clock starts only once something is sent (see Finding a ship by its name). More than nothing and at most a day |
+| `max_asks_each` | 2 | Questions from any one other ship being answered at once (running, or waiting for their ship), all ships of the runtime together |
+| `max_asks` | 8 | Questions from other ships being answered at once, in all |
+| `asks_per_second_each` | 8 | Questions from any one other ship started a second, as many at a stroke |
+| `asks_per_second` | 32 | The same for all other ships together |
 
 `Lookup` (`runtime/src/lookup.rs`):
 
@@ -3387,7 +4093,12 @@ second and at a stroke; `sessions_each` 16, `sessions_from` 16,
 `Network::start` refuses settings that could wedge a ship: `max_ship_bytes`
 below 256 KiB, a `max_message_bytes` without room for the largest command or
 checkpoint plus 4 KiB, or without room for `max_unanswered` command numbers
-twice over, and any time limit that is zero or over a day. A `max_message_bytes` below
+twice over, and any time limit that is zero or over a day (`ask_millis` and
+`max_ask_millis` among them); and an `ask_fuel`, `max_asks`, `max_asks_each`,
+`asks_per_second` or `asks_per_second_each` of zero. A question, an answer or a
+receipt's reply larger than one message carries is not refused at start: each
+is held to what fits (see their rows above), so none can be what waits for
+ever. A `max_message_bytes` below
 1 MiB + 1 KiB is allowed, and then files are neither fetched nor served.
 
 ### `ReplicaConfig` (copy of Azimuth)
@@ -3979,6 +4690,256 @@ of 3 seconds (looks made late, by the test's own clock read before each call,
 are not judged, and the test goes on until ten are), and ending once the
 runtime is let go.
 
+`runtime/src/ask_tests.rs` covers questions between ships and receipts that
+bring a reply, with two real runtimes on localhost, keys set by hand, inside the
+crate so that a network can vanish (stopped with no goodbye) and what the ship
+asked ran can be read off it (each question it ran, when it ended, how long it
+held the ship, and who asked: compiled only into the crate's tests). A question
+answered through `Runtime::ask`, over HTTP for the owner's device (with
+`nosniff` and the sandbox policy; this same ship, a `within` of 0 and no device
+refused) and to an agent as one `answer` event; the handler told the asking ship
+and agent, and an owner's question naming no agent; refused when the interface
+is open only to commands or to neither (over the API, to an agent, over HTTP as
+403 with the other ship's reason), and an agent whose manifest does not let it
+ask refused here with its event, nothing written and nothing reaching the other
+ship (nor a question to this same ship, with no time, or with more than
+allowed); the handler unable to write, send here or to another ship, emit,
+append, mark a file or ask, each a failure with every row count of the ship
+asked, and the lengths of its file and of its `-wal` (the ship awake, so a
+change could sit in the `-wal`), the same (lengths and counts, not the bytes),
+no log entry and nothing emitted; a handler that traps, runs out of fuel (in
+under 2 s) or spins past its time (400 ms; it held the ship under 700 ms)
+failing, the asker's own shorter time (200 ms) being the cut-off, and the ship
+answering and running events after; a question larger than this runtime asks
+refused here, one larger than the ship asked takes answered `limit` with nothing
+run, answers larger than the ship asked gives or than this one takes `limit`,
+and an agent handed `limit`; a flood from one ship (twelve threads for four
+seconds, with the allowances to start questions set too large to matter) never
+holding more than 2 places from that ship or 8 in all (sampled every 5 ms), some
+of it too busy, another ship still answered meanwhile, and every question the
+ship admitted past its look at the rests (each one it went on to run; not those
+refused there) beginning no sooner than three times the last one's length after
+it ended and nine times after the last from the same ship (exactly, by the
+ship's own clock); four threads asking as fast as they can for two seconds with
+the default allowances, the ship asked admitting past its look at the rests no
+more than 8 a second of them and as many again at a stroke (it counts those it
+went on to run, not every start an allowance was charged for); a question given
+up on while it waits for the ship (held by an event kept at a gate, let go only
+once the ship asked has seen the asker gone) running nothing, and one given up
+on while it runs (the giving up seen before its deadline) still stopped for time
+by its own stop record no earlier than its deadline (and less than 300 ms
+after), the ship released in under 1.3 s; questions given up on while they wait
+for their ship's slot (held by an event kept at a gate), and others while they
+wait for a place among the awake ships (the one place held by another ship's
+event kept at a gate), each asker seen inside that wait by the runtime before it
+gives up, giving their places back less than 500 ms (a test threshold) after a
+moment noted once both askers were gone, by the runtime's records, while the
+ship is still held, and a question that runs out of its own time (300 ms) in
+each kind of wait (seen by the runtime in that wait) giving its place back less
+than 200 ms after its one recorded deadline; a question held at the start of its
+ship's wake (the runtime's gate there) whose asker gives up meanwhile, and one
+whose time passes meanwhile, asking no decision of the kernel (counted where a
+decision begins), the second told "it took too long"; with the watchdog's sleeps
+made 15 ms long, an event and a question each given a second, by the runtime's
+own record of that call's one stop (taken after the call began, so an earlier
+call's record cannot stand in for it) stopped no earlier than the deadline it
+was given and less than 115 ms after it (and the event's whole run, by the
+runtime's notes of when it began and was done with, under 1,115 ms); with the
+watchdog held still for three seconds and let go as soon as such a call's
+handler had its deadline set, the call not stopped at once by the ticks missed,
+but no earlier than its deadline and less than 110 ms after it (each figure a
+test threshold, and each includes 100 ms for scheduling); the ship asked
+counting a question's time from the one moment it took the request up (held 100
+ms between that and setting the deadline, the deadline it recorded that moment
+plus the shorter of its own limit and the allowance the asker recorded as it set
+it (the first, provisional one, which its first write could have lowered; with
+two seconds against five here, it does not), within 1 ms); the asking side's
+deadline taken as `Runtime::ask` is called (held before the network has the
+question, or with its task held before it first runs, until the recorded
+deadline has passed: nothing sent, and `NoAnswer`); the allowance worked out
+from a clock sample it is given floored to whole milliseconds and never more
+than the asker gave (a sample with 999 µs left: nothing to send; this observes
+no writer and no moment of acceptance); an answer read after an agent's
+question's deadline (held by a gate until the task's recorded deadline passed)
+handed over as `NO_ANSWER`, not as a reply, and a refusal as too busy held the
+same way past `Runtime::ask`'s deadline `NoAnswer`, not `Busy`; a question whose
+first try reached its ship (held there) and whose later tries could not (that
+ship's network stopped, its entry still listed) `NoAnswer`, not `Unreachable`;
+an answer larger than the asking runtime reads, and a question larger than the
+answering runtime reads, each `Limit` to `Runtime::ask` and `LIMIT` to an agent,
+not tried again, and so a question several times the answering runtime's stream
+window (so it cannot all be written before that runtime stops reading it), one
+try each (that case may take either way: the refusal read while the question is
+still being written, or after the write failed; it is not made to take the
+second), and, with the answering runtime held after sending its refusal and
+before letting go of the request (so nothing stops the write), `Limit` before
+that runtime lets go of the request's receiving side, by its notes, through
+`Runtime::ask` and an agent; a reply taken for a refusal only if its outer
+fields are all the refusal with a reason (unknown fields alone, nothing, a
+truncated field, a refusal with a body or with no reason, every kind of typed
+reply, and a `Fetched` of 300 entries even when they could not be decoded, are
+not); a question's first write (to a stand-in connection, on a stand-in clock)
+sending no byte when the connection is not ready until after the deadline,
+carrying no more than the whole milliseconds left by the clock reading of the
+poll in which the connection takes it when it is ready late (encoded again, once
+for each smaller allowance), and encoded once (counted by the encoder it is
+given) when it is ready at once (the rule is against the clock reading taken in
+the accepting poll; time spent after that reading, encoding, waiting inside the
+writer or descheduled, is not in it); a question's first call on a ship just
+created after the network started (to an agent it does not have), and on one
+brought in from a copy (answered; checked, by a connection that only reads, to
+be in the older journal mode before, and still in it after), and a question to
+that copy once ordinary work had switched it to WAL and it was put to sleep,
+each leaving the bytes of the cleanly closed file the same, each baseline taken
+first and each compared once the ship is put to sleep again (it cannot see a
+write put back before the file closes, and covers no file needing crash repair);
+a `within` on the HTTP route with no value, empty, not decodable, not a number,
+0, past the most, or given more than once (`within&within=1`,
+`within=1&within=%FF`, `within=1&within=2`), or with its name spelled with
+escapes (`%77ithin=0`, `within=1&%77ithin=2`), or with a `%` not followed by two
+hexadecimal digits (`label%+1=x`, `within=%+1`), each refused with 400, no
+question written; a thousand questions (answered, refused, failed, too large,
+too busy), begun (once the network's start-up look is done) with the ship asked
+put to sleep and nothing compiled, not even its kernel, leaving every row count
+of the ship asked, and the lengths of its file and of its `-wal`, as they were
+(lengths and counts, not the bytes), the first told it is too busy while its
+kernel is compiled off its path, exactly two compiles in all (counted: the
+kernel and the agent asked, once each), and a leftover file in the ship's
+directory still there until an ordinary call wakes it; a question to a warm ship
+answered at once while another call is held part way through a compile; one
+module compiled once while two questions and an ordinary call ask for it (the
+second question too busy, the ordinary call waiting for that compile), and a
+compile that panics stopping no later one; exactly one answer for a question to
+a ship no directory lists (within 5 s) and for one whose handler traps; a
+question to a ship that vanished answered once, its answer's handler committing
+between 1.9 and 3.5 s after its asking event committed (by the runtime's
+records) for 2 s given; another, its task held just after reading the question
+(a gate) while its asking ship is put to sleep, answered once with no other wake
+of the ship: by the runtime's own records, the ship's first wake after being put
+to sleep was for writing what came of the question, exactly one place among the
+awake ships reserved for it since (noted where it was taken), no earlier than
+the question's time as its row has it, and the answer's handler committed once,
+less than 3.5 s after its asking event committed (the task let go only with time
+left to its recorded deadline); a question waiting on a ship whose inspection is
+made to fail once when the network starts asked again and answered, nothing else
+done on that ship; questions waiting through a restart of the asking runtime,
+one with time left asked again and answered once the other ship is back, one
+whose time ran out meanwhile answered `NO_ANSWER`, each once; a question waiting
+in an exported ship answered `NO_ANSWER` once in the import, no question left
+waiting there, and the next numbered after it; a question holding room in a full
+queue for its answer (refused when there is none, handed over as `LIMIT` with no
+room for its reply, and a ship with a full queue and questions waiting exported
+and imported under the same settings, and one with a question more than its
+queue has room for refused); with names at their longest (a comet's, an agent's
+of 64 bytes, an interface's of 128), the room held no less than any answer with
+no reply takes, counted in the queue's total as the question is put, the same
+when the ship is woken afresh, and given back when it is dropped; an answer
+written as an old network's job would write it, after the asking runtime's
+network was stopped and a new one started, still run with nothing more arriving;
+the write of what came of a question made to fail three times, then written, one
+answer handed over; a drop while it waits between writes ending its task within
+a second, nothing handed over; a restart while it waits, the question still
+there and answered once; a dropped question never answered, whether its answer
+was queued (taken off the queue, dropping again saying so) or it was still
+waiting when its time ran out; an answer and the time running out written at
+once from two threads two hundred times, one queued and the other finding
+nothing every time, and another copy's mark settling nothing; an event that
+fails putting no question; `max_asks_waiting` held to, an answer queued still
+counting and a drop making room; with no network, a question answered
+`UNREACHABLE` in the same `deliver`, and `Runtime::ask` refused. For receipts: a
+reply only when asked for and only with `RAN` (a command without it, one that
+fails, one with a reply at the limit and one a byte over, which is `LIMIT` and
+whose effects are not kept); `LOST`, made by comparing notes, with no reply
+though one was asked for; exactly once across a restart of the sending runtime
+while its command waited unsent, and a restart of the other ship's runtime after
+the command and its receipt committed there (they are one commit) and before the
+receipt was taken, the reply from the one run handed over once; a ship that
+takes back no reply refusing to send a command that wants one (its limit on
+replies 0, or its queue 592 bytes), and sending one that wants none; two ships
+that filled up with commands for each other, every one wanting a reply of 16
+KiB, getting every command answered (ran with the whole reply, or `LIMIT` for
+want of room for it), each counter counting exactly the commands that ran, and,
+once their queues are run, more such commands coming back `RAN` with their
+replies; a reply held to the smaller of the sender's bound and the receiver's
+own, either way round (512 and 1,024), an empty reply marked as one, and a
+receiver that predates replies answering `RAN` with `replied` unset, which the
+agent is told is a run without a reply; a command sent allowing 1,024 bytes, its
+sender then restarted allowing 512, still bringing back its 1,024; two ships
+full of commands for each other, each having first taken two 64 KiB replies from
+third ships, getting every command delivered, each receipt kept in the audit log
+as its facts (within 512 bytes) and no audit row holding any run of a reply's
+bytes; deliveries at the boundary of one message (a command of exactly the
+largest size with a reply of the largest size, and one byte over not sent; a
+question and an answer each at the largest the settings allow) arriving whole;
+an export holding a queued answer of 2 MiB, a queued receipt with a reply at its
+limit and a question at `max_ask_bytes` imported under the same settings, and
+again once they were handled (their audit rows facts only); an export holding a
+command kept with its reply bound and a receipt with its reply owed to another
+ship imported, and versions of it changed to hold a bound over the ceiling, a
+receipt owed marked as carrying a reply with a verdict other than `RAN`, or a
+reply over the ceiling, refused; a ship exported after its limit on replies was
+lowered (from 1,024 to 512), with its receipt awaited and with it queued,
+imported under the lowered settings, the queued reply handed over whole;
+settings at `usize::MAX` held to their ceilings, and a ship with nothing new and
+one with queued records exported and imported under them; thirty questions
+dropped once a try of each had gone out and come back refused, leaving no task
+putting any of them and no try after; a dropped question's task stopped within a
+second though the dropping event keeps its ship for three; a drop committed
+while the network was held between looking through the ship's questions (which
+registered the question's means to stop) and starting their tasks, the task
+ending, by the runtime's records, less than a second after the drop committed,
+the ship still held, and nothing of it written to a stream; a drop in that same
+gap making no second look at the ship; a question held where its stream is about
+to be opened, dropped meanwhile, writing nothing once let go (and, apart,
+`unless_stopped` with its stop already signalled and its work ready ending at
+its first poll with the work never polled); a load check: while another agent
+asked and dropped questions as fast as it could for two seconds, a question
+asked meanwhile registered, and another ship's command run on the ship it was
+for (and counted there), each less than a second after its event committed by
+the runtime's records (it does not show a drop committing inside either
+interval); one ship held by an event just after it asked a question of its own
+(and with no commands waiting), its look said to be waiting for it on its own
+thread, and then another ship of the same runtime's question arriving at the
+ship asked, its command run, and its answer handed over, all while the first is
+still held; one ship held by an event just after it sent a command, the carrier
+said to be waiting for it on its own thread to find where that command goes, and
+then another ship of the same runtime's question arriving at the ship asked
+while the first is still held; a listing of the ships' directory that reports
+one entry as an error every time, the directory listed again and again, a
+question waiting in a ship it did read answered meanwhile, and that ship looked
+at once; a settlement waiting for its ship (held by an event) when the network
+stops giving up less than a second after, by the runtime's records, the ship
+still held, the runtime then held by nothing but the test, and the question
+answered once, as unreachable, by the next run of the ship's queue; the network
+started again on the same address while a look, said to be waiting on its own
+thread, still waits for its ship (it binds while the ship is still held); a ship
+owed its first-wake upkeep woken by a question's task reading the question, a
+drop committing meanwhile and its event kept: the read returning less than a
+second after the drop committed, the ship still held, and the upkeep done by the
+next ordinary call; one budget paying for the kernel's decision and the handler
+(a ship given less than both together failing though the handler alone would
+fit), and for a nested read's decision and handler too (all of it no less than
+the parts, and less than all by half the nested decision failing); an HTTP
+question counted with long polls (refused 503 when they hold every waiting
+place), and a slow one holding its count while it waits (a long poll answered at
+once meanwhile, and waiting its second after); and `Network::start` refusing an
+`ask_fuel`, `ask_millis` or `max_ask_millis` of 0, places or allowances of 0,
+and messages too small for the largest command, with sizes past their ceilings
+held to them. A request of a kind a runtime does not know (a body field it has
+no name for, as a question is to an older runtime) is answered with the bare
+refusal for an unknown request. The kernel: a read from another ship only to an
+interface open to questions, for an agent or an owner on that ship and never
+with `owner` set, not to one only `remote` or only public, a command from
+another ship not let through by `asked`, an answer to any installed agent and
+not to one that is not, and grants to ask exactly the declared uses with `ask`
+and a ship; and agents installed until the kernel refuses one (one declaring 64
+uses of other ships with read, send and ask, then agents offering public
+interfaces), every answer it then gives within its 256 KiB. In `store.rs`, a
+command without a reply wanted, its receipt, and a `SendRequest` without `reply`
+encoded to the same bytes as written out by hand from the fields that existed
+before, and the reply, when wanted, one field more; and a receipt's reply held
+to a command's size.
+
 `runtime/tests/serve.rs` runs the real `serve` binary as a process of its own
 (`CARGO_BIN_EXE_serve`), and knows it only by what it prints and what it
 answers over HTTP. Each program it starts is in a process group of its own,
@@ -3989,11 +4950,15 @@ ended is seen with `waitid` and `WNOWAIT`), so the group's number cannot have
 been given to another group by then, and nothing is signalled after it is
 reaped. Nothing is ever killed because its command line matched (the list of
 running processes is only read, to show that nothing was left). The walk-through
-(`--two-ships --then-stop`) exits 0, says each of its seven steps and each
+(`--two-ships --then-stop`) exits 0, says each of its eight steps and each
 check it makes (the introduction the ship called reports, the refusal in that
 ship's own words, both lengths and fingerprints, the first ship off, both
-messages after it comes back), prints no em dash and no exclamation mark, and
-leaves none of its programs running. Each of the four messages it says
+messages after it comes back, the question answered, the question to the
+journal refused with the first ship's reason, and the reply on the receipt),
+prints no em dash and no exclamation mark, and leaves none of its programs
+running. The answer step 8 says it was given and the reply it says came back
+are then checked against the first ship's counter, read with the library: the
+reply one more than the answer, and what the counter holds. Each of the four messages it says
 arrived, as entry N of a ship's journal, is then read with the library from
 that journal: entry N is that message, with this run's word. A second run on
 the same directory reuses the ships, has a word of its own, shares a file the
@@ -4412,6 +5377,129 @@ These are stated in the source.
   check it.
 - `verify_log` shows that entries are genuine and contiguous, not that they
   are all there is; that needs the head from a trusted source.
+- Questions between ships: a question that failed on the ship asked (a trap,
+  out of fuel or time) leaves no row or audit row there, so its details are
+  kept nowhere: writing them would let an asker fill the audit log. (It does
+  leave what any call leaves in memory: the rests and allowances, and a module
+  compiled for it, or a compile failure remembered with its reason, retried
+  only by the owner's `add_module`, as under Answering.) Fairness between
+  asking ships is per name, so one owner of many ships (a planet and its
+  moons) gets each ship's share; the rests and allowances are in memory, so a
+  restart of the ship asked forgets them. Questions are not queued on the ship
+  asked: one that finds it busy, or a module it needs not compiled, is told so
+  and asked again by the asker. Questions have no turn against ordinary work:
+  a ship kept busy by ordinary calls leaves them to end "too busy" or "it took
+  too long" at their time. A question given up on once it has its ship runs on
+  until it is stopped for time (below) or returns. An agent's question is put
+  as long as its time lasts, so questions to ships that do not answer hold one
+  of the requests agents' questions may hold (a quarter of `max_requests`) for
+  as long as each try lasts (up to `request_timeout` to connect, and then what
+  is left of its time), and questions to ships that do answer can wait for
+  those places meanwhile (and be answered `NO_ANSWER` if their own time runs
+  out first, as is one that never got a place for a first try). With
+  `max_requests` at 1, an agent's question waiting can hold the only place,
+  and the owner's own question is told it is too busy.
+- An agent's question's time is stamped from this runtime's wall clock just
+  before the asking event commits, in whole milliseconds, so a slow commit uses
+  some of it; the network's task turns it into a steady-clock deadline once,
+  when the question's task starts, before it reads the row (the steady clock
+  read first, then the wall clock, so a pause between the two can only make
+  it earlier), so a clock set back or forward afterwards does not move that
+  task's deadline, though a restart reads the stamped time afresh against the
+  clock as it then is. Three steps follow a question and
+  only the first keeps its time. The network gives up at the deadline (as in
+  Who looks, and when). Writing down what came of it (queueing the answer
+  event) needs a working place, the ship, and, if it is asleep, room among the
+  awake ships: a busy but healthy ship delays it, with no limit of its own,
+  and a ship whose file cannot be written (full, the room it keeps used up by
+  ordinary events, or an I/O error) has the write tried again with no bound on
+  how long, until it goes in (see Room for the answer); the owner makes room.
+  And the agent's `answer` handler runs when the ship next runs its queue,
+  behind what is already queued and within the queued events one `deliver`
+  runs (`max_queued_per_deliver`). Questions waiting in a ship whose file could
+  not be read when the network started (or that a listing of the ships'
+  directory could not read) are looked for again, with growing waits, until it
+  can be read. The look through every ship's file when the network starts is
+  one piece of work in one working place, as at the base, and what it finds is
+  handed on when the whole look returns: one ship held for a long while in it
+  holds up the handing on of what was found in every ship of that look, those
+  looked at before it too.
+- A question stores no application data on the ship asked. Opening a ship for
+  it, or putting another ship to sleep to make room for it, can recover a
+  transaction that a crash interrupted, copy pages that ordinary work had
+  already committed from the log beside the file into the file, and create or
+  remove the files SQLite keeps beside the ship's file (see What a question
+  does leave behind). The tests show the bytes of a cleanly closed file are
+  the same after a question; they do not cover a file that needs crash repair.
+- A call is never stopped for time before its deadline. After its deadline it
+  is stopped at the first point where the running code looks (a loop turn, a
+  function entry, a bulk memory step) and finds both that the watchdog has
+  ticked since the call was last allowed on and that the deadline has passed.
+  The watchdog ticks about every 10 ms; the system can run it, and the call's
+  own thread, late; and after a look that came just before the deadline the
+  call can run on until a later tick; so no number is promised for the
+  overrun. A host call under way is not cut short. Whatever a call returns
+  after its deadline is not kept. The opening of a ship's file for a question
+  is not cut short either. The tests' own figures (a stop within 110 ms or
+  115 ms of a deadline, with the watchdog woken late or held still) are
+  thresholds the tests allow on one machine, not promises.
+- The network finds which other ships a ship's commands are for one ship at a
+  time, waiting for each ship in turn (`carry` in `net.rs`): a ship kept busy
+  (a long event, or a long queue) that has commands waiting holds up finding
+  other ships' new commands for as long; lanes already running carry on.
+  Questions are not held up this way: their notices are taken by a task of
+  their own beside the carrier (`start_looks`), and each ship's questions are
+  looked at by a look of their own (see Who looks, and when).
+- Question notices and registration proceed independently of command discovery,
+  but reading a registered question needs a shared working place, so it can
+  expire unsent while those places are occupied.
+- The network does no periodic question scan of sleeping ships, but an
+  outstanding notice can wake a ship after its last question was dropped, and a
+  queued answer can wake it again to run its queue or check for outbound work.
+- The network can wake a sleeping asking ship to list its waiting questions, to
+  read a question before sending it, and to queue its outcome.
+- A try that finds the destination absent from the directory ends the question
+  as `Unreachable`, even if an earlier try reached it, while a try already
+  awaiting its reply can still complete.
+- The first-write rule uses the clock reading taken in the accepting poll, and
+  time spent encoding, waiting inside the writer, or descheduled after that
+  reading can carry actual acceptance past the deadline.
+- Each ship with a look at its questions outstanding can occupy one thread of
+  a shared pool of blocking threads until the ship, or room to wake it,
+  becomes available, and that wait is not cut short when the network stops.
+  Enough such waits at once can delay work for other ships.
+- The rule that a whole reply comes back with its receipt, and that a receipt
+  always fits one delivery, holds while the limits in force are not made
+  smaller than they were when the command was sent. Making `max_message_bytes`,
+  `max_inbox_bytes` or the reply limits smaller while commands or receipts are
+  outstanding is not supported in this prototype. What can happen: the lane
+  between the two ships held at that receipt, which no longer fits one
+  delivery, retried ahead of everything behind it; or, if only the sending
+  ship's queue limit shrank, the command closed with the reply not handed on
+  and an audit line saying why. (The same is true, as before, of any message
+  queued that is larger than a newly smaller limit.)
+- The watchdog tests' figures (110 ms and 115 ms past a deadline, 1,110 ms and
+  1,115 ms for a whole event) include 100 ms they allow for the system to
+  schedule threads (`ask_tests.rs`); the
+  version-13 ship files exclude files written by earlier, uncommitted versions
+  of that schema (see Commands between ships, exactly once, under Export and
+  import); and a module whose compile failed is remembered as failing
+  until the owner's `add_module` of it (see Answering).
+- A command that wants its reply, run on a ship short of room, does not stand
+  (`LIMIT`) though it would have run without the reply: the reply is never
+  allowed to use the room the ship keeps for taking a command back.
+  The whole reply comes back with RAN from a receiving ship that follows the
+  protocol. A receipt can say RAN with `Receipt.replied` unset when the other
+  ship's runtime predates replies, or when it broke the protocol (a reply over
+  the bound the command was sent with, or a reply not marked): the command is
+  still reported as run, because the other ship said so; no reply is handed
+  on; and when a reply came and was let go, the reason says so. An agent that
+  needs the reply checks `Receipt.replied`.
+  A ship that takes back no reply at all refuses to send a command that wants
+  one.
+- Ship files and exports from before version 13 do not open. Ships near their
+  size limit have two pages fewer for everything else than before, the price
+  of the table of questions and the index on queued answers.
 - Two ships still out of step after one resync stop exchanging commands. The
   commands are kept, and nothing sorts it out yet.
 - A followed log that stops because the publisher's history changed is not

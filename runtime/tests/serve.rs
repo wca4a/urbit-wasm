@@ -295,8 +295,8 @@ fn walk_through(dir: &Path, extra: &[&str]) -> String {
     let status = owned.reap();
     assert!(status.success(), "the walk-through ended {status}:\n{said}");
     // Every step said what it was doing, and each check it makes was made.
-    for step in 1..=7 {
-        assert!(said.contains(&format!("\nStep {step} of 7: ")), "no step {step}:\n{said}");
+    for step in 1..=8 {
+        assert!(said.contains(&format!("\nStep {step} of 8: ")), "no step {step}:\n{said}");
     }
     for expected in [
         "Arrived after",
@@ -307,6 +307,9 @@ fn walk_through(dir: &Path, extra: &[&str]) -> String {
         "still has every byte",
         "~sampel-palnet to ~norsyr-torryn: arrived after",
         "~norsyr-torryn to ~sampel-palnet: arrived after",
+        "\n  Answered after ",
+        "Refused: ~norsyr-torryn answered \"the other ship would not let it be asked: journal on counter is not open to other ships\".",
+        ", saying the command ran, with its reply: \"",
         "Every step worked.",
         "It does not show two machines",
         "Stopping the lookup point and both ships.",
@@ -317,7 +320,22 @@ fn walk_through(dir: &Path, extra: &[&str]) -> String {
     // Nothing a person reads has an em dash or an exclamation mark in it.
     assert!(!said.contains('\u{2014}') && !said.contains('!'), "{said}");
     arrived_as_said(dir, &said);
+    replied_as_said(dir, &said);
     said
+}
+
+/// What step 8 said it was answered, and the reply it said came back with a receipt, are what
+/// ~sampel-palnet's counter stood at, read with the library after the walk-through ended: the
+/// answer to the question one less than the reply (the command counted one more), and the reply
+/// what the counter holds now.
+fn replied_as_said(dir: &Path, said: &str) {
+    // "Answered after N seconds: \"V\"", and "with its reply: \"R\"".
+    let answer: u64 = said.split_once("\n  Answered after ").and_then(|(_, rest)| rest.split('"').nth(1)).unwrap().parse().unwrap();
+    let reply: u64 = said.split_once(", saying the command ran, with its reply: \"").and_then(|(_, rest)| rest.split('"').next()).unwrap().parse().unwrap();
+    assert_eq!(reply, answer + 1, "{said}");
+    let rt = runtime::Runtime::open(dir.join("sampel-palnet"), runtime::Config::default()).unwrap();
+    let held: u64 = String::from_utf8(rt.read("~sampel-palnet", "counter", "counter", b"asked").unwrap()).unwrap().parse().unwrap();
+    assert_eq!(held, reply, "{said}");
 }
 
 #[test]
@@ -373,7 +391,7 @@ fn the_walk_through_takes_only_a_directory_of_its_own_and_one_run_at_a_time() {
     for (file, words) in [(&empty, "is empty"), (&dir.0, "is not a regular file")] {
         let (status, said) = finished(walk(&fresh, &["--file", &file.to_string_lossy()]), Duration::from_secs(60));
         assert_eq!(status.code(), Some(1), "{said}");
-        assert!(said.contains(words) && !said.contains("Step 2 of 7"), "{said}");
+        assert!(said.contains(words) && !said.contains("Step 2 of 8"), "{said}");
     }
     assert!(!fresh.exists(), "a refused run made its directory");
     // While one run holds a directory, another is refused at once.
@@ -527,8 +545,8 @@ fn a_ship_killed_and_started_again_is_reached_again_within_seconds_not_after_the
     use runtime::{Config, Manifest, Provide, Runtime, Use};
     let dir = TempDir::new("killed");
     let (kernel, counter) = (fs::read(wasm("kernel")).unwrap(), fs::read(wasm("counter")).unwrap());
-    let provide = |interface: &str, remote: bool| Provide { interface: interface.into(), public: false, remote };
-    let to_far = Use { ship: "sampel-palnet".into(), agent: "counter".into(), interface: "counter".into(), read: false, send: true };
+    let provide = |interface: &str, remote: bool| Provide { interface: interface.into(), public: false, remote, asked: false };
+    let to_far = Use { ship: "sampel-palnet".into(), agent: "counter".into(), interface: "counter".into(), read: false, send: true, ask: false };
     let manifest = Manifest { provides: vec![provide("counter", true), provide("journal", false)], uses: vec![to_far] };
     // ~sampel-palnet runs as a program of its own; ~nec and ~bud run here, so that their networks'
     // settings can be chosen.
@@ -633,7 +651,7 @@ fn a_ship_whose_lookup_point_was_killed_and_started_again_is_found_again_before_
         let rt = Runtime::open(dir.0.join(ship.trim_start_matches('~')), Config::default()).unwrap();
         let (kernel, counter) = (rt.add_module(&kernel).unwrap(), rt.add_module(&counter).unwrap());
         rt.create_ship(ship, &kernel).unwrap();
-        rt.install(ship, "counter", &counter, &Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true }], uses: vec![] }).unwrap();
+        rt.install(ship, "counter", &counter, &Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true, asked: false }], uses: vec![] }).unwrap();
         ids += &format!("{}\n", runtime::pretend::line(ship, &rt.public_key(ship).unwrap()));
     }
     let list = dir.0.join("ids.txt");

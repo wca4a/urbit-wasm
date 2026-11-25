@@ -47,13 +47,13 @@ fn fast() -> Config {
 }
 
 fn open_counter() -> Manifest {
-    Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true }], uses: vec![] }
+    Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true, asked: false }], uses: vec![] }
 }
 
 fn following_tally(ship: &str) -> Manifest {
-    let counter = Use { ship: ship.into(), agent: "counter".into(), interface: "counter".into(), read: true, send: true };
-    let tally = Use { ship: ship.into(), agent: "tally".into(), interface: "tally".into(), read: false, send: true };
-    Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true }], uses: vec![counter, tally] }
+    let counter = Use { ship: ship.into(), agent: "counter".into(), interface: "counter".into(), read: true, send: true, ask: false };
+    let tally = Use { ship: ship.into(), agent: "tally".into(), interface: "tally".into(), read: false, send: true, ask: false };
+    Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true, asked: false }], uses: vec![counter, tally] }
 }
 
 /// A runtime with `ships`, each with `counter` (open to other ships, and asked about files),
@@ -1799,8 +1799,8 @@ fn an_install_forgets_the_ships_remembered_answers() {
     };
     let yes = |served: Served| matches!(served, Served::About { .. });
     // An answer that rests on a read of another agent, through a grant.
-    let keeper = Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: false }], uses: vec![] };
-    let reading = Manifest { uses: vec![Use { ship: String::new(), agent: "keeper".into(), interface: "counter".into(), read: true, send: false }], ..open_counter() };
+    let keeper = Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: false, asked: false }], uses: vec![] };
+    let reading = Manifest { uses: vec![Use { ship: String::new(), agent: "keeper".into(), interface: "counter".into(), read: true, send: false, ask: false }], ..open_counter() };
     rt.install("~zod", "keeper", &counter, &keeper).unwrap();
     rt.install("~zod", "counter", &counter, &reading).unwrap();
     say(&rt, "~zod", "keeper", "inc gate");

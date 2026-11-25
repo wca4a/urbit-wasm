@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use ed25519_dalek::{Signer, SigningKey};
 use ship_proto::{
-    AppendRequest, Checkpoint, CheckpointBody, Entry, EntryBody, FileMark, FollowRequest, Grant, Kind, Message, NextReply,
+    AppendRequest, AskRequest, Checkpoint, CheckpointBody, Entry, EntryBody, FileMark, FollowRequest, Grant, Kind, Message, NextReply,
     NextRequest, ReadRequest, SendRequest, ShareRequest, Source,
 };
 use wasmtime::{Caller, Engine, Linker, Memory, StoreLimits, Trap};
@@ -31,6 +31,10 @@ const REQUEST_ENVELOPE_BYTES: usize = 1024;
 /// Extra fuel for appending to a log, which signs the entry.
 const SIGN_FUEL: u64 = 50_000;
 
+/// Why a command that wants its reply is refused on a ship that takes back no reply at all
+/// (`max_receipt_reply_bytes` 0, or a queue too small for any receipt with a reply).
+pub(crate) const NO_REPLY_TAKEN: &str = "this ship takes back no reply (its largest is 0 bytes), so a command wanting one is not sent";
+
 /// The most a single `log_next` call hands over.
 const MAX_NEXT_ENTRIES: usize = 256;
 const MAX_NEXT_BYTES: usize = 256 << 10;
@@ -46,6 +50,9 @@ pub struct Ctx {
     pub store_limits: StoreLimits,
     /// Set while handling a read: nothing may be written, sent, or emitted.
     pub read_only: bool,
+    /// Set while answering a question from another ship: a nested read is paid, kernel and
+    /// handler, from what fuel is left, and compiles no module.
+    pub question: bool,
     pub depth: u32,
     pub deadline: Instant,
     /// The encoded `Invocation` describing this call.
@@ -53,6 +60,8 @@ pub struct Ctx {
     /// What the kernel allows this agent to read and send during this call.
     pub reads: Vec<Grant>,
     pub sends: Vec<Grant>,
+    /// The interfaces on other ships this agent may put questions to during this call.
+    pub asks: Vec<Grant>,
     /// A read's reply that did not fit the caller's buffer, kept so the read is not run twice.
     pub pending_reply: Option<Vec<u8>>,
     /// With a pending `log_next` reply: the follower's new position, as (publisher's ship, or
@@ -70,6 +79,14 @@ pub struct Ctx {
     pub appended: u32,
     /// How many commands this event has queued for other ships.
     pub sent: u32,
+    /// How many questions this event has put to other ships.
+    pub asked: u32,
+    /// Inbox room given back by this event: questions it dropped, and answers it dropped
+    /// before they were handed over.
+    pub dropped_bytes: u64,
+    /// How many questions (or queued answers) this event dropped.
+    /// The questions this event dropped (each dropped once it commits: see `Runtime::asks_dropped`).
+    pub dropped: Vec<u64>,
     /// How many other things this event did that the network has to act on: following a log
     /// on another ship, or changing who is told of its own.
     pub net: u32,
@@ -182,7 +199,8 @@ fn send_command(mut caller: Caller<'_, Ctx>, req_ptr: u32, req_len: u32) -> Resu
     let request = SendRequest::decode(&*request)?;
     let ctx = caller.data();
     // A command for an agent on another ship. It is queued for that ship, numbered, and
-    // kept until that ship has it. A ship's own name means the ship itself.
+    // kept until that ship has it. A ship's own name means the ship itself. (`reply` means
+    // something only for another ship: a command here has no receipt.)
     if let Some(ship) = elsewhere(ctx, &request.ship)? {
         if !granted_elsewhere(&ctx.sends, &ship, &request.agent, &request.interface) {
             return Err(Denied(format!("{} may not send {} to {} on ~{ship}", ctx.agent, request.interface, request.agent)).into());
@@ -208,7 +226,14 @@ fn send_command(mut caller: Caller<'_, Ctx>, req_ptr: u32, req_len: u32) -> Resu
         if store::peer_unanswered(&conn, &ship)? >= max_unanswered {
             return Err(LimitExceeded(format!("{max_unanswered} commands to ~{ship} are still unanswered")).into());
         }
-        let number = store::peer_send(&conn, &ship, &agent, &request.agent, &request.interface, &request.payload, tell)?;
+        // The largest reply this ship takes back, kept with the command and carried with it.
+        let reply_most = if request.reply { store::reply_most(&ctx.rt.cfg) as u64 } else { 0 };
+        // 0 on the wire means no reply is wanted, so a command that wants one is not sent when
+        // this ship takes back no reply at all: it would run, and come back RAN with none.
+        if request.reply && reply_most == 0 {
+            return Err(LimitExceeded(NO_REPLY_TAKEN.to_string()).into());
+        }
+        let number = store::peer_send(&conn, &ship, &agent, &request.agent, &request.interface, &request.payload, tell, reply_most)?;
         drop(conn);
         caller.data_mut().sent += 1;
         return Ok(number as i64);
@@ -366,9 +391,12 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
             let (rt, kernel, conn) = (ctx.rt.clone(), ctx.kernel.clone(), ctx.conn.clone());
             let (ship, key) = (ctx.ship.clone(), ctx.key.clone());
             let (source, depth) = (Source { owner: false, agent: ctx.agent.to_string(), ship: String::new() }, ctx.depth + 1);
-            let env = Env { rt: &rt, ship: &ship, kernel: &kernel, conn: &conn, key: &key, deadline: ctx.deadline };
-            // The reader's remaining fuel pays for the read, and what is left comes back.
+            // The reader's remaining fuel pays for the read, and what is left comes back. While
+            // answering a question it pays for the kernel's decision too.
             let fuel = caller.get_fuel()?;
+            let left = std::cell::Cell::new(fuel);
+            let budget = ctx.question.then_some(&left);
+            let env = Env { rt: &rt, ship: &ship, kernel: &kernel, conn: &conn, key: &key, deadline: ctx.deadline, budget };
             let (reply, fuel_left) =
                 ship::read_agent(&env, &source, &request.agent, &request.interface, &request.payload, fuel, depth)?;
             caller.set_fuel(fuel_left)?;
@@ -702,6 +730,70 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
             fill(&mut caller, buf_ptr, buf_cap, &info.encode_to_vec())
         },
     )?;
+
+    // Put a question to an agent on another ship. It is written down in this event's
+    // transaction and asked only if the event commits; the answer comes later, as a
+    // KIND_ANSWER event. Returns the number the answer will carry.
+    linker.func_wrap("host", "ask_to", |mut caller: Caller<'_, Ctx>, req_ptr: u32, req_len: u32| -> Result<i64> {
+        charge(&mut caller, req_len as u64)?;
+        writable(&caller)?;
+        let cfg = &caller.data().rt.cfg;
+        let (max_payload, max_per_event, max_waiting, max_within) = (cfg.max_ask_bytes, cfg.limits.max_effects_per_event, cfg.max_asks_waiting, cfg.max_ask_millis);
+        let request = AskRequest::decode(&*read_guest(&mut caller, req_ptr, req_len, max_payload + REQUEST_ENVELOPE_BYTES, "ask request")?)?;
+        let ctx = caller.data();
+        // Agents on this ship are read, not asked: a question goes to another ship.
+        let Some(ship) = elsewhere(ctx, &request.ship)? else {
+            return Err(Denied("a question is put to another ship; an agent on this ship is read".into()).into());
+        };
+        if !granted_elsewhere(&ctx.asks, &ship, &request.agent, &request.interface) {
+            return Err(Denied(format!("{} may not ask {} on {} on ~{ship}", ctx.agent, request.interface, request.agent)).into());
+        }
+        if check_target(&request.agent, &request.interface).is_err() {
+            return Err(Denied(format!("{:?} cannot be asked", request.agent)).into());
+        }
+        if request.payload.len() > max_payload {
+            return Err(LimitExceeded(format!("question is {} bytes, limit is {max_payload}", request.payload.len())).into());
+        }
+        if request.within_millis == 0 || request.within_millis > max_within {
+            return Err(LimitExceeded(format!("a question is given more than nothing and at most {max_within} ms to be answered")).into());
+        }
+        if ctx.asked >= max_per_event {
+            return Err(LimitExceeded(format!("more than {max_per_event} questions in one event")).into());
+        }
+        // The room its answer will take is held in the queue's quota from now on, so that what
+        // comes of the question can always be queued (see `store::ask_reserve`).
+        let reserve = store::ask_reserve(&ship, &request.agent, &request.interface);
+        if ctx.queued_bytes + reserve > ctx.inbox_room {
+            return Err(LimitExceeded("this ship's queue has no room for the question's answer".into()).into());
+        }
+        let (conn, agent) = (ctx.conn.clone(), ctx.agent.clone());
+        let conn = lock(&conn);
+        if store::asks_waiting(&conn)? >= max_waiting {
+            return Err(LimitExceeded(format!("this ship already has {max_waiting} questions waiting")).into());
+        }
+        let number = store::ask_add(&conn, &agent, &ship, &request.agent, &request.interface, &request.payload, request.within_millis)?;
+        drop(conn);
+        let ctx = caller.data_mut();
+        ctx.asked += 1;
+        ctx.queued_bytes += reserve;
+        Ok(number as i64)
+    })?;
+
+    // Give up on a question this agent put: no answer for it is handed over from the moment
+    // this event commits, whatever arrives. 1 if it was waiting, or its answer was queued and
+    // not yet handed over (that answer is taken off the queue); else 0.
+    linker.func_wrap("host", "ask_drop", |mut caller: Caller<'_, Ctx>, number: u64| -> Result<i64> {
+        charge(&mut caller, 0)?;
+        writable(&caller)?;
+        let (conn, agent) = (caller.data().conn.clone(), caller.data().agent.clone());
+        let (dropped, freed) = store::ask_drop(&lock(&conn), &agent, number)?;
+        let ctx = caller.data_mut();
+        ctx.dropped_bytes += freed;
+        if dropped {
+            ctx.dropped.push(number);
+        }
+        Ok(i64::from(dropped))
+    })?;
 
     // Mark the calling agent's own claim on a file open to every ship, or take the mark off.
     // A change, so it is refused while reading, and kept only if the event commits. For a file

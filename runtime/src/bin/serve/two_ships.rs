@@ -40,7 +40,7 @@ const LIMIT: Duration = Duration::from_secs(60);
 const DEVICE_LABEL: &str = "two-ships walk-through";
 
 /// How many steps the walk-through has.
-const STEPS: usize = 7;
+const STEPS: usize = 8;
 
 /// How many lines each program's output keeps, to show when a step fails.
 const KEPT_LINES: usize = 2000;
@@ -475,6 +475,26 @@ impl Device {
         }
     }
 
+    /// Through this ship, ask an agent on the other ship a question, as its owner: the answer's
+    /// status and its words (the reply itself, for 200). Ctrl-C is looked at before and after,
+    /// as for every request.
+    fn ask(&self, other: &str, agent: &str, interface: &str, payload: &str) -> Done<(u16, String)> {
+        let request = self.limit(self.agent.post(&format!("{}/ask/{}/{agent}/{interface}?within=10", self.base, bare(other))))?;
+        let answer = request.set("Authorization", &self.auth()).send_bytes(payload.as_bytes());
+        let said = match answer {
+            Ok(answer) => {
+                let mut body = Vec::new();
+                answer.into_reader().take(1 << 20).read_to_end(&mut body).map(|_| (200, String::from_utf8_lossy(&body).into_owned())).map_err(|e| e.to_string())
+            }
+            Err(ureq::Error::Status(status, answer)) => Ok((status, answer.into_string().unwrap_or_default())),
+            Err(e) => Err(e.to_string()),
+        };
+        if STOPPING.load(Ordering::SeqCst) {
+            return Err(Stop::Interrupted);
+        }
+        said.or_else(|why| failed(format!("{} could not be asked to put the question: {why}", self.ship)))
+    }
+
     /// Sign this device out, so that runs do not pile up devices on the ship. Ctrl-C is looked
     /// at before (by `limit`) and not after: its answer is not used, it is the last request made
     /// with this device, and nothing that follows it would be skipped for a stop.
@@ -540,20 +560,21 @@ impl Read for MadeUp {
     }
 }
 
-/// The counter agent: its `counter` interface open to other ships, its journal, and leave to
-/// send commands to the counter on `other`. Only what the walk-through needs.
+/// The counter agent: its `counter` interface open to other ships' commands and questions, its
+/// journal (open to neither), and leave to send commands to the counter on `other`. Only what
+/// the walk-through needs.
 fn counter_manifest(other: &str) -> Manifest {
     Manifest {
-        provides: vec![Provide { interface: "counter".into(), public: false, remote: true }, Provide { interface: "journal".into(), public: false, remote: false }],
-        uses: vec![Use { ship: bare(other).into(), agent: "counter".into(), interface: "counter".into(), read: false, send: true }],
+        provides: vec![Provide { interface: "counter".into(), public: false, remote: true, asked: true }, Provide { interface: "journal".into(), public: false, remote: false, asked: false }],
+        uses: vec![Use { ship: bare(other).into(), agent: "counter".into(), interface: "counter".into(), read: false, send: true, ask: false }],
     }
 }
 
 /// The tally agent, with leave to send commands to the counter on `other`.
 fn tally_manifest(other: &str) -> Manifest {
     Manifest {
-        provides: vec![Provide { interface: "tally".into(), public: false, remote: false }],
-        uses: vec![Use { ship: bare(other).into(), agent: "counter".into(), interface: "counter".into(), read: false, send: true }],
+        provides: vec![Provide { interface: "tally".into(), public: false, remote: false, asked: false }],
+        uses: vec![Use { ship: bare(other).into(), agent: "counter".into(), interface: "counter".into(), read: false, send: true, ask: false }],
     }
 }
 
@@ -975,6 +996,62 @@ fn walk(options: &Options, step: &mut usize, lock: &mut Option<fs::File>, held: 
     if took > Duration::from_secs(15) {
         println!("  That is slower than it should be. The README says why it can be, under Known limits.");
     }
+
+    begin(step, &format!("{SECOND}'s owner asks {FIRST} a question, and has a command's reply come back."));
+    first_device.until(Instant::now() + LIMIT);
+    let set = first_device.command("counter", "inc asked")?;
+    if set.parse::<u64>().is_err() {
+        return failed(format!("{FIRST}'s counter agent answered \"{set}\" when asked to count"));
+    }
+    println!("  The owner of {FIRST} counts one more on its counter \"asked\", which now stands at {set}.");
+    println!("  The owner of {SECOND} asks, through {SECOND}, what {FIRST}'s counter agent says \"asked\" stands at.");
+    let started = Instant::now();
+    second_device.until(started + LIMIT);
+    let answer = loop {
+        match second_device.ask(FIRST, "counter", "counter", "asked")? {
+            (200, answer) => break answer,
+            // Not reached yet, or too busy just then.
+            (503 | 504, _) if started.elapsed() < LIMIT => pause()?,
+            (status, words) => return failed(format!("{SECOND}'s question was expected to be answered, and the answer was {status}, {}", words.trim())),
+        }
+    };
+    if answer != set {
+        return failed(format!("{FIRST}'s counter agent answered \"{answer}\", and the counter stands at {set}"));
+    }
+    println!("  Answered after {}: \"{answer}\", what the counter on {FIRST} stands at.", seconds(started.elapsed()));
+    println!("  Asked the same through the agent's journal interface, which is not open to questions:");
+    let refusal = match second_device.ask(FIRST, "counter", "journal", "asked")? {
+        (403, words) => words,
+        (status, words) => return failed(format!("a question to an interface not open to questions was expected to be refused, and the answer was {status}, {}", words.trim())),
+    };
+    println!("  Refused: {SECOND} answered \"{}\".", refusal.trim());
+    println!("  The owner of {SECOND} has its tally agent send {FIRST}'s counter \"inc asked\", asking for the reply.");
+    let started = Instant::now();
+    second_device.until(started + LIMIT);
+    let number = second_device.command("tally", &format!("tell-reply {} inc asked", bare(FIRST)))?;
+    if !number.parse::<u64>().is_ok_and(|number| number > 0) {
+        return failed(format!("{SECOND} would not send the command: its agent answered \"{number}\""));
+    }
+    let prefix = format!("{number} ~{}/counter counter ", bare(FIRST));
+    let line = loop {
+        let receipts = second_device.command("tally", "receipts")?;
+        if let Some(line) = receipts.lines().find(|line| line.starts_with(&prefix)) {
+            break line.to_string();
+        }
+        if started.elapsed() > LIMIT {
+            return failed(format!("waited {} seconds for the receipt of command {number}, and it did not come", LIMIT.as_secs()));
+        }
+        pause()?;
+    };
+    let reply = match line.split_once(" ran [] ").and_then(|(_, rest)| rest.split_once(" reply ")) {
+        Some((_, reply)) => reply.to_string(),
+        None => return failed(format!("the receipt of command {number} did not say it ran with a reply: \"{line}\"")),
+    };
+    let expected = set.parse::<u64>().map(|set| set + 1).unwrap_or(0).to_string();
+    if reply != expected {
+        return failed(format!("the reply that came with the receipt is \"{reply}\", and {expected} was expected"));
+    }
+    println!("  The receipt came back after {}, saying the command ran, with its reply: \"{reply}\".", seconds(started.elapsed()));
     first_device.sign_out();
     second_device.sign_out();
 
@@ -990,6 +1067,8 @@ fn walk(options: &Options, step: &mut usize, lock: &mut Option<fs::File>, held: 
     } else {
         println!("  {FIRST} came back, at the same address, and the two found each other again.");
     }
+    println!("  {SECOND}'s owner asked {FIRST} a question and was answered; one to an interface not");
+    println!("  open to questions was refused; and a command brought its reply back with its receipt.");
     println!("What it does not show: these are three programs on one machine, talking over this");
     println!("machine's own loopback address. It does not show two machines, a real home router,");
     println!("the relay carrying anything (nothing on one machine needs it), or real Urbit ID.");

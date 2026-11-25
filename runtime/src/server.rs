@@ -30,7 +30,7 @@ use ship_proto::{
 use crate::files::{self, FileError, CHUNK};
 use crate::kept::{Opened, SaveFailed};
 use crate::remote::Failed;
-use crate::{canonical_ship, check_agent_name, lock, Error, Position, Rejection, Runtime};
+use crate::{canonical_ship, check_agent_name, check_target, lock, AskError, Error, Position, Rejection, Runtime};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -107,6 +107,12 @@ struct Shared {
 }
 
 impl Server {
+    /// For tests: how many requests are waiting now (long polls, and questions to other ships).
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.shared.waiting.load(Ordering::SeqCst)
+    }
+
     pub fn start(runtime: Arc<Runtime>, cfg: ServerConfig) -> io::Result<Server> {
         // Without the dot, `.net` style matching turns into `evilzod` matching `zod`.
         if cfg.ship_host_suffix.as_deref().is_some_and(|suffix| !suffix.starts_with('.') || suffix.len() < 2) {
@@ -561,13 +567,14 @@ fn read_request(shared: &Shared, stream: &mut TcpStream, deadline: Instant, head
     Ok(request)
 }
 
-/// Turn `%41` and `+` back into the characters they stand for. `None` if it is not valid text.
+/// Turn `%41` and `+` back into the characters they stand for. `None` if it is not valid text,
+/// or a `%` is not followed by two hexadecimal digits.
 fn decode(text: &str, plus_is_space: bool) -> Option<String> {
     let (bytes, mut out, mut i) = (text.as_bytes(), Vec::with_capacity(text.len()), 0);
     while i < bytes.len() {
         match bytes[i] {
             b'%' => {
-                let pair = text.get(i + 1..i + 3)?;
+                let pair = text.get(i + 1..i + 3).filter(|pair| pair.bytes().all(|b| b.is_ascii_hexdigit()))?;
                 out.push(u8::from_str_radix(pair, 16).ok()?);
                 i += 2;
             }
@@ -832,6 +839,7 @@ fn respond_whole<'a>(shared: &'a Shared, request: &mut Request, streamed: &mut O
             let Some(id) = files::parse_id(id) else { return failure(Error::File(FileError::NotFound)).with("Content-Security-Policy", FILE_POLICY) };
             done(runtime.kept_clear(&ship, &id).map(|cleared| Reply::proto(200, &cleared_reply(cleared)))).with("Content-Security-Policy", FILE_POLICY)
         }
+        ("POST", ["ask", other, agent, interface]) => ask_route(shared, &ship, other, agent, interface, query, &request.body).with("Content-Security-Policy", FILE_POLICY),
         ("POST", ["agents", agent, "files", "save"]) => save_route(shared, &ship, agent, &request.body).with("Content-Security-Policy", FILE_POLICY),
         ("GET", ["agents", agent, "files", "saves"]) => {
             let listed = runtime.saves(&ship, agent);
@@ -1176,6 +1184,76 @@ fn save_route(shared: &Shared, ship: &str, agent: &str, body: &[u8]) -> Reply {
     }
 }
 
+/// How long a question asked over HTTP waits for its answer when `within` is not given.
+const DEFAULT_ASK_WITHIN: Duration = Duration::from_secs(10);
+
+/// A question for an agent on another ship, from this ship's owner (`POST
+/// /ask/<ship>/<agent>/<interface>`, the body its payload, `?within=<seconds>` how long to
+/// wait). Every name is checked before it is used, and none becomes a path. It may wait on the
+/// other ship, so it counts among the requests waiting (as a long poll does) while it waits.
+/// The answer is the reply, as it came; anything else is this ship's own words, but for a
+/// refusal, which carries the other ship's reason, cut short and with no control characters
+/// (a plain text answer, never shown as a page).
+fn ask_route(shared: &Shared, here: &str, other: &str, agent: &str, interface: &str, query: &str, body: &[u8]) -> Reply {
+    let cfg = &shared.runtime.inner.cfg;
+    let other = match canonical_ship(other) {
+        Ok(other) if other != here => other,
+        _ => return Reply::text(400, "not a ship other than this one"),
+    };
+    if check_agent_name(agent).is_err() || check_target(agent, interface).is_err() {
+        return Reply::text(400, "not a valid agent or interface name");
+    }
+    let most = Duration::from_millis(cfg.max_ask_millis);
+    // Read once: every occurrence of `within` (each key decoded as values are, so `%77ithin` is
+    // `within` too), with its value if it has one. None: the default. Given once, as a whole
+    // number of seconds in range: that. Anything else (given more than once, with no `=`, empty,
+    // not decodable, not a whole number, out of range), or a key that cannot be decoded:
+    // refused, and nothing is asked.
+    let refused = || Reply::text(400, &format!("within is a whole number of seconds, given once, more than nothing and at most {}", most.as_secs()));
+    let mut given: Vec<Option<&str>> = Vec::new();
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').map_or((pair, None), |(key, value)| (key, Some(value)));
+        match decode(key, true) {
+            Some(key) if key == "within" => given.push(value),
+            Some(_) => {}
+            None => return refused(),
+        }
+    }
+    let within = match given.as_slice() {
+        [] => DEFAULT_ASK_WITHIN.min(most),
+        [Some(value)] => match decode(value, true).filter(|seconds| !seconds.is_empty() && seconds.bytes().all(|b| b.is_ascii_digit())).and_then(|seconds| seconds.parse::<u64>().ok()).map(Duration::from_secs) {
+            Some(within) if !within.is_zero() && within <= most => within,
+            _ => return refused(),
+        },
+        _ => return refused(),
+    };
+    if body.len() > cfg.max_ask_bytes {
+        return Reply::text(413, "the question is larger than this ship asks");
+    }
+    // It waits holding a thread, as a long poll does: it counts among the requests waiting,
+    // of which at most half the workers may be at once. (Unlike a download it sends nothing
+    // large, so it takes no download place.)
+    let waiting = Waiting(&shared.waiting);
+    if shared.waiting.fetch_add(1, Ordering::SeqCst) >= shared.cfg.workers.max(2) / 2 {
+        return Reply::text(503, "too many requests waiting at once; try again shortly").with("Retry-After", "1");
+    }
+    let asked = shared.runtime.ask(here, None, &other, agent, interface, body, within);
+    drop(waiting);
+    match asked {
+        Ok(reply) => Reply::new(200, "application/octet-stream", reply).with("Content-Disposition", "attachment"),
+        Err(AskError::Denied(why)) => Reply::text(403, &format!("the other ship would not let it be asked: {why}")),
+        Err(AskError::Failed) => Reply::text(502, "the agent asked on the other ship failed to answer"),
+        Err(AskError::Limit) => Reply::text(502, "the question or its answer is larger than one of the two ships allows"),
+        Err(AskError::NotUnderstood) => Reply::text(501, "the other ship does not understand questions"),
+        Err(AskError::Busy) => Reply::text(503, "too busy; try again shortly").with("Retry-After", "1"),
+        Err(AskError::Unreachable) => Reply::text(503, "the other ship could not be reached"),
+        Err(AskError::NoNetwork) => Reply::text(503, "this ship is not on the network just now").with("Retry-After", "5"),
+        Err(AskError::NoAnswer) => Reply::text(504, "no answer came in time"),
+        Err(AskError::TooLarge) => Reply::text(413, "the question is larger than this ship asks"),
+        Err(AskError::BadWithin | AskError::BadName) => Reply::text(400, "not a question this ship can ask"),
+    }
+}
+
 /// What a failure to have a file from another ship looks like to a client.
 fn remote_failure(failed: Failed) -> Reply {
     match failed {
@@ -1272,6 +1350,7 @@ fn allowed(parts: &[&str]) -> Option<&'static str> {
         ["agents", _, "files", "uploads", _] | ["agents", _, "files", _] => Some("GET, DELETE"),
         ["agents", _, "files", "uploads", _, _] => Some("PUT"),
         ["files", "from", _, _, _] | ["files", "from", _, _, _, "chunks", _] | ["files", "from", _, _, _, "content"] => Some("GET"),
+        ["ask", _, _, _] => Some("POST"),
         _ => None,
     }
 }

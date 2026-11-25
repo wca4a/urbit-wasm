@@ -70,6 +70,13 @@ fn remote_reads(agent: &Registered) -> Vec<Grant> {
     declared.map(|u| Grant { agent: u.agent.clone(), interface: u.interface.clone(), ship: u.ship.clone() }).collect()
 }
 
+/// The interfaces on other ships that `agent` may ask questions of: exactly what its manifest
+/// declares, in the same way.
+fn remote_asks(agent: &Registered) -> Vec<Grant> {
+    let declared = uses(agent).iter().filter(|u| !u.ship.is_empty() && u.ask);
+    declared.map(|u| Grant { agent: u.agent.clone(), interface: u.interface.clone(), ship: u.ship.clone() }).collect()
+}
+
 /// More than the encoded size of one grant, so sums of it are safe upper bounds.
 fn grant_bytes(agent: &str, interface: &str) -> usize {
     agent.len() + interface.len() + 16
@@ -77,7 +84,8 @@ fn grant_bytes(agent: &str, interface: &str) -> usize {
 
 /// An upper bound on the largest answer `route` could give for any agent in `registry`. Each
 /// agent is granted every public interface, its own, and at most what it declares, once for
-/// reading and once for sending.
+/// reading, once for sending, and once for asking (asking grants only what it declares, so
+/// counting public and own interfaces there too only makes the bound larger).
 fn largest_route(registry: &Registry) -> usize {
     let public: usize = registry
         .agents
@@ -94,7 +102,7 @@ fn largest_route(registry: &Registry) -> usize {
         })
         .max()
         .unwrap_or(0);
-    2 * (public + most_private) + 256
+    3 * (public + most_private) + 256
 }
 
 fn deny(reason: impl Into<String>) -> RouteReply {
@@ -111,6 +119,11 @@ fn decide(request: &RouteRequest) -> RouteReply {
     // runtime keeps a record of each such command and only passes on an answer to one of
     // them, so there is nothing to decide here beyond the agent still being installed.
     if request.kind() == Kind::Receipt {
+        return allow(&registry, target);
+    }
+    // Likewise what came of a question the agent put to another ship: the runtime keeps a
+    // record of each question waiting and only passes on an answer to one of them.
+    if request.kind() == Kind::Answer {
         return allow(&registry, target);
     }
     // The runtime tells an agent that a log it follows on another ship has entries for it.
@@ -135,14 +148,20 @@ fn decide(request: &RouteRequest) -> RouteReply {
         }
         return allow(&registry, target);
     }
-    // A request from an agent on another ship. Only a command, and only to an interface that
-    // is open to other ships. Which ships may do what is then up to the agent, which is told
-    // who is asking. Nothing is known here about the other ship's agents, so nothing is
-    // looked up about the one that sent it.
+    // A request from an agent on another ship, or another ship's owner. A command only to an
+    // interface open to other ships' commands (`remote`); a question (a read) only to one open
+    // to their questions (`asked`). The two are apart: an owner can open an interface to one
+    // and not the other. Which ships may do what is then up to the agent, which is told who is
+    // asking. Nothing is known here about the other ship's agents, so nothing is looked up
+    // about the one that sent it. `owner` is never set for a call from another ship: the owner
+    // of this ship is not on another ship.
     if !source.ship.is_empty() {
-        let open = request.kind() == Kind::Command
-            && !source.owner
-            && provides(target).iter().any(|provide| provide.interface == request.interface && provide.remote);
+        let open = !source.owner
+            && match request.kind() {
+                Kind::Command => provides(target).iter().any(|provide| provide.interface == request.interface && provide.remote),
+                Kind::Read => provides(target).iter().any(|provide| provide.interface == request.interface && provide.asked),
+                _ => false,
+            };
         if !open {
             return deny(format!("{} on {} is not open to other ships", request.interface, target.name));
         }
@@ -176,8 +195,8 @@ fn decide(request: &RouteRequest) -> RouteReply {
             return allow(&registry, target);
         }
         // An unrecognised kind must be refused, never treated as something harmless.
-        // (A receipt was answered above.)
-        Kind::Receipt | Kind::Unspecified | Kind::FileAsk => return deny("unknown kind of call"),
+        // (A receipt and an answer were answered above.)
+        Kind::Receipt | Kind::Answer | Kind::Unspecified | Kind::FileAsk => return deny("unknown kind of call"),
     };
     // The owner may call anything on their own ship. An agent needs the target to provide the
     // interface, and needs it to be public, its own, or a declared use.
@@ -204,6 +223,7 @@ fn allow(registry: &Registry, target: &Registered) -> RouteReply {
         module: target.module.clone(),
         reads: grants(registry, target, |u| u.read).into_iter().chain(remote_reads(target)).collect(),
         sends: grants(registry, target, |u| u.send).into_iter().chain(remote_sends(target)).collect(),
+        asks: remote_asks(target),
     }
 }
 

@@ -103,7 +103,9 @@ fn failed(why: FileAskError) -> Failed {
         FileAskError::Net(NetError::Refused(_)) => Failed::Wrong("the other ship would not answer that"),
         FileAskError::Net(NetError::Garbled) => Failed::Wrong("the other ship's answer made no sense"),
         FileAskError::Net(NetError::NotHere(_)) => Failed::Wrong("the asking ship is not here"),
-        FileAskError::Net(NetError::Unlisted(_) | NetError::Unreachable(_) | NetError::TimedOut) => Failed::Unreachable,
+        // An answer too large to read was taken as a broken stream before questions told the
+        // two apart; for a file it still is.
+        FileAskError::Net(NetError::Unlisted(_) | NetError::Unreachable(_) | NetError::TimedOut | NetError::TooLarge) => Failed::Unreachable,
     }
 }
 

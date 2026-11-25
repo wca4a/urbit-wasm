@@ -722,7 +722,7 @@ fn main() {
         let counter = runtime.add_module(&read(&counter)).expect("the counter module loads");
         match runtime.create_ship("~zod", &kernel) {
             Ok(()) => {
-                let provide = |interface: &str| Provide { interface: interface.into(), public: false, remote: false };
+                let provide = |interface: &str| Provide { interface: interface.into(), public: false, remote: false, asked: false };
                 let manifest = Manifest { provides: vec![provide("counter"), provide("journal")], uses: vec![] };
                 runtime.install("~zod", "counter", &counter, &manifest).expect("the counter agent installs");
             }

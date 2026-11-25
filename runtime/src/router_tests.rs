@@ -326,9 +326,9 @@ fn crew_with(dir: &TempDir, ship: &str, urbit: &Arc<Listings>, cfg: NetConfig, s
 
 /// The same, for several ships on the one runtime.
 fn crew_of(dir: &TempDir, ships: &[&str], urbit: &Arc<Listings>, cfg: NetConfig, socket: Option<MakeSocket>) -> (Arc<Runtime>, Network) {
-    let open_counter = Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true }], uses: vec![] };
-    let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true };
-    let far_tally = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true }], uses: vec![to("counter"), to("tally")] };
+    let open_counter = Manifest { provides: vec![Provide { interface: "counter".into(), public: false, remote: true, asked: false }], uses: vec![] };
+    let to = |agent: &str| Use { ship: "*".into(), agent: agent.into(), interface: agent.into(), read: false, send: true, ask: false };
+    let far_tally = Manifest { provides: vec![Provide { interface: "tally".into(), public: false, remote: true, asked: false }], uses: vec![to("counter"), to("tally")] };
     let rt = Arc::new(Runtime::open(&dir.0, Config { durability: Durability::Normal, ..Config::default() }).unwrap());
     let kernel = rt.add_module(&wasm("kernel")).unwrap();
     let (counter, tally) = (rt.add_module(&wasm("counter")).unwrap(), rt.add_module(&wasm("tally")).unwrap());

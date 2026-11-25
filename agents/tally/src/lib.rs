@@ -2,7 +2,7 @@
 //! incremented. Used to exercise permissions and queued commands.
 
 use ship_sdk::proto::{Message, NextReply, NextRequest};
-use ship_sdk::{agent, emit, invocation, kv, log, read, send};
+use ship_sdk::{agent, ask, emit, invocation, kv, log, read, send};
 
 #[link(wasm_import_module = "host")]
 extern "C" {
@@ -162,6 +162,54 @@ fn handle(event: &[u8]) -> Vec<u8> {
             kv::put(b"ballast", &vec![b'b'; len.parse().unwrap_or(0)]);
             "ok".to_string()
         }
+        // Send the counter on another ship whatever follows the ship's name, as a command whose
+        // reply is to come back with its receipt.
+        (Some("tell-reply"), Some(ship)) => {
+            let rest = text.trim_start()["tell-reply".len()..].trim_start()[ship.len()..].trim();
+            let number = ship_sdk::send_to_for_reply(ship, "counter", "counter", rest.as_bytes());
+            kv::put(b"last-sent", number.to_string().as_bytes());
+            number.to_string()
+        }
+        // The same, the command padded with spaces to exactly `size` bytes: `tell-reply-sized
+        // <ship> <size> <command>`, for a command of a size the owner's own input cannot carry.
+        (Some("tell-reply-sized"), Some(ship)) => {
+            let rest: Vec<&str> = text.split_whitespace().skip(2).collect();
+            let size: usize = rest.first().and_then(|n| n.parse().ok()).unwrap_or(0);
+            let mut command = rest.get(1..).map(|words| words.join(" ")).unwrap_or_default().into_bytes();
+            command.resize(size.max(command.len()), b' ');
+            let number = ship_sdk::send_to_for_reply(ship, "counter", "counter", &command);
+            kv::put(b"last-sent", number.to_string().as_bytes());
+            number.to_string()
+        }
+        // Every receipt that has come back, as a command, for an owner's device to read.
+        (Some("receipts"), None) => String::from_utf8_lossy(&kv::get(b"receipts").unwrap_or_default()).into_owned(),
+        // Put a question to an agent on another ship: `ask-on <ship> <agent> <interface>
+        // <within millis> <payload>`. Answers with the number the question goes under.
+        (Some("ask-on"), Some(ship)) => {
+            let rest: Vec<&str> = text.split_whitespace().skip(2).collect();
+            let (agent, interface) = (rest.first().copied().unwrap_or("counter"), rest.get(1).copied().unwrap_or("counter"));
+            let within = rest.get(2).and_then(|n| n.parse().ok()).unwrap_or(ask::DEFAULT_WITHIN_MILLIS);
+            let payload = rest.get(3..).map(|words| words.join(" ")).unwrap_or_default();
+            let number = ask::to(ship, agent, interface, payload.as_bytes(), within);
+            kv::put(b"last-asked", number.to_string().as_bytes());
+            number.to_string()
+        }
+        // Put the same question several times in one event: `ask-many <ship> <count> <within>`.
+        (Some("ask-many"), Some(ship)) => {
+            let rest: Vec<&str> = text.split_whitespace().skip(2).collect();
+            let count: u32 = rest.first().and_then(|n| n.parse().ok()).unwrap_or(1);
+            let within = rest.get(1).and_then(|n| n.parse().ok()).unwrap_or(ask::DEFAULT_WITHIN_MILLIS);
+            (0..count).map(|_| ask::to(ship, "counter", "counter", b"hits", within).to_string()).collect::<Vec<_>>().join(" ")
+        }
+        // Put a question and then fail, to check the question goes with everything else.
+        (Some("ask-then-crash"), Some(ship)) => {
+            ask::to(ship, "counter", "counter", b"hits", ask::DEFAULT_WITHIN_MILLIS);
+            panic!("crash requested");
+        }
+        // Give up on a question.
+        (Some("drop-ask"), Some(number)) => ask::drop(number.parse().unwrap_or(0)).to_string(),
+        // Every answer that has come back, as a command.
+        (Some("answers"), None) => String::from_utf8_lossy(&kv::get(b"answers").unwrap_or_default()).into_owned(),
         // Send the tally agent on another ship a command that records who it came from.
         (Some("hail"), Some(ship)) => {
             ship_sdk::send_to(ship, "tally", "tally", b"note");
@@ -239,6 +287,8 @@ fn view(request: &[u8]) -> Vec<u8> {
         // that has come back, one to a line.
         (Some("last-sent"), None) => kv::get(b"last-sent").unwrap_or_default(),
         (Some("receipts"), None) => kv::get(b"receipts").unwrap_or_default(),
+        // Every answer to a question this agent put to another ship, one to a line.
+        (Some("answers"), None) => kv::get(b"answers").unwrap_or_default(),
         (Some("who"), None) => caller().into_bytes(),
         // A read of ourselves, to see what a nested read is told about its caller.
         (Some("via-self"), None) => read("tally", "tally", b"who"),
@@ -332,8 +382,15 @@ fn receipted(receipt: &ship_sdk::Receipt) {
         ship_sdk::Verdict::Lost => "lost",
         ship_sdk::Verdict::Unspecified => "unknown",
     };
+    // A long reply is noted by its length, so that the list stays small.
+    // A reply, even an empty one, is marked; RAN with no reply marked says nothing more.
+    let reply = match receipt.reply.len() {
+        _ if !receipt.replied => String::new(),
+        len if len > 64 => format!(" reply of {len} bytes"),
+        _ => format!(" reply {}", String::from_utf8_lossy(&receipt.reply)),
+    };
     let line = format!(
-        "{} ~{}/{} {} {verdict} [{}] from {}\n",
+        "{} ~{}/{} {} {verdict} [{}] from {}{reply}\n",
         receipt.about,
         receipt.ship,
         receipt.agent,
@@ -347,4 +404,33 @@ fn receipted(receipt: &ship_sdk::Receipt) {
     kv::put(b"receipts", &all);
 }
 
-agent!(handle, read = view, notify = notified, receipt = receipted);
+/// Called with what came of each question this agent put to another ship. Keeps them all, one
+/// to a line: the number, where it was put, the outcome, the reason, the reply, and who the
+/// runtime says the answer is from.
+fn answered(answer: &ask::Answered) {
+    let outcome = match answer.outcome() {
+        ask::Outcome::Reply => "reply",
+        ask::Outcome::Denied => "denied",
+        ask::Outcome::Failed => "failed",
+        ask::Outcome::Limit => "limit",
+        ask::Outcome::NoAnswer => "no-answer",
+        ask::Outcome::Unreachable => "unreachable",
+        ask::Outcome::NotUnderstood => "not-understood",
+        ask::Outcome::Unspecified => "unknown",
+    };
+    let line = format!(
+        "{} ~{}/{} {} {outcome} [{}] {} from {}\n",
+        answer.about,
+        answer.ship,
+        answer.agent,
+        answer.interface,
+        answer.reason,
+        if answer.reply.len() > 64 { format!("({} bytes)", answer.reply.len()) } else { String::from_utf8_lossy(&answer.reply).into_owned() },
+        caller()
+    );
+    let mut all = kv::get(b"answers").unwrap_or_default();
+    all.extend_from_slice(line.as_bytes());
+    kv::put(b"answers", &all);
+}
+
+agent!(handle, read = view, notify = notified, receipt = receipted, answer = answered);
