@@ -6,3 +6,9 @@ rust-version.workspace = true
 
 [dependencies]
 ship-proto = { path = "../proto" }
+# For typed agents: the proto3 JSON mapping of generated messages and of the well-known types,
+# read and written inside the agent.
+pbjson = "0.9"
+pbjson-types = "0.9"
+serde = "1"
+serde_json = "1"

@@ -1,0 +1,196 @@
+// The guestbook agent's interfaces: the one place they are written down. The agent's handlers,
+// its calls to other guestbooks, and the JSON the owner's devices send are all derived from it.
+syntax = "proto3";
+
+package guestbook;
+
+import "google/protobuf/empty.proto";
+
+// A guestbook: visitors sign it, the owner can erase a signature, and anyone allowed can look
+// signatures up. Every signature is also an entry in the log named `guestbook`.
+service Guestbook {
+  // Sign the book. Answers with the signature's number.
+  rpc Sign(SignRequest) returns (Signed);
+  // Erase a signature by its number: the log gets an entry with the number and no name. Erasing
+  // one that is not there is a fault, and the event is rolled back: the attempt it counts first
+  // is not kept.
+  rpc Erase(EraseRequest) returns (Erased);
+  // Copy one of this book's signatures into another guestbook: on this ship (sent, nothing comes
+  // back) or on another (sent with its reply wanted, which comes back on the receipt).
+  rpc Pass(PassRequest) returns (Passed);
+  // Ask a guestbook on another ship for one of its signatures. The answer comes later.
+  rpc Fetch(FetchRequest) returns (Fetching);
+  // Follow another guestbook's log, and its visits, on this ship.
+  rpc Follow(FollowRequest) returns (google.protobuf.Empty);
+  // For the tests: add an entry to the log that is not a signature.
+  rpc Scribble(ScribbleRequest) returns (google.protobuf.Empty);
+  // For the tests: sign a placeholder (an entry in the log, and the book and a count written),
+  // and then fail, so that it can be seen that nothing of it is kept.
+  rpc Spoil(google.protobuf.Empty) returns (google.protobuf.Empty);
+  // Signatures whose names start with a prefix, newest first. For the tests, a prefix that
+  // starts with `ship.` is answered with a fault of that code, which only the generated code may
+  // use, so it arrives rewritten as `app.ship...`.
+  rpc Lookup(LookupRequest) returns (Page) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // One signature by its number, or the fault `no-such-signature`.
+  rpc Get(GetRequest) returns (Signature) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // One signature of another guestbook on this ship, read through it now.
+  rpc Peek(PeekRequest) returns (Signature) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // What came back from other guestbooks, and what was taken from the logs followed.
+  rpc Report(google.protobuf.Empty) returns (Activity) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // The log: each signature as it is made. A checkpoint carries the whole book.
+  rpc Signatures(Book) returns (stream Signature);
+}
+
+// Who came by: a history, kept whole.
+service Visits {
+  // Note a visit. Answers with how many there have been.
+  rpc Visit(VisitRequest) returns (VisitCount);
+  // How many visits there have been.
+  rpc Count(google.protobuf.Empty) returns (VisitCount) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // The log: every visit, never summed up.
+  rpc History(google.protobuf.Empty) returns (stream VisitRequest);
+}
+
+enum Mood {
+  MOOD_UNSPECIFIED = 0;
+  MOOD_HAPPY = 1;
+  MOOD_GRUMPY = 2;
+}
+
+message Address {
+  string town = 1;
+  string ship = 2;
+}
+
+message Signature {
+  // Given by the book when it is signed.
+  uint64 number = 1;
+  string name = 2;
+  // A small picture, or anything.
+  bytes stamp = 3;
+  Mood mood = 4;
+  Address from = 5;
+  repeated string tags = 6;
+  map<string, int64> scores = 7;
+  oneof contact {
+    string email = 8;
+    string ship = 9;
+  }
+  optional int32 age = 10;
+  // When it was signed, in milliseconds since 1970, as the signer says.
+  uint64 signed_at = 11;
+}
+
+message SignRequest {
+  Signature signature = 1;
+}
+
+message Signed {
+  uint64 number = 1;
+  // How many signatures the book holds now.
+  uint64 total = 2;
+}
+
+message EraseRequest {
+  uint64 number = 1;
+}
+
+message Erased {
+  uint64 total = 1;
+}
+
+message PassRequest {
+  uint64 number = 1;
+  // Empty for this ship.
+  string ship = 2;
+  string agent = 3;
+}
+
+message Passed {
+  // The number the command went under, for one sent to another ship; 0 on this ship.
+  uint64 sent_as = 1;
+}
+
+message FetchRequest {
+  string ship = 1;
+  string agent = 2;
+  uint64 number = 3;
+}
+
+message Fetching {
+  uint64 question = 1;
+}
+
+message FollowRequest {
+  string agent = 1;
+}
+
+message ScribbleRequest {
+  bytes raw = 1;
+}
+
+message LookupRequest {
+  string prefix = 1;
+  optional uint32 limit = 2;
+}
+
+message Page {
+  repeated Signature signatures = 1;
+  uint64 total = 2;
+}
+
+message GetRequest {
+  uint64 number = 1;
+}
+
+message PeekRequest {
+  string agent = 1;
+  uint64 number = 2;
+}
+
+message Activity {
+  // One line for each receipt and each answer that came back, oldest first.
+  repeated string receipts = 1;
+  repeated string answers = 2;
+  // From the logs followed: the signatures taken, the entries that did not decode (by number),
+  // the checkpoints taken in place of entries that decoded, and the visits taken.
+  repeated uint64 taken = 3;
+  repeated uint64 undecoded = 4;
+  uint64 checkpoints = 5;
+  uint64 visits = 6;
+  // How many times Erase was asked, counting only the events that were kept.
+  uint64 erase_attempts = 7;
+  // The bytes of each entry that did not decode, beside its number in `undecoded`.
+  repeated bytes undecoded_bytes = 8;
+  // Checkpoints handed over whose state did not decode.
+  uint64 bad_checkpoints = 9;
+  // The last checkpoint taken that decoded, and the entry it stands for.
+  Book checkpoint = 10;
+  uint64 checkpoint_seq = 11;
+  // How many times Spoil was asked, counting only the events that were kept.
+  uint64 spoils = 12;
+}
+
+// The state behind the log: the whole book.
+message Book {
+  repeated Signature signatures = 1;
+  uint64 next = 2;
+}
+
+message VisitRequest {
+  string who = 1;
+}
+
+message VisitCount {
+  uint64 visits = 1;
+}

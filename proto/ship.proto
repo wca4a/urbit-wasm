@@ -1023,3 +1023,33 @@ message Introduction {
   bytes record = 2;
   bytes session = 3;
 }
+
+// A call to one method of an interface an agent describes in a proto file of its own (see
+// "Describing an agent's interface" in the README). It is the payload of a typed command or
+// question. The interface is not here: it is the one the call is made through
+// (`Invocation.interface`), which the kernel has already checked. `method` is the method's name
+// as written in the description, and `body` its input message, encoded. With `json` set, the
+// body is the input written as proto3 JSON, and the reply's body is wanted the same way; the
+// agent's own generated code reads and writes it.
+message Call {
+  string method = 1;
+  bytes body = 2;
+  bool json = 3;
+}
+
+// Why a typed call has no result. Codes starting with "ship." are made by the generated code
+// (ship.no-such-interface, ship.no-such-method, ship.not-understood, ship.wrong-kind); any other
+// code is the application's own.
+message Fault {
+  string code = 1;
+  string message = 2;
+}
+
+// What a typed call hands back: the reply bytes of a typed command or question. `body` is the
+// method's output message, encoded, or written as proto3 JSON when the call asked for that.
+message CallReply {
+  oneof result {
+    bytes body = 1;
+    Fault fault = 2;
+  }
+}

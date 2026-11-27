@@ -137,6 +137,13 @@ other's addresses through lookup points, and there is no update mechanism yet.
   commands flow both ways. A command whose answer can no longer come is given
   up: that is written to the sender's audit log, and its agent is handed a
   receipt saying the command is lost and may or may not have run.
+- An agent's interface can be written down once, in a proto3 file. A build step
+  makes typed handlers, typed calls to other agents and typed logs from it, and
+  puts the description in the agent's module. The generator derives the typed
+  handlers and embedded description from the same proto files, and the
+  declaration checks the names of the wired interfaces. The owner's devices can call such an agent's methods with JSON, and fetch its
+  description. Nothing about how events run, what ships send each other, or
+  what a ship's file holds changes for it.
 
 ## Layout
 
@@ -146,7 +153,8 @@ other's addresses through lookup points, and there is no update mechanism yet.
 | `kernel/` | The kernel module |
 | `proto/` | Message definitions (`ship.proto`) |
 | `sdk/` | What an agent links against |
-| `agents/` | Two toy agents used by the tests |
+| `sdk-build/` | The code generator for agents that describe their interfaces, used from their build scripts |
+| `agents/` | Toy agents used by the tests and the walk-through: two untyped, and two typed |
 
 ## Run
 
@@ -168,7 +176,7 @@ One command starts a lookup point and two ships, `~sampel-palnet` and
 they can do, acting as each owner's phone or browser would:
 
 ```sh
-cargo build -p kernel -p counter -p tally --release --target wasm32-unknown-unknown --target-dir target/wasm
+cargo build -p kernel -p counter -p tally -p guestbook -p kit --release --target wasm32-unknown-unknown --target-dir target/wasm
 cargo run -p runtime --release --bin serve -- --two-ships /tmp/two-ships
 ```
 
@@ -184,7 +192,16 @@ against what the first ship's owner was told the counter stands at, and how
 long the question took printed), a question to an interface not open to
 questions refused in the second ship's own words with the first ship's reason,
 and a command sent with its reply wanted coming back with the reply on its
-receipt (checked to be one more than the answer).
+receipt (checked to be one more than the answer). Two more steps, numbered on
+their own after those eight, show the guestbook, an agent whose interfaces are
+written down once in a proto file (see Describing an agent's interface): the
+first ship's owner calls a command and a question of it through the JSON door,
+the JSON sent and received printed (each answer checked to be 200 and
+`application/json` as received, and the question to find the signature the
+command made), and the first ship's guestbook puts a typed question to the
+second ship's, whose answer it decodes (checked to be the signature the second
+ship's owner made just before). Each ship is given the guestbook in the first
+step, after its two agents are installed and said, and before it starts.
 Each step says what it is doing, and says no more than it has checked: each
 message carries a word for this run and is reported with the number of the
 entry it became in the other ship's journal. The three command lines are
@@ -226,7 +243,8 @@ marked with which said it; shown anyway when a step does not work), `--ports
 <first>` (six fixed ports counting up from it, so the addresses stay the same
 between runs), `--file <file>` (share this file instead of a made-up one),
 `--sleep-after <seconds>` (given to the three programs), and `--kernel`,
-`--counter` and `--tally` for the modules.
+`--counter` and `--tally` for the modules. The guestbook's module is read from
+beside the tally module, as `guestbook.wasm`.
 
 ### Other ways to run it
 
@@ -360,6 +378,7 @@ source rather than something the tests prove.
 | `runtime/src/lookup.rs` | Lookup points: being one, finding the one for a galaxy, asking it where a ship is, and announcing this runtime's ships to it |
 | `runtime/src/relay.rs` | The relay: the framing of relayed packets, the socket wrapper (sessions and made-up addresses at a ship, carrying at a point), and the point's sessions and byte allowances |
 | `runtime/src/server.rs` | The HTTP server for apps and browsers |
+| `runtime/src/api.rs` | Descriptions of agents' interfaces: reading and checking a module's `ship.api.v1` section, the cache of built descriptions, typed calls as the owner (`call_method`), and the JSON door's logic |
 | `runtime/src/pretend.rs` | Ships' keys from a list in a file, in place of Urbit ID, for trying things out |
 | `runtime/src/bin/serve.rs` | Command-line wrapper around the HTTP server, with a demo ship; `serve/two_ships.rs` is the two-ship walk-through, and `serve/said.rs` the lines it reads back from the programs it starts |
 | `runtime/src/bin/loadtest.rs` | Load test |
@@ -367,17 +386,27 @@ source rather than something the tests prove.
 | `runtime/tests/files.rs` | Integration tests of files on the ship |
 | `runtime/tests/lookup.rs` | Integration tests of finding ships through lookup points |
 | `runtime/tests/serve.rs` | Tests of the `serve` program, run as a process of its own |
+| `runtime/tests/api.rs` | Integration tests of described interfaces: the guestbook and the kit through the runtime and across two ships, the install check, the JSON the generated code reads and writes, and the JSON door |
+| `runtime/src/api_tests.rs` | Tests of the cache's order and what it keeps, an agent whose description was never checked, a module replaced between a call's lookup and its run, and the door's statuses for faults, inside the crate |
 | `runtime/src/remote_tests.rs` | Tests of fetching a file from another ship, inside the crate so that the ship answering can be made to lie |
 | `runtime/src/kept_tests.rs` | Tests of keeping what was fetched and saving a copy, with the same runtimes and liar, and failures made to happen at chosen points |
 | `runtime/src/ask_tests.rs` | Tests of questions between ships and of receipts that bring a reply, with two real runtimes, inside the crate so that a network can vanish and the parts that decide can be read |
 | `kernel/src/lib.rs` | The default kernel: agent registry and routing policy |
 | `proto/ship.proto` | Every message: runtime and kernel, runtime and agent, client and ship, ship and ship |
-| `sdk/src/lib.rs` | Guest-side bindings and the `agent!` macro |
+| `proto/src/lib.rs` | The generated messages, and `interface_of_service`, the one rule turning a service's name into an interface's |
+| `sdk/src/lib.rs` | Guest-side bindings, and the `agent!` and `typed_agent!` macros |
+| `sdk/src/api.rs` | What generated code stands on: the envelope, `CallError`, typed batches of a log, reading and writing bodies (JSON among them), and the dispatch behind `typed_agent!` |
+| `sdk/src/api/tests.rs` | Tests of the SDK's parts that call no host function (receipts, replies, the compile-time check), run on the machine doing the build |
+| `sdk-build/src/lib.rs` | The code generator: checks a description's files, writes the typed Rust and the description (`ship-sdk-build`) |
+| `sdk-build/src/tests.rs` | Tests of the generator, over proto files written in the tests, and of agents it generated for, built for wasm32 outside the workspace |
 | `agents/counter`, `agents/tally` | Toy agents. `counter` keeps counters, publishes a log, and answers questions with its read handler; `tally` reads and sends to `counter`, follows logs, takes receipts, asks questions of other ships and takes their answers |
+| `agents/guestbook` | A typed agent: its interfaces are in `api/guestbook.proto`, and its handlers, calls, logs and JSON are generated from it (see Describing an agent's interface) |
+| `agents/kit` | A typed agent for the tests, made of the awkward cases the generated code must compile for |
 
-The workspace's default members are `runtime` and `urbit-id`, so a plain
-`cargo build` or `cargo test` covers those two. The SDK, kernel, and agents only link for
-`wasm32-unknown-unknown`.
+The workspace's default members are `runtime`, `urbit-id`, `proto`, `sdk` and
+`sdk-build`, so a plain `cargo build` or `cargo test` covers those five (the
+SDK's tests are of its parts that call no host function). The kernel and
+agents only link for `wasm32-unknown-unknown`.
 
 ## Data directory
 
@@ -662,6 +691,476 @@ file question, or a question from another ship.
   `fn(&Receipt)`; an answer handler is `fn(&ask::Answered)`; a file_ask
   handler is `fn(&FileAsk) -> bool`. A read handler answers other ships'
   questions with nothing new: `invocation()` names the asking ship and agent.
+- `include_api!()` and `typed_agent!(api = api, serve = [Interface =>
+  Handlers, ...], ...)` for an agent that describes its interfaces, and `api`,
+  what the code generated for it stands on: see Describing an agent's
+  interface. `prost`, `pbjson`, `pbjson_types` (the well-known types), `serde`
+  and `serde_json` are re-exported for the generated code.
+
+## Describing an agent's interface
+
+An agent's handlers take and give bytes. An untyped agent, such as `counter`,
+reads a text format of its own, and anything that calls it has to learn that
+format from its source. An agent can instead write its interface down once, in
+a proto3 file, and have the rest made from it: typed handlers in the agent,
+typed calls from one agent to another, typed logs, the proto3 JSON form of its
+messages, and a JSON door for the owner's devices. `agents/guestbook` is such
+an agent, and `agents/kit` one made of awkward cases for the tests; `counter`
+and `tally` stay untyped. Nothing on the event path, in the protocol between
+ships, or in the store changes for it: a typed call is an ordinary payload
+holding a small envelope, and the runtime runs it as it runs any other.
+
+The runtime reads no message types. Bodies, in protobuf or in JSON, are read
+and written by the code generated into the agent, inside the agent's sandbox.
+Message bodies are decoded and encoded inside the agent's event limits. The
+native runtime reads the size-limited description during installation and on a
+cache miss. Installation checks the
+description; the owner's description and typed-call APIs read it, and the
+event path treats the envelopes as ordinary bytes. Of a description the
+runtime reads only the services and the kinds of their methods.
+
+### The description file
+
+Standard proto3. Every application file, served, called or imported, must say
+`syntax = "proto3"`; the generator refuses one that does not. Every file, served, called or imported,
+must have a package (`package guestbook;`); the generator refuses one with
+none, saying to give it one. Imports are allowed
+(`agents/guestbook/api/guestbook.proto` imports `google/protobuf/empty.proto`).
+The embedded description keeps the standard options represented by
+`prost-types` 0.14.5. Building it drops custom option values and unrepresented
+standard options such as `debug_redact`. The runtime uses the standard method
+idempotency option to select questions and serves the section exactly as the
+module carries it.
+
+- Each `service` is one interface, named after the service in lower-case words
+  joined by `-`: `Guestbook` is `guestbook`, `GroupChat` is `group-chat`. A
+  word starts at a capital that follows a small letter or a digit (`Chat2Go`
+  is `chat2-go`), and at the last capital of a run of them that is followed by
+  a small letter (`HTTPServer` is `http-server`); an underscore ends a word and
+  is dropped (`foo_bar` is `foo-bar`). The name must come out starting with a
+  letter, with no empty word (so no leading, trailing or doubled underscore),
+  and at most 128 bytes long. Every such name is one the default kernel
+  accepts for an interface (lower-case letters, digits, `-`, `.` and `_`, at
+  most 128 bytes) and the runtime too (at most 128 bytes, not `.` or `..`).
+  The one function that does this, `ship_proto::interface_of_service`, is used
+  by the code generator and by the runtime alike. A service whose name does not
+  turn into such a name is refused, naming the service.
+- A unary method with no option is a command (`KIND_COMMAND`, the `handle`
+  export). One with `option idempotency_level = NO_SIDE_EFFECTS;` is a question
+  (`KIND_READ`, the `read` export, which also answers other ships' questions).
+  One marked `IDEMPOTENT` is a command.
+- A server-streaming method (`returns (stream Entry)`) is the interface's log,
+  the log named after the interface. Its output is the type of every entry in
+  it. Its input is the type of the state a checkpoint carries, or
+  `google.protobuf.Empty` for a log that is a history kept whole. A service has
+  at most one; a second is refused, naming the service and both methods. The
+  log is not a method to call.
+- A method that streams from its caller (client streaming, or both ways) is
+  refused, naming the method.
+- A method's name is used as written (`Sign`), in calls and in URLs.
+
+### The envelope
+
+`proto/ship.proto` has three messages for it, added and nothing else changed.
+`Call { method, body, json }` is the payload of a typed command or question:
+the method's name and its input, encoded, or, with `json` set, written as
+proto3 JSON, in which case the reply's body is wanted as JSON too. `CallReply {
+oneof result { bytes body; Fault fault } }` is the reply bytes of one: its
+output, in the form the call asked for, or a `Fault { code, message }`. The
+interface is not in the envelope: it is `Invocation.interface`, which the
+kernel has already checked. Log entries and checkpoint states are the bare
+encoded message, since a log has one type.
+
+The codes the generated code makes start with `ship.`: `ship.no-such-interface`
+(the call came through an interface the agent does not serve, or through none
+at all), `ship.no-such-method`, `ship.not-understood` (the payload is not a
+`Call`, or its body does not decode as the method's input, as protobuf or as
+JSON; the message is the decoder's own words), and `ship.wrong-kind` (a command
+reached as a question, or the reverse; it is not run). An application's own
+codes are any other string. A handler that returns a code starting with
+`ship.` has it rewritten with `app.` in front, in every build (`ship.x` arrives
+as `app.ship.x`), so that only the generated code makes those. Fields a
+protobuf body does not know are ignored, as the evolution rule says; for JSON,
+see below.
+
+### Faults
+
+A question's handler returns `Result<Reply, Fault>`. Either way the reply is a
+`CallReply`, nothing is kept, as for any read, and the fault reaches the
+caller typed: the owner (`Runtime::call_method`, or the door), another agent on
+the ship (through `read`), or another ship (through `Answered`).
+
+A command's handler also returns `Result<Reply, Fault>`. In this part, `Err`
+makes the generated code trap, so the event is rolled back exactly as any
+failed handler's is: nothing the handler did is kept. The caller sees what it
+sees for any failed handler (`Rejection::Trap`, or a `FAILED` receipt); the
+fault's code and message do not reach it. The generated refusals on the
+command path are traps as well. When the command's decoder refuses the body,
+generated dispatch traps and the caller receives a failed command without a
+reason. No host function, verdict or outcome was added for faults.
+
+### Code generation
+
+`sdk-build/` (the package `ship-sdk-build`) is built for the machine doing the
+build and used from an agent's `build.rs`, on top of `prost-build` and
+`pbjson-build`. It needs `protoc` on the path, as `proto/` does:
+
+```rust
+fn main() -> std::io::Result<()> {
+    ship_sdk_build::Api::new().serve("api/guestbook.proto").call("../other/api/other.proto").compile()
+}
+```
+
+`serve` names a file of interfaces the agent serves, and `call` a file of
+interfaces it only calls on other agents; `include` adds a directory to look
+in for imports (the directory of each file given is always one). A file named
+both ways is served. A file given is named as protoc names it, because the
+generator asks protoc: it loads each file given alone, with the same
+directories, and takes the name of the last file protoc returns, which is that
+file, after the files it imports. `compile` checks every
+service of the files served and called against the rules above, and refuses
+the build, with a message naming what breaks the rule, for: two services
+served as one interface; two methods of a service whose Rust names are the
+same; a file with no package; two spellings of a package that make one Rust
+module (`demo.Two` and `demo.two`), in any file, served, called or only
+imported, naming both files and both spellings; a package part that makes a
+module named `pbjson`, `pbjson_types`, `serde`, `serde_json` or `prost`, names
+the generated code takes for itself; and a declared JSON name holding a
+backslash, a double quote or a control character. Two services that would
+generate the same service module are refused, naming both services. A message
+named `BookApi` may sit beside service `Book`.
+
+The well-known types come from the SDK, and only these may be used:
+`google.protobuf.Empty`, `Timestamp`, `Duration`, `Any`, `FieldMask`,
+`Struct`, `Value`, `ListValue`, `NullValue`, and the nine wrappers
+(`DoubleValue`, `FloatValue`, `Int64Value`, `UInt64Value`, `Int32Value`,
+`UInt32Value`, `BoolValue`, `StringValue`, `BytesValue`). An application field
+or RPC that uses any other type in `google.protobuf` or its subpackages is a
+build error. Each supported type reached from such a reference must match the
+SDK definition (the generator holds those definitions in a table of its own).
+A file of package `google.protobuf` or one under it is a well-known file;
+every other is an application file. These are build errors too:
+
+- a well-known file that declares a service;
+- a well-known file that defines a supported type an application file uses (or
+  one such a type reaches), when the file is not `syntax = "proto3"`;
+- an application file, served, called or only imported, that is not
+  `syntax = "proto3"`;
+- an `extend` in an application file, at file level or in a message, of
+  anything but one of the standard option messages (`FileOptions`,
+  `MessageOptions`, `FieldOptions`, `OneofOptions`, `EnumOptions`,
+  `EnumValueOptions`, `ServiceOptions`, `MethodOptions`,
+  `ExtensionRangeOptions`); and an extension whose type is a well-known type
+  not supported, as for any field. Importing `descriptor.proto` to declare a
+  custom option is allowed.
+
+It then writes to `OUT_DIR`, in
+`ship_api/`, the message types (made by `prost-build` with `::ship_sdk::prost`
+as the path to prost, and package modules named as prost names them, so
+`type.v1` is `r#type` and `v1`), their proto3 JSON forms (made by
+`pbjson-build`), and a module for each service. `ship_api.rs` includes the
+generated package modules, and `ship_api.bin` holds the embedded description.
+Every input file must declare a package.
+The well-known types (`google.protobuf.*`) come from `pbjson-types`, which
+`ship-sdk` re-exports with `pbjson`, `serde` and `serde_json`, so an agent
+depends on `ship-sdk` alone. `describe` makes the same checks, but for the one
+of Rust names, which is made while the code is written, and says what each
+interface is, writing nothing.
+
+An agent includes it with `ship_sdk::include_api!()`, which makes a module
+named `api` (marked `#[allow(dead_code)]`, so that what it does not use is not
+warned about). Each service becomes a module `<interface>_api` (with `_` for
+`-`) in a module named `_interfaces` in its package's module (so the
+guestbook's is `api::guestbook::_interfaces::guestbook_api`). No package or
+message can make a module named `_interfaces`: prost's module names never
+start with an underscore before a letter. So no service's module can clash with
+a package's or a message's, and the one clash left, two services making one
+module, is refused naming both. Prost's code and the JSON forms are written to
+two directories of their own. For every service, served or called, it has:
+
+- `INTERFACE`, the interface's name.
+- `call::<method>`, one module for each command and question. For a command,
+  `send(agent, &request)` (on this ship; nothing comes back),
+  `send_to(ship, agent, &request)` and `send_to_for_reply(ship, agent,
+  &request)` (on another ship; the number the receipt will carry), and
+  `receipt(&Receipt)`, which turns a receipt into the typed reply or the reason
+  there is none. For a question, `read(agent, &request)` (on this ship: the
+  typed reply, or why not), `ask(ship, agent, &request, within_millis)` (on
+  another ship; the number the answer will carry), and `answered(&Answered)`,
+  which turns an answer into the typed reply, the fault, or the outcome that is
+  not a reply. Why not is a `ship_sdk::api::CallError`: `Fault`,
+  `NotUnderstood` (what came back is not a `CallReply`, or its body does not
+  decode), `Unanswered(Outcome, reason)`, `NotRun(Verdict, reason)` (refused,
+  failed, too large, or malformed), `Lost(reason)` (one of the ships went back
+  to an earlier state, and nobody can tell whether the command ran) or
+  `NoReply(reason)` (the command ran and its receipt carries no reply). Stubs
+  are thin: they build the `Call` (protobuf, never JSON), call the SDK
+  function, and decode.
+- `log`, for a service with a log: the types `Entry`, `State` (`()` for a
+  history) and `Batch`, and `follow(agent)`, `follow_on(ship, agent)`,
+  `unfollow_on(ship, agent)`, `next(agent, max)` and `next_on(ship, agent,
+  max)`. A `Batch` (`ship_sdk::api::Batch`) holds each entry as `Ok(Logged {
+  seq, value })`, or as `Err(Undecoded { seq, bytes, why })` when it does not
+  decode, with the payload exactly as stored, and a checkpoint's state the same
+  way, with `more` and `stopped` as `log::Batch` has them. Nothing panics on an
+  entry that does not decode, and the position moves exactly as for
+  `log::next_on`, whatever decodes.
+
+For a service served, it also has:
+
+- `Handlers`, a trait with an associated function for each command and
+  question, given the decoded input and returning `Result<Output, Fault>`;
+  `ship_sdk::invocation()` still says who is calling.
+- `Checkpoint`, for a log whose state is not `Empty`: `fn state() ->
+  Option<State>`, the state behind the log. It is not there for a history.
+- `Interface`, which implements `ship_sdk::api::Serve<H>` for any `H` that
+  implements `Handlers` (and `Checkpoint`): the dispatch `typed_agent!` wires
+  to the exports. It reads the body as protobuf, or as JSON when the call says
+  so, and writes the reply the same way.
+- In `log`, `append(&Entry) -> u64`, `share(ship)` and `unshare(ship)`.
+
+The description is a `FileDescriptorSet` of the served files and everything
+they import, each after what it imports. A file imported and not served keeps
+its messages and enums and loses its services, and the comments on them, so
+that the description names only interfaces the agent serves. Comments are
+kept, for documents to be made from it later; the places in the source that
+carry no comment are dropped. The guestbook's is 8,219 bytes. One larger than
+256 KiB, a runtime's default `max_api_bytes`, is said in a cargo warning.
+`api::SERVED` lists the interfaces it serves.
+
+`ship_sdk::typed_agent!` declares a typed agent, beside `agent!`, which stays
+as it is for untyped agents:
+
+```rust
+ship_sdk::include_api!();
+use api::guestbook::_interfaces::{guestbook_api, visits_api};
+ship_sdk::typed_agent!(
+    api = api,
+    serve = [guestbook_api::Interface => Keeper, visits_api::Interface => Keeper],
+    notify = notified,
+    receipt = receipted,
+    answer = answered,
+);
+```
+
+It serves one or more interfaces, each with the type that implements its
+handlers. The generator derives the Rust signatures and the description from
+the same files, and the macro takes the description and the list of served
+interfaces from the same module (`api = api`); the interfaces wired in `serve`
+must be exactly those in `api::SERVED`, and leaving one out, wiring one twice,
+or wiring one the description does not serve, is a compile error. The check is
+of names: it cannot tell that a `Serve` implementation of the same name from
+another module implements the same schema. It exports `alloc`, `handle`,
+`read` and `checkpoint`, takes `notify`, `receipt`, `answer` and `file_ask` as
+`agent!` does (any other role is a compile error), and puts the description in
+the module as a custom section named `ship.api.v1` (`#[link_section]` on a
+`#[used]` static of `[u8; N]`). `handle` and `read` read
+`invocation().interface`, find the interface served under that name, decode
+the `Call`, and run the method through that interface's dispatch, answering
+with a `CallReply`. `checkpoint` asks the interface whose log is named for its
+state. A typed agent always has a `checkpoint` export: for a history, and for a
+name that is not one of its logs, it answers that there is no state, so that
+log is kept whole. The generated code builds without warnings.
+
+The JSON code costs size: the guestbook's module is 418,339 bytes, where it was
+218,746 before it had any (serde, serde_json, pbjson and the generated impls;
+the guestbook also gained a method and fields between the two, so the
+difference is not the JSON code's alone).
+
+### JSON, as the generated code reads and writes it
+
+JSON is the proto3 mapping as `pbjson-build` 0.9 generates it, set to ignore
+fields a message does not know and to write every field. The two HTTP tests in
+`runtime/tests/api.rs` exercise the guestbook and kit cases below. The
+`google.protobuf.NullValue` rule follows from the SDK implementation. (The
+tests are `the_door_calls_a_method_with_json_and_with_protobuf_alike` and
+`the_json_the_generated_code_reads_and_writes_at_its_edges`.)
+
+- The enum rules below describe generated application enums. For a
+  non-optional `google.protobuf.NullValue` field, the SDK reads and writes JSON
+  `null`, not an enum name or number.
+- Output uses each field's declared JSON name or its generated lowerCamelCase
+  name. Input takes that name and the field's name as written.
+- Generated application messages write every field without presence,
+  including its default value, and write fields with presence only when set.
+  (A field with presence is a message, an `optional` scalar or a member of a
+  `oneof`.) 64-bit integers are written as strings, bytes as
+  base64 with padding, enums by name.
+- Generated application messages skip unknown fields, including their nested
+  values (1,000 levels tested). SDK-supplied messages use their own JSON
+  implementations. For example, `google.protobuf.Empty` accepts only `{}`, and
+  `google.protobuf.FieldMask` rejects unknown fields and omits an empty `paths`
+  list.
+- Enums: for an enum number with aliases, generated JSON uses the first
+  declared name. It accepts that name or the number and refuses later aliases.
+  Otherwise a known name or number is read; an unknown name or number is
+  refused. A value the code does not know, stored through protobuf, cannot be written as
+  JSON: the call traps (a question so asked is answered as a failed call, and
+  the same call in protobuf answers with the number).
+- `null` is refused for a scalar, a list and an enum, and taken as unset for a
+  field with presence. A repeated known field is refused once its first value
+  has set it. An initial null on a field with presence leaves it unset, and
+  unknown keys can repeat.
+- A declared JSON name is read and written exactly as declared, even one that
+  looks like a Rust path (`::pbjson::alias`). A declared JSON name holding a
+  backslash, a double quote or a control character is a build error.
+- A string inside a field the message does not know is skipped without being
+  checked, so it may hold bytes that are not UTF-8 and the call still runs.
+- 64-bit integers are read from decimal digits, as a string or a number; an
+  exponent, a fraction, a negative number for an unsigned field, and a number
+  past 64 bits are refused.
+- A wrapper type is its bare value, and `null` is refused for it. A timestamp
+  with an offset is read, and written back in UTC with its offset as `+00:00`
+  (not `Z`).
+
+A question whose body fails to decode returns `ship.not-understood` with the
+decoder's diagnostic. The tested JSON errors include a line and column. A body
+a command cannot read is a failed command (see Faults).
+
+### What the runtime does with it
+
+In `runtime/src/api.rs`.
+
+- At install. The module's custom sections are read with `wasmparser` when its
+  verified bytes are compiled, and `Runtime::install` checks what was found.
+  With no `ship.api.v1` section the agent is untyped, as every
+  agent was before. Otherwise there must be exactly one; it must be at most
+  `max_api_bytes`; it must decode as a `FileDescriptorSet` (prost's own
+  decoder, with its limit on nesting); every service's name must turn into an
+  interface name; no method may stream from its caller; a service may have at
+  most one streaming method; no two services may be the same interface; and
+  every interface it describes must be one the manifest provides (fewer is
+  fine: the rest are untyped). A breach refuses the install with
+  `Error::BadModule` naming the rule, before the kernel is asked, so nothing
+  changes. The check is made at install and not when a module is added, since
+  it needs the manifest. What the module holds of a description (its section,
+  none, or why it is unusable) is learnt when its verified bytes are compiled,
+  so installing a module already compiled reads nothing more, as before
+  descriptions. The walk over the services is one pass over the section, with a
+  sorted insert per service and method; the manifest's names are looked up once
+  each. Each file's package is kept once, shared by its services. The
+  runtime does not check that a description's types resolve, nor anything else
+  in it: a client using a description from a ship it does not trust must guard
+  itself.
+- The manifest check at install is a check that the two agree, not a
+  permission. A ship brought in from elsewhere may hold an agent whose
+  description names an interface its manifest does not provide. The door
+  serves it all the same: the owner may call any installed agent, and the
+  generated dispatch decides what exists.
+- A ship brought in from elsewhere can also bring a module whose description
+  breaks the rules, without ever passing this check. Its agent is then answered
+  as one with no usable description, and nothing else about the ship changes.
+- `Runtime::description(ship, agent)` gives the `Description` (the bytes as
+  the module carries them, and each interface's methods with their kinds),
+  `None` for an agent with no usable description, or `Error::UnknownAgent`. The
+  lookup runs the kernel in a rolled-back transaction, to learn the module the
+  kernel names for an owner's command to the agent; obtaining the ship can wait
+  for its lock, wake it, run normal wake upkeep, and compile a cold module.
+  What is read is kept by the module's content hash, at most 32
+  (`api::CACHE_ENTRIES`), the least recently used let go first; a module found
+  to have none, or none that follows the rules, is remembered too. A module
+  whose bytes cannot be read is not: the error is passed on and the next
+  request reads again. An agent given a new module has a new hash, so its new
+  description is seen at the next request. `described_modules()` says how many
+  are kept. Nothing is kept across a restart.
+- `Runtime::deliver_on(ship, agent, interface, event)` runs an owner's command
+  under a named interface, which the agent sees in `Invocation.interface`;
+  everything else is as for `deliver`, which runs it under none and keeps its
+  signature and behaviour (`deliver` is `deliver_on` with an empty interface).
+- `Runtime::call_method(ship, agent, interface, method, body, encoding)`, which
+  the HTTP door and the tests share, looks up the description, the interface
+  and the method's kind; wraps the body, untouched, in a `Call` with `json` set
+  for JSON; runs it as an owner command (`deliver_on`) for a command or an
+  owner read (`read`) for a question; and unwraps the `CallReply`, giving back
+  `Called::Reply` (the body as the agent wrote it) or, for a question,
+  `Called::Fault`. For JSON it checks only that the reply's body is UTF-8 and is
+  JSON. Its `CallError` tells apart: no such agent; no description; no such
+  interface; no such method (the log is not one); a reply that is not a
+  `CallReply`, has neither a body nor a fault, is a fault from a command, or,
+  asked for JSON, is not JSON; and whatever `deliver_on` or `read` returned. The
+  kind is read from the module the agent has when the call is looked up; if the
+  module is replaced before the call runs, the new module's generated dispatch
+  decides, refusing a method of another kind (`ship.wrong-kind`) or one it does
+  not have.
+
+### The JSON door
+
+Two routes of the HTTP server (see HTTP server for clients), routes only in
+`server.rs`, their logic in `api.rs`:
+
+| Method and path | Auth | Answer |
+| --- | --- | --- |
+| `GET /agents/<agent>/api` | device | The description, byte for byte, as `application/x-protobuf`. There is no JSON form. 404 if the agent has no usable description |
+| `POST /agents/<agent>/api/<interface>/<method>` | device | Calls the method as the ship's owner. The body is the method's input, as `application/json` or `application/x-protobuf` (the media type compared without its parameters or capitals; anything else, or none, is 415), passed to the agent untouched. The reply is the method's output in the same encoding, as the agent wrote it |
+
+| Status | When |
+| --- | --- |
+| 200 | The reply |
+| 400 | A question answered `ship.not-understood`: it could not read the body. Also an agent or interface name that is not valid |
+| 401 | Not signed in, or a ship that does not exist |
+| 403 | A cookie-authenticated `POST` that does not show it came from the ship's own page |
+| 404 | No such agent, no usable description, no such interface, no such method (the log is not one); or a question answered `ship.no-such-interface` or `ship.no-such-method` |
+| 405 | A method the address does not take; `Allow` says which |
+| 409 | A question answered `ship.wrong-kind`: the module that ran it is not the one the method's kind was read from, or its description disagrees with its code |
+| 413 | A body larger than `max_body_bytes` |
+| 415 | A body that is not said to be JSON or protobuf |
+| 422 | A question fault with any other code uses the requested encoding. A runtime rejection on either path uses the command route's plain-text reason. Generated command faults trap and return "the command failed" |
+| 502 | The agent's reply is not a `CallReply`, has neither a body nor a fault, is a fault from a command, or, asked for JSON, is not UTF-8 JSON. 502 and not 500: what went wrong is the agent's, behind the door, not the server's |
+| others | Whatever else `deliver_on` and `read` return, with the statuses the command route gives |
+
+A question's fault comes back as `{"code": ..., "message": ...}` (written by
+the door) for a JSON request, or an encoded `Fault` for a protobuf one.
+
+The door has the same authentication and cross-site rules as the other routes,
+and a ship that does not exist answers like one the caller is not signed in to.
+A path is split before each part is decoded, so an encoded `/` stays in its
+part and cannot turn the path into another route's, and an agent or interface
+named `api`, `command` or `files` is only a name in its place. An untyped agent
+answers 404 at `/api` and takes raw bytes at `/command` as before. `/command`
+on a typed agent runs with no interface, and its dispatch refuses it: a trap,
+422 "the command failed". Responses produced by the two API handlers carry the
+file routes' Content-Security-Policy. Earlier server refusals use their ordinary
+headers.
+
+### The examples
+
+`agents/guestbook` serves two interfaces from
+`agents/guestbook/api/guestbook.proto`. `guestbook` has the commands Sign,
+Erase, Pass, Fetch, Follow, Scribble and Spoil, the questions Lookup, Get
+(which answers an application fault, `no-such-signature`), Peek and Report,
+and the log Signatures, whose checkpoint state is the whole book. `visits` has
+the command Visit, the question Count, and the log History, a history. Its
+messages hold a 64-bit integer, bytes, an enum, a nested message, a repeated
+field, a map, a `oneof` and an `optional` scalar. Pass copies a signature into
+another guestbook, with `send` on this ship or `send_to_for_reply` on another,
+whose receipt its receipt handler decodes; Fetch asks a guestbook on another
+ship with `ask`, whose answer its answer handler decodes; Peek reads another
+guestbook on this ship with `read`; Follow follows another guestbook's two
+logs, which its notify handler takes typed, keeping the checkpoint it is handed
+and the bytes of entries that do not decode. For the tests: Scribble puts an
+entry in the log that is not a signature; Spoil appends an entry and writes
+the book and a count, and then fails; Erase counts each attempt before it
+looks; and Lookup with a prefix starting `ship.` answers with a fault of that
+code, so that its rewriting can be seen. An erased signature stays as its
+number with no name, and its entry in the log says so the same way, so that the
+state behind the log changes only with an entry describing the change.
+
+`agents/kit` serves `api`, `command` and `files` (each answering its own name,
+for the door's paths) and `kit` from `agents/kit/api/kit.proto`: well-known
+types as an argument, a result and a field (`Timestamp`, `Empty`, `BoolValue`,
+`Int64Value`), a method named like a Rust keyword (`Type`), a field with a
+declared JSON name, a command that changes nothing (`Echo`), and calls through
+interfaces it only calls. Its ten call-only files cover the guestbook, package
+and service-name layouts, the counter's log, and the supported well-known
+types with a custom method option. Each is a layout the generated code must
+compile for: the guestbook's interfaces, a nested package
+(`kit.deep.v1`), a package that is a Rust keyword (`type.v1`), one named
+`ship_api`, the counter's log, described with types its text entries do not
+decode as, and three neighbours of a service `Book`: a message `BookApi` with
+an `optional` field, one with a nested message, and a child package
+`kit.parent.book_api`; and `wellknown.proto`. Its file imports `shared.proto` for a message, whose
+service is left out of its description, and has a field whose declared JSON
+name is `::pbjson::alias`.
 
 ## Storage
 
@@ -3914,6 +4413,8 @@ starting at `/`).
 | `GET /files/from/<ship>/<agent>/<id>...` | device | A file on another ship (see Fetching a file from another ship) |
 | `GET /files/kept`, `DELETE /files/kept`, `DELETE /files/kept/<id>` | device | What the ship keeps of files fetched from other ships, and clearing it (see Keeping what was opened, and saving a copy) |
 | `POST /ask/<ship>/<agent>/<interface>?within=` | device | A question for an agent on another ship, as this ship's owner; the reply as the body (see Questions between ships) |
+| `GET /agents/<agent>/api` | device | The description of the agent's interfaces, as protobuf (see The JSON door, under Describing an agent's interface, for this and the next, and their statuses) |
+| `POST /agents/<agent>/api/<interface>/<method>` | device | Calls a method of a described interface as the owner, with a JSON or protobuf body, which the agent itself reads; the reply in the same encoding |
 
 - Codes. A one-time code is 128 random bits in hex, made by
   `new_signin_code` on the machine the ship runs on. The reusable access code
@@ -3979,7 +4480,9 @@ nothing kept), and anything else stops the start, naming the flag
 
 `--two-ships <dir>`, with `--then-stop`, `--show-output`, `--ports <first>`,
 `--file <file>`, `--sleep-after`, `--kernel`, `--counter` and `--tally
-<file>`, is the walk-through under Run, and takes no other flag. It starts
+<file>`, is the walk-through under Run, and takes no other flag. It reads the
+guestbook's module from beside the tally module (`guestbook.wasm` in the same
+directory). It starts
 copies of the very binary it runs from (`std::env::current_exe`), and learns
 where each listens from the lines they print, whose words are kept in one
 place (`runtime/src/bin/serve/said.rs`) for the code that prints them and the
@@ -4042,6 +4545,7 @@ not, and 130 when stopped part way.
 | `max_answer_bytes` | 256 KiB | Largest answer (reply) a ship gives or takes; held the same way, and to 4 MiB (`store::MOST_ANSWER_BYTES`) when the runtime opens |
 | `max_ask_millis` | 60,000 | Longest time a question may be given, by `Runtime::ask`, the HTTP route or `ask_to` |
 | `max_asks_waiting` | 256 | Questions a ship's agents may have waiting, counting answers queued and not yet handed over |
+| `max_api_bytes` | 256 KiB | Largest description of its interfaces an agent's module may carry (its `ship.api.v1` section); an install of a module with a larger one is refused. Held to 1 MiB (`api::MOST_API_BYTES`) when the runtime opens |
 | `max_receipt_reply_bytes` | 16 KiB | Largest reply a receipt carries; also held to `max_event_bytes` and to what a ship takes as one message (see Commands between ships, exactly once), and to 1 MiB (`store::MOST_RECEIPT_REPLY_BYTES`) when the runtime opens. At 0 (or with a queue too small for any receipt with a reply) a command that wants its reply is refused |
 | `durability` | `Full` | `Full` or `Normal` (see Storage) |
 | `storage_key` | none | The key everything kept on disk for ships is encrypted under. If none, one is made and kept in the data directory (see Encryption at rest) |
@@ -4140,8 +4644,9 @@ ever. A `max_message_bytes` below
 `cargo test` runs:
 
 - Integration tests in `runtime/tests/runtime.rs`. The first test to need a
-  module runs `cargo build -p kernel -p counter -p tally --release --target
-  wasm32-unknown-unknown --target-dir target/wasm` once per run; the separate
+  module runs `cargo build -p kernel -p counter -p tally -p guestbook -p kit
+  --release --target wasm32-unknown-unknown --target-dir target/wasm` once per
+  run; the separate
   target directory avoids the outer cargo's lock. Hostile modules are written
   inline in WebAssembly text and compiled with the `wat` crate. Each test uses
   its own temporary data directory, and most use `Durability::Normal` to skip
@@ -4956,7 +5461,9 @@ ship's own words, both lengths and fingerprints, the first ship off, both
 messages after it comes back, the question answered, the question to the
 journal refused with the first ship's reason, and the reply on the receipt),
 prints no em dash and no exclamation mark, and leaves none of its programs
-running. The answer step 8 says it was given and the reply it says came back
+running. The guestbook's two steps after the eight make their own checks (the
+signature found by the question, the answer decoded on the first ship), and
+the test sees them only through the walk-through's exit code. The answer step 8 says it was given and the reply it says came back
 are then checked against the first ship's counter, read with the library: the
 reply one more than the answer, and what the counter holds. Each of the four messages it says
 arrived, as entry N of a ship's journal, is then read with the library from
@@ -5036,6 +5543,169 @@ default import limit being at least the ship limit and the seal, and sizes as
 `--max-file-bytes` takes them; in `seal.rs`, a sealed copy being its contents
 and 95 bytes; and in the `serve` binary, every line `said.rs` makes reading
 back as what it was made from.
+
+Describing an agent's interface is tested in `runtime/tests/api.rs`, with the
+guestbook and the kit built as above, and in `runtime/src/api_tests.rs`,
+`sdk-build/src/tests.rs`, `sdk/src/api/tests.rs` and `proto/src/lib.rs`:
+
+- Through the runtime, with protobuf bodies: a command and a question round
+  trip as the owner, by `call_method` and by hand (`deliver_on` with a `Call`);
+  a second interface of the same module found by the interface the call came
+  through. On the question path, a method the interface lacks, a body that does
+  not decode, a command method (one that writes, and the kit's `Echo`, which
+  writes nothing), the log, a payload that is not a `Call`, and an interface
+  not served are each answered with their fault, and the command is not run; on
+  the command path each of those traps (the log and an owner's untyped command
+  too), and nothing is kept. A command that appends to the log and writes the
+  book and a count and then fails keeps none of it (looked at before how the
+  call ended), and one that counts its attempt and fails keeps no count; one
+  that works keeps both its count and its log entry. A question's fault arrives
+  typed, and a handler's code starting with `ship.` arrives as `app.ship...`. A
+  field the input does not know is ignored, in protobuf and in JSON. On one
+  ship, a typed `read` of another instance (its fault passed on as it was) and
+  a typed `send` to it. A typed log: entries taken by a follower, one that does
+  not decode handed over as such with its number and its bytes and the
+  position past it, visits taken from the history; enough signatures for a
+  checkpoint, whose state is compared with the book worked out independently
+  for its entry, the log then trimmed, a late follower handed that state
+  decoded (`Ok`, equal to it, at that entry) and then the entries after it; and
+  the history never given a checkpoint and kept whole. The kit following the
+  counter's log through stubs of an interface it only calls: every entry, and
+  the checkpoint's state, handed over undecoded, compared with the counter's
+  own bytes and numbers.
+- Across two ships, each with its network: a typed `ask::to` whose answer the
+  generated code decodes in the answer handler, a question fault arriving
+  through `Answered`, and a typed `send_to_for_reply` whose receipt the
+  generated code decodes.
+- The description: found once in the release module with `wasmparser`, the
+  served file after its import, its comments kept and every place left with a
+  comment, the same bytes and interfaces as the runtime reads, each method's
+  kind as declared; the kit's import keeping its message and losing its
+  service, so that a manifest of the kit's own interfaces installs. An install
+  refused, naming the rule and installing nothing, for each rule: a section
+  over `max_api_bytes`, two sections, a section that is not a
+  `FileDescriptorSet`, a service whose name does not turn into an interface
+  name, a method streaming from its caller (one way and both), two logs, two
+  services as one interface, and an interface the manifest does not provide;
+  one describing fewer interfaces than the manifest provides installs. Sets the
+  runtime does not resolve, each with one valid service, install at once and
+  describe that service: a method whose types are nowhere, two files importing
+  each other publicly, a package of 5,000 parts, and a map entry with no value.
+  A ship exported from a runtime that took a 300 KiB description and imported
+  into one with the default limit: that agent answered as having no
+  description, the rest of the ship as it was. Inside the crate, an agent given
+  a section that is not a description through the kernel, as an import would
+  leave it: no description, no panic, and the agent still runs. Two description
+  lookups reused one negative cache entry. An ordinary delivery still ran. The cache shows a replaced module's description at
+  once, keeps 32 of 34 modules asked for, lets the least recently used go, and
+  reads one let go again; a module whose stored bytes go missing for a moment
+  is not remembered as having none. A question looked up on the kit and run
+  after the agent was given the guestbook's module (held between the two)
+  answered by the guestbook's dispatch, refusing an interface it lacks.
+- JSON, read and written by the generated code through the door: a signature
+  with every awkward type sent as JSON and as protobuf and read back in both,
+  the JSON compared field by field (64-bit integers as strings, bytes as base64,
+  the enum by name, the nested message, the list, the map, the `oneof` member,
+  the `optional` scalar, defaults written and unset fields with presence left
+  out); a field under its name as written; a field the method does not know
+  ignored; an enum by its number; well-known types as an argument, a result and
+  a field, in both encodings; a method named like a keyword; the kit's typed
+  read of the guestbook through stubs of an interface it only calls, and its
+  fault; and the following JSON cases (the optional `limit` found by omission and by null and not by 0,
+  with one matching signature; a null then a 0 taken as 0, finding none, and
+  repeated unknown keys taken; an enum alias, shown to be declared as one in the
+  description the kit hands out, refused while the first name and the number
+  are read; a declared name `::pbjson::alias` read and written; invalid UTF-8
+  inside an ignored string taken by a command that then runs).
+- The door: the description byte for byte (and the same when JSON is asked
+  for), 404 for an untyped agent (which still takes raw bytes at `/command`)
+  and for an agent not there; every status: a question's fault as 422 in each
+  encoding, a body a question cannot read (a field of the wrong type, malformed
+  JSON, JSON with something after it, protobuf that does not decode) as 400 with
+  `ship.not-understood` and, for JSON, the decoder's line and column, a body a command
+  cannot read as a failed command (422, three failed events in the audit log,
+  nothing kept), a body over the limit (413), 415 for other media types and
+  none, 404 for each thing missing, an invalid name (400), and a command's fault
+  as the command route gives it (422); a hand-written agent whose command
+  answers with a fault after writing (502, and its write read back exactly), and
+  whose questions answer, asked for JSON, UTF-8 that is not JSON (502), a JSON
+  string holding a byte that is not UTF-8 (502), and JSON (200), the second
+  passed on as protobuf; an untyped agent reinstalled, and a typed one installed
+  with its manifest checked, while their stored bytes are away; two hundred
+  services sharing a 10,000-byte package keeping fewer name bytes than the
+  section; an agent whose replies
+  are not `CallReply`s (502); the guestbook's code carrying a description that
+  swaps two methods' kinds, a question answered `ship.wrong-kind` (409) and a
+  command trapped (422); interfaces really named `api`, `command` and `files`
+  answering their own names, on the kit and on agents of those names, encoded
+  slashes and letters, and 405s; an existing ship unsigned, with a wrong token,
+  and a missing ship signed or not giving the same status, body and headers on
+  both routes; and the cross-site rules of the other routes.
+- Inside the crate: the cache's order; a section found once, held to its limit,
+  and refused when it comes twice; and the statuses a question's fault codes
+  give.
+- The generator: each kind of method (a plain method, `IDEMPOTENT`,
+  `NO_SIDE_EFFECTS`, a log with a state and one with `Empty`); each file it
+  refuses, naming what breaks the rule (client streaming, both ways, two logs,
+  two names that do not turn into interface names, two services as one
+  interface, the same two names only called, packages `demo.Two` (only
+  imported) and `demo.two` holding services of different names, a package
+  `demo.serde`, a declared JSON name `a\tb` (a backslash and a `t`), two
+  methods with one Rust name, a proto2 file served and the same file only
+  called, and a file with no package, served, called or imported); a message
+  named as a service's module
+  taken; what it writes: the description holding the served
+  file and its import (without the import's service and the comment on it) and
+  not the file only called, comments kept, the length in `DESCRIPTION`,
+  `SERVED`, a module for each package with prost's code and the JSON forms from
+  directories of their own, the services' modules in `_interfaces`, handlers,
+  checkpoint, dispatch reading JSON and `append` for the served interface and
+  stubs and reading only for the called one. Two small agents built for wasm32
+  outside the workspace: one wiring both of its two interfaces builds without a
+  warning, and one wiring one of them, and one wiring one twice beside the
+  other, do not build, with the macro's message. The rewrite of the JSON code's
+  paths leaves string literals alone, and paths that do not start there
+  (`super::pbjson::Kind`, `mypbjson::x`, `π::pbjson::Kind`).
+  The generated code is compiled, not only read, in the guestbook and the kit:
+  an interface only called, a nested package, packages `type.v1` and
+  `ship_api`, well-known types as an argument, a result and a field, a method
+  named like a Rust keyword, a message `BookApi` (with an `optional` field, and
+  with a nested message) beside a service `Book`, a child package
+  `book_api` beside one. The kit compiles all eighteen supported types as
+  fields and all seventeen message types as RPC inputs and outputs, alongside
+  a custom method option.
+  The well-known types: every supported one, as protoc defines it, taken; a
+  type in a package under `google.protobuf` (`descriptor_proto.ReservedRange`,
+  with a field the SDK's has not), the stock `FeatureSet` as a method's payload
+  and `DescriptorProto` as a nested message's field, refused; an author's
+  `Empty` with a field in package `google.protobuf` refused by its definition;
+  protoc's definitions changed in memory (a field's number, a field's type, an
+  extra field in `Empty`, a member of `Value`'s oneof missing or moved out of
+  it, and the options of `Struct`'s map entry), each refused naming what
+  differs; a file importing `descriptor.proto` to declare and use a custom
+  option written out; and the generator's table of definitions checked
+  against what the SDK's types encode, one field set at a time, each member
+  of `Value`'s oneof included. The stock `FeatureSet` on one side of a method
+  only, each way, refused. A served file of package `google.protobuf` that
+  declares a service refused; a used `Int32Value` defined in a proto2 file
+  refused; an imported proto2 file with a data extension refused for its
+  syntax; an extension of type `DescriptorProto`, at file level and in a
+  message, refused; an extend of an application message (changed in memory,
+  since protoc refuses it in proto3) refused. A served file given through a
+  symbolic link to another file, beside an include that holds a file of the
+  link target's name: the file served is the one protoc names from the path
+  as written, and only its service is served (on Unix). A file given as
+  `api/x.proto` and found by protoc under an include, beside an imported
+  `x.proto` with a service of its own: only the file's own service is served
+  and embedded. An include of `.` beside an absolute path, and a path with
+  `..` in it under an earlier include, both named as protoc names them. A file
+  given alone, with several imports, some nested, is the last file protoc
+  returns. In the table test, the map entry must hold exactly one key and one
+  value.
+- The SDK: a lost, a failed and a replyless receipt told apart, and their words;
+  replies written as protobuf or as JSON and reserved codes rewritten; and the
+  compile-time comparison of served and wired interfaces. And, in
+  `proto/src/lib.rs`, how names turn into interfaces.
 
 The load test (`runtime/src/bin/loadtest.rs`) takes `--ships` (500),
 `--active` (50), `--events` (20,000), `--threads` (8), `--max-awake` (64),
@@ -5575,6 +6245,83 @@ These are stated in the source.
 - Imports of ships of different names may run at once, with no cap on how
   many, each holding about twice its copy in memory for a moment. There is no
   HTTP route for import; a program that calls the runtime decides.
+- A command's fault does not reach its caller in this part. A typed command
+  handler's `Err`, and every refusal the generated code makes on the command
+  path, traps: the event is rolled back and the caller sees a rejection, or a
+  `FAILED` receipt, without the fault's code or message. Only a question's
+  fault comes back.
+- A body the command's decoder refuses produces a failed command without a
+  reason. A generated agent can accept invalid UTF-8 inside the string value of
+  an ignored JSON field. The next part carries a refusal's reason back.
+- A command may already have committed when the door returns 502 for its reply.
+  Retrying it can run the command twice.
+- Generated application messages skip unknown JSON fields.
+  `google.protobuf.Empty` refuses any field. A misspelt field name is not
+  caught: the field is left at its default. For generated application enums,
+  an unknown name or number is refused. For an enum number with aliases, generated JSON
+  uses the first declared name. It accepts that name or the number and refuses
+  later aliases. A value the code does not know cannot be
+  written as JSON (see JSON, as the generated code reads and writes it, for
+  this and the other edges of the tool, which is not made to conform beyond
+  what it does).
+- There is no generated client for phones or the web yet: a device writes the
+  JSON by hand, from the description it can fetch.
+- Log entries over HTTP, and questions to other ships through `/ask/...`, are
+  still raw bytes: the door passes only calls to methods.
+- Nothing checks that a new version of a description is compatible with the
+  old one: a replaced module's description is taken as it is.
+- A ship cannot yet ask another ship which interfaces, or which version of
+  one, it speaks.
+- The runtime does not check that a description's types resolve. The embedded
+  description keeps the standard options represented by `prost-types` 0.14.5.
+  Building it drops custom option values and unrepresented standard options
+  such as `debug_redact`. The runtime uses the standard method idempotency
+  option to select questions and serves the section exactly as the module
+  carries it. A client using a description from a ship it does not trust must
+  guard itself.
+- Concurrent first lookups of the same module can each read and build its
+  description before one result is cached.
+- Each compiled module retains its raw API section, up to `max_api_bytes`,
+  until the runtime exits. The 32-entry limit and `described_modules()` count
+  parsed lookup results, including negative results. A lookup miss rereads the
+  verified blob even when the compiled module is resident.
+- For hand-written descriptions, the runtime accepts an empty method name and
+  uses the last declaration of a repeated method name to select its kind.
+- The generator is a build tool that an agent's author runs on their own proto
+  files. It refuses the layouts listed under its build errors, but it is not
+  hardened against proto files written to mislead it: what it promises is that
+  a set of proto3 files written in the ordinary way gives handlers, calls and
+  JSON that match the description embedded with them.
+- Imported files are embedded whole apart from their services and
+  source-location filtering, so they can contain unused type declarations
+  whose definitions the generator has not checked against the SDK.
+- Agents calling each other are checked by the generated code inside the
+  agent called, not by the runtime, which passes a `Call` on as any payload. An
+  untyped agent called with one is handed the bytes, and a typed stub calling
+  an untyped agent is handed whatever it answers (`CallError::NotUnderstood`
+  when it does not decode).
+- The default kernel permits an owner to call any installed agent. Generated
+  dispatch checks the interface and method. Local agents may also use their
+  own and public interfaces, and remote calls follow the existing manifest and
+  kernel rules.
+- A ship brought in from elsewhere may hold an agent whose description names
+  an interface its manifest does not provide. The door serves it all the same:
+  the owner may call any installed agent, and the generated dispatch decides
+  what exists.
+- The kind of a method is read from the module the agent has when a call is
+  looked up; a module put in its place before the call runs decides the call
+  with its own dispatch (`ship.wrong-kind`, 409, for a question; a trap for a
+  command).
+- A typed agent always has a `checkpoint` export, which answers that there is
+  no state for a history; the runtime may ask it, as it asks any agent with
+  that export.
+- A description is read the first time it is asked for after a start (what a
+  compiled module holds of one is learnt when it is compiled), and nothing of
+  it is kept across a restart.
+- The JSON code makes a typed agent's module larger (the guestbook's is 418,339
+  bytes, where it was 218,746 before it had JSON, and a method and fields
+  fewer), and reading and writing JSON costs the agent's own
+  fuel, time and memory, within the event's limits.
 
 ## License
 

@@ -1,0 +1,10 @@
+// A service `Book` in a package that has a child package `book_api` (parent_child.proto).
+syntax = "proto3";
+
+package kit.parent;
+
+import "parent_child.proto";
+
+service Book {
+  rpc Read(kit.parent.book_api.Page) returns (kit.parent.book_api.Page);
+}

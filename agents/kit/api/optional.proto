@@ -1,0 +1,13 @@
+// A message whose name is a service's module name, with an `optional` field (whose synthetic
+// oneof makes no Rust module), beside that service.
+syntax = "proto3";
+
+package kit.optional;
+
+service Book {
+  rpc Read(BookApi) returns (BookApi);
+}
+
+message BookApi {
+  optional string title = 1;
+}

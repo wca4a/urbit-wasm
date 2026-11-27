@@ -1,0 +1,13 @@
+// The counter's log, described as if its entries were messages. They are text, so none of them
+// decodes as `Text`, and neither does a checkpoint's state.
+syntax = "proto3";
+
+package counterlog;
+
+service Counter {
+  rpc Log(Text) returns (stream Text);
+}
+
+message Text {
+  string line = 1;
+}

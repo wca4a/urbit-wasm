@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package kit.deep.v1;
+
+import "shared.proto";
+
+service Deep {
+  rpc Dig(Hole) returns (shared.Thing);
+}
+
+message Hole {
+  shared.Thing thing = 1;
+  oneof depth {
+    uint32 metres = 2;
+    string word = 3;
+  }
+}

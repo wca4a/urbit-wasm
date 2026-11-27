@@ -1,0 +1,8 @@
+// A package whose last part is the module name of the service `Book` in its parent package.
+syntax = "proto3";
+
+package kit.parent.book_api;
+
+message Page {
+  string text = 1;
+}

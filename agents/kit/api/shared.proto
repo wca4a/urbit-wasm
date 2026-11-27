@@ -1,0 +1,13 @@
+// Imported by the kit for `Thing`. Its service is not the kit's, and is not in the kit's
+// description.
+syntax = "proto3";
+
+package shared;
+
+service Ledger {
+  rpc Add(Thing) returns (Thing);
+}
+
+message Thing {
+  string word = 1;
+}

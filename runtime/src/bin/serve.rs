@@ -163,7 +163,8 @@ const USAGE: &str = "usage: serve --dir <data directory> [--addr 127.0.0.1:8080]
   --ports <first>        start the three programs on six ports counting up from this one, so that
                          their addresses are the same every run; without it each takes any free port
   --file <file>          the file the first ship shares, in place of a made-up one
-  --tally <tally.wasm>   the tally module, for --two-ships";
+  --tally <tally.wasm>   the tally module, for --two-ships. The guestbook module, a typed agent,
+                         is read from beside it, as guestbook.wasm";
 
 fn fail(why: &str) -> ! {
     eprintln!("{why}\n\n{USAGE}");
@@ -526,7 +527,9 @@ fn main() {
         if let Some(other) = given.iter().find(|flag| flag.starts_with("--") && !takes.contains(&flag.as_str()) && !demo_only.contains(&flag.as_str())) {
             fail(&format!("--two-ships starts its own lookup point and ships, and takes only --kernel, --counter, --tally, --file, --ports, --sleep-after, --then-stop and --show-output, not {other}"));
         }
-        let options = two_ships::Options { dir, kernel, counter, tally, then_stop, show_output, ports, file: share, sleep_after };
+        // The typed agent's module is built beside the tally module, and read from there.
+        let guestbook = tally.with_file_name("guestbook.wasm");
+        let options = two_ships::Options { dir, kernel, counter, tally, guestbook, then_stop, show_output, ports, file: share, sleep_after };
         std::process::exit(two_ships::run(options));
     }
     if let Some(flag) = given.iter().find(|flag| demo_only.contains(&flag.as_str())) {

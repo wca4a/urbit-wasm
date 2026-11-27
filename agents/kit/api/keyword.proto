@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package type.v1;
+
+service Keyword {
+  rpc Match(Case) returns (Case);
+}
+
+message Case {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_LOUD = 1;
+  }
+  Kind kind = 1;
+}

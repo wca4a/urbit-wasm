@@ -2,6 +2,7 @@
 //! what may run, and the WASM agents installed on it. A ship handles one event at a time, and
 //! each event is one transaction.
 
+pub mod api;
 mod ask;
 pub mod files;
 mod host;
@@ -318,6 +319,10 @@ pub struct Config {
     /// The largest handler's reply a receipt carries, for a command sent with its reply wanted.
     /// A larger one means the command does not stand: it is undone, and the receipt says LIMIT.
     pub max_receipt_reply_bytes: usize,
+    /// The largest description of its interfaces an agent's module may carry (its `ship.api.v1`
+    /// section, see `api`). An install whose module carries a larger one is refused. Held to
+    /// `api::MOST_API_BYTES` when the runtime opens.
+    pub max_api_bytes: usize,
     pub durability: Durability,
     pub limits: Limits,
     /// The key everything this runtime keeps on disk for its ships is encrypted under: each
@@ -424,6 +429,7 @@ impl Default for Config {
             max_ask_millis: 60_000,
             max_asks_waiting: 256,
             max_receipt_reply_bytes: 16 << 10,
+            max_api_bytes: 256 << 10,
             durability: Durability::Full,
             limits: Limits {
                 max_key_bytes: 1024,
@@ -588,6 +594,10 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub(crate) struct AgentModule {
     pub pre: InstancePre<Ctx>,
+    /// What the module's verified bytes held of a description when it was compiled: its
+    /// `ship.api.v1` section, none, or why the section is unusable (see `api::section`). Kept so
+    /// that installing a module already compiled needs no fresh read of its blob.
+    pub api: Result<Option<Vec<u8>>, String>,
 }
 
 struct Slot {
@@ -632,6 +642,9 @@ pub(crate) struct Inner {
     modules: Mutex<Modules>,
     /// Told whenever a module stops being compiled, for a caller waiting for that compile.
     module_loaded: Condvar,
+    /// Modules' descriptions of their interfaces, built when first asked for (see `api::Cache`).
+    /// Nothing is read or built while this is held.
+    described: Mutex<api::Cache>,
     slots: Mutex<HashMap<String, SlotRef>>,
     /// Ships that are open or being opened. Its size never exceeds `max_awake`.
     ///
@@ -1501,6 +1514,7 @@ impl Runtime {
         cfg.max_receipt_reply_bytes = cfg.max_receipt_reply_bytes.min(store::MOST_RECEIPT_REPLY_BYTES);
         cfg.max_ask_bytes = cfg.max_ask_bytes.min(store::MOST_ASK_BYTES);
         cfg.max_answer_bytes = cfg.max_answer_bytes.min(store::MOST_ANSWER_BYTES);
+        cfg.max_api_bytes = cfg.max_api_bytes.min(api::MOST_API_BYTES);
         let dir_lock = lock_data_dir(data_dir)?;
         // Taken out of the configuration, which is kept and can be read back and printed.
         let check = data_dir.join("storage.check");
@@ -1561,6 +1575,7 @@ impl Runtime {
                 exporting: Mutex::new(HashSet::new()),
                 exporting_done: Condvar::new(),
                 modules: Mutex::new(Modules::default()),
+                described: Mutex::new(api::Cache::default()),
                 module_loaded: Condvar::new(),
                 slots: Mutex::new(HashMap::new()),
                 awake: Mutex::new(HashMap::new()),
@@ -1778,10 +1793,15 @@ impl Runtime {
 
     /// Install an agent, or replace it. The manifest says which interfaces it offers and which
     /// it may use; passing it here is the owner's approval. The ship's kernel has the final say.
+    ///
+    /// A module that describes its interfaces (`api`) is checked first: the description must
+    /// follow the rules, and every interface it describes must be one the manifest provides.
+    /// Otherwise the install is refused with `Error::BadModule`, and nothing changes.
     pub fn install(&self, ship: &str, agent: &str, module_hash: &str, manifest: &Manifest) -> Result<(), Error> {
         check_agent_name(agent)?;
         let module = self.inner.module(module_hash)?;
         require_exports(&module, &["handle"])?;
+        api::check_install(&module.api, manifest)?;
         let install = Install { agent: agent.into(), module: module_hash.into(), manifest: Some(manifest.clone()) };
         let request = AdminRequest { op: Some(Op::Install(install)) };
         self.inner.with_ship(ship, |ship| {
@@ -1801,6 +1821,13 @@ impl Runtime {
     /// A command over the size limit is rejected without running anything, and only its first
     /// bytes are kept in the audit log.
     pub fn deliver(&self, ship: &str, agent: &str, event: &[u8]) -> Result<Outcome, Error> {
+        self.deliver_on(ship, agent, "", event)
+    }
+
+    /// The same as `deliver`, with the owner's command run under `interface` (`deliver` runs it
+    /// under none): the agent sees it in `Invocation.interface`. A typed agent finds the
+    /// interface a call is for there. Everything else is as for `deliver`.
+    pub fn deliver_on(&self, ship: &str, agent: &str, interface: &str, event: &[u8]) -> Result<Outcome, Error> {
         check_agent_name(agent)?;
         let cfg = &self.inner.cfg;
         self.inner.with_ship(ship, |ship| {
@@ -1813,7 +1840,7 @@ impl Runtime {
                 return Err(Error::Rejected(Rejection::Limit(why)));
             }
             let source = Source { owner: true, agent: String::new(), ship: String::new() };
-            let outcome = ship.command(&self.inner, &source, agent, "", event);
+            let outcome = ship.command(&self.inner, &source, agent, interface, event);
             // The owner's command has committed or been rejected: either way it is settled, so
             // a problem while running what is queued must not change what is reported for it.
             // A rejected command queues nothing itself, but the runtime may have queued a
@@ -3191,7 +3218,8 @@ impl Inner {
         if module.get_export("memory").and_then(|export| export.memory().cloned()).is_none() {
             return Err(Error::BadModule("missing exported memory".into()));
         }
-        let compiled = AgentModule { pre: self.linker.instantiate_pre(&module).map_err(bad)? };
+        let api = api::section(wasm, self.cfg.max_api_bytes).map(|found| found.map(<[u8]>::to_vec));
+        let compiled = AgentModule { pre: self.linker.instantiate_pre(&module).map_err(bad)?, api };
         require_exports(&compiled, &["alloc"])?;
         Ok(compiled)
     }

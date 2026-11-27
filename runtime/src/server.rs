@@ -27,6 +27,7 @@ use ship_proto::{
     SignInRequest, Trimmed, UploadReply, UploadRequest,
 };
 
+use crate::api;
 use crate::files::{self, FileError, CHUNK};
 use crate::kept::{Opened, SaveFailed};
 use crate::remote::Failed;
@@ -808,6 +809,14 @@ fn respond_whole<'a>(shared: &'a Shared, request: &mut Request, streamed: &mut O
         ("POST", ["agents", agent, "command"]) => {
             done(runtime.deliver(&ship, agent, &request.body).map(|outcome| Reply::new(200, "application/octet-stream", outcome.reply)))
         }
+        // The JSON door: what the agent describes of its interfaces, and a method called with
+        // JSON or protobuf, which the agent itself reads (see `api`). Its words are data, never a
+        // page.
+        ("GET", ["agents", agent, "api"]) => done(api::door_describe(runtime, &ship, agent).map(door_reply)).with("Content-Security-Policy", FILE_POLICY),
+        ("POST", ["agents", agent, "api", interface, method]) => {
+            let called = api::door_call(runtime, &ship, agent, interface, method, request.header("Content-Type"), &request.body);
+            done(called.map(door_reply)).with("Content-Security-Policy", FILE_POLICY)
+        }
         ("GET", ["files", "from", other, agent, id, rest @ ..]) => {
             match remote_route(shared, &ship, other, agent, id, rest, request.header("Range")) {
                 Ok(Answer::Stream(download)) => {
@@ -862,6 +871,11 @@ fn respond_whole<'a>(shared: &'a Shared, request: &mut Request, streamed: &mut O
         }
         _ => Reply::text(404, "not found"),
     }
+}
+
+/// An answer of the JSON door, as the server sends it.
+fn door_reply(answer: api::Answer) -> Reply {
+    Reply::new(answer.status, answer.kind, answer.body)
 }
 
 /// The threads always left for answering at once: a quarter of them, and at least one.
@@ -1344,6 +1358,8 @@ fn allowed(parts: &[&str]) -> Option<&'static str> {
         ["agents", _, "files", "saves", _] => Some("DELETE"),
         [""] | ["devices"] | ["key"] | ["logs", _, _, "head" | "checkpoint" | "entries"] => Some("GET"),
         ["signout"] | ["devices", _, "revoke"] | ["agents", _, "command"] => Some("POST"),
+        ["agents", _, "api"] => Some("GET"),
+        ["agents", _, "api", _, _] => Some("POST"),
         ["devices", _] => Some("DELETE"),
         ["agents", _, "files"] | ["agents", _, "files", _, "chunks", _] | ["agents", _, "files", _, "content"] => Some("GET"),
         ["agents", _, "files", "uploads"] | ["agents", _, "files", "uploads", _, "finish"] => Some("POST"),

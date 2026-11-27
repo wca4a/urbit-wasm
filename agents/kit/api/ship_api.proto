@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package ship_api;
+
+service Named {
+  rpc Same(Echo) returns (Echo);
+}
+
+message Echo {
+  string text = 1;
+}

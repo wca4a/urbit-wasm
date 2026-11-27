@@ -1,0 +1,63 @@
+// Every well-known type the SDK supplies, used as a field and (each message) as a method's
+// input and output, so that the generated code for each is compiled, not only described; and
+// a custom option declared on descriptor.proto and used. The kit only calls this interface.
+syntax = "proto3";
+
+package kit.wellknown;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/descriptor.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+extend google.protobuf.MethodOptions {
+  string tag = 50000;
+}
+
+message Every {
+  google.protobuf.Empty empty = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  google.protobuf.Duration duration = 3;
+  google.protobuf.Any any = 4;
+  google.protobuf.FieldMask field_mask = 5;
+  google.protobuf.Struct struct = 6;
+  google.protobuf.Value value = 7;
+  google.protobuf.ListValue list_value = 8;
+  google.protobuf.DoubleValue double_value = 9;
+  google.protobuf.FloatValue float_value = 10;
+  google.protobuf.Int64Value int64_value = 11;
+  google.protobuf.UInt64Value uint64_value = 12;
+  google.protobuf.Int32Value int32_value = 13;
+  google.protobuf.UInt32Value uint32_value = 14;
+  google.protobuf.BoolValue bool_value = 15;
+  google.protobuf.StringValue string_value = 16;
+  google.protobuf.BytesValue bytes_value = 17;
+  google.protobuf.NullValue null_value = 18;
+}
+
+service WellKnown {
+  rpc EchoEmpty(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc EchoTimestamp(google.protobuf.Timestamp) returns (google.protobuf.Timestamp);
+  rpc EchoDuration(google.protobuf.Duration) returns (google.protobuf.Duration);
+  rpc EchoAny(google.protobuf.Any) returns (google.protobuf.Any);
+  rpc EchoFieldMask(google.protobuf.FieldMask) returns (google.protobuf.FieldMask);
+  rpc EchoStruct(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc EchoValue(google.protobuf.Value) returns (google.protobuf.Value);
+  rpc EchoListValue(google.protobuf.ListValue) returns (google.protobuf.ListValue);
+  rpc EchoDoubleValue(google.protobuf.DoubleValue) returns (google.protobuf.DoubleValue);
+  rpc EchoFloatValue(google.protobuf.FloatValue) returns (google.protobuf.FloatValue);
+  rpc EchoInt64Value(google.protobuf.Int64Value) returns (google.protobuf.Int64Value);
+  rpc EchoUInt64Value(google.protobuf.UInt64Value) returns (google.protobuf.UInt64Value);
+  rpc EchoInt32Value(google.protobuf.Int32Value) returns (google.protobuf.Int32Value);
+  rpc EchoUInt32Value(google.protobuf.UInt32Value) returns (google.protobuf.UInt32Value);
+  rpc EchoBoolValue(google.protobuf.BoolValue) returns (google.protobuf.BoolValue);
+  rpc EchoStringValue(google.protobuf.StringValue) returns (google.protobuf.StringValue);
+  rpc EchoBytesValue(google.protobuf.BytesValue) returns (google.protobuf.BytesValue);
+  rpc EchoEvery(Every) returns (Every) {
+    option (tag) = "every";
+  }
+}

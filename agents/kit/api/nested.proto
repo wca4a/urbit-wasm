@@ -1,0 +1,16 @@
+// A message whose name is a service's module name, with a nested message (which makes a Rust
+// module of the message's name), beside that service.
+syntax = "proto3";
+
+package kit.nested;
+
+service Book {
+  rpc Read(BookApi) returns (BookApi.Row);
+}
+
+message BookApi {
+  message Row {
+    string word = 1;
+  }
+  Row row = 1;
+}

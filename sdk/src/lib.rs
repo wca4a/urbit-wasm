@@ -3,6 +3,14 @@
 use std::cell::RefCell;
 
 pub use ship_proto as proto;
+/// The Protocol Buffers library, for the message types `ship-sdk-build` generates, so that an
+/// agent with typed interfaces needs no dependency of its own on it.
+pub use ship_proto::prost;
+/// The libraries the generated proto3 JSON code uses, and the well-known types
+/// (`google.protobuf.*`) with their JSON forms, for the same reason.
+pub use {pbjson, pbjson_types, serde, serde_json};
+
+pub mod api;
 use ship_proto::{
     AppendRequest, CheckpointReply, FollowRequest, Invocation, Message, NextReply, NextRequest, ReadRequest, SendRequest,
     ShareRequest,
@@ -484,6 +492,117 @@ macro_rules! agent {
         $crate::export_alloc!();
         $crate::export_fn!("handle", $command);
         $($crate::__export_role!($role, $handler);)*
+    };
+}
+
+/// Include the Rust `ship-sdk-build` generated, as a module named `api` (or the name given): the
+/// message types of every package, the interfaces' modules, `DESCRIPTION` and `SERVED`. The
+/// module is marked `#[allow(dead_code)]`, so that what an agent does not use is not warned
+/// about.
+#[macro_export]
+macro_rules! include_api {
+    () => {
+        $crate::include_api!(api);
+    };
+    ($name:ident) => {
+        #[allow(dead_code)]
+        mod $name {
+            include!(concat!(env!("OUT_DIR"), "/ship_api.rs"));
+        }
+    };
+}
+
+/// Declare an agent whose interfaces are described in proto files (see `api` and
+/// `ship-sdk-build`): the module `include_api!` made, then each interface it serves with the
+/// type that implements that interface's handlers, then any of `notify = f`, `receipt = f`,
+/// `answer = f`, `file_ask = f`, which are as in `agent!`.
+///
+/// ```text
+/// ship_sdk::include_api!();
+/// use api::guestbook::_interfaces::{guestbook_api, visits_api};
+/// ship_sdk::typed_agent!(
+///     api = api,
+///     serve = [guestbook_api::Interface => Keeper, visits_api::Interface => Keeper],
+///     receipt = receipted,
+/// );
+/// ```
+///
+/// The interfaces wired here must be exactly those the description serves (`api::SERVED`):
+/// leaving one out, wiring one twice, or wiring one it does not serve, is a compile error. The
+/// check is of names only.
+///
+/// It exports `alloc`, and `handle`, `read` and `checkpoint` generated from the interfaces:
+/// `handle` runs a command method and `read` a question method, on the interface the call came
+/// through (`invocation().interface`), and `checkpoint` asks the interface whose log is named
+/// for its state. It embeds the description (`api::DESCRIPTION`) in the module as a custom
+/// section named `ship.api.v1`, so that the description travels with the code.
+///
+/// A command or question that reaches the agent through an interface it does not serve here, or
+/// names a method that interface does not have, or is not a `Call` whose body decodes (as
+/// protobuf, or as proto3 JSON when the call says so), is refused with a fault
+/// (`api::NO_SUCH_INTERFACE` and the rest); so is a command method reached as a question, and the
+/// reverse (`api::WRONG_KIND`), which is not run. On the command path a fault traps, a handler's
+/// own `Err` included, so nothing the command did is kept. An owner's command through
+/// `/agents/<agent>/command` comes through no interface, and is refused so.
+///
+/// A typed agent always has a checkpoint export. For a log declared with
+/// `google.protobuf.Empty`, which is a history, and for any name that is not one of its logs,
+/// it answers that there is no state, so the log is kept whole.
+#[macro_export]
+macro_rules! typed_agent {
+    (api = $($api:ident)::+, serve = [$($interface:ty => $handlers:ty),+ $(,)?] $(, $role:ident = $handler:path)* $(,)?) => {
+        $crate::export_alloc!();
+        // The handlers wired here and the description embedded below come from the same files.
+        const _: () = assert!(
+            $crate::api::__same_interfaces($($api)::+::SERVED, &[$(<$interface as $crate::api::Serve<$handlers>>::INTERFACE),+]),
+            "typed_agent!: serve = [...] must wire exactly the interfaces the description serves (api::SERVED)"
+        );
+        const _: () = {
+            // The description travels in the module itself, where the runtime finds it.
+            #[link_section = "ship.api.v1"]
+            #[used]
+            static __SHIP_API: [u8; $($api)::+::DESCRIPTION.len()] = $($api)::+::DESCRIPTION;
+        };
+        const _: () = {
+            #[export_name = "handle"]
+            pub unsafe extern "C" fn __ship_export(ptr: *mut u8, len: u32) -> u64 {
+                $crate::__handle(ptr, len, |payload| $crate::api::__command(payload, &[$((<$interface as $crate::api::Serve<$handlers>>::INTERFACE, (<$interface as $crate::api::Serve<$handlers>>::command as $crate::api::Dispatch, <$interface as $crate::api::Serve<$handlers>>::read as $crate::api::Dispatch))),+]))
+            }
+        };
+        const _: () = {
+            #[export_name = "read"]
+            pub unsafe extern "C" fn __ship_export(ptr: *mut u8, len: u32) -> u64 {
+                $crate::__handle(ptr, len, |payload| $crate::api::__read(payload, &[$((<$interface as $crate::api::Serve<$handlers>>::INTERFACE, (<$interface as $crate::api::Serve<$handlers>>::command as $crate::api::Dispatch, <$interface as $crate::api::Serve<$handlers>>::read as $crate::api::Dispatch))),+]))
+            }
+        };
+        const _: () = {
+            #[export_name = "checkpoint"]
+            pub unsafe extern "C" fn __ship_export(ptr: *mut u8, len: u32) -> u64 {
+                $crate::__handle(ptr, len, |log| $crate::api::__checkpoint(log, &[$((<$interface as $crate::api::Serve<$handlers>>::INTERFACE, <$interface as $crate::api::Serve<$handlers>>::checkpoint as fn() -> Option<Vec<u8>>)),+]))
+            }
+        };
+        $($crate::__typed_role!($role, $handler);)*
+    };
+}
+
+/// The roles a typed agent may still name: the rest are generated.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __typed_role {
+    (notify, $handler:path) => {
+        $crate::__export_role!(notify, $handler);
+    };
+    (receipt, $handler:path) => {
+        $crate::__export_role!(receipt, $handler);
+    };
+    (answer, $handler:path) => {
+        $crate::__export_role!(answer, $handler);
+    };
+    (file_ask, $handler:path) => {
+        $crate::__export_role!(file_ask, $handler);
+    };
+    ($role:ident, $handler:path) => {
+        compile_error!(concat!("typed_agent! makes `", stringify!($role), "` from the description; it takes only notify, receipt, answer and file_ask"));
     };
 }
 

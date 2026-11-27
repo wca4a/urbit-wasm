@@ -3,7 +3,8 @@
 //! over HTTP, the way an app would. It shows the two ships finding each other by name, trading
 //! messages, one opening a file the other holds once it is allowed to, opening it again with the
 //! other ship off, and the two finding each other again after that ship comes back at a new
-//! address.
+//! address. Then two steps more with the guestbook, a typed agent: its owner's device calls it
+//! with JSON, and it puts a typed question to the guestbook on the other ship.
 //!
 //! Everything it prints is for someone who is not a developer. The words it reads back from
 //! the programs it starts are in `said`, beside the code in `serve` that prints them.
@@ -39,8 +40,12 @@ const LIMIT: Duration = Duration::from_secs(60);
 /// can sign out the ones an earlier run left.
 const DEVICE_LABEL: &str = "two-ships walk-through";
 
-/// How many steps the walk-through has.
+/// How many steps the walk-through has, before the guestbook's.
 const STEPS: usize = 8;
+
+/// How many steps with the guestbook come after those, numbered on their own so that the steps
+/// before them read as they always have.
+const GUESTBOOK_STEPS: usize = 2;
 
 /// How many lines each program's output keeps, to show when a step fails.
 const KEPT_LINES: usize = 2000;
@@ -54,6 +59,8 @@ pub struct Options {
     pub kernel: PathBuf,
     pub counter: PathBuf,
     pub tally: PathBuf,
+    /// The guestbook, a typed agent: by default beside the tally module.
+    pub guestbook: PathBuf,
     pub then_stop: bool,
     pub show_output: bool,
     pub ports: Option<u16>,
@@ -495,6 +502,44 @@ impl Device {
         said.or_else(|why| failed(format!("{} could not be asked to put the question: {why}", self.ship)))
     }
 
+    /// Call a method of one of the ship's typed agents through its JSON door, as the owner, with
+    /// `json` as the body: the answer's status, its media type as it said it, and its words.
+    fn call_json(&self, agent: &str, interface: &str, method: &str, json: &str) -> Done<(u16, String, String)> {
+        let request = self.limit(self.agent.post(&format!("{}/agents/{agent}/api/{interface}/{method}", self.base)))?;
+        let answer = request.set("Authorization", &self.auth()).set("Content-Type", "application/json").send_bytes(json.as_bytes());
+        let said = match answer {
+            Ok(answer) => {
+                let (status, kind) = (answer.status(), answer.header("Content-Type").unwrap_or_default().to_string());
+                let mut body = Vec::new();
+                answer.into_reader().take(1 << 20).read_to_end(&mut body).map(|_| (status, kind, String::from_utf8_lossy(&body).into_owned())).map_err(|e| e.to_string())
+            }
+            Err(ureq::Error::Status(status, answer)) => {
+                let kind = answer.header("Content-Type").unwrap_or_default().to_string();
+                Ok((status, kind, answer.into_string().unwrap_or_default()))
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        if STOPPING.load(Ordering::SeqCst) {
+            return Err(Stop::Interrupted);
+        }
+        said.or_else(|why| failed(format!("{}'s {agent} could not be called: {why}", self.ship)))
+    }
+
+    /// The same, saying what was sent and what came back, and failing unless it was answered
+    /// 200 with JSON, as the door answers a reply.
+    fn show_json(&self, agent: &str, interface: &str, method: &str, json: &str) -> Done<serde_json::Value> {
+        println!("  Sent to {} as POST /agents/{agent}/api/{interface}/{method}:", self.ship);
+        println!("    {json}");
+        let (status, kind, words) = self.call_json(agent, interface, method, json)?;
+        if status != 200 || kind != "application/json" {
+            return failed(format!("{}'s {agent} answered {method} with {status} ({kind}), {}", self.ship, words.trim()));
+        }
+        let value = serde_json::from_str(&words).or_else(|e| failed(format!("{}'s {agent} answered {method} with something that is not JSON: {e}", self.ship)))?;
+        println!("  Its answer ({status}, {kind}):");
+        println!("    {words}");
+        Ok(value)
+    }
+
     /// Sign this device out, so that runs do not pile up devices on the ship. Ctrl-C is looked
     /// at before (by `limit`) and not after: its answer is not used, it is the last request made
     /// with this device, and nothing that follows it would be skipped for a stop.
@@ -578,6 +623,15 @@ fn tally_manifest(other: &str) -> Manifest {
     }
 }
 
+/// The guestbook agent, as `book`: its two interfaces, `guestbook` open to other ships'
+/// commands and questions, and leave to send to and ask the guestbook on `other`.
+fn book_manifest(other: &str) -> Manifest {
+    Manifest {
+        provides: vec![Provide { interface: "guestbook".into(), public: false, remote: true, asked: true }, Provide { interface: "visits".into(), public: false, remote: false, asked: false }],
+        uses: vec![Use { ship: bare(other).into(), agent: "book".into(), interface: "guestbook".into(), read: false, send: true, ask: true }],
+    }
+}
+
 /// Make a ship in its own data directory, or find the one an earlier run made, and make sure it
 /// has the counter and tally agents with the manifests above. Returns its key and a new access
 /// code. The runtime is closed again before this returns, since a data directory is opened by
@@ -606,6 +660,14 @@ fn prepare(dir: &Path, ship: &str, other: &str, modules: &[Vec<u8>; 3]) -> Resul
     Ok((key, code, made))
 }
 
+/// Give a ship made by `prepare` the guestbook agent too, as `book`, before its program starts.
+/// The runtime is closed again before this returns, as there.
+fn give_guestbook(dir: &Path, ship: &str, other: &str, module: &[u8]) -> Result<(), String> {
+    let runtime = Runtime::open(dir, Config::default()).map_err(|e| format!("cannot open {}: {e}", dir.display()))?;
+    let guestbook = runtime.add_module(module).map_err(|e| format!("the guestbook module does not load: {e}"))?;
+    runtime.install(ship, "book", &guestbook, &book_manifest(other)).map_err(|e| format!("cannot install the guestbook agent on {ship}: {e}"))
+}
+
 /// Run the walk-through. Returns the exit code: 0 when every step worked, 1 when one did not,
 /// 130 when stopped by Ctrl-C part way.
 pub fn run(options: Options) -> i32 {
@@ -629,14 +691,16 @@ pub fn run(options: Options) -> i32 {
                 Stop::Failed(_) => 1,
                 Stop::Interrupted => 130,
             };
+            // The guestbook's steps are numbered on their own, after the others.
+            let which = if step > STEPS { format!("guestbook step {} of {GUESTBOOK_STEPS}", step - STEPS) } else { format!("step {step} of {STEPS}") };
             match stop {
                 Stop::Failed(why) => {
                     println!();
-                    println!("Step {step} of {STEPS} did not work: {why}.");
+                    println!("{} did not work: {why}.", capitalised(&which));
                 }
                 Stop::Interrupted => {
                     println!();
-                    println!("Stopped part way through step {step} of {STEPS}, as asked.");
+                    println!("Stopped part way through {which}, as asked.");
                 }
             }
             if let Some(programs) = &programs {
@@ -661,7 +725,16 @@ pub fn run(options: Options) -> i32 {
 fn begin(step: &mut usize, what: &str) {
     *step += 1;
     println!();
-    println!("Step {step} of {STEPS}: {what}");
+    if *step > STEPS {
+        println!("Guestbook step {} of {GUESTBOOK_STEPS}: {what}", *step - STEPS);
+    } else {
+        println!("Step {step} of {STEPS}: {what}");
+    }
+}
+
+fn capitalised(words: &str) -> String {
+    let mut chars = words.chars();
+    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
 /// The file in a walk-through's directory that says it is one: a directory that holds other
@@ -791,6 +864,7 @@ fn walk(options: &Options, step: &mut usize, lock: &mut Option<fs::File>, held: 
     }
     // Everything given is looked at before anything is made or started.
     let modules = [module(&options.kernel)?, module(&options.counter)?, module(&options.tally)?];
+    let guestbook = module(&options.guestbook)?;
     let shared = options.file.as_ref().map(|path| regular(path, "the file to share")).transpose()?;
     let (dir, taken) = take_directory(&options.dir)?;
     *lock = Some(taken);
@@ -805,6 +879,9 @@ fn walk(options: &Options, step: &mut usize, lock: &mut Option<fs::File>, held: 
         }
         let (key, code, made) = prepare(&dir.join(bare(ship)), ship, other, &modules).or_else(failed)?;
         println!("  {ship}: {}, in {}.", if made { "made, with two agents" } else { "already here from an earlier run, and reused" }, dir.join(bare(ship)).display());
+        // Said when its steps come: the ship is given the guestbook now, while no program has
+        // its directory.
+        give_guestbook(&dir.join(bare(ship)), ship, other, &guestbook).or_else(failed)?;
         keys.push(pretend::line(ship, &key));
         codes.push(code);
     }
@@ -1052,6 +1129,60 @@ fn walk(options: &Options, step: &mut usize, lock: &mut Option<fs::File>, held: 
         return failed(format!("the reply that came with the receipt is \"{reply}\", and {expected} was expected"));
     }
     println!("  The receipt came back after {}, saying the command ran, with its reply: \"{reply}\".", seconds(started.elapsed()));
+
+    println!();
+    println!("Two steps more, with the guestbook: an agent whose interfaces are written down once, in a");
+    println!("proto file. The proto file defines the handler signatures, the typed calls, and how the");
+    println!("guestbook reads and writes JSON. Each ship was given it in step 1, after its two agents and before it");
+    println!("started, under the name \"book\".");
+    begin(step, &format!("{FIRST}'s owner calls the guestbook on {FIRST} through its JSON door."));
+    first_device.until(Instant::now() + LIMIT);
+    let name = format!("a visitor from {SECOND} (run {word})");
+    let signed = first_device.show_json("book", "guestbook", "Sign", &format!(r#"{{"signature": {{"name": "{name}", "mood": "MOOD_HAPPY", "tags": ["walk-through"], "signedAt": "{}"}}}}"#, now_millis()))?;
+    let Some(number) = signed["number"].as_str().and_then(|number| number.parse::<u64>().ok()) else {
+        return failed(format!("the guestbook on {FIRST} answered Sign without a signature's number: {signed}"));
+    };
+    println!("  That is a command: the signature is number {number}, kept by {FIRST}.");
+    let page = first_device.show_json("book", "guestbook", "Lookup", &format!(r#"{{"prefix": "{name}", "limit": 1}}"#))?;
+    if page["signatures"][0]["number"].as_str() != Some(number.to_string().as_str()) || page["signatures"][0]["name"].as_str() != Some(name.as_str()) {
+        return failed(format!("the guestbook on {FIRST} was asked for the signature just made, and answered {page}"));
+    }
+    println!("  That is a question: it only reads, and found the signature just made.");
+
+    begin(step, &format!("the guestbook on {FIRST} puts a typed question to the guestbook on {SECOND}."));
+    second_device.until(Instant::now() + LIMIT);
+    let theirs = format!("kept on {SECOND} (run {word})");
+    let (status, kind, words) = second_device.call_json("book", "guestbook", "Sign", &format!(r#"{{"signature": {{"name": "{theirs}"}}}}"#))?;
+    let theirs_number = serde_json::from_str::<serde_json::Value>(&words).ok().and_then(|signed| signed["number"].as_str().and_then(|number| number.parse::<u64>().ok()));
+    let (200, "application/json", Some(theirs_number)) = (status, kind.as_str(), theirs_number) else {
+        return failed(format!("the guestbook on {SECOND} would not take a signature: it answered {status} ({kind}), {}", words.trim()));
+    };
+    println!("  The owner of {SECOND} signs the guestbook there: signature number {theirs_number}.");
+    println!("  The owner of {FIRST} has its guestbook ask {SECOND}'s for it, with a call generated from the proto file:");
+    let started = Instant::now();
+    first_device.until(started + LIMIT);
+    let fetching = first_device.show_json("book", "guestbook", "Fetch", &format!(r#"{{"ship": "{}", "agent": "book", "number": {theirs_number}}}"#, bare(SECOND)))?;
+    let Some(question) = fetching["question"].as_str().filter(|question| question.parse::<u64>().is_ok_and(|n| n > 0)).map(str::to_string) else {
+        return failed(format!("the guestbook on {FIRST} would not put the question: it answered {fetching}"));
+    };
+    let line = loop {
+        let (status, kind, words) = first_device.call_json("book", "guestbook", "Report", "{}")?;
+        let report: serde_json::Value = serde_json::from_str(&words).unwrap_or_default();
+        let found = report["answers"].as_array().and_then(|answers| answers.iter().filter_map(|line| line.as_str()).find(|line| line.split(' ').next() == Some(question.as_str())).map(str::to_string));
+        if let (200, "application/json", Some(line)) = (status, kind.as_str(), found) {
+            break line;
+        }
+        if started.elapsed() > LIMIT {
+            return failed(format!("waited {} seconds for the answer to question {question}, and it did not come", LIMIT.as_secs()));
+        }
+        pause()?;
+    };
+    let expected = format!("{question} signature {theirs_number} by {theirs}");
+    if line != expected {
+        return failed(format!("the answer to question {question} was \"{line}\", and \"{expected}\" was expected"));
+    }
+    println!("  The answer came after {}, decoded by the guestbook on {FIRST} as the description says:", seconds(started.elapsed()));
+    println!("    \"{line}\"");
     first_device.sign_out();
     second_device.sign_out();
 
@@ -1069,6 +1200,8 @@ fn walk(options: &Options, step: &mut usize, lock: &mut Option<fs::File>, held: 
     }
     println!("  {SECOND}'s owner asked {FIRST} a question and was answered; one to an interface not");
     println!("  open to questions was refused; and a command brought its reply back with its receipt.");
+    println!("  The guestbook, whose interfaces are written down once in a proto file, was called with JSON");
+    println!("  on {FIRST}, and put a typed question to the guestbook on {SECOND}, whose answer it decoded.");
     println!("What it does not show: these are three programs on one machine, talking over this");
     println!("machine's own loopback address. It does not show two machines, a real home router,");
     println!("the relay carrying anything (nothing on one machine needs it), or real Urbit ID.");
@@ -1132,6 +1265,11 @@ fn pause() -> Done<()> {
         return Err(Stop::Interrupted);
     }
     Ok(())
+}
+
+/// The time now, in milliseconds since 1970.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
 }
 
 /// The address a device reaches its ship at, as `host:port`.

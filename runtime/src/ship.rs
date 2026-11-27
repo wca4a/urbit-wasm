@@ -1740,6 +1740,24 @@ impl Ship {
         }
     }
 
+    /// The content hash of the module an agent runs, as the kernel names it when it routes a
+    /// command from the owner to it: `None` if no agent of that name is installed. Nothing is
+    /// changed, and nothing is run but the kernel's decision.
+    pub fn module_of(&mut self, rt: &Arc<Inner>, agent: &str) -> Result<Option<String>, Error> {
+        self.begin("BEGIN")?;
+        let env = self.env(rt);
+        let source = Source { owner: true, agent: String::new(), ship: String::new() };
+        let routed = route(&env, &source, agent, Kind::Command, "");
+        self.rollback();
+        match routed {
+            Ok((_, reply)) => Ok(Some(reply.module)),
+            Err(e) => match classify(&e) {
+                Rejection::Denied(_) => Ok(None),
+                other => Err(Error::Rejected(other)),
+            },
+        }
+    }
+
     /// The content hashes of the modules this ship's agents run, as its kernel reports them.
     pub fn modules(&mut self, rt: &Arc<Inner>) -> Result<Vec<String>, Error> {
         let request = AdminRequest { op: Some(Op::ListModules(true)) };

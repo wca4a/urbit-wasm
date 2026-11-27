@@ -1,8 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["runtime", "urbit-id", "proto", "sdk", "kernel", "agents/counter", "agents/tally"]
-# The SDK, kernel, and agents only link for wasm32, so plain `cargo build` / `cargo test` cover the runtime.
-default-members = ["runtime", "urbit-id"]
+members = ["runtime", "urbit-id", "proto", "sdk", "sdk-build", "kernel", "agents/counter", "agents/tally", "agents/guestbook", "agents/kit"]
+# The kernel and agents only link for wasm32, so plain `cargo build` / `cargo test` cover the
+# runtime, the message types, the code generator, and the SDK, whose parts that call no host
+# function are tested on the machine doing the build.
+default-members = ["runtime", "urbit-id", "proto", "sdk", "sdk-build"]
 
 [workspace.package]
 edition = "2021"

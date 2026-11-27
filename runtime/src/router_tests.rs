@@ -235,7 +235,7 @@ pub(crate) fn wasm(name: &str) -> Vec<u8> {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let status = Command::new(cargo)
             .current_dir(workspace())
-            .args(["build", "-p", "kernel", "-p", "counter", "-p", "tally", "--release"])
+            .args(["build", "-p", "kernel", "-p", "counter", "-p", "tally", "-p", "guestbook", "-p", "kit", "--release"])
             .args(["--target", "wasm32-unknown-unknown", "--target-dir", "target/wasm"])
             .status()
             .expect("run cargo");

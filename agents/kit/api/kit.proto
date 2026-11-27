@@ -1,0 +1,97 @@
+// The kit: a typed agent for the tests, whose interfaces are the awkward cases.
+syntax = "proto3";
+
+package kit;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+import "shared.proto";
+
+// Three interfaces whose names are also words in the HTTP server's paths. Each says its name.
+service Api {
+  rpc Which(google.protobuf.Empty) returns (Name) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}
+
+service Command {
+  rpc Which(google.protobuf.Empty) returns (Name) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}
+
+service Files {
+  rpc Which(google.protobuf.Empty) returns (Name) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}
+
+// Well-known types, a method named like a Rust keyword, a command that changes nothing, and
+// calls through interfaces the kit only calls.
+service Kit {
+  // A command that writes nothing and answers with what it was given.
+  rpc Echo(Name) returns (Name);
+  // A timestamp in, and a message holding a timestamp and a wrapper out.
+  rpc Clock(google.protobuf.Timestamp) returns (Stamped) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // A wrapper in and out: the flag turned over.
+  rpc Flag(google.protobuf.BoolValue) returns (google.protobuf.BoolValue) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // A method whose Rust name is a keyword.
+  rpc Type(Name) returns (Name) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // The name on a signature in a guestbook on this ship, read through the guestbook's stubs.
+  rpc Borrow(BorrowRequest) returns (shared.Thing) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // Follow the counter's log, whose entries the kit's description of it cannot decode.
+  rpc FollowCounter(google.protobuf.Empty) returns (google.protobuf.Empty);
+  // What was taken from the counter's log.
+  rpc Taken(google.protobuf.Empty) returns (Haul) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}
+
+message Name {
+  string name = 1;
+  // A field whose JSON name is declared, not made from its own.
+  string nickname = 2 [json_name = "alias"];
+  repeated uint64 counts = 3;
+  Level level = 4;
+  // A declared JSON name that looks like a Rust path, which the generated code must not touch.
+  string odd = 5 [json_name = "::pbjson::alias"];
+}
+
+// LEVEL_TOP is an alias of LEVEL_HIGH, which the generated JSON code does not take.
+enum Level {
+  option allow_alias = true;
+  LEVEL_UNSPECIFIED = 0;
+  LEVEL_HIGH = 1;
+  LEVEL_TOP = 1;
+}
+
+message Stamped {
+  google.protobuf.Timestamp at = 1;
+  google.protobuf.Int64Value millis = 2;
+}
+
+message BorrowRequest {
+  string agent = 1;
+  uint64 number = 2;
+}
+
+message Haul {
+  // Each entry that did not decode: its number and its bytes, in order.
+  repeated uint64 seqs = 1;
+  repeated bytes payloads = 2;
+  // Entries that decoded.
+  uint64 decoded = 3;
+  // A checkpoint whose state did not decode: the entry it stands for, and its bytes.
+  uint64 checkpoint_seq = 4;
+  bytes checkpoint_bytes = 5;
+  uint64 checkpoints_decoded = 6;
+}
