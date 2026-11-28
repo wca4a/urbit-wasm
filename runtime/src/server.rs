@@ -693,6 +693,10 @@ fn failure(error: Error) -> Reply {
         }
         Error::Rejected(rejection) => {
             let why = match rejection {
+                // A command its agent turned down on purpose: the agent's fault, encoded, which a
+                // client tells from every other rejection by its content type (those are plain
+                // text).
+                Rejection::Refused(fault) => return Reply::proto(422, &fault),
                 Rejection::OutOfFuel => "the command used up its compute budget".to_string(),
                 Rejection::Timeout => "the command ran too long".to_string(),
                 Rejection::Denied(why) => format!("not permitted: {why}"),

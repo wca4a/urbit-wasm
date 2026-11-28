@@ -153,10 +153,11 @@ message SendRequest {
   // receipt can say RAN with `Receipt.replied` unset when the other ship's runtime predates
   // replies, or when it broke the protocol (a reply over the bound the command was sent with,
   // or a reply not marked): the command is still reported as run, because the other ship said
-  // so; no reply is handed on; and when a reply came and was let go, the reason says so. An
-  // agent that needs the reply checks `Receipt.replied`. This holds while neither ship makes
-  // its message, inbox or reply limits smaller while the command or its receipt is
-  // outstanding.
+  // so; no reply is handed on. A reply that breaks the protocol is discarded. If a fault also
+  // arrived, the reason describes what happened to the fault. Otherwise it identifies the
+  // discarded reply. An agent that needs the reply checks `Receipt.replied`. This holds while
+  // neither ship makes its message, inbox or reply limits smaller while the command or its
+  // receipt is outstanding.
   // A ship that takes back no reply at all (its largest is 0) refuses to send such a
   // command, since 0 in `PeerMessage.reply_most` means no reply is wanted.
   bool reply = 5;
@@ -668,7 +669,8 @@ enum Verdict {
   // other ships. `reason` says which.
   VERDICT_DENIED = 2;
   // It was allowed but the agent's handler failed: it crashed, or ran out of fuel or time.
-  // Nothing it did was kept. The details stay in that ship's own audit log.
+  // Nothing it did was kept. The details stay in that ship's own audit log. (An agent that
+  // turns a command down on purpose says so with VERDICT_REFUSED instead.)
   VERDICT_FAILED = 3;
   // It ran into one of that ship's limits, such as a full log. `reason` says which.
   VERDICT_LIMIT = 4;
@@ -679,14 +681,17 @@ enum Verdict {
   // command may have run. This is made up by the sender's own ship when the two ships
   // find that their accounts of what has passed between them no longer agree.
   VERDICT_LOST = 6;
+  // It was allowed, and the agent turned it down on purpose. Nothing it did was kept. `fault`
+  // says why.
+  VERDICT_REFUSED = 7;
 }
 
 message Receipt {
   // The number of the command this is about: the one `send_to` returned to the sender.
   uint64 about = 1;
   Verdict verdict = 2;
-  // A few words on why, for a command that did not run, or for one that RAN whose reply came
-  // and was let go (see `replied`). For reading, not for parsing.
+  // Human-readable words about the verdict or a discarded fault or reply. If a fault and a reply
+  // both arrive, the reason describes what happened to the fault. For reading, not for parsing.
   string reason = 3;
   // Where the command was sent. Filled in by the sender's own runtime from its record of
   // the command when it hands the receipt to the agent. Empty on the wire.
@@ -702,11 +707,17 @@ message Receipt {
   // receipt can say RAN with `Receipt.replied` unset when the other ship's runtime predates
   // replies, or when it broke the protocol (a reply over the bound the command was sent with,
   // or a reply not marked): the command is still reported as run, because the other ship said
-  // so; no reply is handed on; and when a reply came and was let go, the reason says so. An
-  // agent that needs the reply checks `Receipt.replied`. This holds while neither ship makes
-  // its message, inbox or reply limits smaller while the command or its receipt is
-  // outstanding.
+  // so; no reply is handed on. A reply that breaks the protocol is discarded. If a fault also
+  // arrived, the reason describes what happened to the fault. Otherwise it identifies the
+  // discarded reply. An agent that needs the reply checks `Receipt.replied`. This holds while
+  // neither ship makes its message, inbox or reply limits smaller while the command or its
+  // receipt is outstanding.
   bool replied = 8;
+  // Why the agent turned the command down. Set only with VERDICT_REFUSED. With
+  // VERDICT_REFUSED, the sender takes a fault whose code is 1 to 64 bytes in 0x21 through 0x7e
+  // and whose message is at most 200 bytes, replacing each message control character with a
+  // space. It discards the fault for any other verdict, an invalid code or an overlong message.
+  Fault fault = 9;
 }
 
 // Some messages, in order of their numbers.
@@ -1037,9 +1048,13 @@ message Call {
   bool json = 3;
 }
 
-// Why a typed call has no result. Codes starting with "ship." are made by the generated code
-// (ship.no-such-interface, ship.no-such-method, ship.not-understood, ship.wrong-kind); any other
-// code is the application's own.
+// Why a typed call has no result. Generated dispatch uses `ship.` codes for dispatch faults
+// (ship.no-such-interface, ship.no-such-method, ship.not-understood, ship.wrong-kind) and
+// prefixes a handler's returned `ship.` code with `app.`. A direct `host.refuse` call supplies
+// its own valid code. A question's fault comes back in its `CallReply`. Generated dispatch
+// passes a returned command fault to `refuse` (`host.refuse`). An accepted refusal rolls back
+// the handler's changes and carries the fault in the owner's result or in a receipt sent to
+// another ship (`Receipt.fault`). An invalid code produces an ordinary failure.
 message Fault {
   string code = 1;
   string message = 2;
@@ -1047,6 +1062,8 @@ message Fault {
 
 // What a typed call hands back: the reply bytes of a typed command or question. `body` is the
 // method's output message, encoded, or written as proto3 JSON when the call asked for that.
+// `fault` is a question's fault. A command's fault is not put here: the command refuses
+// instead, so that nothing it did is kept (see `Fault`).
 message CallReply {
   oneof result {
     bytes body = 1;

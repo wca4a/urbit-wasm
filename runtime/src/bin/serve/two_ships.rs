@@ -4,7 +4,9 @@
 //! messages, one opening a file the other holds once it is allowed to, opening it again with the
 //! other ship off, and the two finding each other again after that ship comes back at a new
 //! address. Then two steps more with the guestbook, a typed agent: its owner's device calls it
-//! with JSON, and it puts a typed question to the guestbook on the other ship.
+//! with JSON, and it puts a typed question to the guestbook on the other ship. In each, a command
+//! is turned down on purpose, and its reason comes back: at the JSON door, and on a receipt from
+//! the other ship.
 //!
 //! Everything it prints is for someone who is not a developer. The words it reads back from
 //! the programs it starts are in `said`, beside the code in `serve` that prints them.
@@ -523,6 +525,32 @@ impl Device {
             return Err(Stop::Interrupted);
         }
         said.or_else(|why| failed(format!("{}'s {agent} could not be called: {why}", self.ship)))
+    }
+
+    /// The same, saying what was sent and what came back, and failing unless it was answered
+    /// with `status` and a fault as JSON with `code`, as the door answers a refused command.
+    fn show_fault(&self, agent: &str, interface: &str, method: &str, json: &str, status: u16, code: &str) -> Done<serde_json::Value> {
+        println!("  Sent to {} as POST /agents/{agent}/api/{interface}/{method}:", self.ship);
+        println!("    {json}");
+        let (got, kind, words) = self.call_json(agent, interface, method, json)?;
+        let value: serde_json::Value = serde_json::from_str(&words).unwrap_or_default();
+        if got != status || kind != "application/json" || value["code"].as_str() != Some(code) {
+            return failed(format!("{}'s {agent} was expected to refuse {method} with {status} and the code {code}, and answered {got} ({kind}), {}", self.ship, words.trim()));
+        }
+        println!("  Its answer ({got}, {kind}):");
+        println!("    {words}");
+        Ok(value)
+    }
+
+    /// How many signatures the guestbook `agent` holds, by asking it (a question, which keeps
+    /// nothing).
+    fn signatures(&self, agent: &str) -> Done<u64> {
+        let (status, kind, words) = self.call_json(agent, "guestbook", "Lookup", r#"{"prefix": "", "limit": 0}"#)?;
+        let total = serde_json::from_str::<serde_json::Value>(&words).ok().and_then(|page| page["total"].as_str().and_then(|total| total.parse::<u64>().ok()));
+        match (status, kind.as_str(), total) {
+            (200, "application/json", Some(total)) => Ok(total),
+            _ => failed(format!("{}'s {agent} would not say how many signatures it holds: it answered {status} ({kind}), {}", self.ship, words.trim())),
+        }
     }
 
     /// The same, saying what was sent and what came back, and failing unless it was answered
@@ -1148,6 +1176,21 @@ fn walk(options: &Options, step: &mut usize, lock: &mut Option<fs::File>, held: 
         return failed(format!("the guestbook on {FIRST} was asked for the signature just made, and answered {page}"));
     }
     println!("  That is a question: it only reads, and found the signature just made.");
+    println!("  A command can also turn a call down on purpose, and say why. Signing with no name:");
+    let kept = first_device.signatures("book")?;
+    let unchanged = |what: &str| -> Done<()> {
+        let after = first_device.signatures("book")?;
+        if after != kept {
+            return failed(format!("the guestbook on {FIRST} held {kept} signatures before {what} and {after} after it, and nothing of {what} was to be kept"));
+        }
+        Ok(())
+    };
+    first_device.show_fault("book", "guestbook", "Sign", r#"{"signature": {"name": ""}}"#, 422, "no-name")?;
+    unchanged("the nameless Sign")?;
+    println!("  Spoil writes a placeholder signature into the book, and then turns itself down:");
+    first_device.show_fault("book", "guestbook", "Spoil", "{}", 422, "spoilt")?;
+    unchanged("Spoil")?;
+    println!("  The book still holds {}: nothing a refused command did was kept.", signatures(kept));
 
     begin(step, &format!("the guestbook on {FIRST} puts a typed question to the guestbook on {SECOND}."));
     second_device.until(Instant::now() + LIMIT);
@@ -1183,6 +1226,39 @@ fn walk(options: &Options, step: &mut usize, lock: &mut Option<fs::File>, held: 
     }
     println!("  The answer came after {}, decoded by the guestbook on {FIRST} as the description says:", seconds(started.elapsed()));
     println!("    \"{line}\"");
+    println!("  Then the owner of {FIRST} has its guestbook pass its own signature {number} to {SECOND}'s, as a command,");
+    println!("  with the name left off, which {SECOND}'s guestbook turns down:");
+    let theirs_held = second_device.signatures("book")?;
+    let started = Instant::now();
+    first_device.until(started + LIMIT);
+    second_device.until(started + LIMIT);
+    let passing = first_device.show_json("book", "guestbook", "Pass", &format!(r#"{{"number": {number}, "ship": "{}", "agent": "book", "nameless": true}}"#, bare(SECOND)))?;
+    let Some(sent_as) = passing["sentAs"].as_str().filter(|sent_as| sent_as.parse::<u64>().is_ok_and(|n| n > 0)).map(str::to_string) else {
+        return failed(format!("the guestbook on {FIRST} would not pass the signature: it answered {passing}"));
+    };
+    let line = loop {
+        let (status, kind, words) = first_device.call_json("book", "guestbook", "Report", "{}")?;
+        let report: serde_json::Value = serde_json::from_str(&words).unwrap_or_default();
+        let found = report["receipts"].as_array().and_then(|receipts| receipts.iter().filter_map(|line| line.as_str()).find(|line| line.split(' ').next() == Some(sent_as.as_str())).map(str::to_string));
+        if let (200, "application/json", Some(line)) = (status, kind.as_str(), found) {
+            break line;
+        }
+        if started.elapsed() > LIMIT {
+            return failed(format!("waited {} seconds for the receipt of command {sent_as}, and it did not come", LIMIT.as_secs()));
+        }
+        pause()?;
+    };
+    let expected = format!("{sent_as} no-name: a signature needs a name");
+    if line != expected {
+        return failed(format!("the receipt of command {sent_as} said \"{line}\", and \"{expected}\" was expected"));
+    }
+    println!("  The receipt came back after {}, carrying the reason {SECOND}'s guestbook gave, as {FIRST}'s guestbook read it:", seconds(started.elapsed()));
+    println!("    \"{line}\"");
+    let theirs_after = second_device.signatures("book")?;
+    if theirs_after != theirs_held {
+        return failed(format!("the guestbook on {SECOND} held {theirs_held} signatures before it refused the command and {theirs_after} after"));
+    }
+    println!("  Nothing of the refused command was kept on {SECOND}: its guestbook still holds {}.", signatures(theirs_held));
     first_device.sign_out();
     second_device.sign_out();
 
@@ -1202,6 +1278,8 @@ fn walk(options: &Options, step: &mut usize, lock: &mut Option<fs::File>, held: 
     println!("  open to questions was refused; and a command brought its reply back with its receipt.");
     println!("  The guestbook, whose interfaces are written down once in a proto file, was called with JSON");
     println!("  on {FIRST}, and put a typed question to the guestbook on {SECOND}, whose answer it decoded.");
+    println!("  Commands the guestbook turned down came back with their reasons, at the JSON door and on a");
+    println!("  receipt from {SECOND}, and nothing they did was kept.");
     println!("What it does not show: these are three programs on one machine, talking over this");
     println!("machine's own loopback address. It does not show two machines, a real home router,");
     println!("the relay carrying anything (nothing on one machine needs it), or real Urbit ID.");
@@ -1256,6 +1334,11 @@ fn stop_all(held: &mut Option<Programs>) -> Done<()> {
     } else {
         failed(troubles.join("; "))
     }
+}
+
+/// "1 signature", "2 signatures".
+fn signatures(count: u64) -> String {
+    format!("{count} signature{}", if count == 1 { "" } else { "s" })
 }
 
 /// Half a second, unless Ctrl-C comes first.

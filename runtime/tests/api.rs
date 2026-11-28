@@ -149,6 +149,8 @@ mod gb {
         pub ship: String,
         #[prost(string, tag = "3")]
         pub agent: String,
+        #[prost(bool, tag = "4")]
+        pub nameless: bool,
     }
 
     #[derive(Clone, PartialEq, ship_proto::prost::Message)]
@@ -429,8 +431,12 @@ fn fault_code(reply: &CallReply) -> String {
     }
 }
 
-fn is_trap(result: Result<runtime::Outcome, Error>) -> bool {
-    matches!(result, Err(Error::Rejected(Rejection::Trap(_))))
+/// The code a command was refused with; panics on anything else.
+fn refused_with(result: Result<runtime::Outcome, Error>) -> String {
+    match result {
+        Err(Error::Rejected(Rejection::Refused(fault))) => fault.code,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }
 
 fn settle(rt: &Runtime, ship: &str) {
@@ -515,37 +521,45 @@ fn what_the_generated_dispatch_refuses_and_what_it_keeps() {
     assert_eq!(fault_code(&raw_read(&rt, "book", "nothing-here", &raw_call("Get", b""))), "ship.no-such-interface");
     assert_eq!(page(&rt, "book"), before);
 
-    // On the command path each of those traps, and nothing is kept.
+    // On the command path each of those is a refusal with the same fault, not a trap, and
+    // nothing is kept.
     let count_erases = |rt: &Runtime| report(rt, "book").erase_attempts;
-    assert!(is_trap(rt.deliver_on("~zod", "book", "guestbook", &raw_call("Nope", b""))));
-    assert!(is_trap(rt.deliver_on("~zod", "book", "guestbook", &raw_call("Erase", &[0xff, 0xff, 0xff]))));
-    assert!(is_trap(rt.deliver_on("~zod", "book", "guestbook", &raw_call("Get", &gb::Number { number: 1 }.encode_to_vec()))));
-    assert!(is_trap(rt.deliver_on("~zod", "book", "guestbook", &raw_call("Signatures", b""))));
-    assert!(is_trap(rt.deliver_on("~zod", "book", "guestbook", &[0xff, 0xff])));
-    assert!(is_trap(rt.deliver_on("~zod", "book", "nothing-here", &raw_call("Sign", &sign_body))));
+    assert_eq!(refused_with(rt.deliver_on("~zod", "book", "guestbook", &raw_call("Nope", b""))), "ship.no-such-method");
+    assert_eq!(refused_with(rt.deliver_on("~zod", "book", "guestbook", &raw_call("Erase", &[0xff, 0xff, 0xff]))), "ship.not-understood");
+    assert_eq!(refused_with(rt.deliver_on("~zod", "book", "guestbook", &raw_call("Get", &gb::Number { number: 1 }.encode_to_vec()))), "ship.wrong-kind");
+    assert_eq!(refused_with(rt.deliver_on("~zod", "book", "guestbook", &raw_call("Signatures", b""))), "ship.no-such-method");
+    assert_eq!(refused_with(rt.deliver_on("~zod", "book", "guestbook", &[0xff, 0xff])), "ship.not-understood");
+    assert_eq!(refused_with(rt.deliver_on("~zod", "book", "nothing-here", &raw_call("Sign", &sign_body))), "ship.no-such-interface");
     // An owner's untyped command comes through no interface, and is refused the same way.
-    assert!(is_trap(rt.deliver("~zod", "book", &raw_call("Sign", &sign_body))));
+    assert_eq!(refused_with(rt.deliver("~zod", "book", &raw_call("Sign", &sign_body))), "ship.no-such-interface");
+    // And the handler's own fault: a refusal with its code and message.
+    let nameless = gb::SignRequest { signature: Some(gb::Signature::default()) }.encode_to_vec();
+    assert_eq!(rt.deliver_on("~zod", "book", "guestbook", &raw_call("Sign", &nameless)).unwrap_err().to_string(), "event rejected: refused: no-name: a signature needs a name");
     assert_eq!(page(&rt, "book"), before);
     assert_eq!(count_erases(&rt), 0);
 }
 
 #[test]
-fn a_command_whose_handler_fails_keeps_nothing() {
+fn a_command_whose_handler_refuses_keeps_nothing_and_says_why() {
     let dir = TempDir::new("command-fault");
     let rt = books(&dir, fast(), &["book"]);
     sign(&rt, "book", gb::Signature { name: "one".into(), ..Default::default() });
     let (head, book, activity) = (rt.log_head("~zod", "book", "guestbook").unwrap(), page(&rt, "book"), report(&rt, "book"));
-    // Spoil appends an entry to the log, writes the book and a count, and then fails: none of it
-    // is kept. What was kept is looked at first, then how the call ended.
+    let audited = rt.audit("~zod", 1000).unwrap().len();
+    // Spoil appends an entry to the log, writes the book and a count, and then refuses: none of
+    // it is kept. What was kept is looked at first, then how the call ended: with the fault.
     let spoilt = rt.call_method("~zod", "book", "guestbook", "Spoil", &gb::Empty {}.encode_to_vec(), Encoding::Protobuf);
     assert_eq!(rt.log_head("~zod", "book", "guestbook").unwrap(), head);
     assert_eq!(page(&rt, "book"), book);
     assert_eq!(report(&rt, "book"), activity);
-    assert!(matches!(spoilt, Err(CallError::Runtime(Error::Rejected(Rejection::Trap(_))))), "{spoilt:?}");
+    assert_eq!(spoilt.unwrap(), Called::Fault(Fault { code: "spoilt".into(), message: "this command always refuses, after it has changed things".into() }));
+    // As for any rejected command, the audit log has it, not kept.
+    let audit = rt.audit("~zod", 1000).unwrap();
+    assert_eq!((audit.len(), audit[0].agent.as_str(), audit[0].ok), (audited + 1, "book", false));
     // Erase counts the attempt and then finds nothing to erase: the count is not kept either.
     let erased = rt.call_method("~zod", "book", "guestbook", "Erase", &gb::Number { number: 9 }.encode_to_vec(), Encoding::Protobuf);
     assert_eq!(report(&rt, "book").erase_attempts, 0);
-    assert!(matches!(erased, Err(CallError::Runtime(Error::Rejected(Rejection::Trap(_))))), "{erased:?}");
+    assert_eq!(erased.unwrap(), Called::Fault(Fault { code: "no-such-signature".into(), message: "this book has no signature 9".into() }));
     // One that works is kept, the count and the log entry with it.
     let erased: gb::Number = call(&rt, "book", "guestbook", "Erase", &gb::Number { number: 1 }).unwrap();
     assert_eq!(erased.number, 0);
@@ -560,8 +574,8 @@ fn a_question_fault_arrives_typed_and_a_handler_cannot_use_the_reserved_codes() 
     let rt = books(&dir, fast(), &["book"]);
     let (code, message) = fault_of(&rt, "book", "guestbook", "Get", &gb::Number { number: 7 });
     assert_eq!((code.as_str(), message.as_str()), ("no-such-signature", "this book has no signature 7"));
-    // The handler answers with a code starting with `ship.`, which only the generated code may
-    // make: it arrives rewritten.
+    // The handler answers with a code starting with `ship.`. For this typed question, generated
+    // dispatch rewrites the handler's returned `ship.` prefix to `app.ship.`.
     let (code, _) = fault_of(&rt, "book", "guestbook", "Lookup", &gb::LookupRequest { prefix: "ship.no-such-method".into(), limit: None });
     assert_eq!(code, "app.ship.no-such-method");
 }
@@ -599,7 +613,7 @@ fn a_typed_read_and_send_of_another_instance_on_the_same_ship() {
     // A typed send: the book passes one of its signatures to the spare, which signs it in its
     // own event, after the book's commits.
     sign(&rt, "book", awkward("passed on"));
-    let passed: gb::Number = call(&rt, "book", "guestbook", "Pass", &gb::PassRequest { number: 1, ship: String::new(), agent: "spare".into() }).unwrap();
+    let passed: gb::Number = call(&rt, "book", "guestbook", "Pass", &gb::PassRequest { number: 1, ship: String::new(), agent: "spare".into(), nameless: false }).unwrap();
     assert_eq!(passed.number, 0);
     settle(&rt, "~zod");
     let spare = page(&rt, "spare");
@@ -778,11 +792,36 @@ fn across_two_ships_a_typed_command_brings_its_reply_and_a_typed_question_its_an
     assert_eq!(wait_for_line(&t.b, "~nec", asked.number, true), format!("{} fault no-such-signature: this book has no signature 42", asked.number));
     // ~zod passes its signature to ~nec's book with a typed `send_to_for_reply`; the receipt
     // carries the reply, which the generated code decodes.
-    let passed: gb::Number = call_on(&t.a, "~zod", "Pass", &gb::PassRequest { number: 1, ship: "nec".into(), agent: "book".into() });
+    let passed: gb::Number = call_on(&t.a, "~zod", "Pass", &gb::PassRequest { number: 1, ship: "nec".into(), agent: "book".into(), nameless: false });
     assert!(passed.number > 0);
     assert_eq!(wait_for_line(&t.a, "~zod", passed.number, false), format!("{} signed as 1 of 1", passed.number));
     let on_nec: gb::Page = call_on(&t.b, "~nec", "Lookup", &gb::LookupRequest::default());
     assert_eq!(on_nec.signatures, [gb::Signature { number: 1, ..awkward("on zod") }]);
+    // Passed with its name left off, ~nec's book refuses it: the receipt brings the fault, which
+    // the generated code hands to the receipt handler as the call's error, and nothing was kept
+    // there.
+    let passed: gb::Number = call_on(&t.a, "~zod", "Pass", &gb::PassRequest { number: 1, ship: "nec".into(), agent: "book".into(), nameless: true });
+    assert_eq!(wait_for_line(&t.a, "~zod", passed.number, false), format!("{} no-name: a signature needs a name", passed.number));
+    let on_nec: gb::Page = call_on(&t.b, "~nec", "Lookup", &gb::LookupRequest::default());
+    assert_eq!(on_nec.signatures, [gb::Signature { number: 1, ..awkward("on zod") }]);
+}
+
+/// A command on another ship that runs, writes, and answers with a `CallReply` holding a fault
+/// without refusing (the hand-written `ROGUE`, in place of ~nec's book) comes back RAN with that
+/// reply, and the typed stub does not take it for a refusal: `CallError::NotUnderstood`, saying
+/// the command ran and may have kept what it did, which it has.
+#[test]
+fn a_command_that_ran_and_answered_with_a_fault_is_not_taken_for_a_refusal() {
+    let t = two("ran-with-fault");
+    let signed: gb::Signed = call_on(&t.a, "~zod", "Sign", &gb::SignRequest { signature: Some(awkward("on zod")) });
+    let rogue = t.b.add_module(&wat::parse_str(ROGUE).unwrap()).unwrap();
+    t.b.install("~nec", "book", &rogue, &book_manifest(&[], Some("~zod"))).unwrap();
+    let passed: gb::Number = call_on(&t.a, "~zod", "Pass", &gb::PassRequest { number: signed.number, ship: "nec".into(), agent: "book".into(), nameless: false });
+    let line = wait_for_line(&t.a, "~zod", passed.number, false);
+    assert_eq!(line, format!("{} the reply is not understood: the command ran and answered with a fault (x: y) without refusing, so what it did may have been kept", passed.number));
+    // What it wrote is kept on ~nec.
+    let dumped = t.b.read("~nec", "book", "guestbook", &raw_call("Dump", b"")).unwrap();
+    assert_eq!(CallReply::decode(&*dumped).unwrap().result, Some(call_reply::Result::Body(b"committed".to_vec())));
 }
 
 /// The custom sections named `ship.api.v1` in a module, read with `wasmparser`.
@@ -1374,14 +1413,19 @@ fn the_door_answers_each_failure_with_its_status() {
     let (status, headers, body) = door.ask("POST", "/agents/book/api/guestbook/Get", &[("Content-Type", "application/x-protobuf")], &[0x08, 0xff]);
     assert_eq!((status, header(&headers, "content-type")), (400, Some("application/x-protobuf")));
     assert_eq!(Fault::decode(&*body).unwrap().code, "ship.not-understood");
-    // A body a command cannot read is a failed command: the event traps, nothing is kept, and the
-    // reason does not come back.
+    // A body a command cannot read: the command refuses with ship.not-understood, 400, the
+    // decoder's words in the request's encoding, and nothing is kept (the audit log has each,
+    // not kept, as for any rejected command).
     let failed = |door: &Door| door.rt.audit("~zod", 10_000).unwrap().iter().filter(|entry| !entry.ok).count();
     let failed_before = failed(&door);
-    let (status, words) = text(door.json("/agents/book/api/guestbook/Sign", r#"{"signature": {"name": 5}}"#));
-    assert_eq!((status, words.as_str()), (422, "the command failed"));
-    assert_eq!(text(door.json("/agents/book/api/guestbook/Sign", r#"{"signature": "#)), (422, "the command failed".to_string()));
-    assert_eq!(door.proto("/agents/book/api/guestbook/Sign", &[0x0a, 0x05, 0xff]).0, 422);
+    for body in [r#"{"signature": {"name": 5}}"#, r#"{"signature": "#] {
+        let (status, json) = door.json("/agents/book/api/guestbook/Sign", body);
+        assert_eq!((status, json["code"].as_str()), (400, Some("ship.not-understood")), "{body}: {json}");
+        assert!(json["message"].as_str().unwrap().contains("the body of Sign is not its input written as JSON"), "{json}");
+    }
+    let (status, headers, body) = door.ask("POST", "/agents/book/api/guestbook/Sign", &[("Content-Type", "application/x-protobuf")], &[0x0a, 0x05, 0xff]);
+    assert_eq!((status, header(&headers, "content-type")), (400, Some("application/x-protobuf")));
+    assert_eq!(Fault::decode(&*body).unwrap().code, "ship.not-understood");
     assert_eq!(failed(&door), failed_before + 3);
     assert_eq!(page_on(&door), 0);
     // A body over the server's limit.
@@ -1399,9 +1443,73 @@ fn the_door_answers_each_failure_with_its_status() {
     }
     // A name that is not one.
     assert_eq!(text(door.json("/agents/Book/api/guestbook/Get", "{}")).0, 400);
-    // What deliver can return, as the command route gives it: the handler's own fault, a trap.
-    let (status, words) = text(door.json("/agents/book/api/guestbook/Erase", r#"{"number": 3}"#));
-    assert_eq!((status, words.as_str()), (422, "the command failed"));
+    // A command's own fault: 422, in the request's encoding, as a question's is.
+    let (status, json) = door.json("/agents/book/api/guestbook/Erase", r#"{"number": 3}"#);
+    assert_eq!((status, json), (422, serde_json::json!({"code": "no-such-signature", "message": "this book has no signature 3"})));
+    let (status, headers, body) = door.ask("POST", "/agents/book/api/guestbook/Sign", &[("Content-Type", "application/x-protobuf")], &gb::SignRequest { signature: Some(gb::Signature::default()) }.encode_to_vec());
+    assert_eq!((status, header(&headers, "content-type")), (422, Some("application/x-protobuf")));
+    assert_eq!(Fault::decode(&*body).unwrap(), Fault { code: "no-name".into(), message: "a signature needs a name".into() });
+    // What else deliver can return keeps the command route's plain words: a trap is still "the
+    // command failed". (Its own case is the description that disagrees with its code, below, and
+    // the kit's refusal with a code that breaks the rules.)
+    let (status, headers, body) = door.ask("POST", "/agents/kit/api/kit/Refuse", &[("Content-Type", "application/json")], br#"{"name": "has a space", "nickname": "m"}"#);
+    assert_eq!((status, header(&headers, "content-type"), String::from_utf8_lossy(&body).as_ref()), (422, Some("text/plain; charset=utf-8"), "the command failed"));
+}
+
+/// A refused command at the door, from each place a fault on the command path comes from: the
+/// generated code's refusals with their statuses (400, 404, 409) and an application's own (422),
+/// a handler's `ship.` code arriving as `app.ship.`, and a code that breaks the rules making the
+/// refusal an ordinary failure. `Runtime::call_method` gives each as `Called::Fault`.
+#[test]
+fn a_refused_command_at_the_door_has_the_status_of_its_fault() {
+    let door = Door::new("door-refusals", ServerConfig::default());
+    let refuse = |name: &str, nickname: &str| door.json("/agents/kit/api/kit/Refuse", &serde_json::json!({"name": name, "nickname": nickname}).to_string());
+    assert_eq!(refuse("mine", "my own words"), (422, serde_json::json!({"code": "mine", "message": "my own words"})));
+    for code in ["ship.not-understood", "ship.no-such-method", "ship.wrong-kind", "ship.anything"] {
+        let (status, json) = refuse(code, "m");
+        assert_eq!((status, json["code"].as_str()), (422, Some(format!("app.{code}").as_str())), "{code}");
+    }
+    // A code of 64 bytes is taken; one of 65, or with a space, makes the refusal an ordinary
+    // failure, as the runtime holds every fault to the rules. A message is cut to 200 bytes.
+    let (status, json) = refuse(&"k".repeat(64), &"m".repeat(300));
+    assert_eq!((status, json["code"].as_str().map(str::len), json["message"].as_str().map(str::len)), (422, Some(64), Some(200)));
+    assert_eq!(refuse(&"k".repeat(65), "m"), (422, serde_json::Value::String("the command failed".into())));
+    assert_eq!(refuse("a b", "m"), (422, serde_json::Value::String("the command failed".into())));
+    // Through `Runtime::call_method`: the fault, typed.
+    let request = gb::Name { name: "mine".into(), nickname: "words".into(), ..Default::default() }.encode_to_vec();
+    assert_eq!(door.rt.call_method("~zod", "kit", "kit", "Refuse", &request, Encoding::Protobuf).unwrap(), Called::Fault(Fault { code: "mine".into(), message: "words".into() }));
+    // The generated code's own refusals on the command path, where the door's own checks pass:
+    // a description that names a method and an interface the code does not have (404), and one
+    // that says a question is a command (409).
+    let mut set = FileDescriptorSet::decode(&*sections(&wasm("guestbook"))[0]).unwrap();
+    let file = &mut set.file[1];
+    file.service[0].method.push(MethodDescriptorProto { name: Some("Ghost".into()), input_type: Some(".google.protobuf.Empty".into()), output_type: Some(".google.protobuf.Empty".into()), ..Default::default() });
+    for method in file.service[0].method.iter_mut().filter(|method| method.name() == "Get") {
+        method.options = None;
+    }
+    let mut phantom = file.service[1].clone();
+    phantom.name = Some("Phantom".into());
+    file.service.push(phantom);
+    let liar = with_section(&without_sections(&wasm("guestbook")), "ship.api.v1", &set.encode_to_vec());
+    let hash = door.rt.add_module(&liar).unwrap();
+    door.rt.install("~zod", "liar", &hash, &providing(&["guestbook", "visits", "phantom"])).unwrap();
+    let (status, json) = door.json("/agents/liar/api/guestbook/Ghost", "{}");
+    assert_eq!((status, json["code"].as_str()), (404, Some("ship.no-such-method")), "{json}");
+    let (status, json) = door.json("/agents/liar/api/phantom/Visit", r#"{"who": "x"}"#);
+    assert_eq!((status, json["code"].as_str()), (404, Some("ship.no-such-interface")), "{json}");
+    let (status, json) = door.json("/agents/liar/api/guestbook/Get", r#"{"number": 1}"#);
+    assert_eq!((status, json["code"].as_str()), (409, Some("ship.wrong-kind")), "{json}");
+    let (status, json) = door.json("/agents/liar/api/guestbook/Sign", r#"{"signature": {"name": 7}}"#);
+    assert_eq!((status, json["code"].as_str()), (400, Some("ship.not-understood")), "{json}");
+    // The untyped route: a refusal is 422 with the encoded fault as protobuf; every other
+    // rejection keeps its plain text.
+    let (status, headers, body) = door.ask("POST", "/agents/book/command", &[], b"anything");
+    assert_eq!((status, header(&headers, "content-type")), (422, Some("application/x-protobuf")));
+    assert_eq!(Fault::decode(&*body).unwrap().code, "ship.no-such-interface");
+    let counter = door.rt.add_module(&wasm("counter")).unwrap();
+    door.rt.install("~zod", "counter", &counter, &counter_manifest()).unwrap();
+    let (status, headers, body) = door.ask("POST", "/agents/counter/command", &[], b"crash hits");
+    assert_eq!((status, header(&headers, "content-type"), String::from_utf8_lossy(&body).as_ref()), (422, Some("text/plain; charset=utf-8"), "the command failed"));
 }
 
 /// How many signatures the door's book holds.
@@ -1478,7 +1586,7 @@ fn the_door_refuses_replies_that_are_not_what_a_typed_call_answers() {
 fn a_description_that_disagrees_with_its_code_is_refused_by_the_code() {
     // The guestbook's code, carrying a description that says Sign is a question and Get a
     // command: the door runs each as the description says, and the generated dispatch refuses
-    // the wrong kind, a question with ship.wrong-kind (409) and a command by trapping.
+    // the wrong kind with ship.wrong-kind (409): a question in its reply, a command by refusing.
     let door = Door::new("door-disagree", ServerConfig::default());
     let mut set = FileDescriptorSet::decode(&*sections(&wasm("guestbook"))[0]).unwrap();
     for method in set.file[1].service[0].method.iter_mut() {
@@ -1493,8 +1601,8 @@ fn a_description_that_disagrees_with_its_code_is_refused_by_the_code() {
     door.rt.install("~zod", "liar", &hash, &book_manifest(&[], None)).unwrap();
     let (status, json) = door.json("/agents/liar/api/guestbook/Sign", r#"{"signature": {"name": "x"}}"#);
     assert_eq!((status, json["code"].as_str()), (409, Some("ship.wrong-kind")), "{json}");
-    let (status, words) = door.json("/agents/liar/api/guestbook/Get", r#"{"number": 1}"#);
-    assert_eq!((status, words.as_str().unwrap()), (422, "the command failed"));
+    let (status, json) = door.json("/agents/liar/api/guestbook/Get", r#"{"number": 1}"#);
+    assert_eq!((status, json["code"].as_str()), (409, Some("ship.wrong-kind")), "{json}");
 }
 
 #[test]
@@ -1513,9 +1621,11 @@ fn the_door_cannot_be_confused_with_the_other_routes() {
         for interface in ["api", "command", "files"] {
             assert_eq!(door.json(&format!("/agents/{name}/api/{interface}/Which"), "{}"), (200, kit_name(interface)), "{name} {interface}");
         }
-        // /command on a typed agent runs with no interface, and its dispatch refuses it.
-        let (status, _, body) = door.ask("POST", &format!("/agents/{name}/command"), &[], b"anything");
-        assert_eq!((status, String::from_utf8_lossy(&body).as_ref()), (422, "the command failed"), "{name}");
+        // /command on a typed agent runs with no interface, and its dispatch refuses it: 422 with
+        // the encoded fault.
+        let (status, headers, body) = door.ask("POST", &format!("/agents/{name}/command"), &[], b"anything");
+        assert_eq!((status, header(&headers, "content-type")), (422, Some("application/x-protobuf")), "{name}");
+        assert_eq!(Fault::decode(&*body).unwrap().code, "ship.no-such-interface", "{name}");
     }
     // The files route is still the files route.
     let (status, _, _) = door.ask("GET", "/agents/book/files", &[], b"");

@@ -5527,6 +5527,78 @@ fn a_receipt_is_believed_only_for_a_command_that_was_sent_to_that_ship() {
     assert_eq!(refusals(&nec, "~nec", "tally").len(), 2);
 }
 
+/// Deliver bytes as they are, as whoever holds `seed`, to the ship `called` at `addr`, and return
+/// what it answered, if anything.
+fn deliver_bytes(addr: std::net::SocketAddr, called: &str, (seed, caller): ([u8; 32], &str), request: &[u8]) -> Option<ship_proto::PeerReply> {
+    let tokio = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio.block_on(async {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = endpoint.connect_with(stranger_client(Some((seed, seed)), b"ship/1"), addr, called).unwrap().await.unwrap();
+        assert!(hello(&connection, caller).await);
+        exchange(&connection, request).await
+    })
+}
+
+/// A receipt whose fields do not decode (a fault, or a reason, that is not UTF-8) is not a
+/// receipt: the delivery it came in is refused whole, as any malformed delivery is, the same way
+/// for either; a good receipt ahead of it in the same delivery is not taken either; nothing is
+/// stored and nothing panics; both commands are still awaited and neither receipt is handed on.
+/// The other ship still holds them: the same delivery sent properly (the saved bytes, before
+/// they were spoilt) is taken, each receipt handed on once, the second with its own verdict and
+/// reason (and, for the fault, REFUSED with the fault taken).
+#[test]
+fn a_receipt_whose_fault_or_reason_does_not_decode_refuses_its_delivery() {
+    let dir = TempDir::new("receipt-undecodable");
+    let directory = Directory::new();
+    let (nec, nec_net) = crewed(&dir, "~nec", &directory, fast(), open_counter(), far_tally("*"));
+    let bus = [5u8; 32];
+    directory.set("~bus", ed25519_dalek::SigningKey::from_bytes(&bus).verifying_key().to_bytes(), "127.0.0.1:9".parse().unwrap()).unwrap();
+    let receipts = || view(&nec, "~nec", "tally", "receipts");
+    let refused = ship_proto::Verdict::Refused as i32;
+    let fault = ship_proto::Fault { code: "c".into(), message: "XY".into() };
+    // Each variant has a pair of commands of its own: a good receipt for the first, then the
+    // second's, with "XY" in its fault's message or as its reason.
+    let variants = [
+        ("fault", ship_proto::Receipt { verdict: refused, reason: "the agent refused it".into(), fault: Some(fault), ..Default::default() }, "refused [the agent refused it]"),
+        ("reason", ship_proto::Receipt { verdict: ship_proto::Verdict::Denied as i32, reason: "XY".into(), ..Default::default() }, "denied [XY]"),
+    ];
+    let mut replies = Vec::new();
+    for (n, (label, second, said)) in variants.into_iter().enumerate() {
+        let (one, two) = (2 * n as u64 + 1, 2 * n as u64 + 2);
+        send(&nec, "~nec", "tally", "tell bus inc hits");
+        send(&nec, "~nec", "tally", "tell bus inc hits");
+        assert_eq!(nec.unanswered("~nec").unwrap(), 2, "{label}");
+        let first = ship_proto::PeerMessage { seq: one, receipt: Some(ship_proto::Receipt { about: one, verdict: ship_proto::Verdict::Denied as i32, reason: "no".into(), ..Default::default() }), ..Default::default() };
+        let then = ship_proto::PeerMessage { seq: two, receipt: Some(ship_proto::Receipt { about: two, ..second }), ..Default::default() };
+        let valid = ship_proto::PeerRequest { body: Some(ship_proto::peer_request::Body::Deliver(ship_proto::Deliver { messages: vec![first, then] })) }.encode_to_vec();
+        let mut spoilt = valid.clone();
+        let at = spoilt.windows(2).position(|pair| pair == b"XY").unwrap();
+        spoilt[at..at + 2].copy_from_slice(&[0xff, 0xfe]);
+        let told_before = receipts();
+        let reply = deliver_bytes(nec_net.addr(), "nec", (bus, "bus"), &spoilt).expect("the delivery is answered");
+        assert_eq!(reply.refused, "not a request", "{label}");
+        assert!(reply.body.is_none(), "{label}");
+        replies.push(reply);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!((nec.unanswered("~nec").unwrap(), nec.pending("~nec").unwrap()), (2, 0), "{label}");
+        assert_eq!(receipts(), told_before, "{label}");
+        // The saved bytes, as they were before they were spoilt: taken, each once.
+        let reply = deliver_bytes(nec_net.addr(), "nec", (bus, "bus"), &valid).expect("the delivery is answered");
+        assert_eq!(reply.body, Some(ship_proto::peer_reply::Body::Delivered(ship_proto::Delivered { last: two })), "{label}");
+        eventually("the agent is told of both", || receipts().lines().count() == told_before.lines().count() + 2);
+        assert_eq!(nec.unanswered("~nec").unwrap(), 0, "{label}");
+        std::thread::sleep(Duration::from_millis(300));
+        let told = receipts();
+        let new: Vec<&str> = told.lines().skip(told_before.lines().count()).collect();
+        assert_eq!(new.len(), 2, "{label}: {told}");
+        assert!(new[0].starts_with(&format!("{one} ~bus/counter counter denied [no] ")), "{label}: {told}");
+        assert!(new[1].starts_with(&format!("{two} ~bus/counter counter {said} ")), "{label}: {told}");
+    }
+    assert_eq!(replies[0], replies[1], "both refused alike");
+    // The fault was taken with its REFUSED receipt: the audit line says its code and message.
+    assert!(refusals(&nec, "~nec", "tally").contains(&"~bus did not run command 2 to counter counter: the agent refused it: c: XY".to_string()), "{:?}", refusals(&nec, "~nec", "tally"));
+}
+
 #[test]
 fn only_so_many_commands_may_be_unanswered() {
     // The sender's side: a ship that does not answer is sent only so many.

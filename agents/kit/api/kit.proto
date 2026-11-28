@@ -27,8 +27,8 @@ service Files {
   }
 }
 
-// Well-known types, a method named like a Rust keyword, a command that changes nothing, and
-// calls through interfaces the kit only calls.
+// Well-known types, a method named like a Rust keyword, a command that changes nothing, calls
+// through interfaces the kit only calls, and a command that refuses as it is told.
 service Kit {
   // A command that writes nothing and answers with what it was given.
   rpc Echo(Name) returns (Name);
@@ -54,6 +54,10 @@ service Kit {
   rpc Taken(google.protobuf.Empty) returns (Haul) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
+  // A command that refuses with the fault it is given: `name` as the code and `nickname` as the
+  // message, as the handler returns them (so a code starting `ship.` arrives as `app.ship.`, and
+  // one breaking the rules on a code makes the refusal an ordinary failure).
+  rpc Refuse(Name) returns (Name);
 }
 
 message Name {

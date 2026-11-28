@@ -13,12 +13,17 @@
 //! time and memory. The interface is the one the call is made through, which the kernel has
 //! already checked, so it is not in the envelope.
 //!
-//! A question's fault reaches its caller. A command's does not, in this version: a command
-//! handler that returns `Err`, and every refusal the generated code makes on the command path (a
-//! body that does not decode among them), traps, so the event is rolled back as any failed
-//! handler's is, and nothing the handler did is kept. The caller sees what it sees for any failed
-//! handler (a rejection, or a FAILED receipt). An error must never leave half a change behind,
-//! and carrying the reason back needs the runtime's help, which is not here yet.
+//! A question's fault reaches its caller in its reply. A command's reaches its caller too, as a
+//! refusal: a command handler that returns `Err`, and every refusal the generated code makes on
+//! the command path (a body that does not decode among them), hands the fault to the runtime
+//! (`crate::refuse`), which rolls the event back as it does any rejected event's, so nothing the
+//! handler did is kept, and passes the fault on: to the owner as `Rejection::Refused` (or the
+//! JSON door's answer), to an agent on another ship in its receipt (`Verdict::Refused` with
+//! `Receipt.fault`). That is for a refusal the runtime accepts: generated dispatch passes a
+//! returned fault to `refuse`, an accepted refusal carries the fault to the caller, and an invalid
+//! code produces an ordinary failure. An error never leaves half a change behind. A reply that
+//! cannot be written as JSON still traps: that is a fault in the agent, not something it chose to
+//! say.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -40,11 +45,20 @@ pub const NOT_UNDERSTOOD: &str = "ship.not-understood";
 /// A command reached as a question, or a question reached as a command.
 pub const WRONG_KIND: &str = "ship.wrong-kind";
 
-/// What a handler's fault code is put under when it starts with `ship.`, which only the
-/// generated code may use: `ship.x` from a handler arrives as `app.ship.x`.
+/// What a handler's returned fault code is put under when it starts with `ship.`: `ship.x` from a
+/// handler arrives as `app.ship.x`. Generated dispatch prefixes a handler's returned `ship.` code
+/// with `app.`. A direct `refuse` call preserves any valid code.
 pub const REWRITTEN_PREFIX: &str = "app.";
 
 /// A fault with this code and message.
+///
+/// A command's fault is carried back by the runtime only if its code is 1 to 64 bytes, each
+/// printable ASCII other than space (no space, no control character, nothing outside ASCII);
+/// otherwise the refusal is itself an ordinary failure, and the caller is told only that the
+/// command failed. Nothing here checks or mends the code for you. The message may be any text:
+/// the runtime cuts it to 200 bytes, at a character boundary, and turns each control character
+/// into a space. For a question, generated dispatch prefixes a returned `ship.` code with `app.`
+/// and preserves the message.
 pub fn fault(code: &str, message: &str) -> Fault {
     Fault { code: code.into(), message: message.into() }
 }
@@ -53,15 +67,20 @@ pub fn fault(code: &str, message: &str) -> Fault {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CallError {
     /// The method answered with a fault: the application's own, or one the generated code in
-    /// the agent called made (`ship.no-such-method` and the rest).
+    /// the agent called made (`ship.no-such-method` and the rest). For a command sent to another
+    /// ship, only the fault it was refused with (`Verdict::Refused` with `Receipt.fault`):
+    /// nothing it did there was kept.
     Fault(Fault),
     /// What came back is not a `CallReply`, or its body does not decode as the method's output.
-    /// The agent called is not typed, speaks another version of the interface, or broke it.
+    /// The agent called is not typed, speaks another version of the interface, or broke it. For a
+    /// command sent to another ship, also a receipt saying it ran whose reply holds a fault: the
+    /// command answered with a fault without refusing, so what it did may have been kept.
     NotUnderstood(String),
     /// A question to another ship has no reply: what came of it instead, and the reason.
     Unanswered(Outcome, String),
-    /// A command sent to another ship did not run: the receipt says it was refused, failed, was
-    /// too large, or was malformed. The verdict and the reason.
+    /// A command sent to another ship did not run: the receipt says it was not allowed, failed,
+    /// reached a limit, or was malformed, or was refused with no fault this ship took (the fault
+    /// is `CallError::Fault` when there is one). The verdict and the reason.
     NotRun(Verdict, String),
     /// A command sent to another ship is lost: one of the two ships went back to an earlier
     /// state, and nobody can tell whether it ran. The reason the receipt gives.
@@ -172,9 +191,10 @@ pub fn __request<M: Message + Default + DeserializeOwned>(method: &str, body: &[
     M::decode(body).map_err(|e| fault(NOT_UNDERSTOOD, &format!("the body of {method} does not decode as its input: {e}")))
 }
 
-/// What a handler returned, encoded (or written as proto3 JSON with `json`). A fault whose code
-/// starts with `ship.` is rewritten (`REWRITTEN_PREFIX`), since only the generated code may make
-/// those. A reply that cannot be written as JSON traps: it is a fault in the agent.
+/// What a handler returned, encoded (or written as proto3 JSON with `json`). Generated dispatch
+/// prefixes a handler's returned `ship.` code with `app.` (`REWRITTEN_PREFIX`). A direct `refuse`
+/// call preserves any valid code. A reply that cannot be written as JSON traps: it is a fault in
+/// the agent.
 #[doc(hidden)]
 pub fn __reply<M: Message + Serialize>(returned: Result<M, Fault>, json: bool) -> Result<Vec<u8>, Fault> {
     match returned {
@@ -211,20 +231,17 @@ fn called<'a, T>(payload: &[u8], served: &'a [(&'static str, T)]) -> Result<(&'a
     Ok((entry, call))
 }
 
-/// Stop the event with a fault: on the command path a fault rolls the event back, so nothing
-/// the handler did is kept, and its words do not reach the caller.
-fn trap(fault: Fault) -> ! {
-    panic!("{}: {}", fault.code, fault.message)
-}
-
 /// The `handle` export of a typed agent: run the command a `Call` names on the interface it
-/// came through, and answer with a `CallReply`. Any fault traps.
+/// came through, and answer with a `CallReply`. Generated dispatch passes a returned fault (the
+/// handler's own, or one the generated code made) to `refuse`. An accepted refusal rolls back
+/// the handler's changes and carries the fault in the owner's result or in a receipt sent to
+/// another ship. An invalid code produces an ordinary failure.
 #[doc(hidden)]
 pub fn __command(payload: &[u8], served: &[(&'static str, (Dispatch, Dispatch))]) -> Vec<u8> {
     let outcome = called(payload, served).and_then(|((command, _), call)| command(&call.method, &call.body, call.json));
     match outcome {
         Ok(body) => CallReply { result: Some(Replied::Body(body)) }.encode_to_vec(),
-        Err(fault) => trap(fault),
+        Err(fault) => crate::refuse(&fault),
     }
 }
 
@@ -259,18 +276,38 @@ pub fn __decode_reply<R: Message + Default>(bytes: &[u8]) -> Result<R, CallError
     }
 }
 
-/// What a receipt says of a typed command sent with its reply wanted.
+/// What a receipt says of a typed command sent with its reply wanted. A refusal with a fault is
+/// that fault; one with none (the other ship broke the protocol, or its fault was let go here) did
+/// not run, with the receipt's reason. A receipt saying it ran whose reply is a `CallReply`
+/// holding a fault is not understood: the command did not refuse, and may have kept its changes.
 #[doc(hidden)]
 pub fn __receipt<R: Message + Default>(receipt: &Receipt) -> Result<R, CallError> {
     match receipt.verdict() {
         Verdict::Ran => {}
         Verdict::Lost => return Err(CallError::Lost(receipt.reason.clone())),
+        Verdict::Refused => {
+            return Err(match &receipt.fault {
+                Some(fault) => CallError::Fault(fault.clone()),
+                None => CallError::NotRun(Verdict::Refused, receipt.reason.clone()),
+            })
+        }
         other => return Err(CallError::NotRun(other, receipt.reason.clone())),
     }
     if !receipt.replied {
         return Err(CallError::NoReply(receipt.reason.clone()));
     }
-    __decode_reply(&receipt.reply)
+    // For a command, a fault means refused, nothing kept, and comes only as above. A command that
+    // ran and answered with a fault in its reply did not refuse: what it did may have been kept,
+    // so its reply is not understood as the method's, and not taken for a refusal.
+    let reply = CallReply::decode(&*receipt.reply).map_err(|e| CallError::NotUnderstood(format!("not a call reply: {e}")))?;
+    match reply.result {
+        Some(Replied::Body(body)) => R::decode(&*body).map_err(|e| CallError::NotUnderstood(format!("the reply does not decode as the method's output: {e}"))),
+        Some(Replied::Fault(fault)) => Err(CallError::NotUnderstood(format!(
+            "the command ran and answered with a fault ({}: {}) without refusing, so what it did may have been kept",
+            fault.code, fault.message
+        ))),
+        None => Err(CallError::NotUnderstood("a call reply with neither a body nor a fault".into())),
+    }
 }
 
 /// What an answer says of a typed question put to another ship.

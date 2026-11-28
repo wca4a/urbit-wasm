@@ -12,7 +12,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::serialize::{Data, OwnedData};
 use rusqlite::{params, Connection, DatabaseName, OpenFlags, OptionalExtension, Row};
 
-use ship_proto::{CheckpointBody, Device, Kind, LogNews, Message, PeerMessage, Receipt, Verdict};
+use ship_proto::{CheckpointBody, Device, Fault, Kind, LogNews, Message, PeerMessage, Receipt, Verdict};
 
 use crate::moon::PROOF_BYTES;
 use crate::{signed_bytes, AuditEntry, ChainCheck, Config, Durability, Effect, Error, CHECKPOINT_DOMAIN};
@@ -77,14 +77,83 @@ impl Queued {
 /// The most a receipt says about why a command did not run.
 pub const MAX_REASON_BYTES: usize = 200;
 
-/// More than any receipt takes up, whatever names it carries, apart from a handler's reply. A
-/// receipt is the runtime's own record and not an agent's payload, so its size has a bound of
-/// its own, apart from `max_event_bytes`. A receipt for a command sent with `reply` set may
-/// also carry the handler's reply, of at most `max_receipt_reply_bytes`: see `reply_most`.
+/// The most a fault's code may be, in bytes. A code is 1 to this many bytes, each printable
+/// ASCII other than space (0x21 to 0x7E). An agent's refusal with any other code is an ordinary
+/// failure, and another ship's fault with one is let go.
+pub const MAX_FAULT_CODE_BYTES: usize = 64;
+
+/// The most a fault's message may be, in bytes: the bound a receipt's reason has. The runtime
+/// cuts a refusing agent's message to it, at a character boundary, and turns each control
+/// character into a space.
+pub const MAX_FAULT_MESSAGE_BYTES: usize = MAX_REASON_BYTES;
+
+/// The words a receipt carries as its reason with `Verdict::Refused`, on the wire and in the
+/// copy handed to the agent that sent the command: the agent's own words are in its fault.
+pub const REFUSED_WORDS: &str = "the agent refused it";
+
+/// What an agent is told, and the audit log says, when a fault came with a receipt and was not
+/// taken: with a verdict other than REFUSED, or breaking the rules on a fault.
+pub const FAULT_NOT_TAKEN: &str = "the fault that came with this receipt was not one this ship takes, and was let go";
+
+/// More than any receipt takes up, whatever names it carries, apart from a handler's reply or an
+/// agent's fault. A receipt is the runtime's own record and not an agent's payload, so its size
+/// has a bound of its own, apart from `max_event_bytes`. A receipt for a command sent with `reply`
+/// set may also carry the handler's reply, of at most `max_receipt_reply_bytes` (see
+/// `reply_most`), and a receipt saying REFUSED the agent's fault, of at most `FAULT_FIELD_BYTES`.
+/// A reply comes only with RAN and a fault only with REFUSED, so a receipt never carries both.
 pub const MAX_RECEIPT_BYTES: usize = 512;
 
 /// What a reply adds to a receipt at most, beyond the reply itself: its field's tag and length.
 pub const REPLY_FIELD_BYTES: usize = 16;
+
+/// The bytes a varint of `n` takes.
+const fn varint_bytes(n: usize) -> usize {
+    let (mut bytes, mut rest) = (1, n >> 7);
+    while rest > 0 {
+        bytes += 1;
+        rest >>= 7;
+    }
+    bytes
+}
+
+/// The bytes a length-delimited field of `len` bytes takes, with a field number under 16: its
+/// tag, its length and itself.
+const fn field_bytes(len: usize) -> usize {
+    1 + varint_bytes(len) + len
+}
+
+/// The most a fault adds to a receipt (`Receipt.fault`): its field's tag and length, and the
+/// largest fault there may be (a code of `MAX_FAULT_CODE_BYTES` and a message of
+/// `MAX_FAULT_MESSAGE_BYTES`, each with its own tag and length). 272 bytes; a test encodes the
+/// largest fault with prost and pins it. A receipt carrying a fault may be up to
+/// `MAX_RECEIPT_BYTES` plus this, as one carrying a reply may be up to `MAX_RECEIPT_BYTES` plus
+/// the reply and `REPLY_FIELD_BYTES`. None of the room ships keep for each other's receipts
+/// counts it: the receipt that goes back with a fault is the bare one, with the fixed
+/// `REFUSED_WORDS` and no names, which is far inside `MAX_RECEIPT_BYTES` with it (306 bytes at
+/// the most); only the copy handed to the sending agent, which adds the names, can need it.
+pub const FAULT_FIELD_BYTES: usize = field_bytes(field_bytes(MAX_FAULT_CODE_BYTES) + field_bytes(MAX_FAULT_MESSAGE_BYTES));
+
+/// Whether a fault's code keeps the rule: 1 to `MAX_FAULT_CODE_BYTES` bytes, every one printable
+/// ASCII other than space.
+pub fn fault_code_ok(code: &str) -> bool {
+    !code.is_empty() && code.len() <= MAX_FAULT_CODE_BYTES && code.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// A refusing agent's message as the runtime keeps it: cut to `MAX_FAULT_MESSAGE_BYTES` at a
+/// character boundary, and each control character turned into a space, as a receipt's reason is.
+pub fn fault_message(message: &str) -> String {
+    let mut end = message.len().min(MAX_FAULT_MESSAGE_BYTES);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+/// Whether a fault is one this runtime keeps as it is: a code that keeps the rule, and a message
+/// of at most `MAX_FAULT_MESSAGE_BYTES` with no control character in it.
+pub fn fault_ok(fault: &Fault) -> bool {
+    fault_code_ok(&fault.code) && fault.message.len() <= MAX_FAULT_MESSAGE_BYTES && !fault.message.chars().any(char::is_control)
+}
 
 /// The largest receipt reply any configuration allows (`max_receipt_reply_bytes` is held to it
 /// when a runtime opens). A command keeps the bound it was sent with, which a later, lower
@@ -808,19 +877,21 @@ pub fn short_reason(reason: &str) -> &str {
 
 /// Queue, for `peer`, the receipt for the command it numbered `about`, with the handler's
 /// reply if there is one to send (only for `Verdict::Ran`, and only when it was asked for: the
-/// caller sees to that). A receipt takes no notice of how much is already waiting to go there:
-/// the command has run, or been refused, and saying so must not be what fails. `peer_owed` is
-/// what keeps their number down.
+/// caller sees to that), or the agent's fault (only for `Verdict::Refused`, and only one that
+/// keeps the rules: the caller sees to that too). A receipt takes no notice of how much is
+/// already waiting to go there: the command has run, or been refused, and saying so must not be
+/// what fails. `peer_owed` is what keeps their number down.
 ///
 /// `reply` is `Some` (perhaps empty) exactly when the receipt carries the handler's reply, which
 /// marks it `replied`.
-pub fn receipt_push(conn: &Connection, peer: &str, about: u64, verdict: Verdict, reason: &str, reply: Option<&[u8]>) -> rusqlite::Result<()> {
+pub fn receipt_push(conn: &Connection, peer: &str, about: u64, verdict: Verdict, reason: &str, reply: Option<&[u8]>, fault: Option<&Fault>) -> rusqlite::Result<()> {
     let receipt = Receipt {
         about,
         verdict: verdict as i32,
         reason: short_reason(reason).to_string(),
         reply: reply.unwrap_or_default().to_vec(),
         replied: reply.is_some(),
+        fault: fault.cloned(),
         ..Receipt::default()
     };
     peer_out_push(conn, peer, "", "", "", &receipt.encode_to_vec(), true, 0).map(drop)
@@ -2313,7 +2384,7 @@ pub fn record_rejection(
     conn: &Connection,
     recorded: bool,
     queued: Option<i64>,
-    owed: Option<(&str, u64, Verdict, &str)>,
+    owed: Option<(&str, u64, Verdict, &str, Option<&Fault>)>,
     notice: Option<(Followed, bool)>,
     checkpoint: Option<&str>,
     full: Option<&str>,
@@ -2326,7 +2397,7 @@ pub fn record_rejection(
     // Making room comes first, since everything after it needs some.
     let saved = (if storage_full { reclaim(conn) } else { Ok(()) })
         .and_then(|()| queued.map_or(Ok(()), |seq| inbox_delete(conn, seq)))
-        .and_then(|()| owed.map_or(Ok(()), |(peer, about, verdict, reason)| receipt_push(conn, peer, about, verdict, reason, None)))
+        .and_then(|()| owed.map_or(Ok(()), |(peer, about, verdict, reason, fault)| receipt_push(conn, peer, about, verdict, reason, None, fault)))
         .and_then(|()| checkpoint.map_or(Ok(()), |log| checkpoint_answered(conn, agent, log)))
         .and_then(|()| full.map_or(Ok(()), |log| ask_checkpoint_when_full(conn, agent, log)))
         .and_then(|()| {
@@ -3185,24 +3256,40 @@ pub fn ship_name_ok(name: &str) -> bool {
 }
 
 /// A stored receipt that another ship sent, if it is one this runtime could have kept: about
-/// a numbered command, with a reason no longer than a receipt may carry, and a reply (marked
+/// a numbered command, with a reason no longer than a receipt may carry, a reply (marked
 /// `replied`) only with `Verdict::Ran` and no larger than any bound a command may have kept
-/// (`MOST_RECEIPT_REPLY_BYTES`, not the current setting, which may have been lowered since). Its verdict is otherwise the
-/// other ship's word and is kept as it came, so it may be one this runtime has no name for.
+/// (`MOST_RECEIPT_REPLY_BYTES`, not the current setting, which may have been lowered since), and
+/// a fault only with `Verdict::Refused`, one that keeps the rules on a fault (`fault_ok`), beside
+/// the fixed `REFUSED_WORDS` as its reason, which is how this runtime hands one on. A receipt is
+/// held to `MAX_RECEIPT_BYTES`, with room beyond it for a reply (`REPLY_FIELD_BYTES` and the
+/// reply) or a fault (`FAULT_FIELD_BYTES`), which never come together. A receipt carrying a
+/// fault must also be byte for byte what this runtime writes (its encoding again is the same
+/// bytes), so that nothing this runtime does not know rides along with one. Its verdict is
+/// otherwise the other ship's word and is kept as it came, so it may be one this runtime has no
+/// name for.
 fn taken_receipt(bytes: &[u8]) -> Option<Receipt> {
     let receipt = Receipt::decode(bytes).ok()?;
     let reply = receipt.reply.len();
     // A reply, even an empty one, is marked, and only with RAN.
     let replied = if receipt.replied { receipt.verdict == Verdict::Ran as i32 && reply <= MOST_RECEIPT_REPLY_BYTES } else { reply == 0 };
-    let fits = bytes.len() <= MAX_RECEIPT_BYTES + if reply > 0 { reply + REPLY_FIELD_BYTES } else { 0 };
-    (fits && replied && receipt.about >= 1 && receipt.reason.len() <= MAX_REASON_BYTES).then_some(receipt)
+    // A fault only with REFUSED (so never with a reply), keeping the rules, and with the words
+    // this runtime puts beside one.
+    let faulted = receipt.fault.as_ref().is_none_or(|fault| receipt.verdict == Verdict::Refused as i32 && fault_ok(fault) && receipt.reason == REFUSED_WORDS);
+    let allowance = if reply > 0 { reply + REPLY_FIELD_BYTES } else if receipt.fault.is_some() { FAULT_FIELD_BYTES } else { 0 };
+    let fits = bytes.len() <= MAX_RECEIPT_BYTES + allowance;
+    let written = receipt.fault.is_none() || receipt.encode_to_vec() == bytes;
+    (fits && replied && faulted && written && receipt.about >= 1 && receipt.reason.len() <= MAX_REASON_BYTES).then_some(receipt)
 }
 
 /// A stored receipt that this ship is to send, if it is one this runtime could have written:
-/// as above, and with a verdict it knows.
+/// as above, with a verdict it knows, and REFUSED exactly when there is a fault (a refusal this
+/// runtime writes always carries the agent's fault). It names nothing, so with a fault it still
+/// fits `MAX_RECEIPT_BYTES` (306 bytes at the most): it is given no allowance for the fault.
 fn own_receipt(bytes: &[u8]) -> Option<Receipt> {
     let known = |receipt: &Receipt| Verdict::try_from(receipt.verdict).is_ok_and(|verdict| verdict != Verdict::Unspecified);
-    taken_receipt(bytes).filter(known)
+    let refusal = |receipt: &Receipt| (receipt.verdict == Verdict::Refused as i32) == receipt.fault.is_some();
+    let bare = |receipt: &Receipt| receipt.fault.is_none() || bytes.len() <= MAX_RECEIPT_BYTES;
+    taken_receipt(bytes).filter(known).filter(refusal).filter(bare)
 }
 
 /// A queued answer, if it is one this runtime could have written: an outcome it knows, a
@@ -4288,7 +4375,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         peer_send(&conn, "nec", "tally", "counter", "counter", b"inc hits", true, 0).unwrap();
-        receipt_push(&conn, "nec", 3, Verdict::Ran, "", None).unwrap();
+        receipt_push(&conn, "nec", 3, Verdict::Ran, "", None, None).unwrap();
         let batch = peer_batch(&conn, "nec", 1 << 20).unwrap();
         let mut command = vec![0x08, 0x01, 0x12, 0x05];
         command.extend_from_slice(b"tally");
@@ -4314,6 +4401,110 @@ mod tests {
         peer_send(&conn, "nec", "tally", "counter", "counter", b"inc hits", true, 16384).unwrap();
         let wanted = peer_batch(&conn, "nec", 1 << 20).unwrap().pop().unwrap().encode_to_vec();
         assert_eq!(wanted[2..], [&command[2..], &[0x38, 0x80, 0x80, 0x01][..]].concat()[..]);
+    }
+
+    /// The sizes a fault brings to a receipt, encoded with prost: the largest fault, the receipt
+    /// a refusing ship writes with it (bare, with the fixed words and the largest number a
+    /// command can have), and the copy the sending ship hands its agent (with the largest names
+    /// as well). The bare one is inside `MAX_RECEIPT_BYTES`, so none of the room ships keep for
+    /// each other's receipts moves; the copy is over it, and inside it with `FAULT_FIELD_BYTES`,
+    /// which is what import allows a receipt carrying a fault. Without a fault, the largest copy
+    /// is inside `MAX_RECEIPT_BYTES` as before.
+    #[test]
+    fn a_receipt_with_the_largest_fault_fits_where_receipts_are_held() {
+        let largest = Fault { code: "!".repeat(MAX_FAULT_CODE_BYTES), message: "\u{e9}".repeat(MAX_FAULT_MESSAGE_BYTES / 2) };
+        assert_eq!(largest.message.len(), MAX_FAULT_MESSAGE_BYTES);
+        assert!(fault_ok(&largest));
+        assert_eq!(largest.encoded_len(), 269);
+        let alone = Receipt { fault: Some(largest.clone()), ..Receipt::default() };
+        assert_eq!(alone.encoded_len(), FAULT_FIELD_BYTES);
+        assert_eq!(FAULT_FIELD_BYTES, 272);
+
+        let about = MAX_SEQ as u64;
+        let bare = Receipt { about, verdict: Verdict::Refused as i32, reason: REFUSED_WORDS.into(), fault: Some(largest.clone()), ..Receipt::default() };
+        let bare = bare.encode_to_vec();
+        assert_eq!(bare.len(), 306);
+        assert!(bare.len() <= MAX_RECEIPT_BYTES);
+        assert!(own_receipt(&bare).is_some());
+        assert!(taken_receipt(&bare).is_some());
+
+        let names = |receipt: Receipt| Receipt { ship: "a".repeat(64), agent: "b".repeat(64), interface: "c".repeat(128), ..receipt };
+        let told = names(Receipt::decode(&*bare).unwrap()).encode_to_vec();
+        assert_eq!(told.len(), 569);
+        assert!(told.len() > MAX_RECEIPT_BYTES && told.len() <= MAX_RECEIPT_BYTES + FAULT_FIELD_BYTES);
+        assert!(taken_receipt(&told).is_some());
+
+        // Without a fault the copy is held to `MAX_RECEIPT_BYTES` as it always was: the largest
+        // there can be (an unknown verdict, as long as one can be, and the longest reason) fits.
+        let unknown = names(Receipt { about, verdict: -1, reason: "x".repeat(MAX_REASON_BYTES), ..Receipt::default() }).encode_to_vec();
+        assert_eq!(unknown.len(), 487);
+        assert!(taken_receipt(&unknown).is_some());
+        // And a fault let go leaves fixed words of its own, well inside it.
+        let let_go = names(Receipt { about, verdict: -1, reason: FAULT_NOT_TAKEN.into(), ..Receipt::default() }).encode_to_vec();
+        assert!(let_go.len() <= MAX_RECEIPT_BYTES, "{}", let_go.len());
+
+        // The bound itself, alone: otherwise identical copies carrying a fault and no reply, as
+        // this runtime encodes them, of 784 bytes (`MAX_RECEIPT_BYTES` and `FAULT_FIELD_BYTES`)
+        // and of 785, one taken and one not. Getting there takes names longer than any import
+        // takes (64, 64 and 128 bytes, checked with the rows, not here): with names in their
+        // bounds the largest copy this runtime writes or takes is the 569 bytes above.
+        let sized = |len: usize| -> Vec<u8> {
+            for agent in 0..400 {
+                let receipt = Receipt { agent: "b".repeat(agent), ..Receipt::decode(&*told).unwrap() };
+                let bytes = receipt.encode_to_vec();
+                if bytes.len() == len {
+                    return bytes;
+                }
+            }
+            panic!("no copy of {len} bytes");
+        };
+        let (at, over) = (sized(MAX_RECEIPT_BYTES + FAULT_FIELD_BYTES), sized(MAX_RECEIPT_BYTES + FAULT_FIELD_BYTES + 1));
+        assert_eq!((at.len(), over.len()), (784, 785));
+        assert!(taken_receipt(&at).is_some());
+        assert!(taken_receipt(&over).is_none());
+        // A copy carrying a fault is byte for byte what this runtime writes: the same copy with a
+        // field this runtime does not know added (well inside every bound) is not taken; one
+        // without a fault keeps the rule it had.
+        let mut unknown_field = told.clone();
+        unknown_field.extend_from_slice(&[0x7a, 0x03, b'p', b'a', b'd']); // field 15, three bytes
+        assert!(Receipt::decode(&*unknown_field).is_ok() && unknown_field.len() < at.len());
+        assert!(taken_receipt(&unknown_field).is_none());
+        let mut faultless_padded = names(Receipt { about, verdict: Verdict::Failed as i32, reason: "the agent failed".into(), ..Receipt::default() }).encode_to_vec();
+        faultless_padded.extend_from_slice(&[0x7a, 0x03, b'p', b'a', b'd']);
+        assert!(taken_receipt(&faultless_padded).is_some());
+        // A receipt this ship is to send names nothing and is given no allowance for its fault:
+        // the 306 bytes above are taken; the named copy, canonical and in the allowance, is not
+        // (a copy is never one this ship sends).
+        assert!(own_receipt(&told).is_none());
+        let with = |change: &dyn Fn(&mut Receipt)| {
+            let mut receipt = Receipt::decode(&*told).unwrap();
+            change(&mut receipt);
+            taken_receipt(&receipt.encode_to_vec()).is_some()
+        };
+        assert!(with(&|_| ()));
+        assert!(!with(&|r| r.verdict = Verdict::Failed as i32));
+        assert!(!with(&|r| r.verdict = Verdict::Ran as i32));
+        assert!(!with(&|r| r.reason = "something else".into()));
+        assert!(!with(&|r| r.fault.as_mut().unwrap().code.push('!')));
+        assert!(!with(&|r| r.fault.as_mut().unwrap().code = "a b".into()));
+        assert!(!with(&|r| r.fault.as_mut().unwrap().code = String::new()));
+        assert!(!with(&|r| r.fault.as_mut().unwrap().message.push('x')));
+        assert!(!with(&|r| r.fault.as_mut().unwrap().message = "a\u{7}b".into()));
+        // A refusal this runtime writes always carries a fault, and a fault only a refusal.
+        let faultless = Receipt { about: 1, verdict: Verdict::Refused as i32, reason: REFUSED_WORDS.into(), ..Receipt::default() }.encode_to_vec();
+        assert!(own_receipt(&faultless).is_none());
+        assert!(taken_receipt(&faultless).is_some());
+    }
+
+    /// The wire numbers themselves, from literal bytes: `VERDICT_REFUSED` is 7 and `Receipt.fault`
+    /// is field 9 (a length-delimited field, tag byte 0x4a), and a `Fault` is code 1 and message 2.
+    #[test]
+    fn a_refusal_receipt_is_these_bytes_on_the_wire() {
+        let receipt = Receipt { about: 1, verdict: Verdict::Refused as i32, reason: "r".into(), fault: Some(Fault { code: "c".into(), message: "m".into() }), ..Receipt::default() };
+        let wire: &[u8] = &[0x08, 0x01, 0x10, 0x07, 0x1a, 0x01, b'r', 0x4a, 0x06, 0x0a, 0x01, b'c', 0x12, 0x01, b'm'];
+        assert_eq!(receipt.encode_to_vec(), wire);
+        assert_eq!(Receipt::decode(wire).unwrap(), receipt);
+        assert_eq!(Verdict::Refused as i32, 7);
     }
 
     /// A receipt's reply is held to a command's size, so a receipt with its reply never needs

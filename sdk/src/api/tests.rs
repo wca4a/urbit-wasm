@@ -24,6 +24,33 @@ fn a_lost_a_failed_and_a_replyless_receipt_are_told_apart() {
 }
 
 #[test]
+fn a_refused_receipt_is_its_fault_or_did_not_run_without_one() {
+    // REFUSED with a fault: the fault, typed, whatever the reason says.
+    let refused = Receipt { fault: Some(fault("no-name", "a signature needs a name")), ..receipt(Verdict::Refused, false, vec![]) };
+    let called = __receipt::<Fault>(&refused);
+    assert_eq!(called, Err(CallError::Fault(fault("no-name", "a signature needs a name"))));
+    assert_eq!(called.unwrap_err().to_string(), "no-name: a signature needs a name");
+    // REFUSED with none (the other ship broke the protocol, or its fault was let go): not run,
+    // with the reason.
+    let bare = __receipt::<Fault>(&receipt(Verdict::Refused, false, vec![]));
+    assert_eq!(bare, Err(CallError::NotRun(Verdict::Refused, "why".into())));
+    assert_eq!(bare.unwrap_err().to_string(), "the command did not run (VERDICT_REFUSED): why");
+    // A fault beside any other verdict is not taken for one (this ship's runtime lets such a
+    // fault go before the agent is told; if one came anyway, the verdict decides).
+    let odd = Receipt { fault: Some(fault("x", "y")), ..receipt(Verdict::Failed, false, vec![]) };
+    assert_eq!(__receipt::<Fault>(&odd), Err(CallError::NotRun(Verdict::Failed, "why".into())));
+    // RAN with a reply that is a CallReply holding a fault: the command answered with a fault
+    // without refusing, and may have kept its changes. Not a refusal: not understood.
+    let faulted = CallReply { result: Some(Replied::Fault(fault("oops", "kept anyway"))) }.encode_to_vec();
+    match __receipt::<Fault>(&receipt(Verdict::Ran, true, faulted.clone())) {
+        Err(CallError::NotUnderstood(why)) => assert!(why.contains("ran and answered with a fault (oops: kept anyway) without refusing"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // A question's reply holding a fault is still that fault.
+    assert_eq!(__decode_reply::<Fault>(&faulted), Err(CallError::Fault(fault("oops", "kept anyway"))));
+}
+
+#[test]
 fn the_compile_time_check_wants_the_same_interfaces_both_ways() {
     assert!(__same_interfaces(&["a", "b"], &["b", "a"]));
     assert!(!__same_interfaces(&["a", "b"], &["a"]));

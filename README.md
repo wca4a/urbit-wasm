@@ -390,7 +390,7 @@ source rather than something the tests prove.
 | `runtime/src/api_tests.rs` | Tests of the cache's order and what it keeps, an agent whose description was never checked, a module replaced between a call's lookup and its run, and the door's statuses for faults, inside the crate |
 | `runtime/src/remote_tests.rs` | Tests of fetching a file from another ship, inside the crate so that the ship answering can be made to lie |
 | `runtime/src/kept_tests.rs` | Tests of keeping what was fetched and saving a copy, with the same runtimes and liar, and failures made to happen at chosen points |
-| `runtime/src/ask_tests.rs` | Tests of questions between ships and of receipts that bring a reply, with two real runtimes, inside the crate so that a network can vanish and the parts that decide can be read |
+| `runtime/src/ask_tests.rs` | Tests of questions between ships, of receipts that bring a reply, and of refusals (a command turned down on purpose, on one ship and across two, with agents written by hand), with real runtimes, inside the crate so that a network can vanish and the parts that decide can be read |
 | `kernel/src/lib.rs` | The default kernel: agent registry and routing policy |
 | `proto/ship.proto` | Every message: runtime and kernel, runtime and agent, client and ship, ship and ship |
 | `proto/src/lib.rs` | The generated messages, and `interface_of_service`, the one rule turning a service's name into an interface's |
@@ -461,13 +461,18 @@ If anything fails, the runtime rolls back to the savepoint, so the event's
 effects are gone but the work around it (taking a queued command off the
 queue) stays. It then records the failure in the same transaction: an audit
 row with `ok = 0`, a receipt with a failure verdict if another ship is owed
-one, a checkpoint request if a log was full, and, if SQLite reported the file
-full, dropping log entries that checkpoints already cover. If that
-transaction is lost too, the rejection is recorded in a new one. A queued
-command that is rejected is dropped, not retried.
+one (with the agent's fault, for a refusal), a checkpoint request if a log was
+full, and, if SQLite reported the file full, dropping log entries that
+checkpoints already cover. If that transaction is lost too, the rejection is
+recorded in a new one. A queued command that is rejected is dropped, not
+retried.
 
 A rejected event surfaces as `Error::Rejected` with one of `OutOfFuel`,
-`Timeout`, `Denied`, `Limit`, or `Trap`.
+`Timeout`, `Denied`, `Limit`, `Trap`, or `Refused(Fault)`. `Refused` is a
+command its own handler turned down on purpose with the host function
+`refuse` (see Faults); it is rolled back by the same path as the rest, and is
+the only one that carries words the agent chose for its caller. Its `Display`
+is `event rejected: refused: <code>: <message>`.
 
 `Runtime::deliver` runs the owner's command and then up to
 `max_queued_per_deliver` queued events, so agents that keep sending each
@@ -496,8 +501,11 @@ These stop a hostile or buggy agent from stalling a ship or the process.
 
 - Fuel. Every event gets `fuel_per_event` units. Each host call costs 5,000
   plus one per byte moved, so a cheap guest loop cannot buy unlimited host
-  work. Appending to a log costs 50,000 more, for the signature. A nested read
-  is paid from the reader's remaining fuel. Fuel is also checked after the
+  work. (`refuse` charges only in a command's own handler, before it reads its
+  input: outside it, it traps first and charges nothing; in it, too little
+  fuel is out of fuel before the input's size is looked at.) Appending to a
+  log costs 50,000 more, for the signature. A nested read is paid from the
+  reader's remaining fuel. Fuel is also checked after the
   handler returns, so straight-line code that overran cannot commit.
 - Time. Fuel cannot see how large a bulk memory operation is, so each event
   also has a wall-clock deadline of `max_event_millis`. A watchdog thread
@@ -661,6 +669,7 @@ bigger buffer.
 | `log_next(req, req_len, buf, cap) -> i64` | `NextRequest`. Take entries after this agent's position, at most 256 entries or 256 KiB per call |
 | `file_info(id, id_len, buf, cap) -> i64` | `FileInfo` of a file this agent claims on this ship, by its 32-byte id, with whether its claim is marked open. `-1` for any other id, whether the ship holds it or not. Read-only, and no grant is needed: it is the agent's own data. No host function reads or writes a file's bytes |
 | `file_mark(req, req_len) -> i64` | `FileMark {id, open}`. Mark this agent's own claim on a file open to every ship, or take the mark off. `1` if the agent claims that file, else `0` and nothing changes (not an error). A change, so refused while reading, and kept only if the event commits |
+| `refuse(ptr, len)` | An encoded `Fault {code, message}`. Turn the command being handled down on purpose, and do not come back: the call fails from inside the host, the event is rolled back as any rejected event is, and the fault goes to whoever sent the command. Counts only in a command's own `handle` export at depth 0; anywhere else, and for bytes that are not a `Fault` or a code that breaks the rule, it is an ordinary failure (see Faults). Outside a command's own handler, `refuse` traps before charging host-call fuel or reading the input. In the handler it charges 5,000 fuel plus one per supplied byte. With sufficient fuel, an encoded input exceeding `max_reply_bytes` plus 1 KiB gives `Limit` |
 
 The calls that change something are refused during a read, a checkpoint, a
 file question, or a question from another ship.
@@ -671,6 +680,13 @@ file question, or a question from another ship.
 
 - `kv::get`, `kv::put`, `kv::delete`; `emit`; `invocation`; `read`; `send`;
   `send_to`; `send_to_for_reply`, the same with the reply wanted back.
+- `refuse(&Fault) -> !` and `refuse_with(code, message) -> !`: turn the command
+  being handled down, saying why (the host function `refuse`). An unconditional
+  trap follows the host call, so a host that returned could not let the
+  handler carry on. Untyped agents (`agent!`) may call it too, from their
+  command handler: only a command's own handler can refuse with a fault. A module that
+  calls it imports `host.refuse`; one that does not (the untyped `counter` and
+  `tally`) imports nothing new.
 - `ask::to(ship, agent, interface, payload, within_millis)`, returning the
   question's number, and `ask::drop(number)`; `Answered` and `Outcome` from the
   protocol, and `ask::DEFAULT_WITHIN_MILLIS` (10,000).
@@ -679,7 +695,7 @@ file question, or a question from another ship.
   `next` returns a `Batch` with `entries`, `more`, an optional `checkpoint` to
   replace local state with, and an optional `stopped` reason for a log on
   another ship.
-- `Receipt` (with `reply`) and `Verdict`, re-exported from the protocol.
+- `Receipt` (with `reply` and `fault`) and `Verdict`, re-exported from the protocol.
 - `files::info(id)`, `files::open(id)`, `files::close(id)`, and `FileRef`,
   `FileInfo`, `FileAsk` and `FileAnswer` from the protocol. A `FileRef` (ship,
   id, length, agent) is plain data an agent keeps in place of a file: the id
@@ -706,9 +722,11 @@ a proto3 file, and have the rest made from it: typed handlers in the agent,
 typed calls from one agent to another, typed logs, the proto3 JSON form of its
 messages, and a JSON door for the owner's devices. `agents/guestbook` is such
 an agent, and `agents/kit` one made of awkward cases for the tests; `counter`
-and `tally` stay untyped. Nothing on the event path, in the protocol between
-ships, or in the store changes for it: a typed call is an ordinary payload
-holding a small envelope, and the runtime runs it as it runs any other.
+and `tally` stay untyped. Nothing in the store changes for it, and a typed
+call is an ordinary payload holding a small envelope, which the runtime runs as
+it runs any other. Two things were added for it beside the envelope, so that a
+command's fault reaches its caller: the host function `refuse`, and, between
+ships, `VERDICT_REFUSED` with `Receipt.fault` (see Faults).
 
 The runtime reads no message types. Bodies, in protobuf or in JSON, are read
 and written by the code generated into the agent, inside the agent's sandbox.
@@ -761,15 +779,19 @@ module carries it.
 
 ### The envelope
 
-`proto/ship.proto` has three messages for it, added and nothing else changed.
+`proto/ship.proto` has three messages for it: `Call`, `CallReply` and `Fault`.
 `Call { method, body, json }` is the payload of a typed command or question:
 the method's name and its input, encoded, or, with `json` set, written as
 proto3 JSON, in which case the reply's body is wanted as JSON too. `CallReply {
 oneof result { bytes body; Fault fault } }` is the reply bytes of one: its
-output, in the form the call asked for, or a `Fault { code, message }`. The
-interface is not in the envelope: it is `Invocation.interface`, which the
-kernel has already checked. Log entries and checkpoint states are the bare
-encoded message, since a log has one type.
+output, in the form the call asked for, or, for a question, a `Fault { code,
+message }`. A command's fault does not go in its `CallReply`: the command
+refuses instead, so that nothing it did is kept, and the fault travels as a
+refusal (`Rejection::Refused`, or `Receipt.fault` with `VERDICT_REFUSED`; see
+Faults). Those two, a verdict and a field, were added to the protocol for it,
+add-only. The interface is not in the envelope: it is `Invocation.interface`,
+which the kernel has already checked. Log entries and checkpoint states are the
+bare encoded message, since a log has one type.
 
 The codes the generated code makes start with `ship.`: `ship.no-such-interface`
 (the call came through an interface the agent does not serve, or through none
@@ -777,9 +799,11 @@ at all), `ship.no-such-method`, `ship.not-understood` (the payload is not a
 `Call`, or its body does not decode as the method's input, as protobuf or as
 JSON; the message is the decoder's own words), and `ship.wrong-kind` (a command
 reached as a question, or the reverse; it is not run). An application's own
-codes are any other string. A handler that returns a code starting with
-`ship.` has it rewritten with `app.` in front, in every build (`ship.x` arrives
-as `app.ship.x`), so that only the generated code makes those. Fields a
+codes are any other string. Generated dispatch prefixes a handler's `ship.`
+code with `app.`. A question carries the resulting fault in its reply. For a
+command refusal, the resulting code must be 1 to 64 printable non-space ASCII
+bytes, and the runtime cuts the message to 200 bytes. A direct `refuse` call
+supplies the code without the generated rewrite. Fields a
 protobuf body does not know are ignored, as the evolution rule says; for JSON,
 see below.
 
@@ -790,14 +814,71 @@ A question's handler returns `Result<Reply, Fault>`. Either way the reply is a
 caller typed: the owner (`Runtime::call_method`, or the door), another agent on
 the ship (through `read`), or another ship (through `Answered`).
 
-A command's handler also returns `Result<Reply, Fault>`. In this part, `Err`
-makes the generated code trap, so the event is rolled back exactly as any
-failed handler's is: nothing the handler did is kept. The caller sees what it
-sees for any failed handler (`Rejection::Trap`, or a `FAILED` receipt); the
-fault's code and message do not reach it. The generated refusals on the
-command path are traps as well. When the command's decoder refuses the body,
-generated dispatch traps and the caller receives a failed command without a
-reason. No host function, verdict or outcome was added for faults.
+A command's handler also returns `Result<Reply, Fault>`. Its `Err` is a
+refusal: the command turned down on purpose. The generated dispatch hands the
+fault to the runtime with the host function `refuse` (the SDK's
+`ship_sdk::refuse`), so do the generated refusals on the command path
+(`ship.no-such-interface`, `ship.no-such-method`, `ship.not-understood`,
+`ship.wrong-kind`; a handler's `ship.` code is still rewritten to
+`app.ship.` first), and so may any agent's command handler, typed or not (only
+a command's own handler can refuse with a fault). The runtime fails the
+call from inside the host function, finds the refusal on the error it gets
+back, and rolls the handler's savepoint back by the path every rejection
+takes: nothing the command did is kept. The fault then reaches whoever sent
+the command: the owner's device (the door's answer, with the status of its
+code), an embedder (`Rejection::Refused`, and `Called::Fault` from
+`Runtime::call_method`), or an agent on another ship (`VERDICT_REFUSED` with
+`Receipt.fault`, which `call::<method>::receipt` gives as
+`CallError::Fault`). A reply that cannot be written as JSON still traps: that
+is a fault in the agent, not something it chose to say.
+
+This is the existing failure path with a reason attached, and nothing else:
+no second way to roll back, and no reply that rolls back. The rules, each held
+by the runtime (the SDK is only a convenience):
+
+1. Only a command may refuse. `refuse` counts only in the `handle` export of an
+   event of `KIND_COMMAND`, at depth 0. Anywhere else (a read, including one
+   nested under a command; a notification; a receipt; an answer; a checkpoint
+   request; a file question) it is an ordinary failure with no reason, as a trap
+   is there: those calls have nobody to carry a reason to, a question already
+   says why in its reply, and a read nested under a command is the reading
+   agent's business, which must not speak for the command.
+2. For a command refusal, the fault's code must be 1 to 64 bytes
+   (`runtime::MAX_FAULT_CODE_BYTES`, re-exported from the crate root), every
+   byte printable non-space ASCII (0x21 to 0x7E). Its message is any UTF-8,
+   which the runtime cuts to at most 200 bytes (`runtime::MAX_FAULT_MESSAGE_BYTES`,
+   the bound a receipt's reason has) at a character boundary, turning each
+   control character into a space. (A question's fault is not held to this: it
+   goes back in its reply as the handler made it, after generated dispatch has
+   prefixed a `ship.` code with `app.`; a direct `refuse` call supplies the code
+   without that rewrite.) Bytes that
+   do not decode as a `Fault` (a message that is not UTF-8 among them), or a
+   code that breaks the rule, make the call an ordinary failure with no
+   reason; nothing checks or mends a handler's code in generated code, so a
+   handler that returns such a code (a space in it, or 65 bytes) fails
+   instead of refusing. The order is: outside a command's own handler,
+   `refuse` traps before charging host-call fuel or reading the input; in the
+   handler it charges 5,000 fuel plus one per supplied byte (too little fuel
+   is out of fuel); with sufficient fuel, an encoded input exceeding
+   `max_reply_bytes` plus 1 KiB gives `Limit`, as any request over its size
+   does; only then are the bytes decoded and the code checked.
+3. Nothing is kept. Everything the handler did before refusing is undone: kv,
+   log appends, follows and shares, sends to this ship and to others,
+   questions put, file marks, questions dropped. This is the savepoint's
+   doing, as for any rejection.
+4. A refusal is a refusal even late. A handler that refuses after its deadline
+   is reported as refused, not as out of time (nothing is kept either way, and
+   the agent got to say why). One stopped by the watchdog before it reaches
+   `refuse` is out of time, as before.
+5. It is recorded like any rejection: an audit row with `ok = 0`, whose payload
+   is the command's, as for any rejected event; no reason is added to it.
+
+Fuel exhaustion, timeouts, limits, kernel denials and traps retain their
+existing reports and carry no structured fault. A routing denial carries the
+kernel's reason. Receipts for failures after routing use fixed words. The
+difference is the one
+`verdict_of` gives: what a handler ran into by accident is the agent's own
+business; a refusal is what the agent chose to say to its caller.
 
 ### Code generation
 
@@ -883,17 +964,21 @@ two directories of their own. For every service, served or called, it has:
   `send(agent, &request)` (on this ship; nothing comes back),
   `send_to(ship, agent, &request)` and `send_to_for_reply(ship, agent,
   &request)` (on another ship; the number the receipt will carry), and
-  `receipt(&Receipt)`, which turns a receipt into the typed reply or the reason
-  there is none. For a question, `read(agent, &request)` (on this ship: the
+  `receipt(&Receipt)`, which turns a receipt into the typed reply, the fault the
+  command was refused with, or the reason there is none. For a question, `read(agent, &request)` (on this ship: the
   typed reply, or why not), `ask(ship, agent, &request, within_millis)` (on
   another ship; the number the answer will carry), and `answered(&Answered)`,
   which turns an answer into the typed reply, the fault, or the outcome that is
-  not a reply. Why not is a `ship_sdk::api::CallError`: `Fault`,
-  `NotUnderstood` (what came back is not a `CallReply`, or its body does not
-  decode), `Unanswered(Outcome, reason)`, `NotRun(Verdict, reason)` (refused,
-  failed, too large, or malformed), `Lost(reason)` (one of the ships went back
-  to an earlier state, and nobody can tell whether the command ran) or
-  `NoReply(reason)` (the command ran and its receipt carries no reply). Stubs
+  not a reply. Why not is a `ship_sdk::api::CallError`: `Fault` (a question's
+  fault, or, for a command, only the fault it was refused with:
+  `VERDICT_REFUSED` with `Receipt.fault`, nothing kept), `NotUnderstood` (what
+  came back is not a `CallReply`, or its body does not decode; or, for a
+  command, a `RAN` receipt whose reply holds a fault: the command answered with
+  a fault without refusing, so what it did may have been kept), `Unanswered(Outcome, reason)`, `NotRun(Verdict,
+  reason)` (not allowed, failed, a limit, malformed, or `REFUSED` with no fault
+  taken), `Lost(reason)` (one of the ships went back to an earlier state, and
+  nobody can tell whether the command ran) or `NoReply(reason)` (the command
+  ran and its receipt carries no reply). Stubs
   are thin: they build the `Call` (protobuf, never JSON), call the SDK
   function, and decode.
 - `log`, for a service with a log: the types `Entry`, `State` (`()` for a
@@ -909,8 +994,9 @@ two directories of their own. For every service, served or called, it has:
 For a service served, it also has:
 
 - `Handlers`, a trait with an associated function for each command and
-  question, given the decoded input and returning `Result<Output, Fault>`;
-  `ship_sdk::invocation()` still says who is calling.
+  question, given the decoded input and returning `Result<Output, Fault>`
+  (for a command, `Err` refuses it; see Faults); `ship_sdk::invocation()` still
+  says who is calling.
 - `Checkpoint`, for a log whose state is not `Empty`: `fn state() ->
   Option<State>`, the state behind the log. It is not there for a history.
 - `Interface`, which implements `ship_sdk::api::Serve<H>` for any `H` that
@@ -924,7 +1010,7 @@ they import, each after what it imports. A file imported and not served keeps
 its messages and enums and loses its services, and the comments on them, so
 that the description names only interfaces the agent serves. Comments are
 kept, for documents to be made from it later; the places in the source that
-carry no comment are dropped. The guestbook's is 8,219 bytes. One larger than
+carry no comment are dropped. The guestbook's is 8,499 bytes. One larger than
 256 KiB, a runtime's default `max_api_bytes`, is said in a cargo warning.
 `api::SERVED` lists the interfaces it serves.
 
@@ -962,10 +1048,12 @@ state. A typed agent always has a `checkpoint` export: for a history, and for a
 name that is not one of its logs, it answers that there is no state, so that
 log is kept whole. The generated code builds without warnings.
 
-The JSON code costs size: the guestbook's module is 418,339 bytes, where it was
-218,746 before it had any (serde, serde_json, pbjson and the generated impls;
-the guestbook also gained a method and fields between the two, so the
-difference is not the JSON code's alone).
+The JSON code costs size: the guestbook's module is 421,876 bytes (418,467 as
+the commit before refusals builds here, which this file once gave as 418,339),
+where it was 218,746 before it had any (serde, serde_json, pbjson and the
+generated impls; the guestbook also gained a method and fields between the two,
+and a field and the refusal path since, so the difference is not the JSON
+code's alone).
 
 ### JSON, as the generated code reads and writes it
 
@@ -1015,7 +1103,8 @@ tests are `the_door_calls_a_method_with_json_and_with_protobuf_alike` and
 
 A question whose body fails to decode returns `ship.not-understood` with the
 decoder's diagnostic. The tested JSON errors include a line and column. A body
-a command cannot read is a failed command (see Faults).
+a command cannot read is refused with the same fault, and nothing of the
+command is kept (see Faults).
 
 ### What the runtime does with it
 
@@ -1072,12 +1161,15 @@ In `runtime/src/api.rs`.
   and the method's kind; wraps the body, untouched, in a `Call` with `json` set
   for JSON; runs it as an owner command (`deliver_on`) for a command or an
   owner read (`read`) for a question; and unwraps the `CallReply`, giving back
-  `Called::Reply` (the body as the agent wrote it) or, for a question,
-  `Called::Fault`. For JSON it checks only that the reply's body is UTF-8 and is
-  JSON. Its `CallError` tells apart: no such agent; no description; no such
-  interface; no such method (the log is not one); a reply that is not a
-  `CallReply`, has neither a body nor a fault, is a fault from a command, or,
-  asked for JSON, is not JSON; and whatever `deliver_on` or `read` returned. The
+  `Called::Reply` (the body as the agent wrote it) or `Called::Fault`: a
+  question's fault from its reply, or the fault a command refused with
+  (`Rejection::Refused` from `deliver_on`; nothing of the command was kept).
+  For JSON it checks only that the reply's body is UTF-8 and is JSON. Its
+  `CallError` tells apart: no such agent; no description; no such interface;
+  no such method (the log is not one); a reply that is not a `CallReply`, has
+  neither a body nor a fault, is a fault a command answered with instead of
+  refusing (no generated code does; it may have committed), or, asked for JSON,
+  is not JSON; and whatever else `deliver_on` or `read` returned. The
   kind is read from the module the agent has when the call is looked up; if the
   module is replaced before the call runs, the new module's generated dispatch
   decides, refusing a method of another kind (`ship.wrong-kind`) or one it does
@@ -1093,23 +1185,30 @@ Two routes of the HTTP server (see HTTP server for clients), routes only in
 | `GET /agents/<agent>/api` | device | The description, byte for byte, as `application/x-protobuf`. There is no JSON form. 404 if the agent has no usable description |
 | `POST /agents/<agent>/api/<interface>/<method>` | device | Calls the method as the ship's owner. The body is the method's input, as `application/json` or `application/x-protobuf` (the media type compared without its parameters or capitals; anything else, or none, is 415), passed to the agent untouched. The reply is the method's output in the same encoding, as the agent wrote it |
 
+The door maps a fault by its code. The explanations for `ship.` codes below
+describe generated dispatch. A handler calling `refuse` directly can supply any
+valid code, including these codes.
+
 | Status | When |
 | --- | --- |
 | 200 | The reply |
-| 400 | A question answered `ship.not-understood`: it could not read the body. Also an agent or interface name that is not valid |
+| 400 | A question answered, or a command refused, `ship.not-understood`: it could not read the body. Also an agent or interface name that is not valid |
 | 401 | Not signed in, or a ship that does not exist |
 | 403 | A cookie-authenticated `POST` that does not show it came from the ship's own page |
-| 404 | No such agent, no usable description, no such interface, no such method (the log is not one); or a question answered `ship.no-such-interface` or `ship.no-such-method` |
+| 404 | No such agent, no usable description, no such interface, no such method (the log is not one); or a question answered, or a command refused, `ship.no-such-interface` or `ship.no-such-method` |
 | 405 | A method the address does not take; `Allow` says which |
-| 409 | A question answered `ship.wrong-kind`: the module that ran it is not the one the method's kind was read from, or its description disagrees with its code |
+| 409 | A question answered, or a command refused, `ship.wrong-kind`: the module that ran it is not the one the method's kind was read from, or its description disagrees with its code |
 | 413 | A body larger than `max_body_bytes` |
 | 415 | A body that is not said to be JSON or protobuf |
-| 422 | A question fault with any other code uses the requested encoding. A runtime rejection on either path uses the command route's plain-text reason. Generated command faults trap and return "the command failed" |
-| 502 | The agent's reply is not a `CallReply`, has neither a body nor a fault, is a fault from a command, or, asked for JSON, is not UTF-8 JSON. 502 and not 500: what went wrong is the agent's, behind the door, not the server's |
+| 422 | A question's fault, or a command's refusal, with any other code (an application's own, `app.ship.` ones among them), in the requested encoding. Any other runtime rejection on either path (a trap, fuel, time, a limit, a denial) uses the command route's plain-text reason, "the command failed" for a trap |
+| 502 | The agent's reply is not a `CallReply`, has neither a body nor a fault, is a fault a command answered with instead of refusing, or, asked for JSON, is not UTF-8 JSON. 502 and not 500: what went wrong is the agent's, behind the door, not the server's |
 | others | Whatever else `deliver_on` and `read` return, with the statuses the command route gives |
 
-A question's fault comes back as `{"code": ..., "message": ...}` (written by
-the door) for a JSON request, or an encoded `Fault` for a protobuf one.
+A question's fault, and a refused command's, come back as `{"code": ...,
+"message": ...}` (written by the door) for a JSON request, or an encoded
+`Fault` for a protobuf one, with the status `fault_status` gives the code. So a
+JSON body a command cannot read is 400 with the decoder's words, where before
+refusals it was 422 "the command failed".
 
 The door has the same authentication and cross-site rules as the other routes,
 and a ship that does not exist answers like one the caller is not signed in to.
@@ -1117,8 +1216,9 @@ A path is split before each part is decoded, so an encoded `/` stays in its
 part and cannot turn the path into another route's, and an agent or interface
 named `api`, `command` or `files` is only a name in its place. An untyped agent
 answers 404 at `/api` and takes raw bytes at `/command` as before. `/command`
-on a typed agent runs with no interface, and its dispatch refuses it: a trap,
-422 "the command failed". Responses produced by the two API handlers carry the
+on a typed agent runs with no interface, and its dispatch refuses it
+(`ship.no-such-interface`): 422 with the encoded fault, as the command route
+answers any refusal (see HTTP server for clients). Responses produced by the two API handlers carry the
 file routes' Content-Security-Policy. Earlier server refusals use their ordinary
 headers.
 
@@ -1139,9 +1239,13 @@ guestbook on this ship with `read`; Follow follows another guestbook's two
 logs, which its notify handler takes typed, keeping the checkpoint it is handed
 and the bytes of entries that do not decode. For the tests: Scribble puts an
 entry in the log that is not a signature; Spoil appends an entry and writes
-the book and a count, and then fails; Erase counts each attempt before it
-looks; and Lookup with a prefix starting `ship.` answers with a fault of that
-code, so that its rewriting can be seen. An erased signature stays as its
+the book and a count, and then refuses (`spoilt`), so that a refusal can be
+seen to keep nothing; Erase counts each attempt before it looks (and refuses
+with `no-such-signature`); Sign refuses a signature with no name (`no-name`);
+`Pass` with `nameless` set (field 4, added for this) sends the signature
+without its name. A book on another ship returns `no-name` on its receipt. A
+same-ship send has no receipt. And Lookup with a prefix starting `ship.` answers with a
+fault of that code, so that its rewriting can be seen. An erased signature stays as its
 number with no name, and its entry in the log says so the same way, so that the
 state behind the log changes only with an entry describing the change.
 
@@ -1149,8 +1253,9 @@ state behind the log changes only with an entry describing the change.
 for the door's paths) and `kit` from `agents/kit/api/kit.proto`: well-known
 types as an argument, a result and a field (`Timestamp`, `Empty`, `BoolValue`,
 `Int64Value`), a method named like a Rust keyword (`Type`), a field with a
-declared JSON name, a command that changes nothing (`Echo`), and calls through
-interfaces it only calls. Its ten call-only files cover the guestbook, package
+declared JSON name, a command that changes nothing (`Echo`), a command that
+refuses with the code and message it is given (`Refuse`: `name` and
+`nickname`), and calls through interfaces it only calls. Its ten call-only files cover the guestbook, package
 and service-name layouts, the counter's log, and the supported well-known
 types with a custom method option. Each is a layout the generated code must
 compile for: the guestbook's interfaces, a nested package
@@ -3736,7 +3841,9 @@ sender always learns what became of it.
   ship's runtime predates replies, or when it broke the protocol (a reply over
   the bound the command was sent with, or a reply not marked): the command is
   still reported as run, because the other ship said so; no reply is handed
-  on; and when a reply came and was let go, the reason says so. An agent that
+  on. A reply that breaks the protocol is discarded. If a fault also arrived,
+  the reason and audit line describe what happened to the fault. Otherwise
+  they identify the discarded reply. An agent that
   needs the reply checks `Receipt.replied`.
   A ship that takes back no reply at all (`max_receipt_reply_bytes` 0, or a
   queue too small for any receipt with a reply, 592 bytes or less) does not
@@ -3744,6 +3851,50 @@ sender always learns what became of it.
   wanted; the send is refused there ("this ship takes back no reply ..."),
   and the event with it. A command without `reply` is the same bytes on the wire as before,
   apart from the absent field.
+- An agent that turns a command down on purpose (the host function `refuse`;
+  see Faults) has its fault carried back: the receipt says `REFUSED`, its
+  reason is the fixed words "the agent refused it" (never the agent's message,
+  which is in the fault), and `Receipt.fault` holds the fault, with or without
+  a reply asked for (a refusal carries no reply). Nothing the command did is
+  kept, as for any rejection. On the sending ship a fault is taken only with
+  `REFUSED`, and only one that keeps the rules on a fault (a code of 1 to 64
+  printable ASCII bytes other than space; a message of at most 200 bytes, its
+  control characters turned into spaces as a reason's are); the agent is then
+  handed the receipt with the fixed words as its reason, whatever reason came,
+  and the audit line written for it ends with the fault's code and message
+  (cut, as every such line is, to 512 bytes). A fault that comes with any
+  other verdict, or breaks the rules, is let go: the receipt is handed on with
+  its verdict as the other ship gave it and no fault, and its reason, and the
+  audit line, say "the fault that came with this receipt was not one this ship
+  takes, and was let go". A `REFUSED` receipt carrying neither a fault nor a
+  reply keeps the peer's reason, cut to 200 bytes at a character boundary with
+  control characters replaced by spaces. A reply that breaks the protocol is
+  discarded. If a fault also arrived, the reason and audit line describe what
+  happened to the fault. Otherwise they identify the discarded reply. The
+  SDK's `call::<method>::receipt` gives a `REFUSED` receipt with a fault as
+  `CallError::Fault` (refused, nothing kept), and one without as
+  `CallError::NotRun`. A `RAN` receipt whose reply is a `CallReply` holding a
+  fault is `CallError::NotUnderstood`, never `CallError::Fault`: that command
+  answered with a fault without refusing, so what it did may have been kept.
+  If the named receipt plus its 64-byte queue overhead exceeds
+  `max_inbox_bytes`, the sender closes the command and records the refusal in
+  its bounded audit line without delivering a receipt event. If only the
+  currently free room is insufficient, the receipt waits on the other ship.
+- A receipt whose fields do not decode (a reason or a fault that is not UTF-8,
+  for example) is not a receipt: the delivery it came in is refused whole, as
+  any malformed delivery is, and the commands it answered stay unanswered until
+  that ship sends them properly.
+- Compatibility. A runtime from before refusals never says `REFUSED`. An older
+  runtime forwards the numeric verdict unchanged, skips field 9, and audits
+  verdict 7 with "for a reason this runtime does not know". An agent built
+  against the older enum sees `VERDICT_UNSPECIFIED` through its enum accessor
+  ("unknown" in `tally`'s words). An agent whose source lists every verdict with no catch-all arm needs
+  a line for the new one when it is rebuilt against this SDK (`tally` gained
+  `Verdict::Refused => "refused"`). A module that calls `refuse`, every typed
+  agent among them since its generated dispatch does, imports `host.refuse`,
+  which a runtime from before refusals does not have, so it cannot be installed
+  there; untyped agents that do not call it (`counter`, `tally`) import
+  nothing new.
 
 Room for a receipt with a reply, with its working:
 
@@ -3778,10 +3929,13 @@ Room for a receipt with a reply, with its working:
   ships full of commands for each other each keep, by the rule on sending, the
   room to take the other's first command; replies taken from third ships can
   use it only until their events run, which needs nothing from either ship,
-  so it comes back and the two meet as before. A receipt whose reply breaks the
-  protocol (not `RAN`, not asked for, or over the bound the command carried)
-  is handed on without it, with a reason saying so, and that is written to the
-  audit log; a ship that keeps to the protocol never sends one.
+  so it comes back and the two meet as before. A reply that breaks the
+  protocol is discarded. A reply breaks the protocol if the verdict is not
+  `RAN`, the command did not request a reply, the reply exceeds the command's
+  bound, or nonempty reply bytes arrive with `replied` unset; a ship that
+  keeps to the protocol never sends one. If a fault also arrived, the reason
+  and audit line describe what happened to the fault. Otherwise they identify
+  the discarded reply.
 - Export and import: a command keeps the bound it was sent with, which a
   later, lower setting does not shrink, so import checks kept bounds, and
   receipts with replies (queued, or owed to another ship), against a fixed
@@ -3799,14 +3953,61 @@ Room for a receipt with a reply, with its working:
   out is worked out without overflowing, whatever the settings. Comparing
   notes after a restore and `LOST` make receipts of their own, with no reply.
 
+Room for a receipt with a fault, with its working (each size is pinned by a
+test that encodes it with prost, `store::tests::a_receipt_with_the_largest_fault_fits_where_receipts_are_held`):
+
+- The largest fault: a code of 64 bytes (66 with its tag and length) and a
+  message of 200 (203), 269 bytes; as `Receipt.fault`, 272 bytes,
+  `store::FAULT_FIELD_BYTES`, worked out from the two bounds.
+- The receipt a refusing ship writes and sends: no names, the number (at most
+  `2^62`, 10 bytes with its tag), `REFUSED` (2), the fixed words (22) and the
+  largest fault: 306 bytes, inside `MAX_RECEIPT_BYTES` (512). So every room
+  kept for receipts is unchanged: `room_to_take_one` and the room an
+  accepting ship keeps for each receipt it owes (512 bytes each) hold it, as
+  does import's check of a receipt waiting to go. A receipt with a reply is
+  `RAN` and never carries a fault, and a `REFUSED` one never carries a reply,
+  so `reply_most` is unchanged too.
+- The copy the sending ship hands its agent adds the ship's, agent's and
+  interface's names (at most 64, 64 and 128 bytes: 263 with their tags): with
+  the largest fault and the fixed words, 569 bytes, over 512. That copy is
+  queued against the inbox's quota when it is queued, as every receipt is, and
+  no room is set aside for it, so nothing two ships keep for each other moves.
+  Import holds a queued receipt carrying a fault to `MAX_RECEIPT_BYTES` and
+  `FAULT_FIELD_BYTES` (784 bytes), as it holds one carrying a reply to
+  `MAX_RECEIPT_BYTES`, the reply and `REPLY_FIELD_BYTES`; a fault comes only
+  with `REFUSED` and a reply only with `RAN`, so the two never add up. With
+  neither a fault nor a reply, the largest named copy is 487 bytes, including
+  the longest verdict encoding, reason and names. That is why
+  the sending ship puts its own fixed words beside a fault it takes: with the
+  other ship's reason of up to 200 bytes beside the largest fault, the copy
+  would be 750 bytes.
+- What import accepts: a stored receipt with a fault only if this runtime could
+  have written it (`REFUSED`, a fault keeping the rules, the fixed words, no
+  names, within `MAX_RECEIPT_BYTES` with no allowance; and every `REFUSED`
+  receipt it writes has a fault) or taken it from another ship (the same, with
+  the names, within `MAX_RECEIPT_BYTES` and `FAULT_FIELD_BYTES`), and only as
+  the very bytes this runtime writes: its encoding of the receipt again must be
+  the same bytes, so a field it does not know, padding one, is refused. The
+  rules for a receipt without a fault are unchanged. With names in their bounds
+  the largest copy is the 569 bytes above; 784 bytes is the bound import holds
+  to, pinned on its own (784 taken, 785 not) with names longer than import
+  takes.
+- The audit log: the line about a receipt and the facts of a receipt event are
+  cut to `MAX_RECEIPT_BYTES`, so import's bound on an audit row (the larger of
+  `max_event_bytes` and 512) holds them whatever `max_event_bytes` is; a ship
+  whose events are held to 64 bytes imports its own export holding the largest
+  such copy, before and after it is handled
+  (`a_ship_with_small_events_imports_its_own_export_holding_the_largest_fault`).
+
 | Verdict | Meaning |
 | --- | --- |
 | `RAN` | It ran, and what it did is saved |
 | `DENIED` | Not allowed: no such agent, or the interface is not open to other ships. The kernel's reason is passed on |
-| `FAILED` | The handler crashed, ran out of fuel, or took too long. Only fixed words are sent; details stay in the receiving ship's audit log |
+| `FAILED` | The handler crashed, ran out of fuel, or took too long (an agent that turns a command down on purpose says `REFUSED` instead). Only fixed words are sent; details stay in the receiving ship's audit log |
 | `LIMIT` | It hit one of the receiving ship's limits |
 | `MALFORMED` | It could not be run at all |
 | `LOST` | Made up by the sender's own ship after a restore, when nobody can say whether it ran |
+| `REFUSED` | The agent turned the command down and kept none of its changes. A receipt this runtime writes carries its fault and the fixed reason "the agent refused it". A received `REFUSED` can reach the agent without a fault |
 
 ### Questions between ships
 
@@ -3905,7 +4106,8 @@ decision (each at most `kernel_fuel`, as always), the handler, and every nested
 read with its own decision. The answer is the reply (at most
 `max_answer_bytes`, 256 KiB, and what one message carries), or `denied` with
 the kernel's reason, or `failed` or `limit` in fixed words: a handler that
-traps, runs out of fuel or time, or tries to change something is "the agent
+traps, runs out of fuel or time, tries to change something, or calls `refuse`
+(which counts only for a command) is "the agent
 failed", "it ran out of fuel" or "it took too long"; a reply too large is "the
 answer is larger than that ship gives". The answer is written with nothing of
 the request held, and the ship rests.
@@ -4408,7 +4610,7 @@ starting at `/`).
 | `GET /logs/<agent>/<log>/head` | device | `LogHead` |
 | `GET /logs/<agent>/<log>/entries?after=&max_bytes=&wait=` | device | `EntryList` with the current head. `max_bytes` defaults to 256 KiB, at most 1 MiB. `wait` (seconds) long-polls up to `max_wait`. Gone entries answer 410 with `Trimmed` |
 | `GET /logs/<agent>/<log>/checkpoint` | device | `SignedCheckpoint`, or 404 |
-| `POST /agents/<agent>/command` | device | Runs the body as an owner command; the agent's reply as the body |
+| `POST /agents/<agent>/command` | device | Runs the body as an owner command; the agent's reply as the body. A rejected command is 422: a refusal (the agent turned it down on purpose) with `Content-Type: application/x-protobuf` and the encoded `Fault`; every other rejection with plain text, as before ("the command failed" for a trap, "not permitted: ..." for a denial, and so on). A client tells the two apart by the content type |
 | `/agents/<agent>/files/...` | device | The agent's files (see Files on the ship), and saving a copy of a file on another ship for the agent (`POST .../files/save`, `GET .../files/saves`, `DELETE .../files/saves/<id>`; see Keeping what was opened, and saving a copy) |
 | `GET /files/from/<ship>/<agent>/<id>...` | device | A file on another ship (see Fetching a file from another ship) |
 | `GET /files/kept`, `DELETE /files/kept`, `DELETE /files/kept/<id>` | device | What the ship keeps of files fetched from other ships, and clearing it (see Keeping what was opened, and saving a copy) |
@@ -5195,6 +5397,75 @@ of 3 seconds (looks made late, by the test's own clock read before each call,
 are not judged, and the test goes on until ten are), and ending once the
 runtime is let go.
 
+Refusals are tested in `runtime/src/ask_tests.rs`, with agents written by hand
+in WebAssembly text, each export making the host calls it is given and then
+calling `refuse`. A refused command that first writes a key and deletes
+another, puts out a message, appends to its log, follows a log and shares one,
+sends a command here and one to another ship, puts a question, drops one put
+earlier, and marks a file open: every table of the ship's file but the audit
+log the same row for row before and after, each also looked at through the
+runtime. The test also checks the refusal's code, message and `Display`, and
+verifies that the audit row retains the command payload with `ok = false`.
+`refuse` in a read the owner asks, in one nested under a command, and
+in a notification, a checkpoint request, a receipt, an answer and a file
+question, each an ordinary failure (what the host function did with each call
+recorded, in the crate's tests only), and in a command taken. A fault's rules:
+an empty code, one of 65 bytes, a space, a control byte, a delete byte, a byte
+past ASCII, bytes that are not a fault, and a message that is not text, each an
+ordinary failure; a 64-byte code and a 200-byte message taken whole, every
+printable byte in a code, a message cut where bytes 199 and 200 are one
+character, control characters (one byte and two) turned into spaces; nothing
+kept. A refusal held inside `refuse` until well past the deadline reported as a
+refusal, and a handler stopped before it reaches `refuse` as out of time. A
+command queued here that refuses dropped, the command that queued it standing.
+Across two ships with their networks, the receipt of a refused command, with
+and without a reply asked for, handed to the sending agent with `REFUSED`, the
+fixed words, the fault (its control character a space) and no reply, compared
+field by field, nothing kept on the ship that refused, and the sender's audit
+line with the fault's code and message. The sending side, with receipts as
+another ship might send them: a fault taken with `REFUSED` (the other ship's
+reason replaced by the fixed words; the largest fault whole), let go with `RAN`
+and with `FAILED`, let go when too long or its code breaks the rule, and
+`REFUSED` with no fault handed on as it came, each compared field by field and
+each with its audit line. A ship with a `REFUSED` receipt waiting to go and one
+queued for its agent, both with the largest fault, exported and imported, the
+receipt then handed over; exports changed to break the rules (a fault with
+`FAILED` or `RAN`, `REFUSED` with no fault, a code with a space or too long, a
+message too long or with a control character, other words beside a fault)
+refused. A ship whose events are held to 64 bytes importing its own export with
+the largest copy of a receipt queued (561 bytes, for command 1), and again once
+it was handled, its audit lines cut to 512 bytes. And two ships filled with
+commands for each other, each refused there with the largest fault: every one
+answered, every receipt `refused [the agent refused it]` in `tally`'s words,
+each fill stopped by the file having no more room to send, and the receipt each
+agent's handler was really handed (read, in the crate's tests only, from the
+guest's memory at the pointer and length the handler export is called with,
+and kept only once that call succeeded), decoded, carrying the largest fault,
+whole, once for every command. A module whose start function calls
+`refuse`, and one whose allocator does, each an ordinary failure, from the
+owner and from another ship (its receipt `FAILED`, no fault). A short fault read
+with `max_reply_bytes` at `usize::MAX - 1023`. At the host boundary, a pointer
+out of memory (an ordinary failure naming the out-of-bounds refusal pointer), a fault over `max_reply_bytes` and 1 KiB
+with fuel to spare (a limit), and too little fuel (out of fuel). A kernel whose
+`route` calls `refuse`: routing fails, nothing refused. On the sending side,
+for commands that asked for a reply, a reply marked with `REFUSED` beside a
+valid fault (the fault taken, the reason
+the fault's) and beside an invalid one (both let go, the reason the fault's).
+Exports with a stored receipt carrying a fault padded with a field this runtime
+does not know, in either table, refused. The sizes themselves are pinned in
+`store.rs` by `a_receipt_with_the_largest_fault_fits_where_receipts_are_held`
+(with the import bound alone: canonical copies of 784 bytes taken and 785 not,
+a padded copy refused, a padded copy without a fault taken, a named copy not
+taken as one this ship sends), and the wire numbers by
+`a_refusal_receipt_is_these_bytes_on_the_wire` (literal bytes: verdict 7, field
+9). In `tests/runtime.rs`, for each of a fault and a reason that is not UTF-8,
+with a pair of commands of its own: a delivery holding a good receipt for the
+first and then the second's: refused alike as not a request, nothing stored,
+both commands still awaited and neither receipt handed on; then the same
+delivery's saved bytes from before they were spoilt: taken, each receipt handed
+on once, the second with its own verdict and reason (`REFUSED` with the fault
+taken, or `DENIED` with its reason).
+
 `runtime/src/ask_tests.rs` covers questions between ships and receipts that
 bring a reply, with two real runtimes on localhost, keys set by hand, inside the
 crate so that a network can vanish (stopped with no goodbye) and what the ship
@@ -5462,8 +5733,12 @@ messages after it comes back, the question answered, the question to the
 journal refused with the first ship's reason, and the reply on the receipt),
 prints no em dash and no exclamation mark, and leaves none of its programs
 running. The guestbook's two steps after the eight make their own checks (the
-signature found by the question, the answer decoded on the first ship), and
-the test sees them only through the walk-through's exit code. The answer step 8 says it was given and the reply it says came back
+signature found by the question, the answer decoded on the first ship, two
+commands refused at the JSON door with 422 and their codes and the book's count,
+read before the first of them, unchanged after each, and a command refused on the second ship whose receipt
+brings the fault, with that ship's count unchanged), and the test sees those
+through the walk-through's exit code and the lines it says (the refusal's JSON,
+the book unchanged, the receipt's line, the other ship unchanged). The answer step 8 says it was given and the reply it says came back
 are then checked against the first ship's counter, read with the library: the
 reply one more than the answer, and what the counter holds. Each of the four messages it says
 arrived, as entry N of a ship's journal, is then read with the library from
@@ -5555,11 +5830,14 @@ guestbook and the kit built as above, and in `runtime/src/api_tests.rs`,
   not decode, a command method (one that writes, and the kit's `Echo`, which
   writes nothing), the log, a payload that is not a `Call`, and an interface
   not served are each answered with their fault, and the command is not run; on
-  the command path each of those traps (the log and an owner's untyped command
-  too), and nothing is kept. A command that appends to the log and writes the
-  book and a count and then fails keeps none of it (looked at before how the
-  call ended), and one that counts its attempt and fails keeps no count; one
-  that works keeps both its count and its log entry. A question's fault arrives
+  the command path each of those is a refusal with the same code, not a trap
+  (the log and an owner's untyped command too, the latter as
+  `ship.no-such-interface`), as is the handler's own fault (`no-name`, with its
+  `Display`), and nothing is kept. A command that appends to the log and writes
+  the book and a count and then refuses keeps none of it (looked at before how
+  the call ended), comes back as `Called::Fault` with its code and message, and
+  is in the audit log, not kept; one that counts its attempt and refuses keeps
+  no count; one that works keeps both its count and its log entry. A question's fault arrives
   typed, and a handler's code starting with `ship.` arrives as `app.ship...`. A
   field the input does not know is ignored, in protobuf and in JSON. On one
   ship, a typed `read` of another instance (its fault passed on as it was) and
@@ -5575,8 +5853,15 @@ guestbook and the kit built as above, and in `runtime/src/api_tests.rs`,
   own bytes and numbers.
 - Across two ships, each with its network: a typed `ask::to` whose answer the
   generated code decodes in the answer handler, a question fault arriving
-  through `Answered`, and a typed `send_to_for_reply` whose receipt the
-  generated code decodes.
+  through `Answered`, a typed `send_to_for_reply` whose receipt the
+  generated code decodes, and the same with the signature's name left off
+  (`nameless`), refused on the other ship, whose receipt brings the fault to
+  the receipt handler as the call's error (`no-name: a signature needs a
+  name`), nothing kept there; and a command run by a hand-written agent in
+  place of the other book, which writes and answers with a `CallReply` holding
+  a fault without refusing: its receipt says `RAN`, the typed stub gives
+  `CallError::NotUnderstood` saying the command ran and may have kept what it
+  did, and what it wrote is there.
 - The description: found once in the release module with `wasmparser`, the
   served file after its import, its comments kept and every place left with a
   comment, the same bytes and interfaces as the runtime reads, each method's
@@ -5623,10 +5908,21 @@ guestbook and the kit built as above, and in `runtime/src/api_tests.rs`,
   encoding, a body a question cannot read (a field of the wrong type, malformed
   JSON, JSON with something after it, protobuf that does not decode) as 400 with
   `ship.not-understood` and, for JSON, the decoder's line and column, a body a command
-  cannot read as a failed command (422, three failed events in the audit log,
-  nothing kept), a body over the limit (413), 415 for other media types and
-  none, 404 for each thing missing, an invalid name (400), and a command's fault
-  as the command route gives it (422); a hand-written agent whose command
+  cannot read refused the same way (400 with the decoder's words, in each
+  encoding; all three rejected commands appear in the audit log with `ok =
+  false`, and the guestbook remains empty), a body over
+  the limit (413), 415 for other media types and none, 404 for each thing
+  missing, an invalid name (400), a command's own fault as 422 in each encoding,
+  and a trap still the command route's plain "the command failed"; a refused
+  command from each place a fault on the command path comes from: an
+  application's own code (422), `ship.` codes from a handler arriving as
+  `app.ship.` (422), a 64-byte code taken and a 300-byte message cut to 200, a
+  65-byte code and one with a space each an ordinary failure ("the command
+  failed"), `call_method` giving `Called::Fault`, and the generated refusals
+  through a description that disagrees with its code: a method and an
+  interface the code lacks (404), a question run as a command (409), a body it
+  cannot read (400); the untyped route answering a refusal 422 with the encoded
+  fault as protobuf and a trap with its plain text; a hand-written agent whose command
   answers with a fault after writing (502, and its write read back exactly), and
   whose questions answer, asked for JSON, UTF-8 that is not JSON (502), a JSON
   string holding a byte that is not UTF-8 (502), and JSON (200), the second
@@ -5636,7 +5932,8 @@ guestbook and the kit built as above, and in `runtime/src/api_tests.rs`,
   section; an agent whose replies
   are not `CallReply`s (502); the guestbook's code carrying a description that
   swaps two methods' kinds, a question answered `ship.wrong-kind` (409) and a
-  command trapped (422); interfaces really named `api`, `command` and `files`
+  command refused with it (409); `/command` on a typed agent refused with
+  `ship.no-such-interface` (422, the encoded fault); interfaces really named `api`, `command` and `files`
   answering their own names, on the kit and on agents of those names, encoded
   slashes and letters, and 405s; an existing ship unsigned, with a wrong token,
   and a missing ship signed or not giving the same status, body and headers on
@@ -5703,7 +6000,12 @@ guestbook and the kit built as above, and in `runtime/src/api_tests.rs`,
   returns. In the table test, the map entry must hold exactly one key and one
   value.
 - The SDK: a lost, a failed and a replyless receipt told apart, and their words;
-  replies written as protobuf or as JSON and reserved codes rewritten; and the
+  a `REFUSED` receipt with a fault given as that fault, one without as not run,
+  and a fault beside another verdict not taken for one; a `RAN` receipt whose
+  reply holds a fault not understood (never that fault), while a question's
+  reply holding one is still the fault;
+  replies written as protobuf or as JSON and a handler's returned `ship.` codes
+  rewritten to `app.ship.`; and the
   compile-time comparison of served and wired interfaces. And, in
   `proto/src/lib.rs`, how names turn into interfaces.
 
@@ -6163,7 +6465,9 @@ These are stated in the source.
   ship's runtime predates replies, or when it broke the protocol (a reply over
   the bound the command was sent with, or a reply not marked): the command is
   still reported as run, because the other ship said so; no reply is handed
-  on; and when a reply came and was let go, the reason says so. An agent that
+  on. A reply that breaks the protocol is discarded. If a fault also arrived,
+  the reason and audit line describe what happened to the fault. Otherwise
+  they identify the discarded reply. An agent that
   needs the reply checks `Receipt.replied`.
   A ship that takes back no reply at all refuses to send a command that wants
   one.
@@ -6245,14 +6549,24 @@ These are stated in the source.
 - Imports of ships of different names may run at once, with no cap on how
   many, each holding about twice its copy in memory for a moment. There is no
   HTTP route for import; a program that calls the runtime decides.
-- A command's fault does not reach its caller in this part. A typed command
-  handler's `Err`, and every refusal the generated code makes on the command
-  path, traps: the event is rolled back and the caller sees a rejection, or a
-  `FAILED` receipt, without the fault's code or message. Only a question's
-  fault comes back.
-- A body the command's decoder refuses produces a failed command without a
-  reason. A generated agent can accept invalid UTF-8 inside the string value of
-  an ignored JSON field. The next part carries a refusal's reason back.
+- A command sent with `send` to an agent on the same ship has no reply and no
+  receipt, so a refusal there has nobody to carry its reason to: the queued
+  command is dropped as any rejected one is, and only the audit log says so.
+- Generated dispatch prefixes a handler's `ship.` code with `app.`. A question
+  carries the resulting fault in its reply. For a command refusal, the
+  resulting code must be 1 to 64 printable non-space ASCII bytes
+  (`runtime::MAX_FAULT_CODE_BYTES`), and the runtime cuts the message to 200
+  bytes (`runtime::MAX_FAULT_MESSAGE_BYTES`). A direct `refuse` call supplies
+  the code without the generated rewrite. A command handler whose code breaks
+  the rule fails instead of refusing, with no reason carried; the generated
+  code does not mend it.
+- A module that refuses (every typed agent does, through its generated
+  dispatch) imports `host.refuse`, and so needs a runtime with refusals: a
+  runtime from before them will not install it. An agent whose source lists
+  every `Verdict` with no catch-all needs a line for `REFUSED` when it is
+  rebuilt.
+- A generated agent can accept invalid UTF-8 inside the string value of an
+  ignored JSON field.
 - A command may already have committed when the door returns 502 for its reply.
   Retrying it can run the command twice.
 - Generated application messages skip unknown JSON fields.
@@ -6310,15 +6624,15 @@ These are stated in the source.
   what exists.
 - The kind of a method is read from the module the agent has when a call is
   looked up; a module put in its place before the call runs decides the call
-  with its own dispatch (`ship.wrong-kind`, 409, for a question; a trap for a
-  command).
+  with its own dispatch (`ship.wrong-kind`, 409, a question in its reply and a
+  command as a refusal).
 - A typed agent always has a `checkpoint` export, which answers that there is
   no state for a history; the runtime may ask it, as it asks any agent with
   that export.
 - A description is read the first time it is asked for after a start (what a
   compiled module holds of one is learnt when it is compiled), and nothing of
   it is kept across a restart.
-- The JSON code makes a typed agent's module larger (the guestbook's is 418,339
+- The JSON code makes a typed agent's module larger (the guestbook's is 421,876
   bytes, where it was 218,746 before it had JSON, and a method and fields
   fewer), and reading and writing JSON costs the agent's own
   fuel, time and memory, within the event's limits.

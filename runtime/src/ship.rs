@@ -15,7 +15,7 @@ use ship_proto::{
 use wasmtime::{Store, StoreLimitsBuilder, Trap, UpdateDeadline};
 
 use crate::ask::Asked;
-use crate::host::{Ctx, Denied, LimitExceeded, LogsFull};
+use crate::host::{Ctx, Denied, LimitExceeded, LogsFull, Refused};
 use crate::store::{FetchJob, Followed, Replica};
 use crate::{
     check_target, lock, signed_bytes, store, AgentModule, ChainCheck, Error, Inner, Outcome, Rejection, CHECKPOINT_DOMAIN,
@@ -100,6 +100,8 @@ struct Invoke<'a> {
     outbox_room: u64,
     inbox_room: u64,
     max_reply: usize,
+    /// Whether the agent may refuse here: only for a command's `handle` export at depth 0.
+    may_refuse: bool,
 }
 
 /// The largest answer the runtime accepts from a kernel. Fixed, and above what the kernel
@@ -185,6 +187,9 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
         took: 0,
         can_checkpoint: call.module.pre.module().get_export("checkpoint").is_some(),
         takes_receipts: call.module.pre.module().get_export("receipt").is_some(),
+        // Off while the module starts and while its allocator runs: only the handler itself may
+        // refuse (set just before it is called, below).
+        may_refuse: false,
     };
     let mut store = Store::new(&env.rt.engine, ctx);
     store.limiter(|ctx| &mut ctx.store_limits);
@@ -239,7 +244,19 @@ fn invoke_here(env: &Env, call: Invoke) -> anyhow::Result<Returned> {
     let len = call.input.len() as u32;
     let ptr = alloc.call(&mut store, len)?;
     memory.write(&mut store, ptr as usize, call.input)?;
+    // Nothing of the guest's has run but its start function and `alloc`, neither of which may
+    // refuse. From here on the guest is in its handler.
+    store.data_mut().may_refuse = call.may_refuse;
+    // For the tests: what a receipt handler is really handed, read from the guest's memory at the
+    // pointer and length it is called with (the two just below), kept only once the call has
+    // succeeded.
+    #[cfg(test)]
+    let handed = (call.export == "receipt").then(|| memory.data(&store).get(ptr as usize..).and_then(|tail| tail.get(..len as usize)).map(<[u8]>::to_vec)).flatten();
     let packed = handler.call(&mut store, (ptr, len))?;
+    #[cfg(test)]
+    if let Some(bytes) = handed {
+        lock(&env.rt.receipts_handed).push((env.ship.to_string(), bytes));
+    }
     // Fuel is only checked at loops and calls, so straight-line code can overrun and return.
     let fuel_left = store.get_fuel()?;
     if fuel_left == 0 {
@@ -298,6 +315,7 @@ fn kernel_call(env: &Env, export: &str, input: &[u8], read_only: bool) -> anyhow
         outbox_room: 0,
         inbox_room: 0,
         max_reply: KERNEL_REPLY_BYTES,
+        may_refuse: false,
     };
     let given = call.fuel;
     #[cfg(test)]
@@ -369,6 +387,7 @@ pub(crate) fn read_agent(
             outbox_room: 0,
             inbox_room: 0,
             max_reply: env.rt.cfg.max_reply_bytes,
+            may_refuse: false,
         },
     )?;
     #[cfg(test)]
@@ -599,12 +618,15 @@ impl Ship {
                         // A reply is handed on with RAN, for a command that asked for one, within
                         // the bound the command carried (which that ship held it to before its
                         // command committed). A ship that keeps to the protocol sends nothing
-                        // else; one that does not has what it sent let go, and the receipt and
-                        // the audit log say so. RAN with no reply marked, for a command that
+                        // else; one that does not has what it sent let go: a reply that breaks
+                        // the protocol is discarded (and if a fault also arrived, the reason and
+                        // the audit line describe what happened to the fault; otherwise they
+                        // identify the discarded reply). RAN with no reply marked, for a command that
                         // asked, comes from a ship whose runtime predates replies, or from one
                         // that broke the protocol; either way it is handed on as RAN, since the
-                        // other ship says it ran, with no reply (and with this ship's reason if a
-                        // reply came and was let go). The agent tells by `Receipt.replied`.
+                        // other ship says it ran, with no reply. (If unmarked reply bytes arrived and
+                        // no fault arrived, this ship's reason says the reply was discarded.) The
+                        // agent tells by `Receipt.replied`.
                         let ran = receipt.verdict == Verdict::Ran as i32;
                         let carried = receipt.replied || !receipt.reply.is_empty();
                         let (reply, replied) = if ran && sent.reply > 0 && receipt.replied && receipt.reply.len() as u64 <= sent.reply {
@@ -614,6 +636,28 @@ impl Ship {
                                 reason = REPLY_NOT_TAKEN.to_string();
                             }
                             (Vec::new(), false)
+                        };
+                        // A fault is handed on with REFUSED, and only one that keeps the rules on
+                        // a fault: a code of 1 to 64 printable bytes, and a message of at most 200
+                        // bytes, its control characters turned to spaces as a reason's are. The
+                        // agent is then told the fixed words as the reason, whatever that ship
+                        // sent, so that the copy it is handed stays within what a receipt with a
+                        // fault may be. Any other fault is let go, the receipt handed on with its
+                        // verdict as that ship gave it, and the reason and the audit log say so.
+                        // REFUSED with no fault comes from a ship that broke the protocol. A REFUSED
+                        // receipt without a fault keeps its verdict. If it carries a reply, the
+                        // receiver discards the reply and supplies the reply-discard reason.
+                        let refused = receipt.verdict == Verdict::Refused as i32;
+                        let (fault, fault_let_go) = match &receipt.fault {
+                            Some(fault) if refused && store::fault_code_ok(&fault.code) && fault.message.len() <= store::MAX_FAULT_MESSAGE_BYTES => {
+                                reason = store::REFUSED_WORDS.to_string();
+                                (Some(ship_proto::Fault { code: fault.code.clone(), message: store::fault_message(&fault.message) }), false)
+                            }
+                            Some(_) => {
+                                reason = store::FAULT_NOT_TAKEN.to_string();
+                                (None, true)
+                            }
+                            None => (None, false),
                         };
                         let mut unqueued = false;
                         if sent.tell {
@@ -626,6 +670,7 @@ impl Ship {
                                 interface: sent.interface.clone(),
                                 reply,
                                 replied,
+                                fault: fault.clone(),
                             }
                             .encode_to_vec();
                             let cost = told.len() as u64 + store::MESSAGE_OVERHEAD;
@@ -642,9 +687,15 @@ impl Ship {
                                 added += cost;
                             }
                         }
-                        if receipt.verdict != Verdict::Ran as i32 || unqueued || reason == REPLY_NOT_TAKEN {
+                        if receipt.verdict != Verdict::Ran as i32 || unqueued || reason == REPLY_NOT_TAKEN || fault_let_go {
                             let ran = receipt.verdict == Verdict::Ran as i32;
-                            let why = if reason.is_empty() { String::new() } else { format!(": {reason}") };
+                            // With a fault taken, the line says the agent's code and message in
+                            // place of the fixed words already said by the verdict.
+                            let why = match &fault {
+                                Some(fault) => format!(": {}: {}", fault.code, fault.message),
+                                None if reason.is_empty() => String::new(),
+                                None => format!(": {reason}"),
+                            };
                             let untold = if unqueued { " (the receipt is too large for this ship's queue, so the agent was not told)" } else { "" };
                             let line = format!(
                                 "~{peer} {} command {} to {} {}: {}{why}{untold}",
@@ -703,7 +754,7 @@ impl Ship {
                     } else {
                         (Verdict::Malformed, "not a command that could be run")
                     };
-                    store::receipt_push(conn, peer, message.seq, verdict, why, None)?;
+                    store::receipt_push(conn, peer, message.seq, verdict, why, None, None)?;
                     spare = spare.saturating_sub(store::MAX_RECEIPT_BYTES as u64);
                     answered = true;
                 }
@@ -1020,6 +1071,7 @@ impl Ship {
                         interface: orphan.interface.clone(),
                         reply: Vec::new(),
                         replied: false,
+                        fault: None,
                     }
                     .encode_to_vec();
                     let cost = told.len() as u64 + store::MESSAGE_OVERHEAD;
@@ -1180,6 +1232,9 @@ impl Ship {
                     inbox_room: rt.cfg.max_inbox_bytes.saturating_sub(self.inbox_bytes),
                     // Room for the state itself plus the few bytes that wrap it.
                     max_reply: if asking.is_some() { rt.cfg.max_checkpoint_bytes + 16 } else { rt.cfg.max_reply_bytes },
+                    // A command's own handler, and nothing else, may turn it down with a reason
+                    // (see the host function `refuse`).
+                    may_refuse: kind == Kind::Command,
                 },
             )? };
             let conn = lock(&self.conn);
@@ -1212,7 +1267,7 @@ impl Ship {
                     return Err(ReplyTooLarge(format!("the reply is {} bytes, and a receipt carries at most {most}", reply.len())).into());
                 }
                 let before = store::spare_bytes(&conn)?;
-                store::receipt_push(&conn, peer, about, Verdict::Ran, "", reply)?;
+                store::receipt_push(&conn, peer, about, Verdict::Ran, "", reply, None)?;
                 let after = store::spare_bytes(&conn)?;
                 if reply.is_some_and(|reply| !reply.is_empty()) && after < before && after < room_to_take_one(&rt.cfg) {
                     return Err(NoRoomForReply.into());
@@ -1314,7 +1369,12 @@ impl Ship {
                 } else if owed.is_some_and(|(_, _, wanted)| wanted > 0) && e.chain().any(|cause| cause.downcast_ref::<ReplyTooLarge>().is_some()) {
                     reason = REPLY_TOO_LARGE.to_string();
                 }
-                let owed = owed.map(|(peer, about, _)| (peer, about, verdict, reason.as_str()));
+                // A refusal's fault goes with the receipt, as the agent's word to its caller.
+                let fault = match &rejection {
+                    Rejection::Refused(fault) => Some(fault.clone()),
+                    _ => None,
+                };
+                let owed = owed.map(|(peer, about, _)| (peer, about, verdict, reason.as_str(), fault.as_ref()));
                 let rejection = Error::Rejected(rejection);
                 // An append found the logs full. The append itself is undone like the rest of
                 // the event, but a checkpoint of that log is what would make room, and only an
@@ -1334,7 +1394,7 @@ impl Ship {
                         && notice.is_none_or(|log| store::notify_failed(&conn, agent, log).is_ok())
                         && (!storage_full || store::reclaim(&conn).is_ok())
                         && full.is_none_or(|log| store::ask_checkpoint_when_full(&conn, agent, log).is_ok())
-                        && owed.is_none_or(|(peer, about, verdict, reason)| store::receipt_push(&conn, peer, about, verdict, reason, None).is_ok())
+                        && owed.is_none_or(|(peer, about, verdict, reason, fault)| store::receipt_push(&conn, peer, about, verdict, reason, None, fault).is_ok())
                         && (unrecorded || store::audit(&conn, agent, &audited(kind, payload), false, rt.cfg.audit_rows).is_ok())
                         && (!frugal || settled_within(&conn, spare_before, &rt.cfg))
                         && conn.execute_batch("COMMIT").is_ok()
@@ -1537,6 +1597,7 @@ impl Ship {
                     outbox_room: 0,
                     inbox_room: 0,
                     max_reply: FILE_ANSWER_BYTES,
+                    may_refuse: false,
                 },
             )?;
             Ok(FileAnswer::decode(&*returned.reply)?.allow)
@@ -1588,6 +1649,7 @@ impl Ship {
                     outbox_room: 0,
                     inbox_room: 0,
                     max_reply,
+                    may_refuse: false,
                 },
             )?;
             #[cfg(test)]
@@ -1942,8 +2004,14 @@ fn left(held: &Replica, job: &FetchJob, cfg: &crate::Config) -> Taken {
 /// error from inside a handler can name things the other ship has no right to know, such as
 /// another agent it tried to read or another ship it tried to send to. The details stay in
 /// this ship's audit log.
+///
+/// A refusal is different: it is not something the handler ran into but what the agent chose to
+/// say to its caller. Its fault goes with the receipt (see `Ship::execute`), and the reason is
+/// fixed words, never the agent's message, which is in the fault: so a receipt with the largest
+/// fault stays well inside the room a receipt is budgeted.
 fn verdict_of(rejection: &Rejection, routed: bool) -> (Verdict, String) {
     let (verdict, words) = match rejection {
+        Rejection::Refused(_) => (Verdict::Refused, store::REFUSED_WORDS),
         Rejection::Denied(why) if !routed => return (Verdict::Denied, why.clone()),
         Rejection::Denied(_) => (Verdict::Failed, "the agent failed"),
         Rejection::Limit(_) => (Verdict::Limit, "a limit on that ship was reached"),
@@ -1989,6 +2057,7 @@ fn verdict_words(verdict: i32) -> &'static str {
         Ok(Verdict::Limit) => "a limit was reached",
         Ok(Verdict::Malformed) => "it could not be run",
         Ok(Verdict::Lost) => "it is not known whether it ran",
+        Ok(Verdict::Refused) => store::REFUSED_WORDS,
         Ok(Verdict::Unspecified) | Err(_) => "for a reason this runtime does not know",
     }
 }
@@ -2028,8 +2097,8 @@ impl std::error::Error for NoRoomForReply {}
 /// What the sender of a command that asked for its reply is told when the reply was too large.
 const REPLY_TOO_LARGE: &str = "the reply is larger than that ship sends with a receipt";
 
-/// What an agent is told, with a receipt saying RAN, when the reply that came with it was not
-/// one this ship takes: not asked for, with another verdict, or larger than its own limit.
+/// When this ship discards a reply and the receipt carries no fault, it uses these words as the
+/// reason.
 const REPLY_NOT_TAKEN: &str = "the reply that came with this receipt was not one this ship takes, and was let go";
 
 /// An event queued commands for other ships and would have left the ship's file without room
@@ -2046,6 +2115,11 @@ impl std::fmt::Display for NoRoomToSend {
 impl std::error::Error for NoRoomToSend {}
 
 fn classify(err: &anyhow::Error) -> Rejection {
+    // A refusal is the agent's own word, and only ever made by a command's handler, which stops
+    // there: nothing else can have gone wrong after it. It is a refusal however late it came.
+    if let Some(refused) = err.chain().find_map(|cause| cause.downcast_ref::<Refused>()) {
+        return Rejection::Refused(refused.0.clone());
+    }
     if err.chain().any(|cause| cause.downcast_ref::<NoRoomToSend>().is_some()) {
         return Rejection::Limit(NoRoomToSend.to_string());
     }

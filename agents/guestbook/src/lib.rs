@@ -76,7 +76,8 @@ impl guestbook_api::Handlers for Keeper {
     fn pass(request: PassRequest) -> Result<Passed, Fault> {
         let book: Book = load("book");
         let signature = signed(&book).find(|signature| signature.number == request.number).cloned().ok_or_else(|| no_such(request.number))?;
-        let signing = SignRequest { signature: Some(Signature { number: 0, ..signature }) };
+        let name = if request.nameless { String::new() } else { signature.name.clone() };
+        let signing = SignRequest { signature: Some(Signature { number: 0, name, ..signature }) };
         if request.ship.is_empty() {
             guestbook_api::call::sign::send(&request.agent, &signing);
             return Ok(Passed { sent_as: 0 });
@@ -110,7 +111,7 @@ impl guestbook_api::Handlers for Keeper {
         let mut activity: Activity = load("activity");
         activity.spoils += 1;
         keep("activity", &activity);
-        Err(fault("spoilt", "this command always fails, after it has changed things"))
+        Err(fault("spoilt", "this command always refuses, after it has changed things"))
     }
 
     fn lookup(request: LookupRequest) -> Result<Page, Fault> {

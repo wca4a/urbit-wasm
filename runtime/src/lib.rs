@@ -45,6 +45,8 @@ pub use seal::StorageKey;
 pub use urbit_id;
 use urbit_id::{Keyfile, NetworkKeys, Wallet};
 pub use store::RemoteFollow;
+/// The bounds on a fault a command refuses with: see the host function `refuse`.
+pub use store::{MAX_FAULT_CODE_BYTES, MAX_FAULT_MESSAGE_BYTES};
 pub use files::{FileError, FileInfo, FilesKept, PreparedChunk, UploadState};
 pub use ask::AskError;
 
@@ -475,6 +477,10 @@ pub enum Rejection {
     Denied(String),
     Limit(String),
     Trap(String),
+    /// A command's handler turned the command down on purpose, saying why. Nothing it did was
+    /// kept, as for any rejection; unlike the rest, its words are for the caller. Only a
+    /// command's own handler can refuse (see the host function `refuse`).
+    Refused(ship_proto::Fault),
 }
 
 #[derive(Debug)]
@@ -560,6 +566,7 @@ impl fmt::Display for Error {
             Error::Rejected(Rejection::Denied(why)) => write!(f, "event rejected: not permitted: {why}"),
             Error::Rejected(Rejection::Limit(why)) => write!(f, "event rejected: limit exceeded: {why}"),
             Error::Rejected(Rejection::Trap(why)) => write!(f, "event rejected: {why}"),
+            Error::Rejected(Rejection::Refused(fault)) => write!(f, "event rejected: refused: {}: {}", fault.code, fault.message),
             Error::NotBuilt { ship, room } => write!(
                 f,
                 "{ship} could not be brought in: its file did not fit in the {room} bytes allowed for building it (twice max_ship_bytes), so either it is far too large for this runtime or the disk is full"
@@ -770,6 +777,15 @@ pub(crate) struct Inner {
     /// answering questions, in the order they ran.
     #[cfg(test)]
     pub(crate) question_parts: Mutex<Vec<u64>>,
+    /// For tests: each call to `refuse`, as (agent, the call's kind, its depth, whether it was
+    /// taken as a refusal).
+    #[cfg(test)]
+    pub(crate) refusals: Mutex<Vec<(String, i32, u32, bool)>>,
+    /// For tests: each receipt an agent's receipt handler was handed, as (ship, the bytes in the
+    /// guest's memory at the pointer and length the handler was called with), kept only once that
+    /// call succeeded.
+    #[cfg(test)]
+    pub(crate) receipts_handed: Mutex<Vec<(String, Vec<u8>)>>,
     /// For tests: run commands from other ships as a runtime from before replies does, sending
     /// no reply whatever the command asked.
     #[cfg(test)]
@@ -1645,6 +1661,10 @@ impl Runtime {
                 question_fuel: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 question_parts: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                refusals: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                receipts_handed: Mutex::new(Vec::new()),
                 kept_dirs: Mutex::new(kept::KeptDirs::default()),
                 keeping_after: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]

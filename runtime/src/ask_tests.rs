@@ -3038,3 +3038,800 @@ fn a_malformed_within_on_the_http_route_asks_nothing() {
     assert_eq!(t.b.inner.ask_writes.load(Ordering::SeqCst), writes, "a question was asked");
     assert_eq!(http(&server, "POST", "/ships/nec/ask/zod/counter/counter?within=5", &auth, b"hits").0, 200);
 }
+
+// Refusals: a command its agent turns down on purpose, with a fault. Nothing the command did is
+// kept, and the fault reaches whoever sent it. The agents here are written by hand (WAT), each
+// export making the host calls it is given, in order, and then calling `refuse` if told to.
+
+use ship_proto::{AppendRequest, AskRequest, Fault, FileMark, FollowRequest, Message, PeerMessage, ReadRequest, Receipt, SendRequest, ShareRequest, Verdict};
+
+/// One thing a hand-written agent does in one of its exports.
+enum Step {
+    Put(&'static [u8], &'static [u8]),
+    Delete(&'static [u8]),
+    Emit(&'static [u8]),
+    Append(AppendRequest),
+    Follow(FollowRequest),
+    Share(ShareRequest),
+    Send(SendRequest),
+    SendTo(SendRequest),
+    Ask(AskRequest),
+    Drop(u64),
+    Mark(FileMark),
+    Read(ReadRequest),
+    /// Keep what the export was handed under its first two bytes (a receipt's number, while it
+    /// is below 128).
+    KeepInput,
+    /// Answer with what is kept under the bytes the export was handed.
+    AnswerKept,
+    /// Call `refuse` with these bytes.
+    Refuse(Vec<u8>),
+    /// Call `refuse` with this pointer and length, whatever is there.
+    RefuseAt(u32, u32),
+    /// Loop for ever.
+    Spin,
+}
+
+/// Where a hand-written agent's buffer for what it reads back is, and how large.
+const BUFFER: (u64, u64) = (200_000, 50_000);
+
+/// A module whose exports each make the host calls given. Every export answers with nothing
+/// unless a step says otherwise. Two names are not exports of their own: steps under `start` make
+/// a start function, run as the module is made, and steps under `alloc` run in the allocator
+/// before it allocates.
+fn hand_agent(exports: &[(&str, Vec<Step>)]) -> Vec<u8> {
+    let mut data = String::new();
+    let mut at = 16usize;
+    let mut place = |bytes: &[u8]| -> String {
+        let here = at;
+        let escaped: String = bytes.iter().map(|b| format!("\\{b:02x}")).collect();
+        data.push_str(&format!("  (data (i32.const {here}) \"{escaped}\")\n"));
+        at += bytes.len() + 16;
+        assert!(at < 131_072, "too much data for a hand-written agent");
+        format!("(i32.const {here}) (i32.const {})", bytes.len())
+    };
+    let (mut funcs, mut allocating) = (String::new(), String::new());
+    for (export, steps) in exports {
+        let mut body = String::new();
+        for step in steps {
+            let line = match step {
+                Step::Put(key, value) => format!("(call $kv_put {} {})", place(key), place(value)),
+                Step::Delete(key) => format!("(call $kv_delete {})", place(key)),
+                Step::Emit(bytes) => format!("(call $emit {})", place(bytes)),
+                Step::Append(request) => format!("(drop (call $log_append {}))", place(&request.encode_to_vec())),
+                Step::Follow(request) => format!("(call $log_follow {})", place(&request.encode_to_vec())),
+                Step::Share(request) => format!("(call $log_share {})", place(&request.encode_to_vec())),
+                Step::Send(request) => format!("(call $send {})", place(&request.encode_to_vec())),
+                Step::SendTo(request) => format!("(drop (call $send_to {}))", place(&request.encode_to_vec())),
+                Step::Ask(request) => format!("(drop (call $ask_to {}))", place(&request.encode_to_vec())),
+                Step::Drop(number) => format!("(drop (call $ask_drop (i64.const {number})))"),
+                Step::Mark(request) => format!("(drop (call $file_mark {}))", place(&request.encode_to_vec())),
+                Step::Read(request) => format!("(drop (call $read {} (i32.const {}) (i32.const {})))", place(&request.encode_to_vec()), BUFFER.0, BUFFER.1),
+                Step::KeepInput => "(call $kv_put (local.get 0) (i32.const 2) (local.get 0) (local.get 1))".to_string(),
+                Step::AnswerKept => format!(
+                    "(local.set $n (call $kv_get (local.get 0) (local.get 1) (i32.const {}) (i32.const {})))\n    (if (i64.lt_s (local.get $n) (i64.const 0)) (then (local.set $n (i64.const 0))))\n    (return (i64.or (i64.const {}) (local.get $n)))",
+                    BUFFER.0,
+                    BUFFER.1,
+                    BUFFER.0 << 32
+                ),
+                Step::Refuse(bytes) => format!("(call $refuse {})", place(bytes)),
+                Step::RefuseAt(ptr, len) => format!("(call $refuse (i32.const {ptr}) (i32.const {len}))"),
+                Step::Spin => "(loop $spin (br $spin))".to_string(),
+            };
+            body.push_str("    ");
+            body.push_str(&line);
+            body.push('\n');
+        }
+        match *export {
+            "start" => funcs.push_str(&format!("  (func $start (local $n i64)\n{body})\n  (start $start)\n")),
+            "alloc" => allocating = body,
+            _ => funcs.push_str(&format!("  (func (export \"{export}\") (param i32 i32) (result i64) (local $n i64)\n{body}    (i64.const 0))\n")),
+        }
+    }
+    let source = format!(
+        r#"(module
+  (import "host" "kv_put" (func $kv_put (param i32 i32 i32 i32)))
+  (import "host" "kv_get" (func $kv_get (param i32 i32 i32 i32) (result i64)))
+  (import "host" "kv_delete" (func $kv_delete (param i32 i32)))
+  (import "host" "emit" (func $emit (param i32 i32)))
+  (import "host" "read" (func $read (param i32 i32 i32 i32) (result i64)))
+  (import "host" "send" (func $send (param i32 i32)))
+  (import "host" "send_to" (func $send_to (param i32 i32) (result i64)))
+  (import "host" "log_append" (func $log_append (param i32 i32) (result i64)))
+  (import "host" "log_follow" (func $log_follow (param i32 i32)))
+  (import "host" "log_share" (func $log_share (param i32 i32)))
+  (import "host" "ask_to" (func $ask_to (param i32 i32) (result i64)))
+  (import "host" "ask_drop" (func $ask_drop (param i64) (result i64)))
+  (import "host" "file_mark" (func $file_mark (param i32 i32) (result i64)))
+  (import "host" "refuse" (func $refuse (param i32 i32)))
+  (memory (export "memory") 4)
+  (global $heap (mut i32) (i32.const 131072))
+  (func (export "alloc") (param $len i32) (result i32) (local $at i32) (local $n i64)
+{allocating}    (local.set $at (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $at))
+{data}{funcs})"#
+    );
+    wat::parse_str(&source).unwrap_or_else(|e| panic!("{e}\n{source}"))
+}
+
+fn fault(code: &str, message: &str) -> Fault {
+    Fault { code: code.into(), message: message.into() }
+}
+
+fn fault_bytes(code: &str, message: &str) -> Vec<u8> {
+    fault(code, message).encode_to_vec()
+}
+
+/// The largest fault there may be: a code of 64 bytes and a message of 200, the message in
+/// characters of two bytes.
+fn largest_fault() -> Fault {
+    fault(&"!".repeat(crate::store::MAX_FAULT_CODE_BYTES), &"\u{e9}".repeat(crate::store::MAX_FAULT_MESSAGE_BYTES / 2))
+}
+
+/// An agent offering `interface` (open to other ships' commands), with these uses.
+fn offering(interface: &str, uses: Vec<Use>) -> Manifest {
+    Manifest { provides: vec![Provide { interface: interface.into(), public: false, remote: true, asked: false }], uses }
+}
+
+/// Leave to send to (and ask) `agent`'s `interface` on `ship`.
+fn sending_to(ship: &str, agent: &str, interface: &str) -> Use {
+    Use { ship: ship.into(), agent: agent.into(), interface: interface.into(), read: false, send: true, ask: true }
+}
+
+/// A runtime with one ship, `ship`, and nothing installed.
+fn lone(dir: &Path, cfg: Config, ship: &str) -> Arc<Runtime> {
+    let rt = Arc::new(Runtime::open(dir, cfg).unwrap());
+    let kernel = rt.add_module(&wasm("kernel")).unwrap();
+    rt.create_ship(ship, &kernel).unwrap();
+    rt
+}
+
+/// Install (or replace) `agent` on `ship` as a hand-written agent.
+fn hand_install(rt: &Runtime, ship: &str, agent: &str, exports: &[(&str, Vec<Step>)], manifest: &Manifest) {
+    let module = rt.add_module(&hand_agent(exports)).unwrap();
+    rt.install(ship, agent, &module, manifest).unwrap();
+}
+
+fn rejected(result: Result<crate::Outcome, Error>) -> Rejection {
+    match result {
+        Err(Error::Rejected(rejection)) => rejection,
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
+/// Every row of every table of a ship's file but the audit log, as text, by table.
+fn everything_but_the_audit(rt: &Runtime, ship: &str) -> BTreeMap<String, Vec<String>> {
+    rt.inner
+        .with_ship(ship, |held| {
+            let conn = lock(&held.conn);
+            let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name != 'audit'")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let mut all = BTreeMap::new();
+            for table in tables {
+                let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\""))?;
+                let columns = stmt.column_count();
+                let rows = stmt
+                    .query_map([], |row| (0..columns).map(|i| row.get::<_, rusqlite::types::Value>(i).map(|value| format!("{value:?}"))).collect::<rusqlite::Result<Vec<_>>>().map(|values| values.join(" | ")))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                // The audit log's own numbering is the audit log's.
+                let rows = rows.into_iter().filter(|row| !(table == "sqlite_sequence" && row.starts_with("Text(\"audit\")"))).collect();
+                all.insert(table, rows);
+            }
+            Ok(all)
+        })
+        .unwrap()
+}
+
+/// The receipt a hand-written recorder (`KeepInput` in its receipt export, `AnswerKept` in its
+/// read export) was handed for the command numbered `about`.
+fn recorded(rt: &Runtime, ship: &str, agent: &str, about: u8) -> Option<Receipt> {
+    let bytes = rt.read(ship, agent, agent, &[0x08, about]).unwrap();
+    (!bytes.is_empty()).then(|| Receipt::decode(&*bytes).unwrap())
+}
+
+/// A recorder: its command sends `payload` to `agent`'s `interface` on `ship` (wanting the
+/// reply as `reply` says), and it keeps each receipt and answers with it.
+fn recorder(ship: &str, agent: &str, interface: &str, reply: bool) -> Vec<(&'static str, Vec<Step>)> {
+    let send = SendRequest { ship: ship.into(), agent: agent.into(), interface: interface.into(), payload: b"please".to_vec(), reply };
+    vec![("handle", vec![Step::SendTo(send)]), ("receipt", vec![Step::KeepInput]), ("read", vec![Step::AnswerKept])]
+}
+
+/// A refused command keeps nothing: before it refuses, it writes a key and deletes another, puts
+/// out a message, appends to its log, follows a log and shares one, sends a command here and one
+/// to another ship, puts a question, drops one it put earlier, and marks a file open. After it,
+/// every table of the ship's file but the audit log holds exactly what it held before; the
+/// refusal comes back with its code and message; and the audit log has the command, not kept.
+#[test]
+fn a_refused_command_keeps_nothing_it_did_and_says_why() {
+    let dir = TempDir::new("refuse-keeps-nothing");
+    let rt = lone(&dir.0, Config { max_queued_per_deliver: 0, ..fast() }, "~zod");
+    // As though a network were running, so that a question put waits to be put.
+    rt.inner.networked.store(true, Ordering::SeqCst);
+    let manifest = offering("evil", vec![sending_to("nec", "counter", "counter")]);
+    let question = AskRequest { ship: "nec".into(), agent: "counter".into(), interface: "counter".into(), payload: b"?".to_vec(), within_millis: 60_000 };
+    let setup = vec![
+        Step::Put(b"kept", b"1"),
+        Step::Append(AppendRequest { log: "evil".into(), payload: b"first".to_vec() }),
+        Step::Ask(question.clone()),
+    ];
+    hand_install(&rt, "~zod", "evil", &[("handle", setup)], &manifest);
+    rt.deliver("~zod", "evil", b"set up").unwrap();
+    let (upload, _) = rt.upload_start("~zod", "evil", 5, "text/plain").unwrap();
+    rt.upload_chunk("~zod", "evil", &upload, 0, b"hello".to_vec()).unwrap();
+    let id = rt.upload_finish("~zod", "evil", &upload, None).unwrap().id;
+    assert!(!rt.file_info("~zod", "evil", &id).unwrap().open);
+
+    let everything = vec![
+        Step::Put(b"new", b"2"),
+        Step::Delete(b"kept"),
+        Step::Emit(b"out"),
+        Step::Append(AppendRequest { log: "evil".into(), payload: b"second".to_vec() }),
+        Step::Follow(FollowRequest { ship: String::new(), agent: "evil".into(), log: "evil".into() }),
+        Step::Share(ShareRequest { log: "evil".into(), ship: "nec".into(), stop: false }),
+        Step::Send(SendRequest { ship: String::new(), agent: "evil".into(), interface: "evil".into(), payload: b"again".to_vec(), reply: false }),
+        Step::SendTo(SendRequest { ship: "nec".into(), agent: "counter".into(), interface: "counter".into(), payload: b"inc hits".to_vec(), reply: true }),
+        Step::Ask(question),
+        Step::Drop(1),
+        Step::Mark(FileMark { id: id.to_vec(), open: true }),
+        Step::Refuse(fault_bytes("not-today", "the book is closed")),
+    ];
+    hand_install(&rt, "~zod", "evil", &[("handle", everything)], &manifest);
+    let before = everything_but_the_audit(&rt, "~zod");
+    let audited = rt.audit("~zod", 1000).unwrap().len();
+    let refused = rejected(rt.deliver("~zod", "evil", b"do everything"));
+    assert_eq!(everything_but_the_audit(&rt, "~zod"), before);
+    assert_eq!(refused, Rejection::Refused(fault("not-today", "the book is closed")));
+    assert_eq!(Error::Rejected(refused).to_string(), "event rejected: refused: not-today: the book is closed");
+    // Looked at one by one as well, through the runtime.
+    assert!(!rt.file_info("~zod", "evil", &id).unwrap().open);
+    assert_eq!(rt.log_head("~zod", "evil", "evil").unwrap().unwrap().0, 1);
+    assert_eq!(rt.log_position("~zod", "evil", "evil", "evil").unwrap(), None);
+    assert!(rt.log_shares("~zod", "evil", "evil").unwrap().is_empty());
+    assert_eq!((rt.pending("~zod").unwrap(), rt.outbound_pending("~zod").unwrap(), rt.unanswered("~zod").unwrap()), (0, 0, 0));
+    assert!(rt.drain_outbox("~zod", 1 << 20).unwrap().is_empty());
+    // The audit log has the command, not kept, as for any rejection.
+    let audit = rt.audit("~zod", 1000).unwrap();
+    assert_eq!(audit.len(), audited + 1);
+    assert_eq!((audit[0].agent.as_str(), audit[0].event.as_slice(), audit[0].ok), ("evil", b"do everything".as_slice(), false));
+}
+
+/// A refusal counts only in a command's own handler. In a read (asked by the owner, or nested
+/// under a command), a notification, a receipt, an answer, a checkpoint request and a file
+/// question it is an ordinary failure, with no fault, each its own case; the command is the one
+/// place it is taken.
+#[test]
+fn a_refusal_counts_only_in_a_commands_own_handler() {
+    use ship_proto::Kind;
+    let dir = TempDir::new("refuse-where");
+    let rt = lone(&dir.0, Config { max_queued_per_deliver: 0, checkpoint_min_bytes: 1, ..fast() }, "~zod");
+    rt.inner.networked.store(true, Ordering::SeqCst);
+    let no = || Step::Refuse(fault_bytes("no", "not here"));
+    let manifest = offering("evil", vec![sending_to("nec", "counter", "counter")]);
+    let send = SendRequest { ship: "nec".into(), agent: "counter".into(), interface: "counter".into(), payload: b"inc".to_vec(), reply: false };
+    let question = AskRequest { ship: "nec".into(), agent: "counter".into(), interface: "counter".into(), payload: b"?".to_vec(), within_millis: 60_000 };
+    let mut exports = vec![("handle", vec![
+        Step::Follow(FollowRequest { ship: String::new(), agent: "evil".into(), log: "evil".into() }),
+        Step::Append(AppendRequest { log: "evil".into(), payload: b"one".to_vec() }),
+        Step::SendTo(send),
+        Step::Ask(question),
+    ])];
+    for export in ["read", "notify", "receipt", "answer", "checkpoint", "file_ask"] {
+        exports.push((export, vec![no()]));
+    }
+    hand_install(&rt, "~zod", "evil", &exports, &manifest);
+    let reader = vec![("handle", vec![Step::Read(ReadRequest { agent: "evil".into(), interface: "evil".into(), payload: b"look".to_vec() })])];
+    hand_install(&rt, "~zod", "reader", &reader, &Manifest { provides: vec![], uses: vec![Use { ship: String::new(), agent: "evil".into(), interface: "evil".into(), read: true, send: false, ask: false }] });
+    let taken = |agent: &str, kind: Kind, depth: u32| -> Vec<bool> {
+        lock(&rt.inner.refusals).iter().filter(|(who, k, d, _)| who == agent && *k == kind as i32 && *d == depth).map(|(_, _, _, taken)| *taken).collect()
+    };
+
+    // A read the owner asks, and one nested under a command: an ordinary failure, each.
+    assert!(matches!(rt.read("~zod", "evil", "evil", b"look"), Err(Error::Rejected(Rejection::Trap(_)))));
+    assert_eq!(taken("evil", Kind::Read, 0), [false]);
+    assert!(matches!(rejected(rt.deliver("~zod", "reader", b"go")), Rejection::Trap(_)));
+    assert_eq!(taken("evil", Kind::Read, 1), [false]);
+
+    // The command commits: a follow and an append (so a notification and a checkpoint request
+    // are queued), a command to ~nec and a question to it.
+    rt.deliver("~zod", "evil", b"set up").unwrap();
+    // ~nec's receipt for the command, and the answer to the question, as they would come.
+    rt.inner
+        .with_ship("~zod", |ship| ship.accept(&rt.inner, "nec", &[PeerMessage { seq: 1, receipt: Some(Receipt { about: 1, verdict: Verdict::Ran as i32, ..Receipt::default() }), ..PeerMessage::default() }]))
+        .unwrap();
+    let incarnation = rt.incarnation("~zod").unwrap();
+    rt.inner.with_ship("~zod", |ship| ship.ask_answered(&rt.inner, &incarnation, 1, Outcome::Reply, b"yes", "")).unwrap();
+    let audited = rt.audit("~zod", 1000).unwrap().len();
+    // (A notification whose handler fails is prompted again a few times.)
+    while rt.run_pending("~zod", 10).unwrap() > 0 {}
+    for kind in [Kind::Notify, Kind::Checkpoint, Kind::Receipt, Kind::Answer] {
+        let seen = taken("evil", kind, 0);
+        assert!(!seen.is_empty() && seen.iter().all(|taken| !taken), "{kind:?}: {seen:?}");
+    }
+    let audit = rt.audit("~zod", 1000).unwrap();
+    assert!(audit.len() - audited >= 4 && audit[..audit.len() - audited].iter().all(|entry| entry.agent == "evil" && !entry.ok));
+
+    // A file question: no, as for any failure.
+    let (upload, _) = rt.upload_start("~zod", "evil", 2, "").unwrap();
+    rt.upload_chunk("~zod", "evil", &upload, 0, b"hi".to_vec()).unwrap();
+    let id = rt.upload_finish("~zod", "evil", &upload, None).unwrap().id;
+    let permit = rt.inner.with_ship("~zod", |ship| ship.file_permit(&rt.inner, "nec", "evil", &id, None)).unwrap();
+    assert!(matches!(permit, crate::ship::Permit::No));
+    assert_eq!(taken("evil", Kind::FileAsk, 0), [false]);
+
+    // And a command's own handler: taken.
+    hand_install(&rt, "~zod", "evil", &[("handle", vec![no()])], &manifest);
+    assert_eq!(rejected(rt.deliver("~zod", "evil", b"now")), Rejection::Refused(fault("no", "not here")));
+    assert_eq!(taken("evil", Kind::Command, 0), [true]);
+}
+
+/// What a fault may be: a code of 1 to 64 bytes, each printable ASCII other than space, and any
+/// message, cut to 200 bytes at a character boundary with each control character turned into a
+/// space. A refusal that breaks the rule on the code, or that is not a fault at all, is an
+/// ordinary failure, each case its own.
+#[test]
+fn what_a_fault_may_be_is_held_to_its_rules() {
+    let dir = TempDir::new("refuse-rules");
+    let rt = lone(&dir.0, fast(), "~zod");
+    let manifest = offering("evil", vec![]);
+    let refusing = |bytes: Vec<u8>| {
+        hand_install(&rt, "~zod", "evil", &[("handle", vec![Step::Put(b"k", b"v"), Step::Refuse(bytes)])], &manifest);
+        rejected(rt.deliver("~zod", "evil", b"go"))
+    };
+    let ordinary = |label: &str, bytes: Vec<u8>| {
+        let rejection = refusing(bytes);
+        assert!(matches!(rejection, Rejection::Trap(_)), "{label}: {rejection:?}");
+    };
+    ordinary("an empty code", fault_bytes("", "m"));
+    ordinary("a code of 65 bytes", fault_bytes(&"a".repeat(65), "m"));
+    ordinary("a space", fault_bytes("a b", "m"));
+    ordinary("a control byte", fault_bytes("a\u{1}b", "m"));
+    ordinary("a byte past ASCII", fault_bytes("caf\u{e9}", "m"));
+    ordinary("a delete byte", fault_bytes("a\u{7f}", "m"));
+    ordinary("bytes that are not a fault", vec![0xff, 0xff, 0xff]);
+    // A message that is not UTF-8 does not decode as a fault either.
+    ordinary("a message that is not text", vec![0x0a, 0x01, b'c', 0x12, 0x02, 0xc3, 0x28]);
+
+    // At the bounds: taken whole.
+    let whole = fault(&"~".repeat(64), &"m".repeat(200));
+    assert_eq!(refusing(whole.encode_to_vec()), Rejection::Refused(whole));
+    // Longer: cut at a character boundary. Bytes 199 and 200 are one character, so it goes.
+    let straddling = format!("{}\u{e9}tail", "m".repeat(199));
+    assert_eq!(refusing(fault_bytes("long", &straddling)), Rejection::Refused(fault("long", &"m".repeat(199))));
+    // Control characters (one byte, and two) turned into spaces.
+    assert_eq!(refusing(fault_bytes("c", "a\u{7}b\nc\u{85}d\te")), Rejection::Refused(fault("c", "a b c d e")));
+    // Every printable byte but space may be in a code: all 94, in two codes of 64 and 30.
+    let printable: Vec<char> = (0x21u8..=0x7e).map(char::from).collect();
+    assert_eq!(printable.len(), 94);
+    for part in printable.chunks(64) {
+        let code: String = part.iter().collect();
+        assert_eq!(refusing(fault_bytes(&code, "")), Rejection::Refused(fault(&code, "")));
+    }
+    // Nothing of any of it was kept.
+    assert!(rt.inner.with_ship("~zod", |ship| Ok(crate::store::kv_get(&lock(&ship.conn), "evil", b"k", 16)?)).unwrap().is_none());
+}
+
+/// A handler that refuses after its deadline is reported as refused, not as out of time: here
+/// the refusal is held, inside `refuse`, until well past the deadline. A handler the watchdog
+/// stops before it reaches `refuse` is out of time, as before.
+#[test]
+fn a_refusal_after_the_deadline_is_still_a_refusal() {
+    let dir = TempDir::new("refuse-late");
+    let rt = lone(&dir.0, Config { max_event_millis: 200, fuel_per_event: 1 << 50, ..fast() }, "~zod");
+    let manifest = offering("evil", vec![]);
+    hand_install(&rt, "~zod", "evil", &[("handle", vec![Step::Put(b"k", b"v"), Step::Refuse(fault_bytes("late", "but said"))])], &manifest);
+    let (entered, release) = rt.inner.gates.arm("refusing");
+    let held = rt.clone();
+    let thread = std::thread::spawn(move || held.deliver("~zod", "evil", b"go"));
+    entered.recv_timeout(Duration::from_secs(10)).expect("the handler to refuse");
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_millis(500));
+    release.send(()).unwrap();
+    let result = thread.join().unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert_eq!(rejected(result), Rejection::Refused(fault("late", "but said")));
+    assert!(rt.inner.with_ship("~zod", |ship| Ok(crate::store::kv_get(&lock(&ship.conn), "evil", b"k", 16)?)).unwrap().is_none());
+
+    hand_install(&rt, "~zod", "evil", &[("handle", vec![Step::Spin, Step::Refuse(fault_bytes("never", "reached"))])], &manifest);
+    assert_eq!(rejected(rt.deliver("~zod", "evil", b"go")), Rejection::Timeout);
+}
+
+/// A command one agent queues for another on the same ship, which refuses it, is dropped as any
+/// rejected queued command is: off the queue, nothing it did kept, recorded as not kept. The
+/// command that queued it stands.
+#[test]
+fn a_queued_command_that_refuses_is_dropped() {
+    let dir = TempDir::new("refuse-queued");
+    let rt = lone(&dir.0, Config { max_queued_per_deliver: 0, ..fast() }, "~zod");
+    hand_install(&rt, "~zod", "evil", &[("handle", vec![Step::Put(b"k", b"v"), Step::Refuse(fault_bytes("no", "thanks"))])], &offering("evil", vec![]));
+    let send = SendRequest { ship: String::new(), agent: "evil".into(), interface: "evil".into(), payload: b"queued".to_vec(), reply: false };
+    let uses = vec![Use { ship: String::new(), agent: "evil".into(), interface: "evil".into(), read: false, send: true, ask: false }];
+    hand_install(&rt, "~zod", "sender", &[("handle", vec![Step::Put(b"sent", b"yes"), Step::Send(send)])], &Manifest { provides: vec![], uses });
+    rt.deliver("~zod", "sender", b"go").unwrap();
+    assert_eq!(rt.pending("~zod").unwrap(), 1);
+    assert_eq!(rt.run_pending("~zod", 10).unwrap(), 1);
+    assert_eq!(rt.pending("~zod").unwrap(), 0);
+    let audit = rt.audit("~zod", 10).unwrap();
+    assert_eq!((audit[0].agent.as_str(), audit[0].event.as_slice(), audit[0].ok), ("evil", b"queued".as_slice(), false));
+    let kept = |agent: &str, key: &[u8]| rt.inner.with_ship("~zod", |ship| Ok(crate::store::kv_get(&lock(&ship.conn), agent, key, 16)?)).unwrap().is_some();
+    assert!(kept("sender", b"sent"));
+    assert!(!kept("evil", b"k"));
+    // Run again: nothing more.
+    assert_eq!(rt.run_pending("~zod", 10).unwrap(), 0);
+}
+
+/// Two ships: a command ~zod's agents send to an agent on ~nec that refuses it comes back with
+/// REFUSED and the fault, the fixed words as its reason and no reply, whether or not a reply was
+/// asked for; and nothing the command did on ~nec was kept.
+#[test]
+fn a_refused_command_from_another_ship_brings_its_fault_back_on_the_receipt() {
+    let dirs = (TempDir::new("refuse-far-a"), TempDir::new("refuse-far-b"));
+    let directory = Directory::new();
+    let zod = lone(&dirs.0 .0, fast(), "~zod");
+    let nec = lone(&dirs.1 .0, fast(), "~nec");
+    let refusal = vec![
+        Step::Put(b"k", b"v"),
+        Step::Append(AppendRequest { log: "evil".into(), payload: b"entry".to_vec() }),
+        Step::Refuse(fault_bytes("closed", "the book is closed \u{1} today")),
+    ];
+    let open = Manifest { provides: vec![Provide { interface: "evil".into(), public: false, remote: true, asked: true }], uses: vec![] };
+    hand_install(&nec, "~nec", "evil", &[("handle", refusal), ("read", vec![Step::Refuse(fault_bytes("no", "not a command"))])], &open);
+    for (agent, reply) in [("rec", false), ("rep", true)] {
+        hand_install(&zod, "~zod", agent, &recorder("nec", "evil", "evil", reply), &offering(agent, vec![sending_to("nec", "evil", "evil")]));
+    }
+    let zod_net = Network::start(zod.clone(), directory.clone(), NetConfig::default()).unwrap();
+    let nec_net = Network::start(nec.clone(), directory.clone(), NetConfig::default()).unwrap();
+    directory.set("~zod", zod.public_key("~zod").unwrap(), zod_net.addr()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    zod.deliver("~zod", "rec", b"send").unwrap();
+    zod.deliver("~zod", "rep", b"send").unwrap();
+    eventually("both receipts", Duration::from_secs(30), || recorded(&zod, "~zod", "rec", 1).is_some() && recorded(&zod, "~zod", "rep", 2).is_some());
+    for (agent, about) in [("rec", 1), ("rep", 2)] {
+        let receipt = recorded(&zod, "~zod", agent, about).unwrap();
+        let expected = Receipt {
+            about: about as u64,
+            verdict: Verdict::Refused as i32,
+            reason: crate::store::REFUSED_WORDS.into(),
+            ship: "nec".into(),
+            agent: "evil".into(),
+            interface: "evil".into(),
+            reply: Vec::new(),
+            replied: false,
+            fault: Some(fault("closed", "the book is closed   today")),
+        };
+        assert_eq!(receipt, expected, "{agent}");
+    }
+    // Nothing of either command was kept on ~nec, and each is in its audit log, not kept.
+    assert!(nec.log_head("~nec", "evil", "evil").unwrap().is_none());
+    assert!(nec.inner.with_ship("~nec", |ship| Ok(crate::store::kv_get(&lock(&ship.conn), "evil", b"k", 16)?)).unwrap().is_none());
+    assert_eq!(nec.audit("~nec", 100).unwrap().iter().filter(|entry| entry.agent == "evil" && !entry.ok).count(), 2);
+    // ~zod's audit log says what became of each, with the agent's words.
+    let lines: Vec<String> = zod.audit("~zod", 100).unwrap().into_iter().filter(|entry| !entry.ok && entry.event.starts_with(b"~nec")).map(|entry| String::from_utf8_lossy(&entry.event).into_owned()).collect();
+    assert!(lines.contains(&"~nec did not run command 1 to evil evil: the agent refused it: closed: the book is closed   today".to_string()), "{lines:?}");
+    assert_eq!(zod.unanswered("~zod").unwrap(), 0);
+    // A question from another ship's owner, which the read handler answers by calling `refuse`:
+    // an ordinary failure there, told as one.
+    assert_eq!(zod.ask("~zod", None, "~nec", "evil", "evil", b"?", Duration::from_secs(10)), Err(AskError::Failed));
+    let seen: Vec<_> = lock(&nec.inner.refusals).iter().filter(|(_, kind, _, _)| *kind == ship_proto::Kind::Read as i32).cloned().collect();
+    assert_eq!(seen, [("evil".to_string(), ship_proto::Kind::Read as i32, 0, false)]);
+    drop((zod_net, nec_net));
+}
+
+/// The sending ship takes a fault only with REFUSED, and only one within the rules (its control
+/// characters turned into spaces); the agent is then told the fixed words, whatever reason came.
+/// A fault with RAN or FAILED, or one too long or with a code that breaks the rule, is let go:
+/// the receipt is handed on with its verdict and no fault, and the reason and the audit log say
+/// a fault came and was not taken. A REFUSED receipt without a fault keeps its verdict. If it
+/// carries a reply, the receiver discards the reply and supplies the reply-discard reason.
+#[test]
+fn the_sending_ship_takes_a_fault_only_with_refused_and_within_the_rules() {
+    let dir = TempDir::new("refuse-taken");
+    let rt = lone(&dir.0, Config { max_queued_per_deliver: 0, ..fast() }, "~zod");
+    hand_install(&rt, "~zod", "rec", &recorder("nec", "evil", "evil", false), &offering("rec", vec![sending_to("nec", "evil", "evil")]));
+    // The same, its commands sent with the reply wanted, for the cases that bring a reply.
+    hand_install(&rt, "~zod", "rep", &recorder("nec", "evil", "evil", true), &offering("rep", vec![sending_to("nec", "evil", "evil")]));
+    let not_taken = crate::store::FAULT_NOT_TAKEN;
+    let refused = Verdict::Refused as i32;
+    let cases: Vec<(Receipt, Receipt)> = vec![
+        // Taken: the reason that came is replaced, control characters become spaces.
+        (Receipt { verdict: refused, reason: "whatever that ship says".into(), fault: Some(fault("no", "line\nbreak")), ..Receipt::default() }, Receipt { verdict: refused, reason: crate::store::REFUSED_WORDS.into(), fault: Some(fault("no", "line break")), ..Receipt::default() }),
+        // The largest there may be: taken whole.
+        (Receipt { verdict: refused, fault: Some(largest_fault()), ..Receipt::default() }, Receipt { verdict: refused, reason: crate::store::REFUSED_WORDS.into(), fault: Some(largest_fault()), ..Receipt::default() }),
+        // With RAN, or FAILED: let go.
+        (Receipt { verdict: Verdict::Ran as i32, fault: Some(fault("no", "m")), ..Receipt::default() }, Receipt { verdict: Verdict::Ran as i32, reason: not_taken.into(), ..Receipt::default() }),
+        (Receipt { verdict: Verdict::Failed as i32, reason: "the agent failed".into(), fault: Some(fault("no", "m")), ..Receipt::default() }, Receipt { verdict: Verdict::Failed as i32, reason: not_taken.into(), ..Receipt::default() }),
+        // Too long, or a code that breaks the rule: let go.
+        (Receipt { verdict: refused, fault: Some(fault("no", &"m".repeat(201))), ..Receipt::default() }, Receipt { verdict: refused, reason: not_taken.into(), ..Receipt::default() }),
+        (Receipt { verdict: refused, fault: Some(fault("n o", "m")), ..Receipt::default() }, Receipt { verdict: refused, reason: not_taken.into(), ..Receipt::default() }),
+        (Receipt { verdict: refused, fault: Some(fault(&"c".repeat(65), "m")), ..Receipt::default() }, Receipt { verdict: refused, reason: not_taken.into(), ..Receipt::default() }),
+        // REFUSED with none: handed on as it came.
+        (Receipt { verdict: refused, reason: "no reason given".into(), ..Receipt::default() }, Receipt { verdict: refused, reason: "no reason given".into(), ..Receipt::default() }),
+        // A reply marked with REFUSED is let go, though the command asked for one (these two are
+        // sent by `rep`); a fault beside it within the rules is taken, and the reason is the
+        // fault's; one breaking them is let go too, and the reason says so.
+        (Receipt { verdict: refused, replied: true, reply: b"r".to_vec(), fault: Some(fault("no", "m")), ..Receipt::default() }, Receipt { verdict: refused, reason: crate::store::REFUSED_WORDS.into(), fault: Some(fault("no", "m")), ..Receipt::default() }),
+        (Receipt { verdict: refused, replied: true, reply: b"r".to_vec(), fault: Some(fault("n o", "m")), ..Receipt::default() }, Receipt { verdict: refused, reason: not_taken.into(), ..Receipt::default() }),
+    ];
+    let sender = |about: u64| if about >= 9 { "rep" } else { "rec" };
+    for (n, (came, _)) in cases.iter().enumerate() {
+        let about = n as u64 + 1;
+        rt.deliver("~zod", sender(about), b"send").unwrap();
+        let message = PeerMessage { seq: about, receipt: Some(Receipt { about, ..came.clone() }), ..PeerMessage::default() };
+        assert_eq!(rt.inner.with_ship("~zod", |ship| ship.accept(&rt.inner, "nec", &[message])).unwrap(), about);
+    }
+    assert_eq!(rt.run_pending("~zod", 100).unwrap(), cases.len());
+    for (n, (_, told)) in cases.iter().enumerate() {
+        let about = n as u64 + 1;
+        let expected = Receipt { about, ship: "nec".into(), agent: "evil".into(), interface: "evil".into(), ..told.clone() };
+        assert_eq!(recorded(&rt, "~zod", sender(about), about as u8).unwrap(), expected, "case {about}");
+    }
+    let lines: Vec<String> = rt.audit("~zod", 1000).unwrap().into_iter().filter(|entry| (entry.agent == "rec" || entry.agent == "rep") && !entry.ok && entry.event.starts_with(b"~nec")).map(|entry| String::from_utf8_lossy(&entry.event).into_owned()).collect();
+    assert_eq!(lines.len(), cases.len(), "{lines:?}");
+    assert!(lines.contains(&"~nec did not run command 1 to evil evil: the agent refused it: no: line break".to_string()), "{lines:?}");
+    assert!(lines.contains(&format!("~nec ran command 3 to evil evil: it ran: {not_taken}")), "{lines:?}");
+    assert!(lines.contains(&format!("~nec did not run command 4 to evil evil: the agent failed: {not_taken}")), "{lines:?}");
+    for about in [5, 6, 7] {
+        assert!(lines.contains(&format!("~nec did not run command {about} to evil evil: the agent refused it: {not_taken}")), "{lines:?}");
+    }
+    assert!(lines.contains(&"~nec did not run command 8 to evil evil: the agent refused it: no reason given".to_string()), "{lines:?}");
+    assert!(lines.contains(&"~nec did not run command 9 to evil evil: the agent refused it: no: m".to_string()), "{lines:?}");
+    assert!(lines.contains(&format!("~nec did not run command 10 to evil evil: the agent refused it: {not_taken}")), "{lines:?}");
+}
+
+/// A module cannot refuse before its handler is entered: one whose start function calls `refuse`
+/// with a fault within the rules, and one whose allocator does, each fail as any module that
+/// traps there does, with no fault, whether the command is the owner's or another ship's (whose
+/// receipt says FAILED and carries no fault). Nothing else of a guest's runs before its handler.
+#[test]
+fn a_module_cannot_refuse_before_its_handler_is_entered() {
+    let dir = TempDir::new("refuse-early");
+    let rt = lone(&dir.0, Config { max_queued_per_deliver: 0, ..fast() }, "~zod");
+    let early = || vec![Step::Refuse(fault_bytes("early", "before the handler"))];
+    let mut about = 0;
+    for (label, place) in [("start", "start"), ("allocator", "alloc")] {
+        hand_install(&rt, "~zod", "evil", &[(place, early()), ("handle", vec![Step::Refuse(fault_bytes("late", "in the handler"))])], &offering("evil", vec![]));
+        let rejection = rejected(rt.deliver("~zod", "evil", b"go"));
+        assert!(matches!(rejection, Rejection::Trap(_)), "{label}: {rejection:?}");
+        about += 1;
+        let command = PeerMessage { seq: about, from_agent: "rec".into(), agent: "evil".into(), interface: "evil".into(), payload: b"go".to_vec(), receipt: None, reply_most: 0 };
+        rt.inner.with_ship("~zod", |ship| ship.accept(&rt.inner, "nec", &[command])).unwrap();
+        assert_eq!(rt.run_pending("~zod", 10).unwrap(), 1);
+        let owed = rt.inner.with_ship("~zod", |ship| Ok(Receipt::decode(&*lock(&ship.conn).query_row("SELECT payload FROM peer_out WHERE receipt != 0 ORDER BY seq DESC LIMIT 1", [], |r| r.get::<_, Vec<u8>>(0))?).unwrap())).unwrap();
+        assert_eq!((owed.about, owed.verdict(), owed.reason.as_str(), owed.fault), (about, Verdict::Failed, "the agent failed", None), "{label}");
+    }
+    // Each call to `refuse` there was an ordinary failure.
+    let taken: Vec<bool> = lock(&rt.inner.refusals).iter().map(|(_, _, _, taken)| *taken).collect();
+    assert_eq!(taken, [false; 4]);
+}
+
+/// The bound on what `refuse` reads stays sound with replies allowed to be as large as there is:
+/// with `max_reply_bytes` at `usize::MAX - 1023`, a short fault is a refusal, not a limit.
+#[test]
+fn a_refusal_is_read_whatever_replies_may_be() {
+    let dir = TempDir::new("refuse-bound");
+    let rt = lone(&dir.0, Config { max_reply_bytes: usize::MAX - 1023, ..fast() }, "~zod");
+    hand_install(&rt, "~zod", "evil", &[("handle", vec![Step::Refuse(fault_bytes("short", "m"))])], &offering("evil", vec![]));
+    assert_eq!(rejected(rt.deliver("~zod", "evil", b"go")), Rejection::Refused(fault("short", "m")));
+}
+
+/// At the host boundary: a pointer out of the guest's memory is an ordinary failure; a refusal
+/// larger than `max_reply_bytes` and 1 KiB, with fuel to spare, is a limit; and one the handler
+/// has too little fuel left to pay for is out of fuel. None of them is a refusal.
+#[test]
+fn a_refusal_the_host_cannot_read_or_be_paid_for_is_not_one() {
+    let dir = TempDir::new("refuse-boundary");
+    let rt = lone(&dir.0, Config { max_reply_bytes: 100, fuel_per_event: 50_000, ..fast() }, "~zod");
+    let manifest = offering("evil", vec![]);
+    let outcome = |ptr: u32, len: u32| {
+        hand_install(&rt, "~zod", "evil", &[("handle", vec![Step::RefuseAt(ptr, len)])], &manifest);
+        rejected(rt.deliver("~zod", "evil", b"go"))
+    };
+    assert!(matches!(outcome(1 << 30, 8), Rejection::Trap(why) if why.contains("refusal pointer is out of bounds")));
+    assert!(matches!(outcome(0, 1125), Rejection::Limit(why) if why.contains("refusal is 1125 bytes, limit is 1124")));
+    let poor_dir = TempDir::new("refuse-poor");
+    let poor = lone(&poor_dir.0, Config { fuel_per_event: 20_000, ..fast() }, "~zod");
+    hand_install(&poor, "~zod", "evil", &[("handle", vec![Step::RefuseAt(0, 100_000)])], &manifest);
+    assert_eq!(rejected(poor.deliver("~zod", "evil", b"go")), Rejection::OutOfFuel);
+}
+
+/// A kernel whose `route` calls `refuse` fails routing as any kernel that traps does: the command
+/// is not routed, and nothing is a refusal.
+#[test]
+fn a_kernel_cannot_refuse() {
+    let dir = TempDir::new("refuse-kernel");
+    let rt = Runtime::open(&dir.0, fast()).unwrap();
+    let kernel = rt.add_module(&hand_agent(&[("route", vec![Step::Refuse(fault_bytes("kernel", "no"))]), ("admin", vec![])])).unwrap();
+    rt.create_ship("~zod", &kernel).unwrap();
+    assert!(matches!(rejected(rt.deliver("~zod", "anyone", b"go")), Rejection::Trap(_)));
+    let seen = lock(&rt.inner.refusals).clone();
+    assert!(!seen.is_empty() && seen.iter().all(|(agent, _, _, taken)| agent == "kernel" && !taken), "{seen:?}");
+}
+
+/// A ship with a REFUSED receipt waiting to go to another ship, and one with a REFUSED receipt
+/// queued for its agent, each with the largest fault, export and import; and exports changed so
+/// that what is stored is not what this runtime could have written or taken are refused.
+#[test]
+fn refused_receipts_waiting_and_queued_export_and_import_and_broken_ones_are_refused() {
+    let code = "test-test-test-test-test-test-test-test";
+    let cfg = Config { max_queued_per_deliver: 0, ..fast() };
+    let dir = TempDir::new("refuse-export");
+    let rt = lone(&dir.0, cfg.clone(), "~zod");
+    let largest = largest_fault();
+    hand_install(&rt, "~zod", "evil", &[("handle", vec![Step::Refuse(largest.encode_to_vec())])], &offering("evil", vec![]));
+    hand_install(&rt, "~zod", "rec", &recorder("nec", "evil", "evil", false), &offering("rec", vec![sending_to("nec", "evil", "evil")]));
+    // ~nec's command to evil, refused here: its receipt waits to go.
+    let command = PeerMessage { seq: 1, from_agent: "rec".into(), agent: "evil".into(), interface: "evil".into(), payload: b"please".to_vec(), receipt: None, reply_most: 0 };
+    rt.inner.with_ship("~zod", |ship| ship.accept(&rt.inner, "nec", &[command])).unwrap();
+    assert_eq!(rt.run_pending("~zod", 10).unwrap(), 1);
+    // rec's command to ~nec, refused there: its receipt is queued for rec. (It is message 2 to
+    // ~nec, after the receipt waiting to go.)
+    rt.deliver("~zod", "rec", b"send").unwrap();
+    let receipt = Receipt { about: 2, verdict: Verdict::Refused as i32, reason: "anything".into(), fault: Some(largest.clone()), ..Receipt::default() };
+    rt.inner.with_ship("~zod", |ship| ship.accept(&rt.inner, "nec", &[PeerMessage { seq: 2, receipt: Some(receipt), ..PeerMessage::default() }])).unwrap();
+    let stored = |rt: &Runtime, sql: &str| -> Receipt {
+        rt.inner.with_ship("~zod", |ship| Ok(Receipt::decode(&*lock(&ship.conn).query_row(sql, [], |r| r.get::<_, Vec<u8>>(0))?).unwrap())).unwrap()
+    };
+    let owed = "SELECT payload FROM peer_out WHERE receipt != 0";
+    let queued = "SELECT payload FROM inbox WHERE kind = 5";
+    assert_eq!(stored(&rt, owed), Receipt { about: 1, verdict: Verdict::Refused as i32, reason: crate::store::REFUSED_WORDS.into(), fault: Some(largest.clone()), ..Receipt::default() });
+    let told = stored(&rt, queued);
+    assert_eq!(told.fault, Some(largest.clone()));
+    rt.set_recovery_key("~zod", crate::seal::recovery_public(code)).unwrap();
+    let out = TempDir::new("refuse-export-copy");
+    rt.export_ship("~zod", out.0.join("copy")).unwrap();
+    let into = TempDir::new("refuse-export-into");
+    let other = Runtime::open(&into.0, cfg.clone()).unwrap();
+    other.import_ship(out.0.join("copy"), "~zod", code).unwrap();
+    assert_eq!(stored(&other, owed).fault, Some(largest.clone()));
+    assert_eq!(stored(&other, queued), told);
+    // The receipt queued is handed over in the copy.
+    assert_eq!(other.run_pending("~zod", 10).unwrap(), 1);
+    assert_eq!(recorded(&other, "~zod", "rec", 2).unwrap(), told);
+
+    let refused = |label: &str, change: &dyn Fn(&rusqlite::Connection)| {
+        let copy = out.0.join(label);
+        copy_export(&out.0.join("copy"), &copy);
+        rework(&copy, "~zod", code, change);
+        let into = TempDir::new(&format!("refuse-export-{label}"));
+        let rt = Runtime::open(&into.0, cfg.clone()).unwrap();
+        let imported = rt.import_ship(&copy, "~zod", code);
+        assert!(matches!(&imported, Err(Error::BadShipFile(_))), "{label}: {imported:?}");
+    };
+    let change = |sql: &'static str, edit: fn(&mut Receipt)| {
+        move |file: &rusqlite::Connection| {
+            let bytes: Vec<u8> = file.query_row(sql, [], |r| r.get(0)).unwrap();
+            let mut receipt = Receipt::decode(&*bytes).unwrap();
+            edit(&mut receipt);
+            let (table, which) = if sql.contains("peer_out") { ("peer_out", "receipt != 0") } else { ("inbox", "kind = 5") };
+            file.execute(&format!("UPDATE {table} SET payload = ?1 WHERE {which}"), [receipt.encode_to_vec()]).unwrap();
+        }
+    };
+    // Waiting to go: a fault with another verdict; REFUSED with none; a fault breaking the rules;
+    // other words beside it.
+    refused("owed-failed", &change(owed, |r| r.verdict = Verdict::Failed as i32));
+    refused("owed-faultless", &change(owed, |r| r.fault = None));
+    refused("owed-spaced", &change(owed, |r| r.fault.as_mut().unwrap().code = "a b".into()));
+    refused("owed-words", &change(owed, |r| r.reason = "the agent failed".into()));
+    // Queued for the agent: a fault with RAN; a message over the bound; a control character;
+    // other words beside it; a code too long.
+    refused("queued-ran", &change(queued, |r| r.verdict = Verdict::Ran as i32));
+    refused("queued-long", &change(queued, |r| r.fault.as_mut().unwrap().message.push('m')));
+    refused("queued-control", &change(queued, |r| r.fault.as_mut().unwrap().message = "a\nb".into()));
+    refused("queued-words", &change(queued, |r| r.reason = "anything".into()));
+    refused("queued-code", &change(queued, |r| r.fault.as_mut().unwrap().code.push('!')));
+    // Either, as it is but with a field this runtime does not know added: a receipt with a fault
+    // is taken only as the bytes this runtime writes.
+    let padded = |sql: &'static str| {
+        move |file: &rusqlite::Connection| {
+            let mut bytes: Vec<u8> = file.query_row(sql, [], |r| r.get(0)).unwrap();
+            bytes.extend_from_slice(&[0x7a, 0x03, b'p', b'a', b'd']);
+            assert!(Receipt::decode(&*bytes).is_ok());
+            let (table, which) = if sql.contains("peer_out") { ("peer_out", "receipt != 0") } else { ("inbox", "kind = 5") };
+            file.execute(&format!("UPDATE {table} SET payload = ?1 WHERE {which}"), [bytes]).unwrap();
+        }
+    };
+    refused("owed-padded", &padded(owed));
+    refused("queued-padded", &padded(queued));
+}
+
+/// A ship whose events are small (64 bytes) imports its own export holding a receipt queued for
+/// its agent with the largest fault and the largest names (561 bytes for command 1, over
+/// `MAX_RECEIPT_BYTES` and inside its allowance), and again once the receipt has been handled and the audit log
+/// holds the lines about it, each cut to `MAX_RECEIPT_BYTES` (the bound import holds an audit
+/// row to is the larger of that and `max_event_bytes`).
+#[test]
+fn a_ship_with_small_events_imports_its_own_export_holding_the_largest_fault() {
+    let code = "test-test-test-test-test-test-test-test";
+    let cfg = Config { max_event_bytes: 64, max_queued_per_deliver: 0, ..fast() };
+    let dir = TempDir::new("refuse-small");
+    let rt = lone(&dir.0, cfg.clone(), "~zod");
+    let (ship, agent, interface) = ("a".repeat(64), "b".repeat(64), "c".repeat(128));
+    hand_install(&rt, "~zod", "rec", &recorder(&ship, &agent, &interface, false), &offering("rec", vec![sending_to(&ship, &agent, &interface)]));
+    rt.deliver("~zod", "rec", b"send").unwrap();
+    let receipt = Receipt { about: 1, verdict: Verdict::Refused as i32, reason: "r".repeat(200), fault: Some(largest_fault()), ..Receipt::default() };
+    rt.inner.with_ship("~zod", |held| held.accept(&rt.inner, &ship, &[PeerMessage { seq: 1, receipt: Some(receipt), ..PeerMessage::default() }])).unwrap();
+    let told: Vec<u8> = rt.inner.with_ship("~zod", |held| Ok(lock(&held.conn).query_row("SELECT payload FROM inbox WHERE kind = 5", [], |r| r.get(0))?)).unwrap();
+    // 569 bytes with the largest command number; this one is number 1, eight bytes fewer.
+    assert_eq!(told.len(), 561);
+    rt.set_recovery_key("~zod", crate::seal::recovery_public(code)).unwrap();
+    let out = TempDir::new("refuse-small-copy");
+    rt.export_ship("~zod", out.0.join("queued")).unwrap();
+    let first = TempDir::new("refuse-small-first");
+    let other = Runtime::open(&first.0, cfg.clone()).unwrap();
+    other.import_ship(out.0.join("queued"), "~zod", code).unwrap();
+    assert_eq!(other.run_pending("~zod", 10).unwrap(), 1);
+    assert_eq!(recorded(&other, "~zod", "rec", 1).unwrap().encode_to_vec(), told);
+    // The audit log now holds the line about the receipt (cut to 512 bytes, from more) and the
+    // facts of the receipt event: each over `max_event_bytes`, none over `MAX_RECEIPT_BYTES`.
+    let rows = other.audit("~zod", 100).unwrap();
+    let line = rows.iter().find(|entry| entry.event.starts_with(format!("~{ship} did not run command 1").as_bytes())).expect("the line about the receipt");
+    assert_eq!(line.event.len(), crate::store::MAX_RECEIPT_BYTES);
+    assert!(rows.iter().any(|entry| entry.event.starts_with(b"receipt 1 the agent refused it") && entry.event.len() > 64));
+    assert!(rows.iter().all(|entry| entry.event.len() <= crate::store::MAX_RECEIPT_BYTES));
+    other.set_recovery_key("~zod", crate::seal::recovery_public(code)).unwrap();
+    other.export_ship("~zod", out.0.join("handled")).unwrap();
+    let second = TempDir::new("refuse-small-second");
+    let again = Runtime::open(&second.0, cfg).unwrap();
+    again.import_ship(out.0.join("handled"), "~zod", code).unwrap();
+    assert_eq!(recorded(&again, "~zod", "rec", 1).unwrap().encode_to_vec(), told);
+}
+
+/// Two ships that have filled up with commands for each other, every one refused there with the
+/// largest fault, still get everything through, and every command comes back REFUSED: the
+/// receipt each writes, the largest fault and all (306 bytes at the most), is inside the room the
+/// two keep for receipts (`MAX_RECEIPT_BYTES` each), which a fault does not move.
+#[test]
+fn two_full_ships_whose_commands_are_refused_with_the_largest_fault_still_get_through() {
+    let small = Config { max_ship_bytes: 340 << 10, audit_rows: 32, ..fast() };
+    let dirs = (TempDir::new("full-refused-a"), TempDir::new("full-refused-b"));
+    let directory = Directory::new();
+    let refusing = hand_agent(&[("handle", vec![Step::Refuse(largest_fault().encode_to_vec())])]);
+    let crew = |dir: &Path, ship: &str, other: &str| {
+        let rt = lone(dir, small.clone(), ship);
+        let (counter, tally) = (rt.add_module(&refusing).unwrap(), rt.add_module(&wasm("tally")).unwrap());
+        rt.install(ship, "counter", &counter, &counter_with(false, true)).unwrap();
+        rt.install(ship, "tally", &tally, &asking_tally(other)).unwrap();
+        rt
+    };
+    let (zod, nec) = (crew(&dirs.0 .0, "~zod", "nec"), crew(&dirs.1 .0, "~nec", "zod"));
+    let padding = "p".repeat(2000);
+    let fill = |rt: &Runtime, ship: &str, other: &str| {
+        let command = format!("tell {other} {padding}");
+        let mut sent = 0;
+        let stopped = loop {
+            match rt.deliver(ship, "tally", command.as_bytes()) {
+                Ok(_) => sent += 1,
+                Err(e) => break e,
+            }
+        };
+        // It stopped because the file had no more room to send, and for no other reason.
+        assert!(matches!(&stopped, Error::Rejected(Rejection::Limit(why)) if why == "this ship's file is too full to send more to other ships"), "{stopped:?}");
+        assert!(sent > 5, "only {sent} were sent");
+        sent
+    };
+    let (from_zod, from_nec) = (fill(&zod, "~zod", "nec"), fill(&nec, "~nec", "zod"));
+    let zod_net = Network::start(zod.clone(), directory.clone(), NetConfig::default()).unwrap();
+    let nec_net = Network::start(nec.clone(), directory.clone(), NetConfig::default()).unwrap();
+    directory.set("~zod", zod.public_key("~zod").unwrap(), zod_net.addr()).unwrap();
+    directory.set("~nec", nec.public_key("~nec").unwrap(), nec_net.addr()).unwrap();
+    eventually("every command answered", Duration::from_secs(90), || {
+        zod.unanswered("~zod").unwrap() == 0 && nec.unanswered("~nec").unwrap() == 0 && zod.pending("~zod").unwrap() == 0 && nec.pending("~nec").unwrap() == 0
+    });
+    for (rt, ship, sent) in [(&zod, "~zod", from_zod), (&nec, "~nec", from_nec)] {
+        let got = receipts(rt, ship);
+        assert_eq!(got.len(), sent, "{ship}");
+        assert!(got.iter().all(|line| line.contains("/counter counter refused [the agent refused it] from ")), "{ship}: {got:?}");
+    }
+    // And each receipt tally's handler was handed carried the largest fault, whole: the bytes it
+    // was given, decoded, one for each command and none twice.
+    for (rt, ship, sent) in [(&zod, "zod", from_zod), (&nec, "nec", from_nec)] {
+        let handed: Vec<Receipt> = lock(&rt.inner.receipts_handed).iter().filter(|(on, _)| on == ship).map(|(_, bytes)| Receipt::decode(&**bytes).unwrap()).collect();
+        let mut numbers: Vec<u64> = handed.iter().map(|receipt| receipt.about).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, (1..=sent as u64).collect::<Vec<_>>(), "{ship}");
+        for receipt in &handed {
+            let fault = receipt.fault.as_ref().unwrap_or_else(|| panic!("{ship}: receipt {} handed on with no fault", receipt.about));
+            assert_eq!((fault.code.as_str(), fault.message.as_str()), (largest_fault().code.as_str(), largest_fault().message.as_str()), "{ship}");
+        }
+    }
+    drop((zod_net, nec_net));
+}

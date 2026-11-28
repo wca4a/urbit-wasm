@@ -380,6 +380,7 @@ fn receipted(receipt: &ship_sdk::Receipt) {
         ship_sdk::Verdict::Limit => "limit",
         ship_sdk::Verdict::Malformed => "malformed",
         ship_sdk::Verdict::Lost => "lost",
+        ship_sdk::Verdict::Refused => "refused",
         ship_sdk::Verdict::Unspecified => "unknown",
     };
     // A long reply is noted by its length, so that the list stays small.

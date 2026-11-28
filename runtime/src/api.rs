@@ -291,11 +291,12 @@ impl Encoding {
     }
 }
 
-/// What a typed call came to: the reply's body as the agent wrote it, or a question's fault.
+/// What a typed call came to: the reply's body as the agent wrote it, or a fault.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Called {
     Reply(Vec<u8>),
-    /// A question's fault, with its code and message (a command's never comes back: it traps).
+    /// A question's fault, from its reply, or a command's, which the command refused with:
+    /// nothing the command did was kept. Its code and message.
     Fault(Fault),
 }
 
@@ -311,7 +312,8 @@ pub enum CallError {
     /// The interface has no method of that name to call (its log is not one).
     NoSuchMethod(String),
     /// What the agent answered is not a `CallReply`, has neither a body nor a fault, is a fault
-    /// from a command (which may already have committed), or, asked for JSON, is not JSON.
+    /// a command answered with instead of refusing (it may have committed), or, asked for JSON,
+    /// is not JSON.
     BadReply(String),
     /// Whatever `Runtime::deliver_on` or `Runtime::read` returned, and a ship that does not
     /// exist, a name that is not valid, or a module whose bytes cannot be read.
@@ -372,9 +374,11 @@ impl Runtime {
     /// module is replaced before the call runs, the new module's generated dispatch decides: a
     /// method of another kind there is refused (`ship.wrong-kind`), and one it lacks too.
     ///
-    /// Only a question's fault comes back. A command's fault traps in the agent and comes back as
-    /// the rejection any failed command does; a command that answers with a fault anyway (no
-    /// generated code does) is `CallError::BadReply`, though it may already have committed.
+    /// A question's fault comes back from its reply. A command produces `Called::Fault` when
+    /// `deliver_on` returns `Rejection::Refused`: nothing the command did is kept. An invalid
+    /// refusal code produces `CallError::Runtime`. A command that answers with a fault in its
+    /// `CallReply` without refusing (no generated code does) is `CallError::BadReply`, since it
+    /// may already have committed.
     pub fn call_method(&self, ship: &str, agent: &str, interface: &str, method: &str, body: &[u8], encoding: Encoding) -> Result<Called, CallError> {
         check_target(agent, interface).map_err(CallError::Runtime)?;
         let description = self.description(ship, agent)?.ok_or(CallError::NoDescription)?;
@@ -384,7 +388,11 @@ impl Runtime {
         self.inner.gates.pass("typed call looked up");
         let call = Call { method: method.to_string(), body: body.to_vec(), json: encoding == Encoding::Json }.encode_to_vec();
         let reply = match kind {
-            MethodKind::Command => self.deliver_on(ship, agent, interface, &call)?.reply,
+            MethodKind::Command => match self.deliver_on(ship, agent, interface, &call) {
+                Ok(outcome) => outcome.reply,
+                Err(Error::Rejected(crate::Rejection::Refused(fault))) => return Ok(Called::Fault(fault)),
+                Err(error) => return Err(error.into()),
+            },
             _ => self.read(ship, agent, interface, &call)?,
         };
         let reply = CallReply::decode(&*reply).map_err(|e| CallError::BadReply(format!("it is not a CallReply: {e}")))?;
@@ -428,8 +436,8 @@ pub(crate) fn encoding_of(media_type: Option<&str>) -> Option<Encoding> {
     }
 }
 
-/// The status a question's fault is answered with at the door, by its code: the generated
-/// code's refusals as what they mean for the request, and an application's fault as 422.
+/// The status a fault is answered with at the door. The door selects the HTTP status from the
+/// fault code for both questions and refused commands.
 pub(crate) fn fault_status(code: &str) -> u16 {
     match code {
         "ship.not-understood" => 400,

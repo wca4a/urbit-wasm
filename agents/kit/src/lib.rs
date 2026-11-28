@@ -76,6 +76,10 @@ impl kit_api::Handlers for Kit {
     fn taken(_: Empty) -> Result<Haul, Fault> {
         Ok(taken())
     }
+
+    fn refuse(request: Name) -> Result<Name, Fault> {
+        Err(fault(&request.name, &request.nickname))
+    }
 }
 
 /// The counter's log has entries for the kit: take them through the typed log of an interface

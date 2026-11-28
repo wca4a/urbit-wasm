@@ -643,7 +643,9 @@ impl prost_build::ServiceGenerator for Generator {
             let _ = writeln!(out);
             let _ = writeln!(out, "    /// The handlers of `{name}`: one for each command and each question. Each is given the");
             let _ = writeln!(out, "    /// decoded input and returns the output or a fault; `ship_sdk::invocation()` still says");
-            let _ = writeln!(out, "    /// who is calling. A command's fault rolls its event back and does not reach the caller.");
+            let _ = writeln!(out, "    /// who is calling. Generated dispatch passes a returned command fault to `refuse`. An");
+            let _ = writeln!(out, "    /// accepted refusal rolls back the handler's changes and carries the fault in the owner's");
+            let _ = writeln!(out, "    /// result or in a receipt sent to another ship. An invalid code produces an ordinary failure.");
             let _ = writeln!(out, "    pub trait Handlers {{");
             for method in commands.iter().chain(&questions) {
                 docs(&method.comments, 2, out);
@@ -724,7 +726,7 @@ impl prost_build::ServiceGenerator for Generator {
                 let _ = writeln!(out, "            pub fn send_to_for_reply(ship: &str, agent: &str, request: &{input}) -> u64 {{");
                 let _ = writeln!(out, "                ::ship_sdk::send_to_for_reply(ship, agent, super::super::INTERFACE, &{call})");
                 let _ = writeln!(out, "            }}");
-                let _ = writeln!(out, "            /// The typed reply a receipt carries, or why there is none.");
+                let _ = writeln!(out, "            /// The typed reply a receipt carries, the fault the command was refused with, or why there is none.");
                 let _ = writeln!(out, "            pub fn receipt(receipt: &::ship_sdk::Receipt) -> {result}<{output}, ::ship_sdk::api::CallError> {{");
                 let _ = writeln!(out, "                ::ship_sdk::api::__receipt(receipt)");
                 let _ = writeln!(out, "            }}");

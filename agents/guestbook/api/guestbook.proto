@@ -16,7 +16,8 @@ service Guestbook {
   // is not kept.
   rpc Erase(EraseRequest) returns (Erased);
   // Copy one of this book's signatures into another guestbook: on this ship (sent, nothing comes
-  // back) or on another (sent with its reply wanted, which comes back on the receipt).
+  // back) or on another (sent with its reply wanted, which comes back on the receipt, or the
+  // fault the other book refused it with).
   rpc Pass(PassRequest) returns (Passed);
   // Ask a guestbook on another ship for one of its signatures. The answer comes later.
   rpc Fetch(FetchRequest) returns (Fetching);
@@ -25,11 +26,11 @@ service Guestbook {
   // For the tests: add an entry to the log that is not a signature.
   rpc Scribble(ScribbleRequest) returns (google.protobuf.Empty);
   // For the tests: sign a placeholder (an entry in the log, and the book and a count written),
-  // and then fail, so that it can be seen that nothing of it is kept.
+  // and then refuse (`spoilt`), so that it can be seen that nothing of it is kept.
   rpc Spoil(google.protobuf.Empty) returns (google.protobuf.Empty);
   // Signatures whose names start with a prefix, newest first. For the tests, a prefix that
-  // starts with `ship.` is answered with a fault of that code, which only the generated code may
-  // use, so it arrives rewritten as `app.ship...`.
+  // starts with `ship.` is answered with a fault of that code. For this typed question,
+  // generated dispatch rewrites the handler's returned `ship.` prefix to `app.ship.`.
   rpc Lookup(LookupRequest) returns (Page) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
@@ -114,6 +115,9 @@ message PassRequest {
   // Empty for this ship.
   string ship = 2;
   string agent = 3;
+  // For the tests and the walk-through: send the signature without its name. A guestbook on
+  // another ship returns `no-name` in its receipt. A same-ship send has no receipt.
+  bool nameless = 4;
 }
 
 message Passed {

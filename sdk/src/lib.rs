@@ -51,6 +51,38 @@ extern "C" {
     fn host_ask_to(req: *const u8, req_len: u32) -> i64;
     #[link_name = "ask_drop"]
     fn host_ask_drop(number: u64) -> i64;
+    #[link_name = "refuse"]
+    fn host_refuse(ptr: *const u8, len: u32);
+}
+
+/// Turn the command being handled down on purpose, saying why, and do not come back. Nothing the
+/// command did is kept, exactly as for a handler that fails, and the fault reaches whoever sent
+/// the command: the owner (`Rejection::Refused`, or the JSON door's answer), or the agent on
+/// another ship that sent it (`Receipt.fault`, with `Verdict::Refused`).
+///
+/// It counts only in a command's own handler (the `handle` export). Anywhere else (a read, a
+/// read nested under a command, a notification, a receipt, an answer, a checkpoint request, a
+/// file question) it is an ordinary failure, with no reason carried, as a trap is there. The
+/// runtime holds the fault to its rules: a code of 1 to 64 bytes, each printable ASCII other than
+/// space, or the refusal is itself an ordinary failure; a message of any UTF-8, cut to 200 bytes
+/// at a character boundary, with each control character turned into a space.
+///
+/// A module that calls this imports `host.refuse`, which a runtime from before refusals does not
+/// have: it cannot be installed there.
+pub fn refuse(fault: &proto::Fault) -> ! {
+    let bytes = fault.encode_to_vec();
+    unsafe { host_refuse(bytes.as_ptr(), bytes.len() as u32) };
+    // The runtime never returns from a refusal. Were a host ever to, the handler must still not
+    // carry on.
+    #[cfg(target_arch = "wasm32")]
+    core::arch::wasm32::unreachable();
+    #[cfg(not(target_arch = "wasm32"))]
+    std::process::abort();
+}
+
+/// The same, with a code and a message.
+pub fn refuse_with(code: &str, message: &str) -> ! {
+    refuse(&proto::Fault { code: code.into(), message: message.into() })
 }
 
 /// Questions to agents on other ships. A question only reads: the other agent's read handler
@@ -319,9 +351,10 @@ pub fn send(agent: &str, interface: &str, payload: &[u8]) {
 /// The event is rejected if this agent's manifest does not name that ship and agent.
 ///
 /// Reaching the other ship is not the same as running there: the other agent may refuse the
-/// command, or fail. Either way that ship sends back one receipt, which also arrives exactly
-/// once. A refusal is written to this ship's audit log. An agent declared with `receipt = f`
-/// is also handed each receipt, carrying the number returned here.
+/// command (`Verdict::Refused`, its reason in `Receipt.fault`), or fail. Either way that ship
+/// sends back one receipt, which also arrives exactly once. A command that did not run is
+/// written to this ship's audit log. An agent declared with `receipt = f` is also handed each
+/// receipt, carrying the number returned here.
 ///
 /// One other thing can become of a command. If either ship goes back to an earlier state,
 /// such as a restored backup, the record of the command or of its answer may go with it.
@@ -347,8 +380,9 @@ pub fn send_to(ship: &str, agent: &str, interface: &str, payload: &[u8]) -> u64 
 /// receipt can say RAN with `Receipt.replied` unset when the other ship's runtime predates
 /// replies, or when it broke the protocol (a reply over the bound the command was sent with, or
 /// a reply not marked): the command is still reported as run, because the other ship said so;
-/// no reply is handed on; and when a reply came and was let go, the reason says so. An agent
-/// that needs the reply checks `Receipt.replied`.
+/// no reply is handed on. A reply that breaks the protocol is discarded. If a fault also arrived,
+/// the reason describes what happened to the fault. Otherwise it identifies the discarded reply.
+/// An agent that needs the reply checks `Receipt.replied`.
 ///
 /// On a ship that takes back no reply at all (its `max_receipt_reply_bytes` is 0, or its queue
 /// is too small for any receipt with a reply), this is refused here and the event with it,
@@ -442,8 +476,9 @@ macro_rules! export_fn {
 ///
 /// The answer handler is `fn(&ask::Answered)`. It is called once for each question this agent
 /// put to another ship with `ask::to` and did not drop, with the number `ask::to` returned and
-/// what came of it: the other agent's reply, or why there is none. It runs as an event of its
-/// own and may do anything a command handler may. An agent with no answer handler is never
+/// what came of it: the other agent's reply, or why there is none. It runs as a separate event
+/// and may change state. Only a command's own handler can refuse with a fault. An agent with no
+/// answer handler is never
 /// told; its questions are still answered and forgotten.
 ///
 /// A read handler answers questions from other ships too, if the manifest opens its interface
@@ -461,15 +496,17 @@ macro_rules! export_fn {
 ///
 /// The receipt handler is `fn(&Receipt)`. It is called once for each command this agent sent
 /// to another ship with `send_to`, when that ship says what became of it: whether it ran, and
-/// if not, why. It runs as an event of its own and may do anything a command handler may. For a
+/// if not, why. It runs as a separate event and may change state. Only a command's own handler
+/// can refuse with a fault. For a
 /// command sent with `send_to_for_reply`, a receipt saying RAN carries the handler's reply in
 /// `Receipt.reply`, with `Receipt.replied` set (so an empty reply is told from none).
 /// The whole reply comes back with RAN from a receiving ship that follows the protocol. A
 /// receipt can say RAN with `Receipt.replied` unset when the other ship's runtime predates
 /// replies, or when it broke the protocol (a reply over the bound the command was sent with, or
 /// a reply not marked): the command is still reported as run, because the other ship said so;
-/// no reply is handed on; and when a reply came and was let go, the reason says so. An agent
-/// that needs the reply checks `Receipt.replied`.
+/// no reply is handed on. A reply that breaks the protocol is discarded. If a fault also arrived,
+/// the reason describes what happened to the fault. Otherwise it identifies the discarded reply.
+/// An agent that needs the reply checks `Receipt.replied`.
 /// This holds while neither ship makes its message, inbox or reply limits smaller while the
 /// command or its receipt is outstanding.
 ///
@@ -541,8 +578,10 @@ macro_rules! include_api {
 /// names a method that interface does not have, or is not a `Call` whose body decodes (as
 /// protobuf, or as proto3 JSON when the call says so), is refused with a fault
 /// (`api::NO_SUCH_INTERFACE` and the rest); so is a command method reached as a question, and the
-/// reverse (`api::WRONG_KIND`), which is not run. On the command path a fault traps, a handler's
-/// own `Err` included, so nothing the command did is kept. An owner's command through
+/// reverse (`api::WRONG_KIND`), which is not run. Generated dispatch passes a returned command
+/// fault, a handler's own `Err` included, to `refuse`. An accepted refusal rolls back the
+/// handler's changes and carries the fault in the owner's result or in a receipt sent to another
+/// ship. An invalid code produces an ordinary failure. An owner's command through
 /// `/agents/<agent>/command` comes through no interface, and is refused so.
 ///
 /// A typed agent always has a checkpoint export. For a log declared with

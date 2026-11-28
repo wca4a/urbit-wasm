@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use ed25519_dalek::{Signer, SigningKey};
 use ship_proto::{
-    AppendRequest, AskRequest, Checkpoint, CheckpointBody, Entry, EntryBody, FileMark, FollowRequest, Grant, Kind, Message, NextReply,
+    AppendRequest, AskRequest, Checkpoint, CheckpointBody, Entry, EntryBody, Fault, FileMark, FollowRequest, Grant, Kind, Message, NextReply,
     NextRequest, ReadRequest, SendRequest, ShareRequest, Source,
 };
 use wasmtime::{Caller, Engine, Linker, Memory, StoreLimits, Trap};
@@ -97,6 +97,10 @@ pub struct Ctx {
     /// Whether the module running has a receipt handler, and so is told what becomes of the
     /// commands it sends to other ships.
     pub takes_receipts: bool,
+    /// Whether a refusal counts in this call: only in the `handle` export of a command, at depth
+    /// 0, and only once that export has been entered (not while the module starts or its
+    /// allocator runs): see `refuse`.
+    pub may_refuse: bool,
 }
 
 #[derive(Debug)]
@@ -122,6 +126,20 @@ impl fmt::Display for LogsFull {
 }
 
 impl std::error::Error for LogsFull {}
+
+/// A command's handler turned the command down on purpose, with this fault (already held to the
+/// rules: see `refuse`). Its event is rolled back as any rejected event is, and the fault goes to
+/// whoever sent the command.
+#[derive(Debug)]
+pub struct Refused(pub Fault);
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "refused: {}: {}", self.0.code, self.0.message)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 #[derive(Debug)]
 pub struct Denied(pub String);
@@ -808,5 +826,56 @@ pub fn linker(engine: &Engine) -> Result<Linker<Ctx>> {
         Ok(i64::from(marked))
     })?;
 
+    // Turn the command being handled down on purpose: the agent hands over an encoded `Fault`
+    // and does not come back. The call fails here, from inside the host, so the guest stops at
+    // once; `Ship::execute` finds the fault on the error, rolls the handler's work back by the
+    // path every rejection takes, and passes the fault to whoever sent the command.
+    linker.func_wrap("host", "refuse", |mut caller: Caller<'_, Ctx>, ptr: u32, len: u32| -> Result<()> {
+        #[cfg(test)]
+        caller.data().rt.clone().gates.pass("refusing");
+        let failed = refusal(&mut caller, ptr, len);
+        #[cfg(test)]
+        {
+            let ctx = caller.data();
+            let kind = ship_proto::Invocation::decode(&*ctx.invocation).map_or(-1, |invocation| invocation.kind);
+            lock(&ctx.rt.refusals).push((ctx.agent.to_string(), kind, ctx.depth, failed.downcast_ref::<Refused>().is_some()));
+        }
+        Err(failed)
+    })?;
+
     Ok(linker)
+}
+
+/// What a call to `refuse` fails with: `Refused` with the fault as the runtime keeps it, or, where
+/// a refusal does not count or is itself faulty, an ordinary failure that carries no reason.
+fn refusal(caller: &mut Caller<'_, Ctx>, ptr: u32, len: u32) -> anyhow::Error {
+    // Only a command's own handler may refuse: the `handle` export of a command, not a read
+    // nested under it. Anywhere else this is an ordinary failure, as a trap is there, with no
+    // reason carried. A read, a notification, a receipt, an answer, a checkpoint request and a
+    // file question have nobody to carry a reason to; a question already says why in its reply
+    // (a `CallReply` holding its fault); and a read nested under a command is the reading
+    // agent's business, which must not speak for the command.
+    if !caller.data().may_refuse {
+        return anyhow!("refuse was called where a refusal does not count");
+    }
+    if let Err(e) = charge(caller, len as u64) {
+        return e;
+    }
+    // A fault larger than any reply the agent could have given is a limit, as any request over
+    // its size is.
+    let most = caller.data().rt.cfg.max_reply_bytes.saturating_add(REQUEST_ENVELOPE_BYTES);
+    let bytes = match read_guest(caller, ptr, len, most, "refusal") {
+        Ok(bytes) => bytes,
+        Err(e) => return e,
+    };
+    // A refusal that is itself faulty is an ordinary failure: bytes that are not a `Fault`, or a
+    // code that breaks the rule. Its details go nowhere.
+    let Ok(fault) = Fault::decode(&*bytes) else {
+        return anyhow!("the refusal is not a fault");
+    };
+    if !store::fault_code_ok(&fault.code) {
+        return anyhow!("the refusal's code is not one a fault may have");
+    }
+    let message = store::fault_message(&fault.message);
+    Refused(Fault { code: fault.code, message }).into()
 }
